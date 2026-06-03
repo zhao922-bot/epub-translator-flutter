@@ -6,7 +6,7 @@
 
 本项目是从 Python 版本 ([epub-translator](https://github.com/zhao922-bot/epub-translator)) 完全重构为 Flutter 版本，实现了以下改进：
 
-- 🚀 **跨平台支持** - 从单一平台扩展到 Windows、macOS、Linux、Android、iOS
+- 🚀 **跨平台支持** - 从单一平台扩展到 Windows、macOS、Linux、Android、iOS（目前仅测试了 Windows 和 Android）
 - 🎨 **现代化 UI** - Material Design 3 界面，深色/浅色主题自动切换
 - ⚡ **性能提升** - Dart 语言原生性能，更快的启动速度和响应速度
 - 📱 **原生体验** - 响应式设计，适配各种屏幕尺寸
@@ -168,18 +168,11 @@ flutter run
 # Windows
 flutter build windows
 
-# macOS
-flutter build macos
-
-# Linux
-flutter build linux
-
 # Android
 flutter build apk
-
-# iOS
-flutter build ios
 ```
+
+> **注意**: 目前仅测试了 Windows 和 Android 平台。macOS、Linux 和 iOS 版本可能存在兼容性问题，欢迎贡献者测试和改进。
 
 ---
 
