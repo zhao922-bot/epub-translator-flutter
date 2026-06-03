@@ -294,7 +294,7 @@ genhtml coverage/lcov.info -o coverage/html
 ### v1.0.0 (2026-06-03)
 - 🎉 首个 Flutter 版本发布
 - ✅ 从 Python 版本完全重构
-- ✅ 支持 Windows、macOS、Linux、Android、iOS
+- ✅ 支持 Windows 和 Android 平台
 - ✅ Material Design 3 界面
 - ✅ Riverpod 状态管理
 - ✅ 并发翻译支持
@@ -314,7 +314,7 @@ genhtml coverage/lcov.info -o coverage/html
 - ✅ **修改** - 可以修改源代码
 - ✅ **分发** - 可以分发原始或修改后的代码
 - ✅ **私人使用** - 可以私人使用
-- ✅ ** sublicense** - 可以授予 sublicenses
+- ✅ **Sublicense** - 可以授予 sublicenses
 
 ### 条件
 
