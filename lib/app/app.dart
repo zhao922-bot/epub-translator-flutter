@@ -16,13 +16,32 @@ class EpubTranslatorApp extends ConsumerWidget {
     final UiLanguage uiLanguage = ref.watch(
       settingsProvider.select((TranslationConfig config) => config.uiLanguage),
     );
+    final AppThemeMode appThemeMode = ref.watch(
+      settingsProvider.select((TranslationConfig config) => config.themeMode),
+    );
+    final double textScale = ref.watch(
+      settingsProvider.select((TranslationConfig config) => config.textScale),
+    );
     return MaterialApp.router(
       title: strings.appTitle,
       debugShowCheckedModeBanner: false,
       routerConfig: appRouter,
       theme: AppTheme.light(uiLanguage),
       darkTheme: AppTheme.dark(uiLanguage),
-      themeMode: ThemeMode.dark,
+      themeMode: switch (appThemeMode) {
+        AppThemeMode.system => ThemeMode.system,
+        AppThemeMode.light => ThemeMode.light,
+        AppThemeMode.dark => ThemeMode.dark,
+      },
+      builder: (BuildContext context, Widget? child) {
+        final MediaQueryData media = MediaQuery.of(context);
+        return MediaQuery(
+          data: media.copyWith(
+            textScaler: TextScaler.linear(textScale.clamp(0.9, 1.3)),
+          ),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
     );
   }
 }

@@ -15,9 +15,12 @@ class AppShell extends ConsumerWidget {
   final String currentLocation;
   final Widget child;
 
+  static const Key brandKey = ValueKey<String>('app-shell-brand');
+  static const Key shellKey = ValueKey<String>('app-shell');
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final TextTheme textTheme = Theme.of(context).textTheme;
     final strings = ref.watch(appStringsProvider);
     final List<NavItem> items = <NavItem>[
       NavItem(
@@ -47,11 +50,11 @@ class AppShell extends ConsumerWidget {
     );
 
     return Scaffold(
+      key: shellKey,
       body: SafeArea(
         child: LayoutBuilder(
           builder: (BuildContext context, BoxConstraints constraints) {
             final bool useBottomNavigation = constraints.maxWidth < 900;
-            final bool compactSidebar = constraints.maxHeight < 720;
             if (useBottomNavigation) {
               return Column(
                 children: <Widget>[
@@ -65,6 +68,7 @@ class AppShell extends ConsumerWidget {
                         .map(
                           (item) => NavigationDestination(
                             icon: Icon(item.icon),
+                            selectedIcon: Icon(item.icon),
                             label: item.label,
                           ),
                         )
@@ -77,98 +81,119 @@ class AppShell extends ConsumerWidget {
             return Row(
               children: <Widget>[
                 Container(
-                  width: 220,
-                  decoration: BoxDecoration(
-                    border: Border(
-                      right: BorderSide(color: scheme.outlineVariant),
+                  width: 244,
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: <Color>[Color(0xFF152842), Color(0xFF0D1728)],
                     ),
                   ),
                   child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
                       Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          20,
-                          compactSidebar ? 16 : 20,
-                          20,
-                          compactSidebar ? 12 : 16,
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        key: brandKey,
+                        padding: const EdgeInsets.fromLTRB(20, 26, 20, 22),
+                        child: Row(
                           children: <Widget>[
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(12),
-                              child: Image.asset(
-                                'assets/icons/app_icon.png',
-                                width: compactSidebar ? 36 : 48,
-                                height: compactSidebar ? 36 : 48,
-                                fit: BoxFit.cover,
+                            Container(
+                              width: 46,
+                              height: 46,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.14),
+                                borderRadius: BorderRadius.circular(15),
+                                border: Border.all(
+                                  color: Colors.white.withValues(alpha: 0.18),
+                                ),
+                              ),
+                              clipBehavior: Clip.antiAlias,
+                              child: Padding(
+                                padding: const EdgeInsets.all(6),
+                                child: ClipRRect(
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: Image.asset(
+                                    'assets/icons/app_icon.png',
+                                    fit: BoxFit.cover,
+                                    semanticLabel: strings.appTitle,
+                                  ),
+                                ),
                               ),
                             ),
-                            SizedBox(height: compactSidebar ? 10 : 14),
-                            Text(
-                              strings.appTitle,
-                              style: Theme.of(context).textTheme.titleLarge,
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              strings.appSubtitle,
-                              style: Theme.of(context).textTheme.bodySmall
-                                  ?.copyWith(color: scheme.onSurfaceVariant),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    strings.appTitle,
+                                    style: textTheme.titleMedium?.copyWith(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w700,
+                                      letterSpacing: -0.25,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    strings.appSubtitle,
+                                    style: textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.64,
+                                      ),
+                                      fontSize: 11.5,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ],
+                              ),
                             ),
                           ],
                         ),
                       ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 20),
+                        child: Container(
+                          height: 1,
+                          color: Colors.white.withValues(alpha: 0.12),
+                        ),
+                      ),
+                      const SizedBox(height: 18),
                       Expanded(
-                        child: NavigationRail(
-                          selectedIndex: selectedIndex < 0 ? 0 : selectedIndex,
-                          extended: true,
-                          groupAlignment: -1,
-                          destinations: items
-                              .map(
-                                (item) => NavigationRailDestination(
-                                  icon: Icon(item.icon),
-                                  label: Text(item.label),
-                                ),
-                              )
-                              .toList(),
-                          onDestinationSelected: (index) {
-                            context.go(items[index].location);
+                        child: ListView.separated(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          itemCount: items.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 6),
+                          itemBuilder: (BuildContext context, int index) {
+                            return _SidebarDestination(
+                              item: items[index],
+                              selected: index == selectedIndex,
+                              onTap: () => context.go(items[index].location),
+                            );
                           },
                         ),
                       ),
                       Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          20,
-                          compactSidebar ? 12 : 20,
-                          20,
-                          compactSidebar ? 12 : 20,
-                        ),
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: scheme.surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: scheme.outlineVariant),
-                          ),
-                          child: Padding(
-                            padding: EdgeInsets.all(compactSidebar ? 10 : 12),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                Text(
-                                  strings.shellStatus,
-                                  style: Theme.of(context).textTheme.labelLarge,
-                                ),
-                                const SizedBox(height: 8),
-                                Text(
-                                  strings.shellStatusBody,
-                                  style: Theme.of(context).textTheme.bodySmall
-                                      ?.copyWith(
-                                        color: scheme.onSurfaceVariant,
-                                      ),
-                                ),
-                              ],
+                        padding: const EdgeInsets.fromLTRB(20, 10, 20, 22),
+                        child: Row(
+                          children: <Widget>[
+                            Icon(
+                              Icons.auto_stories_outlined,
+                              size: 16,
+                              color: Colors.white.withValues(alpha: 0.48),
                             ),
-                          ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                strings.appSubtitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.labelMedium?.copyWith(
+                                  color: Colors.white.withValues(alpha: 0.48),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ],
@@ -178,6 +203,69 @@ class AppShell extends ConsumerWidget {
               ],
             );
           },
+        ),
+      ),
+    );
+  }
+}
+
+class _SidebarDestination extends StatelessWidget {
+  const _SidebarDestination({
+    required this.item,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final NavItem item;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final TextTheme textTheme = Theme.of(context).textTheme;
+    final Color foreground = selected
+        ? const Color(0xFF162B49)
+        : Colors.white.withValues(alpha: 0.72);
+
+    return Semantics(
+      selected: selected,
+      button: true,
+      label: item.label,
+      child: Material(
+        color: selected
+            ? const Color(0xFFEAF1FF)
+            : Colors.white.withValues(alpha: 0.001),
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+            child: Row(
+              children: <Widget>[
+                Icon(item.icon, size: 21, color: foreground),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    item.label,
+                    style: textTheme.labelLarge?.copyWith(
+                      color: foreground,
+                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                    ),
+                  ),
+                ),
+                if (selected)
+                  Container(
+                    width: 5,
+                    height: 5,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF4E78B2),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+              ],
+            ),
+          ),
         ),
       ),
     );

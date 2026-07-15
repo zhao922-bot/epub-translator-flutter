@@ -42,6 +42,18 @@ class PlatformUtils {
     );
   }
 
+  static Future<String?> readSecret(String name) {
+    return NativePlatformBridge.readSecret(name);
+  }
+
+  static Future<void> writeSecret(String name, String value) {
+    return NativePlatformBridge.writeSecret(name, value);
+  }
+
+  static Future<void> deleteSecret(String name) {
+    return NativePlatformBridge.deleteSecret(name);
+  }
+
   static Future<String> appDocumentsDirectory() async {
     final String? directory =
         await NativePlatformBridge.appDocumentsDirectory();

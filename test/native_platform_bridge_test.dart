@@ -43,4 +43,20 @@ $OutputEncoding = $utf8NoBom
     },
     skip: Platform.isWindows ? null : 'Windows-only PowerShell process test.',
   );
+
+  test(
+    'round trips Windows secrets through DPAPI storage',
+    () async {
+      final String name = 'codex_test_${DateTime.now().microsecondsSinceEpoch}';
+      addTearDown(() => NativePlatformBridge.deleteSecret(name));
+
+      await NativePlatformBridge.writeSecret(name, 'sk-secret-value');
+      final String? restored = await NativePlatformBridge.readSecret(name);
+      await NativePlatformBridge.deleteSecret(name);
+
+      expect(restored, 'sk-secret-value');
+      expect(await NativePlatformBridge.readSecret(name), isNull);
+    },
+    skip: Platform.isWindows ? null : 'Windows-only DPAPI storage test.',
+  );
 }

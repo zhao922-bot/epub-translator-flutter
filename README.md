@@ -2,11 +2,13 @@
 
 一款功能强大的 EPUB 电子书翻译工具，使用 Flutter 框架重构，支持多平台运行。
 
+当前版本：**v1.1.0**（Windows / Android） · 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## ✨ 项目背景
 
 本项目是从 Python 版本 ([epub-translator](https://github.com/zhao922-bot/epub-translator)) 完全重构为 Flutter 版本，实现了以下改进：
 
-- 🚀 **跨平台支持** - 从单一平台扩展到 Windows、macOS、Linux、Android、iOS（目前仅测试了 Windows 和 Android）
+- 🚀 **平台支持** - **Windows 与 Android** 为官方支持与测试目标（macOS / Linux / iOS 未作为本仓库开发范围）
 - 🎨 **现代化 UI** - Material Design 3 界面，深色/浅色主题自动切换
 - ⚡ **性能提升** - Dart 语言原生性能，更快的启动速度和响应速度
 - 📱 **原生体验** - 响应式设计，适配各种屏幕尺寸
@@ -49,34 +51,33 @@
 
 | 特性 | Python 版本 | Flutter 版本 |
 |------|-----------|-------------|
-| **运行平台** | 仅限 Windows/macOS/Linux | 全平台（包括移动端） |
+| **运行平台** | 仅限 Windows/macOS/Linux | Windows + Android（官方） |
 | **UI 框架** | PyQt/Tkinter（较旧） | Material Design 3（现代化） |
 | **启动速度** | 较慢（解释型语言） | ⚡ 极快（原生编译） |
 | **内存占用** | 较高 | ✅ 优化内存管理 |
-| **并发性能** | 受 GIL 限制 | ✅ 真正的多线程 |
+| **并发性能** | 受 GIL 限制 | ✅ async 并发 API 请求；ZIP 解包/重打包走 isolate |
 | **响应式设计** | ❌ 固定布局 | ✅ 自适应各种屏幕 |
-| **主题支持** | 有限 | ✅ 深色/浅色主题 |
+| **主题支持** | 有限 | ✅ 深色/浅色主题 + 字号缩放 |
 | **代码维护** | 复杂 | ✅ 模块化、易维护 |
-| **国际化** | 手动实现 | ✅ Riverpod 状态管理 |
-| **状态管理** | 全局变量 | ✅ 响应式状态管理 |
+| **国际化** | 手动实现 | ✅ 中英文界面 |
+| **状态管理** | 全局变量 | ✅ Riverpod 响应式状态管理 |
 
 ### 🚀 Flutter 版本优势
 
-#### 1. **真正的跨平台**
-- 一套代码库运行在 5 个平台
-- 原生性能，无跨平台性能损失
-- 统一的用户体验
+#### 1. **Windows + Android 优先**
+- 桌面与移动双端统一体验
+- Windows 文件对话框 / DPAPI 密钥；Android 原生选书、分享与安全存储
 
 #### 2. **现代化架构**
 - **Riverpod** 状态管理：响应式、类型安全、易于测试
-- **GoRouter** 路由管理：声明式路由，深度链接支持
+- **GoRouter** 路由管理：声明式路由
 - **Feature-based** 架构：模块化、易于扩展
 
 #### 3. **更好的性能**
 - Dart AOT 编译为原生代码
-- 更快的启动速度（< 1 秒）
-- 更低的内存占用
-- 真正的多线程并发翻译
+- 更快的启动速度
+- 大书 ZIP 打开/重打包在 isolate 中执行，减轻 UI 卡顿
+- 多请求并发翻译 + 块缓存续传
 
 #### 4. **开发体验**
 - Hot Reload 即时预览
@@ -172,7 +173,7 @@ flutter build windows
 flutter build apk
 ```
 
-> **注意**: 目前仅测试了 Windows 和 Android 平台。macOS、Linux 和 iOS 版本可能存在兼容性问题，欢迎贡献者测试和改进。
+> **注意**: 本项目当前只针对 **Windows** 与 **Android** 开发和验证。其它平台不在支持范围内。
 
 ---
 
@@ -215,7 +216,6 @@ flutter build apk
 | `timeoutSeconds` | 30-300 | 120 | 翻译超时时间 |
 | `maxRetries` | 1-6 | 3 | 失败重试次数 |
 | `retryDelaySeconds` | 1-15 | 5 | 重试间隔时间 |
-| `disableThinking` | true/false | true | 禁用 AI 思考模式 |
 
 ### 界面语言
 
@@ -262,10 +262,29 @@ flutter test
 # 运行特定测试文件
 flutter test test/widget_test.dart
 
+# 合成大书 isolate 压测
+flutter test test/epub_isolate_stress_test.dart --reporter expanded
+
+# 可选：真实 EPUB 路径集成压测（未设置环境变量时自动 skip）
+# PowerShell:
+#   $env:EPUB_STRESS_PATH = 'D:\books\big.epub'
+#   flutter test test/epub_real_path_stress_test.dart --reporter expanded
+
 # 生成测试覆盖率报告
 flutter test --coverage
 genhtml coverage/lcov.info -o coverage/html
 ```
+
+### 翻译管线模块（Windows / Android）
+
+| 模块 | 职责 |
+|------|------|
+| `EpubInspector` | isolate 打开 ZIP、spine 检查 |
+| `TranslationBatchPlanner` | 分块 / 邻接上下文规划 |
+| `TranslationApiClient` | Dio、重试、限流、连接测试 |
+| `EpubChapterTranslator` | 缓存、书记忆、调度翻译 |
+| `EpubRepacker` | 写回 XHTML + isolate 重打包 |
+| `EpubTranslationRepository` | Facade（对外 API 稳定） |
 
 ---
 
@@ -290,6 +309,15 @@ genhtml coverage/lcov.info -o coverage/html
 ---
 
 ## 📝 更新日志
+
+### v1.1.0 (2026-07-16)
+- 完整 EPUB 翻译链路：章节检查、可选章节、分块翻译、质量校验与安全回写。
+- 新增任务历史、断点续译、块缓存、术语表和翻译前耗时/费用预估。
+- 重构桌面翻译工作台与设置页，统一中英文排版、深浅主题和紧凑窗口体验。
+- 强化 Windows / Android 原生能力、密钥存储、错误脱敏、可取消重试及原子 EPUB 输出。
+- 新增 CI 与覆盖真实 EPUB、取消、重试、回写和界面的离线测试。
+
+完整条目见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### v1.0.0 (2026-06-03)
 - 🎉 首个 Flutter 版本发布

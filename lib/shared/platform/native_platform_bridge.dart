@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show Directory, Platform, Process, ProcessResult;
+import 'dart:io' show Directory, File, Platform, Process, ProcessResult;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -102,6 +102,71 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     }
   }
 
+  static Future<String?> readSecret(String name) async {
+    if (!kIsWeb && Platform.isAndroid) {
+      return _androidChannel.invokeMethod<String>('readSecret', {'name': name});
+    }
+
+    if (!kIsWeb && Platform.isWindows) {
+      final File file = await _windowsSecretFile(name);
+      if (!await file.exists()) {
+        return null;
+      }
+      final String encrypted = (await file.readAsString()).trim();
+      if (encrypted.isEmpty) {
+        return null;
+      }
+      final String decrypted = await _runWindowsSecretScript(r'''
+Add-Type -AssemblyName System.Security
+$raw = [Console]::In.ReadToEnd().Trim()
+if ([string]::IsNullOrWhiteSpace($raw)) { return }
+$protected = [Convert]::FromBase64String($raw)
+$bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($bytes))
+''', encrypted);
+      return decrypted.isEmpty ? null : decrypted;
+    }
+
+    return null;
+  }
+
+  static Future<void> writeSecret(String name, String value) async {
+    if (!kIsWeb && Platform.isAndroid) {
+      await _androidChannel.invokeMethod<void>('writeSecret', {
+        'name': name,
+        'value': value,
+      });
+      return;
+    }
+
+    if (!kIsWeb && Platform.isWindows) {
+      final File file = await _windowsSecretFile(name);
+      await file.parent.create(recursive: true);
+      final String encrypted = await _runWindowsSecretScript(r'''
+Add-Type -AssemblyName System.Security
+$plain = [Console]::In.ReadToEnd()
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
+$protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+[Console]::Out.Write([Convert]::ToBase64String($protected))
+''', value);
+      await file.writeAsString(encrypted, flush: true);
+    }
+  }
+
+  static Future<void> deleteSecret(String name) async {
+    if (!kIsWeb && Platform.isAndroid) {
+      await _androidChannel.invokeMethod<void>('deleteSecret', {'name': name});
+      return;
+    }
+
+    if (!kIsWeb && Platform.isWindows) {
+      final File file = await _windowsSecretFile(name);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+  }
+
   static Future<String?> _runWindowsDialog(String script) async {
     final ProcessResult result = await Process.run(
       'powershell',
@@ -135,5 +200,40 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
       return utf8.decode(output);
     }
     return output?.toString() ?? '';
+  }
+
+  static Future<File> _windowsSecretFile(String name) async {
+    final String appDirectory =
+        await appDocumentsDirectory() ?? Directory.current.path;
+    final String safeName = name
+        .replaceAll(RegExp(r'[\\/:*?"<>|]'), '_')
+        .trim();
+    return File(path.join(appDirectory, 'secrets', '$safeName.dpapi'));
+  }
+
+  static Future<String> _runWindowsSecretScript(
+    String script,
+    String input,
+  ) async {
+    final Process process = await Process.start('powershell', <String>[
+      '-NoProfile',
+      '-Command',
+      script,
+    ]);
+    process.stdin.write(input);
+    await process.stdin.close();
+
+    final Future<String> stdout = utf8.decoder.bind(process.stdout).join();
+    final Future<String> stderr = utf8.decoder.bind(process.stderr).join();
+    final int exitCode = await process.exitCode;
+    final String stdoutText = await stdout;
+    final String stderrText = await stderr;
+    if (exitCode != 0) {
+      final String error = stderrText.trim();
+      throw StateError(
+        error.isNotEmpty ? error : 'Windows secret operation failed.',
+      );
+    }
+    return stdoutText;
   }
 }

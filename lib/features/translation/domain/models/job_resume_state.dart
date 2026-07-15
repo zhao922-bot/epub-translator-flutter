@@ -49,19 +49,37 @@ class JobResumeState {
 
   factory JobResumeState.fromJson(Map<String, dynamic> json) {
     return JobResumeState(
-      jobKey: json['jobKey'] as String? ?? '',
-      inputFingerprint: json['inputFingerprint'] as String? ?? '',
-      inputPath: json['inputPath'] as String? ?? '',
-      outputPath: json['outputPath'] as String? ?? '',
-      status: json['status'] as String? ?? 'running',
-      completedFiles: json['completedFiles'] as int? ?? 0,
-      totalFiles: json['totalFiles'] as int? ?? 0,
-      completedBlocks: json['completedBlocks'] as int? ?? 0,
-      totalBlocks: json['totalBlocks'] as int? ?? 0,
-      cachedBlocks: json['cachedBlocks'] as int? ?? 0,
-      resumedBlocks: json['resumedBlocks'] as int? ?? 0,
-      currentChapter: json['currentChapter'] as String? ?? '',
-      updatedAtIso8601: json['updatedAtIso8601'] as String? ?? '',
+      jobKey: _readString(json['jobKey']),
+      inputFingerprint: _readString(json['inputFingerprint']),
+      inputPath: _readString(json['inputPath']),
+      outputPath: _readString(json['outputPath']),
+      status: _readString(json['status'], fallback: 'running'),
+      completedFiles: _readNonNegativeInt(json['completedFiles']),
+      totalFiles: _readNonNegativeInt(json['totalFiles']),
+      completedBlocks: _readNonNegativeInt(json['completedBlocks']),
+      totalBlocks: _readNonNegativeInt(json['totalBlocks']),
+      cachedBlocks: _readNonNegativeInt(json['cachedBlocks']),
+      resumedBlocks: _readNonNegativeInt(json['resumedBlocks']),
+      currentChapter: _readString(json['currentChapter']),
+      updatedAtIso8601: _readString(json['updatedAtIso8601']),
     );
+  }
+
+  static String _readString(Object? value, {String fallback = ''}) {
+    return value is String ? value : fallback;
+  }
+
+  static int _readNonNegativeInt(Object? value) {
+    final int? parsed = switch (value) {
+      int value => value,
+      num value => value.round(),
+      String value =>
+        int.tryParse(value.trim()) ?? double.tryParse(value.trim())?.round(),
+      _ => null,
+    };
+    if (parsed == null || parsed < 0) {
+      return 0;
+    }
+    return parsed;
   }
 }

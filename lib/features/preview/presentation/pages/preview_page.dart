@@ -5,6 +5,7 @@ import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../../shared/widgets/section_card.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
+import '../../../translation/domain/models/chapter_selection_preset.dart';
 import '../../application/preview_provider.dart';
 import '../../domain/models/preview_chapter.dart';
 
@@ -38,6 +39,8 @@ class PreviewPage extends ConsumerWidget {
             width: stackedLayout ? double.infinity : 360,
             child: SectionCard(
               title: strings.chapterChecklist,
+              icon: Icons.checklist_rounded,
+              variant: SectionCardVariant.standard,
               trailing: TextButton.icon(
                 onPressed: dashboardState.inspectedChapters.isEmpty
                     ? null
@@ -60,6 +63,44 @@ class PreviewPage extends ConsumerWidget {
                           ),
                           style: Theme.of(context).textTheme.bodySmall,
                         ),
+                      ),
+                    ),
+                  if (dashboardState.inspectedChapters.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: <Widget>[
+                          ActionChip(
+                            label: Text(strings.presetRecommended),
+                            onPressed: () =>
+                                dashboardController.applyChapterSelectionPreset(
+                                  ChapterSelectionPreset.recommended,
+                                ),
+                          ),
+                          ActionChip(
+                            label: Text(strings.presetContentOnly),
+                            onPressed: () =>
+                                dashboardController.applyChapterSelectionPreset(
+                                  ChapterSelectionPreset.contentOnly,
+                                ),
+                          ),
+                          ActionChip(
+                            label: Text(strings.presetAll),
+                            onPressed: () =>
+                                dashboardController.applyChapterSelectionPreset(
+                                  ChapterSelectionPreset.allChapters,
+                                ),
+                          ),
+                          ActionChip(
+                            label: Text(strings.presetNone),
+                            onPressed: () =>
+                                dashboardController.applyChapterSelectionPreset(
+                                  ChapterSelectionPreset.none,
+                                ),
+                          ),
+                        ],
                       ),
                     ),
                   ...List<Widget>.generate(chapters.length, (int index) {
@@ -114,6 +155,8 @@ class PreviewPage extends ConsumerWidget {
             children: <Widget>[
               SectionCard(
                 title: selectedChapter.title,
+                icon: Icons.menu_book_outlined,
+                variant: SectionCardVariant.emphasis,
                 trailing: _PreviewBadge(
                   chapter: selectedChapter,
                   strings: strings,
@@ -148,20 +191,40 @@ class PreviewPage extends ConsumerWidget {
                       ],
                     ),
                     const SizedBox(height: 16),
-                    ExcludeSemantics(
-                      child: SelectableText(
-                        selectedChapter.body,
-                        style: Theme.of(
-                          context,
-                        ).textTheme.bodyLarge?.copyWith(height: 1.6),
-                      ),
+                    Text(
+                      strings.sourcePreview,
+                      style: Theme.of(context).textTheme.titleSmall,
                     ),
+                    const SizedBox(height: 8),
+                    SelectableText(
+                      selectedChapter.body,
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyLarge?.copyWith(height: 1.6),
+                    ),
+                    if (selectedChapter.translatedBlockCount > 0) ...<Widget>[
+                      const SizedBox(height: 20),
+                      Text(
+                        strings.translatedPreview,
+                        style: Theme.of(context).textTheme.titleSmall,
+                      ),
+                      const SizedBox(height: 8),
+                      SelectableText(
+                        _translatedExcerpt(dashboardState, selectedChapter),
+                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                          height: 1.6,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
               const SizedBox(height: 16),
               SectionCard(
                 title: strings.currentFilteringRule,
+                icon: Icons.filter_alt_outlined,
+                variant: SectionCardVariant.subtle,
                 child: Text(
                   strings.currentFilteringRuleBody,
                   style: Theme.of(context).textTheme.bodyMedium,
@@ -189,6 +252,29 @@ class PreviewPage extends ConsumerWidget {
       ),
     );
   }
+}
+
+String _translatedExcerpt(
+  TranslationDashboardState dashboardState,
+  PreviewChapter selectedChapter,
+) {
+  for (final chapter in dashboardState.inspectedChapters) {
+    if (chapter.path != selectedChapter.path) {
+      continue;
+    }
+    final Iterable<String> parts = chapter.blocks
+        .map((block) => block.translatedHtml)
+        .whereType<String>()
+        .map((html) => html.replaceAll(RegExp(r'<[^>]+>'), ' '))
+        .map((text) => text.replaceAll(RegExp(r'\s+'), ' ').trim())
+        .where((text) => text.isNotEmpty)
+        .take(8);
+    final String joined = parts.join('\n\n');
+    if (joined.isNotEmpty) {
+      return joined;
+    }
+  }
+  return selectedChapter.body;
 }
 
 class _PreviewBadge extends StatelessWidget {
