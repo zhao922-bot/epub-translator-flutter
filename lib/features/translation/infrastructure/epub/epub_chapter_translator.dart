@@ -15,6 +15,7 @@ import '../../domain/models/job_resume_state.dart';
 import '../../domain/models/translation_config.dart';
 import '../../domain/models/translation_job.dart';
 import '../../domain/models/translation_run_result.dart';
+import '../../domain/models/translation_style_profile.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../translation_cache_store.dart';
 import '../translation_quality.dart';
@@ -42,7 +43,7 @@ class EpubChapterTranslator {
   final TranslationApiClient _apiClient;
   final TranslationBatchPlanner _batchPlanner;
 
-  static const String _cacheSchemaVersion = 'v6-glossary-and-path-keys';
+  static const String _cacheSchemaVersion = 'v9-cjk-inline-typography';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -58,15 +59,27 @@ class EpubChapterTranslator {
     return TranslationApiClient.sanitizeOutputSuffix(suffix);
   }
 
+  static String prepareBlockHtmlForTargetForTest({
+    required String sourceHtml,
+    required String targetLanguage,
+  }) {
+    return _prepareBlockHtmlForTarget(
+      sourceHtml: sourceHtml,
+      targetLanguage: targetLanguage,
+    );
+  }
+
   static String blockCacheKeyForTest({
     required TranslationConfig config,
     required ExtractedBlock block,
     required String chapterPath,
+    TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return EpubChapterTranslator()._blockCacheKey(
       config,
       block,
       chapterPath: chapterPath,
+      confirmedStyleProfile: confirmedStyleProfile,
     );
   }
 
@@ -74,16 +87,24 @@ class EpubChapterTranslator {
     required String inputFingerprint,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return EpubChapterTranslator()._jobKey(
       inputFingerprint: inputFingerprint,
       config: config,
       chapters: chapters,
+      confirmedStyleProfile: confirmedStyleProfile,
     );
   }
 
   static String normalizeInputPathForCacheForTest(String inputPath) {
     return _normalizeInputPathForCache(inputPath);
+  }
+
+  static List<Map<String, String>> styleProfileSourceChaptersForTest(
+    List<InspectedChapter> chapters,
+  ) {
+    return _styleProfileSourceChapters(chapters);
   }
 
   static String outputFilePathForTest({
@@ -166,6 +187,291 @@ class EpubChapterTranslator {
     )).toJson();
   }
 
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    CancelToken? cancelToken,
+  }) async {
+    if (!config.styleProfileEnabled) {
+      return TranslationStyleProfile.empty;
+    }
+    final Dio dio = _apiClient.buildDio(config);
+    return _generateStyleProfile(
+      dio: dio,
+      config: config,
+      chapters: chapters,
+      cancelToken: cancelToken,
+    );
+  }
+
+  Future<TranslationStyleProfile> generateStyleProfileForTest({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+  }) async {
+    return _generateStyleProfile(dio: dio, config: config, chapters: chapters);
+  }
+
+  /// Dedicated style-profile call, not piggybacked on book-memory summary.
+  Future<TranslationStyleProfile> _generateStyleProfile({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    CancelToken? cancelToken,
+  }) async {
+    final List<Map<String, String>> sourceChapters =
+        _styleProfileSourceChapters(chapters);
+    if (sourceChapters.isEmpty) {
+      return TranslationStyleProfile.empty;
+    }
+
+    final Map<String, dynamic> payload = <String, dynamic>{
+      'kind': 'styleProfile',
+      'targetLanguage': config.targetLanguage,
+      'chapters': sourceChapters,
+    };
+    final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
+      dio: dio,
+      config: config,
+      payload: payload,
+      systemPrompt:
+          'You analyze an EPUB before translation. Return strict JSON only. '
+          'Required top-level object keys: primaryGenre, secondaryGenres, tone, '
+          'sentenceStyle, translationConstraints, avoid, confidence. '
+          'primaryGenre must be a practical book type such as business nonfiction, '
+          'science fiction, romance, historical fiction, literary fiction, mystery, '
+          'fantasy, memoir, self-help, biography, or philosophy. '
+          'secondaryGenres is a short string array. tone and sentenceStyle are short phrases. '
+          'translationConstraints and avoid may be either string arrays or single strings. '
+          'Write notes for translators into ${config.targetLanguage}. '
+          'confidence must be one of: high, medium, low. '
+          'Prefer executable style rules over marketing labels. '
+          'If evidence is thin, still provide a best-effort primaryGenre with confidence low. '
+          'Do not wrap the JSON in markdown fences.',
+      cancelToken: cancelToken,
+    );
+    return _parseStyleProfileResponse(jsonPayload);
+  }
+
+  /// Samples meaningful front matter plus early/middle/late body chapters.
+  ///
+  /// Indexes, contents, copyright pages, credits and other structural matter
+  /// must not influence the inferred writing style even when an EPUB uses
+  /// opaque filenames or generic document titles.
+  static List<Map<String, String>> _styleProfileSourceChapters(
+    List<InspectedChapter> chapters,
+  ) {
+    final List<InspectedChapter> eligible = chapters
+        .where((InspectedChapter chapter) => chapter.includeInTranslation)
+        .where((InspectedChapter chapter) => chapter.blocks.isNotEmpty)
+        .where(
+          (InspectedChapter chapter) => !_excludeFromStyleSampling(chapter),
+        )
+        .toList(growable: false);
+    if (eligible.isEmpty) {
+      return const <Map<String, String>>[];
+    }
+
+    final List<InspectedChapter> selected = <InspectedChapter>[];
+    final Map<String, String> rolesByPath = <String, String>{};
+    void add(InspectedChapter chapter, String role) {
+      if (selected.any((InspectedChapter c) => c.path == chapter.path)) {
+        return;
+      }
+      selected.add(chapter);
+      rolesByPath[chapter.path] = role;
+    }
+
+    for (final InspectedChapter chapter
+        in eligible
+            .where(
+              (InspectedChapter c) => c.category == ChapterCategory.frontMatter,
+            )
+            .where(_isMeaningfulFrontMatter)
+            .take(2)) {
+      add(chapter, 'frontMatter');
+    }
+
+    final List<InspectedChapter> content = eligible
+        .where((InspectedChapter c) => c.category == ChapterCategory.content)
+        .toList(growable: false);
+    final List<InspectedChapter> representativeContent =
+        _representativeContentChapters(content);
+    for (int index = 0; index < representativeContent.length; index += 1) {
+      final String role = switch (index) {
+        0 => 'earlyContent',
+        1 when representativeContent.length >= 3 => 'middleContent',
+        _ => 'lateContent',
+      };
+      add(representativeContent[index], role);
+    }
+
+    if (selected.length < 2) {
+      for (final InspectedChapter chapter in eligible) {
+        add(chapter, 'fallback');
+        if (selected.length >= 4) {
+          break;
+        }
+      }
+    }
+
+    return selected
+        .map((InspectedChapter chapter) {
+          return <String, String>{
+            'path': chapter.path,
+            'title': chapter.title,
+            'category': chapter.category.name,
+            'role': rolesByPath[chapter.path] ?? 'fallback',
+            'text': _representativeStyleText(chapter.blocks),
+          };
+        })
+        .where((Map<String, String> chapter) => chapter['text']!.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  static List<InspectedChapter> _representativeContentChapters(
+    List<InspectedChapter> content,
+  ) {
+    if (content.length <= 3) {
+      return content;
+    }
+    return <InspectedChapter>[
+      content.first,
+      content[content.length ~/ 2],
+      content.last,
+    ];
+  }
+
+  static bool _excludeFromStyleSampling(InspectedChapter chapter) {
+    if (chapter.category == ChapterCategory.ancillary ||
+        chapter.category == ChapterCategory.reference ||
+        chapter.category == ChapterCategory.backMatter) {
+      return true;
+    }
+    final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
+    return <String>[
+      'index',
+      '_ind_',
+      'table of contents',
+      'contents',
+      '_toc_',
+      'copyright',
+      '_cop_',
+      'cover',
+      '_cvi_',
+      'title page',
+      '_tp_',
+      'acknowledg',
+      '_ack_',
+      'illustration',
+      '_ill_',
+      'about the author',
+      '_ata_',
+      'bibliography',
+      'endnote',
+    ].any(token.contains);
+  }
+
+  static bool _isMeaningfulFrontMatter(InspectedChapter chapter) {
+    final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
+    return <String>[
+      'preface',
+      '_prf_',
+      'foreword',
+      'introduction',
+      'prologue',
+    ].any(token.contains);
+  }
+
+  static String _representativeStyleText(List<ExtractedBlock> blocks) {
+    final List<String> texts = blocks
+        .map((ExtractedBlock block) => block.sourceText.trim())
+        .where((String value) => value.isNotEmpty)
+        .toList(growable: false);
+    if (texts.isEmpty) {
+      return '';
+    }
+    if (texts.length <= 12) {
+      return _trimMemoryText(texts.join('\n'));
+    }
+
+    const int segmentBlocks = 4;
+    const int segmentCharacterLimit = _memoryChapterTextLimit ~/ 3;
+    final int middleStart = max(0, (texts.length - segmentBlocks) ~/ 2);
+    final int endingStart = max(0, texts.length - segmentBlocks);
+    final List<String> opening = texts.take(segmentBlocks).toList();
+    final List<String> middle = texts
+        .skip(middleStart)
+        .take(segmentBlocks)
+        .toList();
+    final List<String> ending = texts
+        .skip(endingStart)
+        .take(segmentBlocks)
+        .toList();
+
+    return <String>[
+      '[Opening]\n${_trimStyleSegment(opening, segmentCharacterLimit)}',
+      '[Middle]\n${_trimStyleSegment(middle, segmentCharacterLimit)}',
+      '[Ending]\n${_trimStyleSegment(ending, segmentCharacterLimit)}',
+    ].join('\n');
+  }
+
+  static String _trimStyleSegment(List<String> texts, int limit) {
+    final String collapsed = texts
+        .join('\n')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (collapsed.length <= limit) {
+      return collapsed;
+    }
+    return '${collapsed.substring(0, limit - 3)}...';
+  }
+
+  static TranslationStyleProfile _parseStyleProfileResponse(
+    Map<String, dynamic> jsonPayload,
+  ) {
+    Object? candidate = jsonPayload['styleProfile'];
+    if (candidate is! Map) {
+      candidate = jsonPayload;
+    }
+    final Map<String, Object?> styleJson = <String, Object?>{
+      for (final MapEntry<dynamic, dynamic> entry in candidate.entries)
+        entry.key.toString(): entry.value,
+    };
+    // Common alternate key names from model drift.
+    styleJson.putIfAbsent(
+      'primaryGenre',
+      () => styleJson['genre'] ?? styleJson['primary_genre'],
+    );
+    styleJson.putIfAbsent(
+      'secondaryGenres',
+      () => styleJson['secondary'] ?? styleJson['tags'],
+    );
+    styleJson.putIfAbsent(
+      'translationConstraints',
+      () => styleJson['constraints'] ?? styleJson['do'],
+    );
+    final TranslationStyleProfile profile = TranslationStyleProfile.fromJson(
+      styleJson,
+    );
+    if (!profile.isEmpty) {
+      return profile;
+    }
+    // Last-resort: if model only returned a genre-like string field.
+    final String genre = TranslationStyleProfile.fromJson(<String, Object?>{
+      'primaryGenre': styleJson['primaryGenre'],
+    }).primaryGenre;
+    if (genre.isEmpty) {
+      return TranslationStyleProfile.empty;
+    }
+    return TranslationStyleProfile(
+      primaryGenre: genre,
+      confidence: TranslationStyleConfidenceParsing.parse(
+        styleJson['confidence'],
+      ),
+    );
+  }
+
   Future<Map<String, Object?>> updateBookMemoryAfterChapterForTest({
     required Dio dio,
     required TranslationConfig config,
@@ -194,12 +500,22 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
     required CancelToken cancelToken,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
     try {
       final List<InspectedChapter> selectedChapters = chapters
-          .where((InspectedChapter chapter) => chapter.includeInTranslation)
+          .where(
+            (InspectedChapter chapter) =>
+                chapter.includeInTranslation && chapter.blocks.isNotEmpty,
+          )
+          .map(
+            (InspectedChapter chapter) => _prepareChapterForTarget(
+              chapter,
+              targetLanguage: config.targetLanguage,
+            ),
+          )
           .toList();
       final int totalBlocks = selectedChapters.fold<int>(
         0,
@@ -241,11 +557,18 @@ class EpubChapterTranslator {
         outputDirectory: outputDirectory,
         suffix: config.outputSuffix,
       );
+      final TranslationStyleProfile? confirmedProfile =
+          config.styleProfileEnabled ? confirmedStyleProfile : null;
+      final TranslationStyleProfile? userStyleProfile =
+          confirmedProfile == null || confirmedProfile.isEmpty
+          ? null
+          : confirmedProfile;
       final String inputFingerprint = await _inputFingerprint(inputPath);
       final String jobKey = _jobKey(
         inputFingerprint: inputFingerprint,
         config: config,
         chapters: selectedChapters,
+        confirmedStyleProfile: userStyleProfile,
       );
       final JobResumeState? previousState = await _cacheStore.loadJobState(
         jobKey,
@@ -264,6 +587,10 @@ class EpubChapterTranslator {
         totalBlocks: totalBlocks,
         cachedBlocks: 0,
         resumedBlocks: 0,
+        styleProfile: confirmedProfile ?? TranslationStyleProfile.empty,
+        styleProfileConfirmed:
+            !config.styleProfileEnabled || confirmedProfile != null,
+        styleProfileEnabled: config.styleProfileEnabled,
       );
 
       void emit(TranslationJob job, String logLine) {
@@ -319,9 +646,21 @@ class EpubChapterTranslator {
               chapter.path: chapter,
           };
 
-      _BookMemory? bookMemory;
-      bool initialBookMemoryAttempted = false;
+      _BookMemory? bookMemory = userStyleProfile == null
+          ? null
+          : _BookMemory.empty.copyWith(
+              styleProfile: userStyleProfile,
+              styleProfileConfirmed: true,
+            );
+      bool initialBookMemoryAttempted = userStyleProfile != null;
       final Map<int, bool> chapterPendingCache = <int, bool>{};
+
+      if (userStyleProfile != null && !userStyleProfile.isEmpty) {
+        emit(
+          currentJob,
+          'Style profile: using user-confirmed profile ${userStyleProfile.summaryLabel}.',
+        );
+      }
 
       Future<void> ensureInitialBookMemory() async {
         if (initialBookMemoryAttempted) {
@@ -337,11 +676,17 @@ class EpubChapterTranslator {
             chapters: chapters,
             cancelToken: cancelToken,
           );
-          bookMemory = initialMemory;
+          bookMemory = userStyleProfile == null
+              ? initialMemory
+              : initialMemory.copyWith(
+                  styleProfile: userStyleProfile,
+                  styleProfileConfirmed: true,
+                );
           memoryStopwatch.stop();
           totalMemoryElapsed += memoryStopwatch.elapsed;
           memoryRequestCount += 1;
-          if (initialMemory.isEmpty) {
+          if (initialMemory.isEmpty &&
+              (userStyleProfile == null || userStyleProfile.isEmpty)) {
             emit(
               currentJob,
               'Book memory: no useful front matter or early chapter text was found in ${_formatDuration(memoryStopwatch.elapsed)}.',
@@ -351,12 +696,51 @@ class EpubChapterTranslator {
               currentJob,
               'Book memory: created initial summary from front matter and early chapters in ${_formatDuration(memoryStopwatch.elapsed)}.',
             );
+            final TranslationStyleProfile styleProfile =
+                bookMemory?.styleProfile ?? TranslationStyleProfile.empty;
+            if (!config.styleProfileEnabled) {
+              emit(
+                currentJob,
+                'Style profile: disabled in settings; using generic translation style.',
+              );
+            } else if (userStyleProfile != null && !userStyleProfile.isEmpty) {
+              emit(
+                currentJob,
+                'Style profile: user-confirmed ${userStyleProfile.summaryLabel} will guide later batches.',
+              );
+            } else if (styleProfile.shouldInject) {
+              emit(
+                currentJob,
+                'Style profile: ${styleProfile.summaryLabel}. Soft genre/tone constraints will guide later batches.',
+              );
+            } else if (!styleProfile.isEmpty) {
+              emit(
+                currentJob,
+                'Style profile: low confidence (${styleProfile.summaryLabel}); keeping generic translation style.',
+              );
+            } else {
+              emit(
+                currentJob,
+                'Style profile: not enough signal from front matter/early chapters; keeping generic translation style.',
+              );
+            }
           }
         } catch (error) {
-          emit(
-            currentJob,
-            'Book memory: initial summary skipped (${_linePreview(_safeErrorText(error, config))}). Translation will continue without whole-book memory until a chapter summary is available.',
-          );
+          if (userStyleProfile != null && !userStyleProfile.isEmpty) {
+            bookMemory = _BookMemory.empty.copyWith(
+              styleProfile: userStyleProfile,
+              styleProfileConfirmed: true,
+            );
+            emit(
+              currentJob,
+              'Book memory: initial summary skipped (${_linePreview(_safeErrorText(error, config))}). Continuing with user-confirmed style profile.',
+            );
+          } else {
+            emit(
+              currentJob,
+              'Book memory: initial summary skipped (${_linePreview(_safeErrorText(error, config))}). Translation will continue without whole-book memory until a chapter summary is available.',
+            );
+          }
         }
       }
 
@@ -372,6 +756,7 @@ class EpubChapterTranslator {
             config,
             block,
             chapterPath: chapter.path,
+            confirmedStyleProfile: userStyleProfile,
           );
           final String? cachedTranslation = await _cacheStore
               .getBlockTranslation(cacheKey);
@@ -436,6 +821,7 @@ class EpubChapterTranslator {
               config,
               block,
               chapterPath: chapter.path,
+              confirmedStyleProfile: userStyleProfile,
             );
             final String? cachedTranslation = await _cacheStore
                 .getBlockTranslation(cacheKey);
@@ -562,6 +948,7 @@ class EpubChapterTranslator {
                       config,
                       batch.blocks[index],
                       chapterPath: chapter.path,
+                      confirmedStyleProfile: userStyleProfile,
                     ),
                     translatedBatch[index],
                   ),
@@ -780,6 +1167,8 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required ExtractedBlock block,
     CancelToken? cancelToken,
+    TranslationStyleProfile styleProfile = TranslationStyleProfile.empty,
+    bool styleProfileConfirmed = false,
   }) async {
     Object? lastError;
     for (int attempt = 1; ; attempt += 1) {
@@ -794,7 +1183,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_apiClient.lockedGlossaryInstruction(config)}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
             },
             <String, String>{'role': 'user', 'content': block.sourceHtml},
           ],
@@ -863,17 +1252,25 @@ class EpubChapterTranslator {
     final Map<String, dynamic> payload = <String, dynamic>{
       'kind': 'initialBookMemory',
       'targetLanguage': config.targetLanguage,
+      'styleProfileEnabled': config.styleProfileEnabled,
       'chapters': sourceChapters,
     };
+    final String styleProfilePrompt = config.styleProfileEnabled
+        ? ' Also return styleProfile as an object with keys: primaryGenre, secondaryGenres, tone, sentenceStyle, translationConstraints, avoid, confidence. primaryGenre should be a practical book type such as business nonfiction, science fiction, romance, historical fiction, literary fiction, mystery, fantasy, memoir, or self-help. secondaryGenres is a short string array. tone and sentenceStyle are short phrases. translationConstraints and avoid are short actionable string arrays for translators. confidence must be one of: high, medium, low. If evidence is weak, set confidence to low and keep constraints conservative. Prefer executable style rules over marketing labels.'
+        : ' Do not invent a styleProfile.';
     final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
       dio: dio,
       config: config,
       payload: payload,
       systemPrompt:
-          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters. Keep bookSummary under 120 words. styleGuide is a short string array. glossary is an array of objects with source and target. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.',
+          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${config.styleProfileEnabled ? ', styleProfile' : ''}. Keep bookSummary under 120 words. styleGuide is a short string array. glossary is an array of objects with source and target. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
       cancelToken: cancelToken,
     );
-    return _BookMemory.fromJson(jsonPayload);
+    final _BookMemory memory = _BookMemory.fromJson(jsonPayload);
+    if (!config.styleProfileEnabled) {
+      return memory.copyWith(clearStyleProfile: true);
+    }
+    return memory;
   }
 
   Future<_BookMemory> _updateBookMemoryAfterChapter({
@@ -1406,6 +1803,12 @@ class EpubChapterTranslator {
           if (cancelToken?.isCancelled ?? false) {
             throw const TranslationCancelledException();
           }
+          final TranslationStyleProfile batchStyleProfile =
+              _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+          final bool batchStyleConfirmed =
+              _styleProfileConfirmedFromBookMemoryJson(
+                batch.context.bookMemory,
+              );
           final Map<String, dynamic> requestData = <String, dynamic>{
             'model': config.model,
             'temperature': 0.2,
@@ -1413,7 +1816,7 @@ class EpubChapterTranslator {
               <String, String>{
                 'role': 'system',
                 'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_apiClient.lockedGlossaryInstruction(config)}',
+                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
               },
               <String, String>{'role': 'user', 'content': payload},
             ],
@@ -1481,6 +1884,11 @@ class EpubChapterTranslator {
         throw const TranslationCancelledException();
       }
       if (TranslationApiClient.shouldFallbackBatchDioException(error)) {
+        final TranslationStyleProfile fallbackStyleProfile =
+            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+        final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
+          batch.context.bookMemory,
+        );
         return Future.wait<String>(
           batch.blocks.map(
             (ExtractedBlock block) => _translateBlock(
@@ -1488,12 +1896,19 @@ class EpubChapterTranslator {
               config: config,
               block: block,
               cancelToken: cancelToken,
+              styleProfile: fallbackStyleProfile,
+              styleProfileConfirmed: fallbackConfirmed,
             ),
           ),
         );
       }
       rethrow;
     } on FormatException catch (_) {
+      final TranslationStyleProfile fallbackStyleProfile =
+          _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+      final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
+        batch.context.bookMemory,
+      );
       return Future.wait<String>(
         batch.blocks.map(
           (ExtractedBlock block) => _translateBlock(
@@ -1501,10 +1916,63 @@ class EpubChapterTranslator {
             config: config,
             block: block,
             cancelToken: cancelToken,
+            styleProfile: fallbackStyleProfile,
+            styleProfileConfirmed: fallbackConfirmed,
           ),
         ),
       );
     }
+  }
+
+  TranslationStyleProfile _styleProfileFromBookMemoryJson(
+    Map<String, Object?>? bookMemory,
+  ) {
+    if (bookMemory == null) {
+      return TranslationStyleProfile.empty;
+    }
+    final Object? raw = bookMemory['styleProfile'];
+    if (raw is Map<String, Object?>) {
+      return TranslationStyleProfile.fromJson(raw);
+    }
+    if (raw is Map) {
+      return TranslationStyleProfile.fromJson(
+        raw.map(
+          (dynamic key, dynamic value) =>
+              MapEntry<String, Object?>(key.toString(), value),
+        ),
+      );
+    }
+    return TranslationStyleProfile.empty;
+  }
+
+  bool _styleProfileConfirmedFromBookMemoryJson(
+    Map<String, Object?>? bookMemory,
+  ) {
+    if (bookMemory == null) {
+      return false;
+    }
+    final Object? raw = bookMemory['styleProfileConfirmed'];
+    return raw == true;
+  }
+
+  String _styleProfileInstruction({
+    required TranslationConfig config,
+    TranslationStyleProfile? styleProfile,
+    bool confirmed = false,
+  }) {
+    if (!config.styleProfileEnabled) {
+      return '';
+    }
+    final TranslationStyleProfile? profile = styleProfile;
+    if (profile == null || profile.isEmpty) {
+      return '';
+    }
+    if (confirmed) {
+      return profile.toConfirmedPromptInstruction(
+        targetLanguage: config.targetLanguage,
+      );
+    }
+    return profile.toPromptInstruction(targetLanguage: config.targetLanguage);
   }
 
   String _linePreview(String value) {
@@ -1609,6 +2077,7 @@ class EpubChapterTranslator {
     required String inputFingerprint,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return sha256
         .convert(
@@ -1622,6 +2091,8 @@ class EpubChapterTranslator {
               config.bilingual,
               config.lockedGlossary.trim(),
               config.residualQualityCheck,
+              config.styleProfileEnabled,
+              _styleProfileCacheValue(confirmedStyleProfile),
               chapters
                   .map((InspectedChapter chapter) => chapter.path)
                   .join('|'),
@@ -1635,6 +2106,7 @@ class EpubChapterTranslator {
     TranslationConfig config,
     ExtractedBlock block, {
     required String chapterPath,
+    TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return sha256
         .convert(
@@ -1646,12 +2118,116 @@ class EpubChapterTranslator {
               config.targetLanguage.trim(),
               config.lockedGlossary.trim(),
               config.residualQualityCheck,
+              config.styleProfileEnabled,
+              _styleProfileCacheValue(confirmedStyleProfile),
               chapterPath,
               block.sourceHtml,
             ].join('|'),
           ),
         )
         .toString();
+  }
+
+  static String _styleProfileCacheValue(
+    TranslationStyleProfile? confirmedStyleProfile,
+  ) {
+    if (confirmedStyleProfile == null || confirmedStyleProfile.isEmpty) {
+      return 'none';
+    }
+    return jsonEncode(confirmedStyleProfile.toJson());
+  }
+
+  static InspectedChapter _prepareChapterForTarget(
+    InspectedChapter chapter, {
+    required String targetLanguage,
+  }) {
+    if (!_isCjkTargetLanguage(targetLanguage)) {
+      return chapter;
+    }
+    return chapter.copyWith(
+      blocks: chapter.blocks
+          .map(
+            (ExtractedBlock block) => block.copyWith(
+              sourceHtml: _prepareBlockHtmlForTarget(
+                sourceHtml: block.sourceHtml,
+                targetLanguage: targetLanguage,
+              ),
+            ),
+          )
+          .toList(growable: false),
+    );
+  }
+
+  static String _prepareBlockHtmlForTarget({
+    required String sourceHtml,
+    required String targetLanguage,
+  }) {
+    if (!_isCjkTargetLanguage(targetLanguage) ||
+        (!sourceHtml.contains('dropcap') && !sourceHtml.contains('small'))) {
+      return sourceHtml;
+    }
+    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    bool changed = false;
+    final List<dom.Element> spans = fragment
+        .querySelectorAll('span[class]')
+        .toList(growable: false);
+    for (final dom.Element span in spans) {
+      final bool isDropCap = span.classes.any(
+        (String className) => className.toLowerCase().startsWith('dropcap'),
+      );
+      final bool isUppercaseSmallCaps =
+          span.classes.any(_isSmallCapsClass) &&
+          _isUppercaseLatinRun(span.text);
+      if (!isDropCap && !isUppercaseSmallCaps) {
+        continue;
+      }
+      _unwrapElement(span);
+      changed = true;
+    }
+    return changed ? fragment.outerHtml : sourceHtml;
+  }
+
+  static bool _isCjkTargetLanguage(String targetLanguage) {
+    final String normalized = targetLanguage.trim().toLowerCase();
+    return normalized.contains('chinese') ||
+        normalized.contains('japanese') ||
+        normalized.contains('korean') ||
+        normalized.contains('中文') ||
+        normalized.contains('汉语') ||
+        normalized.contains('漢語') ||
+        normalized.contains('日语') ||
+        normalized.contains('日語') ||
+        normalized.contains('韩语') ||
+        normalized.contains('韓語');
+  }
+
+  static bool _isSmallCapsClass(String className) {
+    final String normalized = className.toLowerCase();
+    return normalized == 'small' ||
+        normalized == 'small-caps' ||
+        normalized == 'smallcaps';
+  }
+
+  static bool _isUppercaseLatinRun(String value) {
+    final String letters = value.replaceAll(RegExp('[^A-Za-z]'), '');
+    return letters.isNotEmpty && letters == letters.toUpperCase();
+  }
+
+  static void _unwrapElement(dom.Element element) {
+    final dom.Node? parent = element.parentNode;
+    if (parent == null) {
+      return;
+    }
+    final int index = parent.nodes.indexOf(element);
+    if (index < 0) {
+      return;
+    }
+    final List<dom.Node> children = element.nodes.toList(growable: false);
+    for (final dom.Node child in children) {
+      child.remove();
+    }
+    element.remove();
+    parent.nodes.insertAll(index, children);
   }
 
   JobResumeState _resumeStateFromJob({
@@ -1743,11 +2319,25 @@ class _BookMemory {
     this.styleGuide = const <String>[],
     this.glossary = const <Map<String, String>>[],
     this.recentChapters = const <_ChapterMemory>[],
+    this.styleProfile = TranslationStyleProfile.empty,
+    this.styleProfileConfirmed = false,
   });
 
   static const _BookMemory empty = _BookMemory();
 
   factory _BookMemory.fromJson(Map<String, Object?> json) {
+    final Object? rawStyleProfile = json['styleProfile'];
+    final TranslationStyleProfile styleProfile =
+        rawStyleProfile is Map<String, Object?>
+        ? TranslationStyleProfile.fromJson(rawStyleProfile)
+        : rawStyleProfile is Map
+        ? TranslationStyleProfile.fromJson(
+            rawStyleProfile.map(
+              (dynamic key, dynamic value) =>
+                  MapEntry<String, Object?>(key.toString(), value),
+            ),
+          )
+        : TranslationStyleProfile.empty;
     return _BookMemory(
       bookSummary: _stringValue(json['bookSummary']),
       styleGuide: _stringList(
@@ -1756,6 +2346,8 @@ class _BookMemory {
       ),
       glossary: _glossaryList(json['glossary']),
       recentChapters: _chapterMemoryList(json['recentChapters']),
+      styleProfile: styleProfile,
+      styleProfileConfirmed: json['styleProfileConfirmed'] == true,
     );
   }
 
@@ -1763,12 +2355,38 @@ class _BookMemory {
   final List<String> styleGuide;
   final List<Map<String, String>> glossary;
   final List<_ChapterMemory> recentChapters;
+  final TranslationStyleProfile styleProfile;
+  final bool styleProfileConfirmed;
 
   bool get isEmpty =>
       bookSummary.trim().isEmpty &&
       styleGuide.isEmpty &&
       glossary.isEmpty &&
-      recentChapters.isEmpty;
+      recentChapters.isEmpty &&
+      styleProfile.isEmpty;
+
+  _BookMemory copyWith({
+    String? bookSummary,
+    List<String>? styleGuide,
+    List<Map<String, String>>? glossary,
+    List<_ChapterMemory>? recentChapters,
+    TranslationStyleProfile? styleProfile,
+    bool? styleProfileConfirmed,
+    bool clearStyleProfile = false,
+  }) {
+    return _BookMemory(
+      bookSummary: bookSummary ?? this.bookSummary,
+      styleGuide: styleGuide ?? this.styleGuide,
+      glossary: glossary ?? this.glossary,
+      recentChapters: recentChapters ?? this.recentChapters,
+      styleProfile: clearStyleProfile
+          ? TranslationStyleProfile.empty
+          : (styleProfile ?? this.styleProfile),
+      styleProfileConfirmed: clearStyleProfile
+          ? false
+          : (styleProfileConfirmed ?? this.styleProfileConfirmed),
+    );
+  }
 
   _BookMemory mergeChapter(_ChapterMemory chapter) {
     final List<_ChapterMemory> mergedRecent = <_ChapterMemory>[
@@ -1788,6 +2406,8 @@ class _BookMemory {
       styleGuide: styleGuide,
       glossary: _mergeGlossary(glossary, chapter.glossary),
       recentChapters: List<_ChapterMemory>.unmodifiable(limitedRecent),
+      styleProfile: styleProfile,
+      styleProfileConfirmed: styleProfileConfirmed,
     );
   }
 
@@ -1799,6 +2419,8 @@ class _BookMemory {
       'recentChapters': recentChapters
           .map((_ChapterMemory chapter) => chapter.toJson())
           .toList(growable: false),
+      if (!styleProfile.isEmpty) 'styleProfile': styleProfile.toJson(),
+      if (styleProfileConfirmed) 'styleProfileConfirmed': true,
     };
   }
 

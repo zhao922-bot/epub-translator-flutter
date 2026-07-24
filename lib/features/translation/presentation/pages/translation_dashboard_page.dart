@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -9,48 +8,19 @@ import '../../../settings/application/settings_controller.dart';
 import '../../application/translation_dashboard_controller.dart';
 import '../../domain/models/actionable_error.dart';
 import '../../domain/models/translation_job.dart';
+import '../../domain/models/translation_style_profile.dart';
 import '../widgets/translation_inputs.dart';
 import '../widgets/translation_logs.dart';
 import '../widgets/translation_overview.dart';
+import '../widgets/translation_style_profile_card.dart';
 import '../widgets/translation_workflow_steps.dart';
 
-class TranslationDashboardPage extends ConsumerStatefulWidget {
+/// Window drop is handled globally by [AppShell] so imports work on any page.
+class TranslationDashboardPage extends ConsumerWidget {
   const TranslationDashboardPage({super.key});
 
   @override
-  ConsumerState<TranslationDashboardPage> createState() =>
-      _TranslationDashboardPageState();
-}
-
-class _TranslationDashboardPageState
-    extends ConsumerState<TranslationDashboardPage> {
-  static const MethodChannel _windowDropChannel = MethodChannel(
-    'epub_translator/window_drop',
-  );
-
-  @override
-  void initState() {
-    super.initState();
-    _windowDropChannel.setMethodCallHandler(_handleWindowDrop);
-  }
-
-  @override
-  void dispose() {
-    _windowDropChannel.setMethodCallHandler(null);
-    super.dispose();
-  }
-
-  Future<void> _handleWindowDrop(MethodCall call) async {
-    if (call.method != 'fileDropped' || call.arguments is! String) {
-      return;
-    }
-    await ref
-        .read(translationDashboardProvider.notifier)
-        .importDroppedEpubPath(call.arguments as String);
-  }
-
-  @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final TranslationDashboardState state = ref.watch(
       translationDashboardProvider,
     );
@@ -59,9 +29,11 @@ class _TranslationDashboardPageState
     );
     final settingsController = ref.read(settingsProvider.notifier);
     final strings = ref.watch(appStringsProvider);
-    final bool canTranslate = state.inspectedChapters.any(
+    final bool hasSelectedChapters = state.inspectedChapters.any(
       (chapter) => chapter.includeInTranslation && chapter.blocks.isNotEmpty,
     );
+    final bool canTranslate =
+        hasSelectedChapters && !state.requiresStyleProfileConfirmation;
     final bool isRunActive = state.isRunActive;
     final bool hasInput = state.inputPath.isNotEmpty;
     final bool hasInspected = state.inspectedChapters.isNotEmpty;
@@ -71,6 +43,8 @@ class _TranslationDashboardPageState
         (job != null && job.status != TranslationJobStatus.idle) ||
         (job?.hasExportableEpub ?? false);
     final bool showLogs = state.logs.isNotEmpty;
+    final bool showStyleProfile =
+        state.config.styleProfileEnabled && hasInspected;
 
     // Primary actions only when they add value beyond the drop zone.
     final List<Widget> primaryActions = <Widget>[];
@@ -107,9 +81,7 @@ class _TranslationDashboardPageState
         ),
       );
     }
-    // No header "Choose EPUB" when empty — drop zone is the single entry.
 
-    // Primary workspace: import/config first; status & logs are secondary.
     return PageScaffold(
       title: strings.translationPageTitle,
       subtitle: strings.translationPageSubtitle,
@@ -123,6 +95,7 @@ class _TranslationDashboardPageState
             outputDirectory: state.outputDirectory,
             targetLanguage: state.config.targetLanguage,
             bilingual: state.config.bilingual,
+            enabled: !isRunActive,
             onInputChanged: controller.setInputPath,
             onOutputChanged: controller.setOutputDirectory,
             onTargetLanguageChanged: (value) {
@@ -148,6 +121,40 @@ class _TranslationDashboardPageState
             canTranslate: canTranslate,
             job: state.job,
           ),
+          if (showStyleProfile) ...<Widget>[
+            const SizedBox(height: 16),
+            TranslationStyleProfileCard(
+              strings: strings,
+              profile: state.styleProfile,
+              confirmed: state.styleProfileConfirmed,
+              enabled: true,
+              editable: !isRunActive,
+              isGenerating: state.isGeneratingStyleProfile,
+              canGenerate: hasInspected && !isRunActive,
+              onGenerate: controller.generateStyleProfile,
+              onConfirm: controller.confirmStyleProfile,
+              onChanged:
+                  ({
+                    String? primaryGenre,
+                    String? secondaryGenresCsv,
+                    String? tone,
+                    String? sentenceStyle,
+                    String? constraintsText,
+                    String? avoidText,
+                    TranslationStyleConfidence? confidence,
+                  }) {
+                    controller.setStyleProfileField(
+                      primaryGenre: primaryGenre,
+                      secondaryGenresCsv: secondaryGenresCsv,
+                      tone: tone,
+                      sentenceStyle: sentenceStyle,
+                      constraintsText: constraintsText,
+                      avoidText: avoidText,
+                      confidence: confidence,
+                    );
+                  },
+            ),
+          ],
           if (showOverview) ...<Widget>[
             const SizedBox(height: 16),
             TranslationOverview(

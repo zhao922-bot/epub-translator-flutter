@@ -32,6 +32,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
 
+  Future<void> get ready => _initialLoad;
+
   Future<void> _load() async {
     final TranslationConfig loaded = await _store.load();
     if (!mounted) {
@@ -64,14 +66,35 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     await _persist(next);
   }
 
-  Future<void> setApiBaseUrl(String value) =>
-      _update((config) => config.copyWith(apiBaseUrl: value.trim()));
+  Future<void> setApiBaseUrl(String value) => _update((config) {
+    final String nextUrl = value.trim();
+    return config.copyWith(
+      apiProviderSelection: ApiProviderSelection.custom,
+      apiBaseUrl: nextUrl,
+      customApiBaseUrl: nextUrl,
+      customApiKey: config.apiKey,
+      customModel: config.model,
+    );
+  });
 
-  Future<void> setApiKey(String value) =>
-      _update((config) => config.copyWith(apiKey: value.trim()));
+  Future<void> setApiKey(String value) => _update((config) {
+    final String nextKey = value.trim();
+    return config.apiProviderSelection == ApiProviderSelection.deepseek
+        ? config.copyWith(apiKey: nextKey, deepseekApiKey: nextKey)
+        : config.copyWith(apiKey: nextKey, customApiKey: nextKey);
+  });
 
-  Future<void> setModel(String value) =>
-      _update((config) => config.copyWith(model: value.trim()));
+  Future<void> setModel(String value) => _update((config) {
+    final String nextModel = value.trim();
+    return config.copyWith(
+      apiProviderSelection: ApiProviderSelection.custom,
+      apiBaseUrl: config.apiBaseUrl,
+      customApiBaseUrl: config.apiBaseUrl,
+      customApiKey: config.apiKey,
+      model: nextModel,
+      customModel: nextModel,
+    );
+  });
 
   Future<void> setUiLanguage(UiLanguage value) =>
       _update((config) => config.copyWith(uiLanguage: value));
@@ -108,6 +131,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setResidualQualityCheck(bool value) =>
       _update((config) => config.copyWith(residualQualityCheck: value));
+
+  Future<void> setStyleProfileEnabled(bool value) =>
+      _update((config) => config.copyWith(styleProfileEnabled: value));
 
   Future<void> setTextScale(double value) =>
       _update((config) => config.copyWith(textScale: value.clamp(0.9, 1.3)));

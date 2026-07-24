@@ -6,8 +6,10 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/session_path_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _BlockingRepository implements TranslationRepository {
@@ -53,11 +55,21 @@ class _BlockingRepository implements TranslationRepository {
   }
 
   @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    return TranslationStyleProfile.empty;
+  }
+
+  @override
   Future<TranslationRunResult> translateChapters({
     required String inputPath,
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) {
@@ -69,6 +81,8 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
   int startCount = 0;
   String? lastInputPath;
   String? lastOutputDirectory;
+  int styleGenerateCount = 0;
+  TranslationStyleProfile? lastConfirmedStyleProfile;
 
   @override
   Future<void> cancelJob(String jobId) async {}
@@ -123,6 +137,16 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     return 'OK';
   }
 
+  @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    styleGenerateCount += 1;
+    return TranslationStyleProfile.empty;
+  }
+
   int translateCount = 0;
 
   @override
@@ -131,10 +155,12 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
     translateCount += 1;
+    lastConfirmedStyleProfile = confirmedStyleProfile;
     final String outputPath =
         '$outputDirectory\\${inputPath.split(RegExp(r'[\\/]')).last.replaceAll('.epub', '')}_translated.epub';
     final TranslationJob job = TranslationJob(
@@ -154,6 +180,35 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
   }
 }
 
+class _ControlledSessionPathStore extends SessionPathStore {
+  final Completer<({String inputPath, String outputDirectory})> loadCompleter =
+      Completer<({String inputPath, String outputDirectory})>();
+
+  @override
+  Future<({String inputPath, String outputDirectory})> load() =>
+      loadCompleter.future;
+
+  @override
+  Future<void> save({
+    required String inputPath,
+    required String outputDirectory,
+  }) async {}
+}
+
+class _ControlledHistoryStore extends JobHistoryStore {
+  final Completer<List<TranslationJob>> loadCompleter =
+      Completer<List<TranslationJob>>();
+  List<TranslationJob> saved = const <TranslationJob>[];
+
+  @override
+  Future<List<TranslationJob>> load() => loadCompleter.future;
+
+  @override
+  Future<void> save(List<TranslationJob> jobs) async {
+    saved = jobs;
+  }
+}
+
 class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
   @override
   Future<TranslationRunResult> translateChapters({
@@ -161,6 +216,7 @@ class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
@@ -348,6 +404,46 @@ void main() {
   });
 
   test(
+    'restores an unfinished translation as resumable with its style',
+    () async {
+      const TranslationStyleProfile profile = TranslationStyleProfile(
+        primaryGenre: 'history',
+        confidence: TranslationStyleConfidence.high,
+      );
+      final _MemoryJobHistoryStore historyStore = _MemoryJobHistoryStore(
+        initial: const <TranslationJob>[
+          TranslationJob(
+            id: 'interrupted-job',
+            inputPath: 'C:\\Books\\old.epub',
+            outputPath: 'C:\\Books\\old_translated.epub',
+            status: TranslationJobStatus.running,
+            phase: TranslationJobPhase.translation,
+            progress: 0.4,
+            completedBlocks: 4,
+            totalBlocks: 10,
+            styleProfile: profile,
+            styleProfileConfirmed: true,
+            styleProfileEnabled: true,
+          ),
+        ],
+      );
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: historyStore,
+          );
+
+      await Future<void>.delayed(Duration.zero);
+
+      final TranslationJob restored = controller.state.jobHistory.single;
+      expect(restored.status, TranslationJobStatus.cancelled);
+      expect(restored.phase, TranslationJobPhase.translation);
+      expect(restored.styleProfileConfirmed, isTrue);
+      expect(restored.styleProfile.sameContentAs(profile), isTrue);
+    },
+  );
+
+  test(
     'retries a failed translation by inspecting then translating again',
     () async {
       final _SuccessfulInspectionRepository repository =
@@ -363,6 +459,12 @@ void main() {
             currentChapter: 'Translation failed',
             completedBlocks: 2,
             totalBlocks: 10,
+            styleProfile: TranslationStyleProfile(
+              primaryGenre: 'business nonfiction',
+              tone: 'concise',
+              confidence: TranslationStyleConfidence.high,
+            ),
+            styleProfileConfirmed: true,
           ),
         ],
       );
@@ -379,6 +481,11 @@ void main() {
       expect(repository.translateCount, 1);
       expect(repository.lastInputPath, 'C:\\Books\\failed.epub');
       expect(repository.lastOutputDirectory, 'C:\\Translated');
+      expect(repository.styleGenerateCount, 0);
+      expect(
+        repository.lastConfirmedStyleProfile?.primaryGenre,
+        'business nonfiction',
+      );
       expect(controller.state.inputPath, 'C:\\Books\\failed.epub');
       expect(controller.state.outputDirectory, 'C:\\Translated');
       expect(controller.state.job?.status, TranslationJobStatus.completed);
@@ -449,6 +556,7 @@ void main() {
     controller.setInputPath('C:\\Books\\book.epub');
 
     await controller.startInspection();
+    controller.confirmStyleProfile();
     await controller.startTranslation();
 
     final String lastLog = controller.state.logs.last;
@@ -479,6 +587,7 @@ void main() {
       controller.setInputPath('C:\\Books\\book.epub');
 
       await controller.startInspection();
+      controller.confirmStyleProfile();
       await controller.startTranslation();
 
       final String? errorMessage = controller.state.job?.errorMessage;
@@ -534,4 +643,135 @@ void main() {
       expect(controller.state.logs.last, contains('.epub'));
     },
   );
+
+  test('active runs reject result-affecting dashboard changes', () async {
+    final _BlockingRepository repository = _BlockingRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(repository: repository);
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    final Future<void> run = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.state.isRunActive, isTrue);
+
+    controller.setTargetLanguage('Japanese');
+    controller.setBilingual(true);
+
+    expect(controller.state.config.targetLanguage, 'Chinese');
+    expect(controller.state.config.bilingual, isFalse);
+
+    repository.inspectionCompleter.complete(
+      InspectionResult(
+        job: const TranslationJob(
+          id: 'done',
+          inputPath: 'C:\\Books\\book.epub',
+          outputPath: 'C:\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: const <InspectedChapter>[],
+      ),
+    );
+    await run;
+  });
+
+  test('waits for persisted settings before starting inspection', () async {
+    final Completer<void> settingsReady = Completer<void>();
+    final _SuccessfulInspectionRepository repository =
+        _SuccessfulInspectionRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          settingsReady: () => settingsReady.future,
+        );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    final Future<void> run = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    expect(repository.startCount, 0);
+
+    settingsReady.complete();
+    await run;
+
+    expect(repository.startCount, 1);
+  });
+
+  test(
+    'regenerates style when the saved task used a different style mode',
+    () async {
+      final _SuccessfulInspectionRepository repository =
+          _SuccessfulInspectionRepository();
+      final _MemoryJobHistoryStore historyStore = _MemoryJobHistoryStore(
+        initial: const <TranslationJob>[
+          TranslationJob(
+            id: 'style-disabled-job',
+            inputPath: 'C:\\Books\\book.epub',
+            outputPath: 'C:\\Books',
+            status: TranslationJobStatus.failed,
+            phase: TranslationJobPhase.translation,
+            progress: 0.3,
+            totalBlocks: 10,
+            styleProfile: TranslationStyleProfile.empty,
+            styleProfileConfirmed: true,
+            styleProfileEnabled: false,
+          ),
+        ],
+      );
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: historyStore,
+          );
+      await Future<void>.delayed(Duration.zero);
+
+      await controller.retryJob('style-disabled-job');
+
+      expect(repository.styleGenerateCount, 1);
+      expect(repository.translateCount, 1);
+    },
+  );
+
+  test('late session restore cannot overwrite a new user path', () async {
+    final _ControlledSessionPathStore pathStore = _ControlledSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    controller.setInputPath('C:\\Books\\new.epub');
+    pathStore.loadCompleter.complete((
+      inputPath: 'C:\\Books\\old.epub',
+      outputDirectory: 'C:\\OldOutput',
+    ));
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.state.inputPath, 'C:\\Books\\new.epub');
+    expect(controller.state.outputDirectory, isNot('C:\\OldOutput'));
+  });
+
+  test('clearing history wins over a late startup history load', () async {
+    final _ControlledHistoryStore historyStore = _ControlledHistoryStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          historyStore: historyStore,
+        );
+
+    controller.clearJobHistory();
+    historyStore.loadCompleter.complete(const <TranslationJob>[
+      TranslationJob(
+        id: 'old-job',
+        inputPath: 'old.epub',
+        outputPath: '',
+        status: TranslationJobStatus.failed,
+        progress: 0,
+      ),
+    ]);
+    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.state.jobHistory, isEmpty);
+    expect(historyStore.saved, isEmpty);
+  });
 }

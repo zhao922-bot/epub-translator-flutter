@@ -16,11 +16,21 @@ class PreviewPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final chapters = ref.watch(previewChaptersProvider);
     final selectedIndex = ref.watch(previewSelectedIndexProvider);
-    final selectedChapter =
-        chapters[selectedIndex.clamp(0, chapters.length - 1)];
+    final int safeSelectedIndex = selectedIndex.clamp(0, chapters.length - 1);
+    final selectedChapter = chapters[safeSelectedIndex];
     final selectedController = ref.read(previewSelectedIndexProvider.notifier);
+    if (safeSelectedIndex != selectedIndex) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!context.mounted ||
+            ref.read(previewSelectedIndexProvider) != selectedIndex) {
+          return;
+        }
+        selectedController.state = safeSelectedIndex;
+      });
+    }
     final dashboardState = ref.watch(translationDashboardProvider);
     final dashboardController = ref.read(translationDashboardProvider.notifier);
+    final bool selectionEnabled = !dashboardState.isRunActive;
     final strings = ref.watch(appStringsProvider);
     final selectedCount = chapters
         .where((PreviewChapter chapter) => chapter.includeInTranslation)
@@ -42,7 +52,9 @@ class PreviewPage extends ConsumerWidget {
               icon: Icons.checklist_rounded,
               variant: SectionCardVariant.standard,
               trailing: TextButton.icon(
-                onPressed: dashboardState.inspectedChapters.isEmpty
+                onPressed:
+                    dashboardState.inspectedChapters.isEmpty ||
+                        !selectionEnabled
                     ? null
                     : dashboardController.resetChapterSelection,
                 icon: const Icon(Icons.restart_alt_rounded),
@@ -74,31 +86,39 @@ class PreviewPage extends ConsumerWidget {
                         children: <Widget>[
                           ActionChip(
                             label: Text(strings.presetRecommended),
-                            onPressed: () =>
-                                dashboardController.applyChapterSelectionPreset(
-                                  ChapterSelectionPreset.recommended,
-                                ),
+                            onPressed: selectionEnabled
+                                ? () => dashboardController
+                                      .applyChapterSelectionPreset(
+                                        ChapterSelectionPreset.recommended,
+                                      )
+                                : null,
                           ),
                           ActionChip(
                             label: Text(strings.presetContentOnly),
-                            onPressed: () =>
-                                dashboardController.applyChapterSelectionPreset(
-                                  ChapterSelectionPreset.contentOnly,
-                                ),
+                            onPressed: selectionEnabled
+                                ? () => dashboardController
+                                      .applyChapterSelectionPreset(
+                                        ChapterSelectionPreset.contentOnly,
+                                      )
+                                : null,
                           ),
                           ActionChip(
                             label: Text(strings.presetAll),
-                            onPressed: () =>
-                                dashboardController.applyChapterSelectionPreset(
-                                  ChapterSelectionPreset.allChapters,
-                                ),
+                            onPressed: selectionEnabled
+                                ? () => dashboardController
+                                      .applyChapterSelectionPreset(
+                                        ChapterSelectionPreset.allChapters,
+                                      )
+                                : null,
                           ),
                           ActionChip(
                             label: Text(strings.presetNone),
-                            onPressed: () =>
-                                dashboardController.applyChapterSelectionPreset(
-                                  ChapterSelectionPreset.none,
-                                ),
+                            onPressed: selectionEnabled
+                                ? () => dashboardController
+                                      .applyChapterSelectionPreset(
+                                        ChapterSelectionPreset.none,
+                                      )
+                                : null,
                           ),
                         ],
                       ),
@@ -107,11 +127,14 @@ class PreviewPage extends ConsumerWidget {
                     final PreviewChapter chapter = chapters[index];
                     return ListTile(
                       contentPadding: EdgeInsets.zero,
-                      selected: index == selectedIndex,
+                      selected: index == safeSelectedIndex,
                       onTap: () => selectedController.state = index,
                       leading: Checkbox(
                         value: chapter.includeInTranslation,
-                        onChanged: chapter.path.isEmpty
+                        onChanged:
+                            chapter.path.isEmpty ||
+                                chapter.blockCount == 0 ||
+                                !selectionEnabled
                             ? null
                             : (bool? value) {
                                 if (value == null) {

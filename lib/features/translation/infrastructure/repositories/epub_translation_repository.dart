@@ -4,6 +4,7 @@ import '../../domain/models/inspected_chapter.dart';
 import '../../domain/models/inspection_result.dart';
 import '../../domain/models/translation_config.dart';
 import '../../domain/models/translation_run_result.dart';
+import '../../domain/models/translation_style_profile.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub/epub_chapter_translator.dart';
 import '../epub/epub_inspector.dart';
@@ -137,6 +138,18 @@ class EpubTranslationRepository implements TranslationRepository {
     );
   }
 
+  Future<TranslationStyleProfile> generateStyleProfileForTest({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+  }) {
+    return _translator.generateStyleProfileForTest(
+      dio: dio,
+      config: config,
+      chapters: chapters,
+    );
+  }
+
   @override
   Future<void> cancelJob(String jobId) async {
     final CancelToken? token = _activeCancelToken;
@@ -205,6 +218,7 @@ class EpubTranslationRepository implements TranslationRepository {
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
@@ -216,8 +230,34 @@ class EpubTranslationRepository implements TranslationRepository {
         config: config,
         chapters: chapters,
         cancelToken: cancelToken,
+        confirmedStyleProfile: confirmedStyleProfile,
         onProgress: onProgress,
         isCancelled: isCancelled,
+      );
+    } on TranslationCancelledException {
+      rethrow;
+    } catch (error) {
+      if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
+        throw const TranslationCancelledException();
+      }
+      rethrow;
+    } finally {
+      _clearCancelTokenIfCurrent(cancelToken);
+    }
+  }
+
+  @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    final CancelToken cancelToken = _beginCancellableRun();
+    try {
+      return await _translator.generateStyleProfile(
+        config: config,
+        chapters: chapters,
+        cancelToken: cancelToken,
       );
     } on TranslationCancelledException {
       rethrow;

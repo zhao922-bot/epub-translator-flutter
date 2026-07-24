@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:epub_translator_flutter/app/app.dart';
 import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
+import 'package:epub_translator_flutter/features/preview/application/preview_provider.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
@@ -207,6 +208,22 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('preview resets an out-of-range chapter selection', (
+    tester,
+  ) async {
+    await tester.pumpWidget(testApp());
+    await tester.pumpAndSettle();
+    final ProviderContainer container = ProviderScope.containerOf(
+      tester.element(find.byType(MaterialApp)),
+    );
+    container.read(previewSelectedIndexProvider.notifier).state = 99;
+
+    await tester.tap(find.byIcon(Icons.chrome_reader_mode_rounded).first);
+    await tester.pumpAndSettle();
+
+    expect(container.read(previewSelectedIndexProvider), 0);
+  });
+
   testWidgets('settings fields update after async settings load', (
     tester,
   ) async {
@@ -282,7 +299,8 @@ void main() {
 
     // Primary UI shows basename; full path is under Advanced paths.
     expect(find.text('dragged.epub'), findsWidgets);
-    expect(find.textContaining('Dropped EPUB: dragged.epub'), findsOneWidget);
+    // Log line + floating SnackBar both surface the drop confirmation.
+    expect(find.textContaining('Dropped EPUB: dragged.epub'), findsWidgets);
 
     final Finder advancedPaths = find.text('Manual paths');
     await tester.ensureVisible(advancedPaths);
@@ -305,6 +323,59 @@ void main() {
     );
     expect(apiKeyField.obscureText, isTrue);
   });
+
+  testWidgets(
+    'Custom API values survive a round trip through the DeepSeek preset',
+    (tester) async {
+      await tester.pumpWidget(testApp());
+      await tester.pumpAndSettle();
+
+      await openSettings(tester);
+
+      expect(find.text('OpenAI-compatible'), findsNothing);
+      expect(find.text('deepseek-v4-flash'), findsOneWidget);
+
+      final Finder baseUrlField = find.descendant(
+        of: find.byKey(const ValueKey<String>('settings-api-base-url')),
+        matching: find.byType(EditableText),
+      );
+      final Finder apiKeyField = find.descendant(
+        of: find.byKey(const ValueKey<String>('settings-api-key')),
+        matching: find.byType(EditableText),
+      );
+      final Finder modelField = find.descendant(
+        of: find.byKey(const ValueKey<String>('settings-model')),
+        matching: find.byType(EditableText),
+      );
+      await tester.enterText(baseUrlField, 'https://custom.example/v1');
+      await tester.enterText(apiKeyField, 'sk-custom-profile');
+      await tester.enterText(modelField, 'custom-model');
+      await tester.pumpAndSettle();
+
+      final Finder deepSeekChip = find.byKey(
+        const ValueKey<String>('api-provider-deepseek'),
+      );
+      final Finder customChip = find.byKey(
+        const ValueKey<String>('api-provider-custom'),
+      );
+      await tester.tap(deepSeekChip);
+      await tester.pumpAndSettle();
+
+      expect(find.text('https://api.deepseek.com'), findsOneWidget);
+      expect(find.text('deepseek-v4-flash'), findsOneWidget);
+
+      await tester.tap(customChip);
+      await tester.pumpAndSettle();
+
+      expect(tester.widget<ChoiceChip>(customChip).selected, isTrue);
+      expect(find.text('https://custom.example/v1'), findsOneWidget);
+      expect(find.text('custom-model'), findsOneWidget);
+      expect(
+        tester.widget<EditableText>(apiKeyField).controller.text,
+        'sk-custom-profile',
+      );
+    },
+  );
 
   testWidgets('API key visibility can be toggled without losing the value', (
     tester,

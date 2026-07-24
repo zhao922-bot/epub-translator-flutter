@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -455,6 +456,84 @@ void main() {
       expect(withoutGlossary, isNot(equals(withGlossary)));
       expect(withoutGlossary, hasLength(64));
       expect(withGlossary, hasLength(64));
+    });
+
+    test('block cache key changes when confirmed style profile changes', () {
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test',
+        model: 'example-model',
+        targetLanguage: 'Chinese',
+        styleProfileEnabled: true,
+      );
+      const TranslationStyleProfile business = TranslationStyleProfile(
+        primaryGenre: 'business nonfiction',
+        tone: 'analytical',
+        confidence: TranslationStyleConfidence.high,
+      );
+      const TranslationStyleProfile literary = TranslationStyleProfile(
+        primaryGenre: 'literary fiction',
+        tone: 'lyrical',
+        confidence: TranslationStyleConfidence.high,
+      );
+
+      final String businessKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block,
+        chapterPath: 'chapter-1.xhtml',
+        confirmedStyleProfile: business,
+      );
+      final String literaryKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block,
+        chapterPath: 'chapter-1.xhtml',
+        confirmedStyleProfile: literary,
+      );
+
+      expect(businessKey, isNot(equals(literaryKey)));
+      expect(businessKey, hasLength(64));
+      expect(literaryKey, hasLength(64));
+    });
+
+    test('job key changes when confirmed style profile changes', () {
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test',
+        model: 'example-model',
+        targetLanguage: 'Chinese',
+        styleProfileEnabled: true,
+      );
+      final List<InspectedChapter> chapters = <InspectedChapter>[
+        _chapter(
+          path: 'chapter-1.xhtml',
+          title: 'Chapter One',
+          category: ChapterCategory.content,
+          text: 'Hello Alice.',
+        ),
+      ];
+      const TranslationStyleProfile business = TranslationStyleProfile(
+        primaryGenre: 'business nonfiction',
+        confidence: TranslationStyleConfidence.high,
+      );
+      const TranslationStyleProfile literary = TranslationStyleProfile(
+        primaryGenre: 'literary fiction',
+        confidence: TranslationStyleConfidence.high,
+      );
+
+      final String businessKey = EpubChapterTranslator.jobKeyForTest(
+        inputFingerprint: 'fingerprint-1',
+        config: config,
+        chapters: chapters,
+        confirmedStyleProfile: business,
+      );
+      final String literaryKey = EpubChapterTranslator.jobKeyForTest(
+        inputFingerprint: 'fingerprint-1',
+        config: config,
+        chapters: chapters,
+        confirmedStyleProfile: literary,
+      );
+
+      expect(businessKey, isNot(equals(literaryKey)));
+      expect(businessKey, hasLength(64));
+      expect(literaryKey, hasLength(64));
     });
   });
 

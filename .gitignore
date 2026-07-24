@@ -1,6 +1,7 @@
 # Miscellaneous
 *.class
 *.log
+*.obj
 *.pyc
 *.swp
 .DS_Store
@@ -61,6 +62,15 @@ app.*.map.json
 # Environment and secrets
 *.env
 *.env.*
+
+# Local diagnostics, live-test reports, and private EPUB fixtures
+/work/
+/dist/
+
+# Local AI-assistant configuration (not part of the application)
+/.claude/
+/.codex/
+/CLAUDE.md
 
 # Node.js (if applicable)
 node_modules/

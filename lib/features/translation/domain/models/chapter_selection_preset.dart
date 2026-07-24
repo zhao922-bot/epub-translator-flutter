@@ -11,9 +11,10 @@ extension ChapterSelectionPresetOps on ChapterSelectionPreset {
         .map((InspectedChapter chapter) {
           final bool include = switch (this) {
             ChapterSelectionPreset.recommended =>
-              chapter.recommendedForTranslation,
+              chapter.blocks.isNotEmpty && chapter.recommendedForTranslation,
             ChapterSelectionPreset.contentOnly =>
-              chapter.category == ChapterCategory.content,
+              chapter.blocks.isNotEmpty &&
+                  chapter.category == ChapterCategory.content,
             ChapterSelectionPreset.allChapters => chapter.blocks.isNotEmpty,
             ChapterSelectionPreset.none => false,
           };

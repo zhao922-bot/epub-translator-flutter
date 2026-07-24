@@ -1,387 +1,131 @@
 # EPUB Translator Flutter
 
-一款功能强大的 EPUB 电子书翻译工具，使用 Flutter 框架重构，支持多平台运行。
+一款面向整本书翻译的 Flutter EPUB 工具。它不只是把文本发送给模型，而是围绕 EPUB 结构解析、风格确认、上下文翻译、质量校验、断点续传和兼容性输出，提供完整的书籍翻译工作流。
 
-当前版本：**v1.1.0**（Windows / Android） · 详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**v1.2.0**
 
-## ✨ 项目背景
+- Windows x64：已验证并发布完整便携包。
+- Android：保留源码与构建支持；v1.2.0 暂不发布 APK，待完成真机全链路验证后再提供。
 
-本项目是从 Python 版本 ([epub-translator](https://github.com/zhao922-bot/epub-translator)) 完全重构为 Flutter 版本，实现了以下改进：
+## 核心能力
 
-- 🚀 **平台支持** - **Windows 与 Android** 为官方支持与测试目标（macOS / Linux / iOS 未作为本仓库开发范围）
-- 🎨 **现代化 UI** - Material Design 3 界面，深色/浅色主题自动切换
-- ⚡ **性能提升** - Dart 语言原生性能，更快的启动速度和响应速度
-- 📱 **原生体验** - 响应式设计，适配各种屏幕尺寸
+### 面向整本书的翻译流程
 
----
+- 读取 EPUB 书脊、章节、目录、图片和样式，识别真正需要翻译的正文块。
+- 支持按章节选择、工作量与批次数预估，以及正式翻译前预览。
+- 按块批量调用模型，并使用上下文、锁定术语、书籍记忆和缓存维持前后连贯。
+- 对漏翻、源语言残留、异常短输出、格式破坏等情况进行校验和重试。
+- 翻译中断后可从历史任务和缓存继续，避免整本书从头开始。
 
-## 🎯 核心功能
+### 可确认、可编辑的风格档案
 
-### 📚 EPUB 翻译
-- ✅ 智能章节识别和分割
-- ✅ 并发翻译支持（可配置 1-8 个并发）
-- ✅ 翻译进度实时显示
-- ✅ 翻译日志记录
+软件会在正式翻译前，从有代表性的正文、前言和中段章节中采样，分析书籍类型、语气、叙事视角、目标读者、术语策略等信息。目录、索引、版权页等低价值页面会尽量排除。
 
-### 🌍 多语言支持
-- ✅ 支持任意源语言到目标语言的翻译
-- ✅ 双语对照翻译模式（原文 + 译文）
-- ✅ 中英文界面切换
+生成结果和置信度会先展示给用户。用户可以修改或补充风格档案，确认后才用于整本书翻译，因此 AI 的误判不会被直接锁死并扩散到全书。
 
-### 🔌 API 集成
-- ✅ 支持 DeepSeek API（默认）
-- ✅ 可配置的 API 端点和密钥
-- ✅ 连接测试功能
-- ✅ 自动重试机制（可配置重试次数和延迟）
+### EPUB 输出兼容性
 
-### ⚙️ 灵活配置
-- ✅ 分块大小调节（1000-12000 字符）
-- ✅ 并发数控制（1-8）
-- ✅ 超时时间设置（30-300 秒）
-- ✅ 输出文件后缀自定义
+- 保留原书图片、目录、章节顺序、链接与大部分排版结构。
+- 同步更新 OPF、NCX、HTML 目录和文档语言信息。
+- 输出前检查 XML/XHTML 是否可解析，降低损坏 EPUB 的概率。
+- 针对中文阅读优化段落排版、行高、首字下沉、小型大写和深色模式颜色继承。
+- 修复空锚点、自闭合标签和英文装饰性首字母引起的目录失效、下划线、文字重叠或中英文混排问题。
 
-### 📦 导出功能
-- ✅ 导出翻译后的 EPUB 文件
-- ✅ 保存到下载目录
-- ✅ 打开输出文件夹
+### 稳定性与隐私
 
----
+- 任务运行期间锁定 API、模型和关键翻译参数，避免误触改变正在执行的任务。
+- DeepSeek 与 Custom 配置独立保存，切换提供商不会互相覆盖。
+- Windows 下 API Key 使用系统级加密存储；日志、错误和历史记录会进行密钥脱敏。
+- 临时文件与最终输出分离；失败或取消不会覆盖已有 EPUB。
+- 软件不会内置、上传或提交任何用户 API Key。
 
-## 🔄 Python vs Flutter 对比
+## 使用流程
 
-| 特性 | Python 版本 | Flutter 版本 |
-|------|-----------|-------------|
-| **运行平台** | 仅限 Windows/macOS/Linux | Windows + Android（官方） |
-| **UI 框架** | PyQt/Tkinter（较旧） | Material Design 3（现代化） |
-| **启动速度** | 较慢（解释型语言） | ⚡ 极快（原生编译） |
-| **内存占用** | 较高 | ✅ 优化内存管理 |
-| **并发性能** | 受 GIL 限制 | ✅ async 并发 API 请求；ZIP 解包/重打包走 isolate |
-| **响应式设计** | ❌ 固定布局 | ✅ 自适应各种屏幕 |
-| **主题支持** | 有限 | ✅ 深色/浅色主题 + 字号缩放 |
-| **代码维护** | 复杂 | ✅ 模块化、易维护 |
-| **国际化** | 手动实现 | ✅ 中英文界面 |
-| **状态管理** | 全局变量 | ✅ Riverpod 响应式状态管理 |
+1. 在“设置”中选择 DeepSeek 或 Custom，填写接口地址、API Key 和模型名称。
+2. 导入无 DRM 的 EPUB，并等待结构检查完成。
+3. 选择需要翻译的章节，查看块数、批次数、Token 和时间预估。
+4. 生成风格档案，检查 AI 的判断并按需修改。
+5. 开始翻译；可随时查看进度、诊断信息或中断任务。
+6. 完成后打开输出目录，将译后 EPUB 导入阅读器验收。
 
-### 🚀 Flutter 版本优势
+## API 配置
 
-#### 1. **Windows + Android 优先**
-- 桌面与移动双端统一体验
-- Windows 文件对话框 / DPAPI 密钥；Android 原生选书、分享与安全存储
+### DeepSeek
 
-#### 2. **现代化架构**
-- **Riverpod** 状态管理：响应式、类型安全、易于测试
-- **GoRouter** 路由管理：声明式路由
-- **Feature-based** 架构：模块化、易于扩展
+- 默认接口：`https://api.deepseek.com`
+- 默认模型：`deepseek-v4-flash`
 
-#### 3. **更好的性能**
-- Dart AOT 编译为原生代码
-- 更快的启动速度
-- 大书 ZIP 打开/重打包在 isolate 中执行，减轻 UI 卡顿
-- 多请求并发翻译 + 块缓存续传
+### Custom
 
-#### 4. **开发体验**
-- Hot Reload 即时预览
-- 强大的类型系统
-- 优秀的 IDE 支持
-- 完整的测试框架
+用于兼容采用 OpenAI Chat Completions 请求格式的第三方服务。Custom 的接口地址、API Key 和模型名称会独立保存，不会被 DeepSeek 预设覆盖。
 
-#### 5. **用户体验**
-- Material Design 3 设计语言
-- 响应式布局，适配手机、平板、桌面
-- 流畅的动画和过渡效果
-- 原生手势支持
+第三方服务即使声称兼容，也可能在返回格式、上下文长度、限流规则或模型行为上存在差异。建议先翻译短章节，通过质量校验后再进行整书任务。
 
----
+> API 请求会发送书籍中待翻译的文本及必要上下文到你配置的服务商。请在使用前确认服务商的隐私政策和计费规则。
 
-## 📸 界面预览
+## Windows 安装
 
-```
-┌─────────────────────────────────────────┐
-│  🎯 翻译工作台                           │
-├─────────────────────────────────────────┤
-│  📁 输入文件: book.epub                 │
-│  📂 输出目录: /output                    │
-│  🌍 目标语言: Chinese                   │
-│  📖 双语对照: [关闭]                     │
-│                                         │
-│  [检查 EPUB]  [翻译选中章节]              │
-├─────────────────────────────────────────┤
-│  📊 翻译概览                             │
-│  ━━━━━━━━━━━━━━━━━━━━━━━ 75%            │
-│  章节: 10/13 | 字符: 45,230 | 时间: 2:30 │
-├─────────────────────────────────────────┤
-│  📝 翻译日志                             │
-│  14:30:01 ✅ 第1章翻译完成               │
-│  14:30:15 ✅ 第2章翻译完成               │
-│  14:30:28 ⏳ 第3章翻译中...              │
-└─────────────────────────────────────────┘
-```
+从 [GitHub Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) 下载：
 
----
+`epub-translator-flutter-v1.2.0-windows-x64-portable.zip`
 
-## 🛠️ 技术栈
+完整解压 ZIP 后运行 `epub_translator_flutter_clean.exe`。请不要只单独复制 EXE；Flutter Windows 程序还需要同目录中的 DLL 和 `data` 文件夹。
 
-### 核心框架
-- **Flutter 3.12+** - UI 框架
-- **Dart 3.12+** - 编程语言
+当前发布包面向 64 位 Windows。由于应用暂未进行商业代码签名，Windows SmartScreen 首次运行时可能显示安全提醒。
 
-### 状态管理
-- **flutter_riverpod** - 响应式状态管理
-- **go_router** - 声明式路由
+## v1.2.0 重点更新
 
-### 网络和 IO
-- **dio** - HTTP 客户端
-- **archive** - EPUB 文件处理
-- **html/xml** - 内容解析
+- 新增翻译前风格档案生成、置信度展示和用户编辑确认。
+- 优化风格采样，避免目录、索引等页面干扰书籍类型判断。
+- 修复 DeepSeek / Custom 配置切换丢失，以及翻译途中误改配置的问题。
+- 加强任务历史续传、启动恢复、缓存失效和取消状态处理。
+- 改进第三方兼容接口的响应清理、源语言残留判断和重试逻辑。
+- 修复零文本章节被推荐、目录无法跳转、异常下划线、文字重叠、蓝色正文和英文首字母残留等 EPUB 兼容性问题。
+- 重做主要工作台与设置界面，统一字体、间距、控件状态和错误反馈。
 
-### 工具库
-- **path** - 路径处理
-- **crypto** - 加密支持
-- **logger** - 日志记录
+完整记录见 [CHANGELOG.md](CHANGELOG.md)。
 
----
+## 从源码构建
 
-## 🚀 快速开始
+建议使用 Flutter 3.44 或更高版本。项目要求 Dart 3.12 或更高版本。
 
-### 前置要求
-
-- Flutter SDK 3.12+
-- Dart SDK 3.12+
-- 任一目标平台的开发环境（Windows/macOS/Linux/Android/iOS）
-
-### 安装
-
-```bash
-# 克隆仓库
-git clone https://github.com/zhao922-bot/epub-translator-flutter.git
-cd epub-translator-flutter
-
-# 安装依赖
+```powershell
 flutter pub get
-
-# 运行应用
-flutter run
-```
-
-### 构建发布版本
-
-```bash
-# Windows
-flutter build windows
-
-# Android
-flutter build apk
-```
-
-> **注意**: 本项目当前只针对 **Windows** 与 **Android** 开发和验证。其它平台不在支持范围内。
-
----
-
-## 📖 使用指南
-
-### 1️⃣ 配置 API
-
-1. 打开应用，进入 **设置** 页面
-2. 输入 API 端点（默认：`https://api.deepseek.com`）
-3. 输入 API 密钥
-4. 选择模型（默认：`deepseek-chat`）
-5. 点击 **测试连接** 验证配置
-
-### 2️⃣ 翻译 EPUB
-
-1. 进入 **翻译工作台** 页面
-2. 选择输入的 EPUB 文件
-3. 选择输出目录
-4. 设置目标语言
-5. 点击 **检查 EPUB** 查看章节信息
-6. 选择要翻译的章节
-7. 点击 **翻译选中章节**
-
-### 3️⃣ 导出翻译
-
-1. 翻译完成后，点击 **导出 EPUB**
-2. 或点击 **保存到下载目录**
-3. 翻译后的文件会自动命名（默认后缀：`_translated`）
-
----
-
-## ⚙️ 配置说明
-
-### 翻译参数
-
-| 参数 | 范围 | 默认值 | 说明 |
-|------|------|--------|------|
-| `chunkSize` | 1000-12000 | 3000 | 每次翻译的字符数 |
-| `maxConcurrent` | 1-8 | 3 | 并发翻译数 |
-| `timeoutSeconds` | 30-300 | 120 | 翻译超时时间 |
-| `maxRetries` | 1-6 | 3 | 失败重试次数 |
-| `retryDelaySeconds` | 1-15 | 5 | 重试间隔时间 |
-
-### 界面语言
-
-- 🇺🇸 English
-- 🇨🇳 中文
-
----
-
-## 📁 项目结构
-
-```
-lib/
-├── app/                          # 应用配置
-│   ├── app.dart                 # 应用入口
-│   ├── routes.dart              # 路由配置
-│   └── theme/                   # 主题配置
-├── features/                     # 功能模块
-│   ├── jobs/                    # 任务管理
-│   │   ├── domain/models/      # 数据模型
-│   │   ├── application/        # 业务逻辑
-│   │   └── presentation/       # UI 表现层
-│   ├── preview/                 # 预览功能
-│   ├── settings/                # 设置页面
-│   └── translation/            # 翻译核心功能
-│       ├── domain/             # 领域层（模型、仓库接口）
-│       ├── application/        # 应用层（控制器）
-│       ├── infrastructure/     # 基础设施层（实现）
-│       └── presentation/       # 表现层（UI）
-└── shared/                      # 共享组件
-    ├── localization/           # 国际化
-    ├── models/                 # 共享模型
-    ├── platform/               # 平台相关
-    └── widgets/                # 通用组件
-```
-
----
-
-## 🧪 测试
-
-```bash
-# 运行所有测试
+flutter analyze lib test tool
 flutter test
-
-# 运行特定测试文件
-flutter test test/widget_test.dart
-
-# 合成大书 isolate 压测
-flutter test test/epub_isolate_stress_test.dart --reporter expanded
-
-# 可选：真实 EPUB 路径集成压测（未设置环境变量时自动 skip）
-# PowerShell:
-#   $env:EPUB_STRESS_PATH = 'D:\books\big.epub'
-#   flutter test test/epub_real_path_stress_test.dart --reporter expanded
-
-# 生成测试覆盖率报告
-flutter test --coverage
-genhtml coverage/lcov.info -o coverage/html
+flutter build windows --release
 ```
 
-### 翻译管线模块（Windows / Android）
+Windows 构建输出位于：
 
-| 模块 | 职责 |
-|------|------|
-| `EpubInspector` | isolate 打开 ZIP、spine 检查 |
-| `TranslationBatchPlanner` | 分块 / 邻接上下文规划 |
-| `TranslationApiClient` | Dio、重试、限流、连接测试 |
-| `EpubChapterTranslator` | 缓存、书记忆、调度翻译 |
-| `EpubRepacker` | 写回 XHTML + isolate 重打包 |
-| `EpubTranslationRepository` | Facade（对外 API 稳定） |
+```text
+build\windows\x64\runner\Release\
+```
 
----
+Android 构建命令仍可使用，但 v1.2.0 未将 APK 列为正式验证和发布产物：
 
-## 🤝 贡献
+```powershell
+flutter build apk --release
+```
 
-欢迎提交 Issue 和 Pull Request！
+## 项目结构
 
-### 开发流程
+```text
+lib/features/preview/       EPUB 导入、结构检查与章节选择
+lib/features/settings/      API、模型和翻译参数配置
+lib/features/translation/   风格档案、翻译编排、质量校验与 EPUB 回写
+lib/shared/                 主题、本地化与通用组件
+test/                       离线回归测试与可选真实 API 测试
+tool/                       EPUB 诊断与修复工具
+```
 
-1. Fork 项目
-2. 创建功能分支 (`git checkout -b feature/新功能`)
-3. 提交更改 (`git commit -m '添加新功能'`)
-4. 推送到分支 (`git push origin feature/新功能`)
-5. 创建 Pull Request
+## 已知边界
 
-### 代码规范
+- 不支持受 DRM 保护的 EPUB。
+- 极少数出版商自定义脚本、字体或复杂 CSS 可能在不同阅读器中表现不同。
+- 翻译质量、速度和费用受模型、接口服务商、网络和原书结构影响。
+- 建议保留原始 EPUB，并先用短章节验证所选模型。
 
-- 遵循 Dart 官方代码规范
-- 使用 `flutter analyze` 检查代码质量
-- 确保所有测试通过
+## 许可
 
----
-
-## 📝 更新日志
-
-### v1.1.0 (2026-07-16)
-- 完整 EPUB 翻译链路：章节检查、可选章节、分块翻译、质量校验与安全回写。
-- 新增任务历史、断点续译、块缓存、术语表和翻译前耗时/费用预估。
-- 重构桌面翻译工作台与设置页，统一中英文排版、深浅主题和紧凑窗口体验。
-- 强化 Windows / Android 原生能力、密钥存储、错误脱敏、可取消重试及原子 EPUB 输出。
-- 新增 CI 与覆盖真实 EPUB、取消、重试、回写和界面的离线测试。
-
-完整条目见 [CHANGELOG.md](CHANGELOG.md)。
-
-### v1.0.0 (2026-06-03)
-- 🎉 首个 Flutter 版本发布
-- ✅ 从 Python 版本完全重构
-- ✅ 支持 Windows 和 Android 平台
-- ✅ Material Design 3 界面
-- ✅ Riverpod 状态管理
-- ✅ 并发翻译支持
-- ✅ 双语对照翻译
-
----
-
-## 📄 许可证
-
-本项目采用 **MIT 许可证** - 查看 [LICENSE](LICENSE) 文件了解详情
-
-### 许可证概述
-
-**MIT 许可证** 是一种宽松的开源许可证，允许：
-
-- ✅ **商业使用** - 可以在商业项目中使用
-- ✅ **修改** - 可以修改源代码
-- ✅ **分发** - 可以分发原始或修改后的代码
-- ✅ **私人使用** - 可以私人使用
-- ✅ **Sublicense** - 可以授予 sublicenses
-
-### 条件
-
-- 📋 **保留版权声明** - 必须在所有副本中包含版权声明
-- 📋 **保留许可证** - 必须在所有副本中包含许可证文本
-
-### 免责声明
-
-- ⚠️ **不提供担保** - 软件按"原样"提供，不提供任何担保
-- ⚠️ **不承担责任** - 作者不对任何损害承担责任
-
-### 为什么选择 MIT？
-
-- 🎯 **简单易懂** - 法律条款简洁明了
-- 🎯 **商业友好** - 允许商业使用而无需开源
-- 🎯 **社区标准** - 最流行的开源许可证之一
-- 🎯 **企业接受** - 被大多数公司和组织接受
-
----
-
-**完整的许可证文本请查看 [LICENSE](LICENSE) 文件**
-
----
-
-## 🙏 致谢
-
-- [Flutter](https://flutter.dev/) - 强大的跨平台 UI 框架
-- [DeepSeek](https://deepseek.com/) - AI 翻译 API
-- [Riverpod](https://riverpod.dev/) - 响应式状态管理
-
----
-
-## 📧 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- 📧 GitHub Issues: [epub-translator-flutter/issues](https://github.com/zhao922-bot/epub-translator-flutter/issues)
-- 💬 Discussions: [epub-translator-flutter/discussions](https://github.com/zhao922-bot/epub-translator-flutter/discussions)
-
----
-
-**⭐ 如果这个项目对你有帮助，请给个 Star 支持一下！**
+本项目使用 [MIT License](LICENSE)。

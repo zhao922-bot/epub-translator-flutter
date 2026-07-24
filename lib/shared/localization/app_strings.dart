@@ -186,6 +186,35 @@ class AppStrings {
       isChinese ? '残留质量检查' : 'Residual quality check';
   String get residualQualityCheckBody =>
       isChinese ? '拒绝明显未译完整的文本块' : 'Reject largely untranslated blocks';
+  String get styleProfileEnabled => isChinese ? '书籍风格档案' : 'Book style profile';
+  String get styleProfileEnabledBody => isChinese
+      ? '从前言/目录/前几章推断文体，并注入后续翻译'
+      : 'Infer tone from front matter and guide later chapters';
+  String get styleProfileSectionTitle =>
+      isChinese ? '书籍风格档案' : 'Book style profile';
+  String get styleProfileSectionBody => isChinese
+      ? '翻译前先确认类型与文风；可手动修改后再开翻。'
+      : 'Review genre and tone before translation. Edit freely, then confirm.';
+  String get generateStyleProfile =>
+      isChinese ? '生成风格档案' : 'Generate style profile';
+  String get regenerateStyleProfile => isChinese ? '重新生成' : 'Regenerate';
+  String get confirmStyleProfile =>
+      isChinese ? '确认风格并用于翻译' : 'Confirm style for translation';
+  String get styleProfileConfirmedBadge => isChinese ? '已确认' : 'Confirmed';
+  String get styleProfilePendingBadge => isChinese ? '待确认' : 'Needs review';
+  String get styleProfilePrimaryGenre => isChinese ? '主要类型' : 'Primary genre';
+  String get styleProfileSecondaryGenres =>
+      isChinese ? '次要类型（逗号分隔）' : 'Secondary genres (comma-separated)';
+  String get styleProfileTone => isChinese ? '语气' : 'Tone';
+  String get styleProfileSentenceStyle => isChinese ? '句式风格' : 'Sentence style';
+  String get styleProfileConstraints =>
+      isChinese ? '翻译约束（每行一条）' : 'Translation constraints (one per line)';
+  String get styleProfileAvoid =>
+      isChinese ? '应避免（每行一条）' : 'Avoid (one per line)';
+  String get styleProfileConfidence => isChinese ? '置信度' : 'Confidence';
+  String get styleProfileEmptyHint => isChinese
+      ? '检查完成后可生成风格档案；也可先手填。'
+      : 'Generate a style profile after inspection, or fill it in manually.';
   String get textScaleLabel => isChinese ? '字号' : 'Text size';
   String get lockedGlossary => isChinese ? '锁定术语表' : 'Locked glossary';
   String get lockedGlossaryHint =>
@@ -194,4 +223,167 @@ class AppStrings {
       isChinese ? '支持 Windows、Android' : 'Windows, Android';
   String get accessibilitySection => isChinese ? '无障碍' : 'Accessibility';
   String get qualitySection => isChinese ? '质量与术语' : 'Quality';
+
+  // —— Runtime log messages (dashboard) ——
+  String logSelectedEpub(String name) =>
+      isChinese ? '已选择 EPUB：$name' : 'Selected EPUB: $name';
+  String logDroppedEpub(String name) =>
+      isChinese ? '已拖入 EPUB：$name' : 'Dropped EPUB: $name';
+  String get logChooseEpubFile =>
+      isChinese ? '请选择 .epub 文件。' : 'Please choose a .epub file.';
+  String get logPickEpubBeforeInspect => isChinese
+      ? '请先选择 EPUB 再开始检查。'
+      : 'Pick an EPUB file before starting inspection.';
+  String logStartingInspection(String name) =>
+      isChinese ? '开始检查 EPUB：$name' : 'Starting EPUB inspection for $name';
+  String logInspectionFailed(String error) =>
+      isChinese ? '检查失败：$error' : 'Inspection failed: $error';
+  String get logInspectBeforeTranslate => isChinese
+      ? '请先检查 EPUB 再开始翻译。'
+      : 'Inspect an EPUB before starting translation.';
+  String get logNoChaptersChecked => isChinese
+      ? '尚未勾选要翻译的章节。'
+      : 'No chapters are checked for translation yet.';
+  String logQueuedTranslation(int chapters, int blocks) => isChinese
+      ? '已排队翻译：$chapters 章 · $blocks 块。'
+      : 'Queued translation for $chapters chapters and $blocks blocks.';
+  String logRoughLoad(int batches, int tokens, int chars) => isChinese
+      ? '粗估：约 $batches 个 API 批次 · $tokens 输入 tokens（源字符 $chars）。'
+      : 'Rough load: ~$batches API batches, ~$tokens input tokens (source chars $chars).';
+  String get logTranslationCompleteAndroid => isChinese
+      ? '翻译完成。请用「分享」导出 EPUB。'
+      : 'Translation complete. Use Share EPUB to export the book from Android.';
+  String get logTranslationCompleteDesktop => isChinese
+      ? '翻译完成。请用「打开」查看输出文件。'
+      : 'Translation complete. Use Open EPUB to view the output file.';
+  String logCacheResume(int cached, int resumed) => isChinese
+      ? '缓存/续传：$cached 缓存块 · $resumed 续传块。'
+      : 'Cache/resume: $cached cached, $resumed resumed blocks.';
+  String logTranslationFailed(String error) =>
+      isChinese ? '翻译失败：$error' : 'Translation failed: $error';
+  String logCheckpointed(int blocks) => isChinese
+      ? '进度已检查点（约 $blocks 块）。再次点「开始翻译」可从缓存续传。'
+      : 'Progress was checkpointed (~$blocks blocks). Tap Translate again to resume from cache.';
+  String get logRunAlreadyActiveInspect => isChinese
+      ? '当前已有任务进行中。请取消或等待后再检查。'
+      : 'A run is already in progress. Cancel it or wait before starting inspection.';
+  String get logRunAlreadyActiveTranslate => isChinese
+      ? '当前已有任务进行中。请取消或等待后再翻译。'
+      : 'A run is already in progress. Cancel it or wait before starting translation.';
+  String get logRunAlreadyActiveGeneric =>
+      isChinese ? '当前已有任务进行中。请稍后再试。' : 'A run is already in progress.';
+  String get logSelectAfterRun => isChinese
+      ? '请等当前任务结束后再选择新的 EPUB。'
+      : 'Select a new EPUB after the current run finishes.';
+  String get logDropAfterRun => isChinese
+      ? '请等当前任务结束后再拖入新的 EPUB。'
+      : 'Drop a new EPUB after the current run finishes.';
+  String get logChangeOutputAfterRun => isChinese
+      ? '请等当前任务结束后再更改输出目录。'
+      : 'Change the output directory after the current run finishes.';
+  String get logInputLocked => isChinese
+      ? '任务进行中，输入路径已锁定。'
+      : 'Input path is locked while a run is in progress.';
+  String get logOutputLocked => isChinese
+      ? '任务进行中，输出目录已锁定。'
+      : 'Output directory is locked while a run is in progress.';
+  String logCouldNotSelectEpub(String error) =>
+      isChinese ? '无法选择 EPUB：$error' : 'Could not select EPUB: $error';
+  String logSelectedOutput(String dir) =>
+      isChinese ? '已选择输出目录：$dir' : 'Selected output directory: $dir';
+  String logAndroidOutputDir(String dir) => isChinese
+      ? 'Android 使用应用管理的输出目录：$dir'
+      : 'Android uses an app-managed output directory: $dir';
+  String logAppliedPreset(String name) =>
+      isChinese ? '已应用章节预设：$name。' : 'Applied chapter selection preset: $name.';
+  String get logNoActiveRunToCancel =>
+      isChinese ? '当前没有可取消的运行中任务。' : 'No active run is available to cancel.';
+  String get logCancelAlreadyPending => isChinese
+      ? '取消请求已提交，正在尽可能中止进行中的请求。'
+      : 'Cancellation is already pending. In-flight HTTP requests are being aborted when possible.';
+  String get logCancellationRequested => isChinese
+      ? '已请求取消。将尽可能中止进行中的 API 调用。'
+      : 'Cancellation requested. Aborting in-flight API calls when possible.';
+  String logCachedProgressSoFar(int blocks) => isChinese
+      ? '目前已缓存约 $blocks 块。取消后可再点翻译续传。'
+      : 'Cached progress so far: ~$blocks blocks. After cancel, press Translate selected to resume.';
+  String get logRunCancelled => isChinese ? '任务已取消。' : 'Run cancelled.';
+  String logResumeHint(int blocks) => isChinese
+      ? '之后可续传翻译；约 $blocks 块已缓存。'
+      : 'You can resume translation later; about $blocks blocks are already cached.';
+  String logOpenedShare(String name) => isChinese
+      ? '已打开 Android 分享：$name。'
+      : 'Opened Android share sheet for $name.';
+  String logOpenedEpub(String name) =>
+      isChinese ? '已打开译后 EPUB：$name' : 'Opened translated EPUB: $name';
+  String logCouldNotOpenEpub(String message) => isChinese
+      ? '无法打开译后 EPUB：$message'
+      : 'Could not open translated EPUB: $message';
+  String logCouldNotExport(String error) =>
+      isChinese ? '无法导出 EPUB：$error' : 'Could not export EPUB: $error';
+  String get logDownloadsAndroidOnly => isChinese
+      ? '保存到下载仅在 Android 可用。'
+      : 'Saving to Downloads is only available on Android.';
+  String logSavedToDownloads(String path) =>
+      isChinese ? '已保存译后 EPUB 到 $path。' : 'Saved translated EPUB to $path.';
+  String logCouldNotSaveDownloads(String error) =>
+      isChinese ? '无法保存到下载：$error' : 'Could not save EPUB to Downloads: $error';
+  String get logNoOutputForHistory => isChinese
+      ? '该历史项没有可打开的输出文件。'
+      : 'No output file is available for this history item.';
+  String logOutputNotFound(String path) =>
+      isChinese ? '找不到输出文件：$path' : 'Output file was not found: $path';
+  String logCouldNotOpenJobOutput(String error) =>
+      isChinese ? '无法打开任务输出：$error' : 'Could not open job output: $error';
+  String get logRetryWait => isChinese
+      ? '请等当前任务结束后再重试历史项。'
+      : 'Wait for the current run to finish before retrying a history item.';
+  String get logHistoryNotFound =>
+      isChinese ? '找不到该历史项。' : 'Could not find that history item.';
+  String get logOnlyFailedOrCancelled => isChinese
+      ? '仅失败或已取消的任务可重试。'
+      : 'Only failed or cancelled jobs can be retried.';
+  String get logHistoryMissingPath => isChinese
+      ? '该历史项没有可重试的 EPUB 路径。'
+      : 'This history item does not include an EPUB path to retry.';
+  String logRetrying(String name) =>
+      isChinese ? '从历史重试：$name。' : 'Retrying $name from history.';
+  String get logRetryContinueTranslate => isChinese
+      ? '检查完成，继续翻译重试。'
+      : 'Inspection ready. Continuing with translation for the retry.';
+  String get logClearedHistory =>
+      isChinese ? '已清空任务历史。' : 'Cleared job history.';
+  String get logNoCompletedEpub => isChinese
+      ? '尚无已完成的译后 EPUB。'
+      : 'No completed translated EPUB is available yet.';
+  String logRestoredEpub(String name) =>
+      isChinese ? '已恢复上次 EPUB：$name' : 'Restored last EPUB: $name';
+  String logRestoredOutput(String dir) =>
+      isChinese ? '已恢复上次输出目录：$dir' : 'Restored last output directory: $dir';
+  String get logConfirmStyleBeforeTranslate => isChinese
+      ? '请先确认书籍风格档案，再开始整书翻译。'
+      : 'Confirm the book style profile before starting full-book translation.';
+  String get logGeneratingStyleProfile => isChinese
+      ? '正在根据前言/目录/前几章生成风格档案…'
+      : 'Generating style profile from front matter and early chapters…';
+  String logStyleProfileReady(String label) => isChinese
+      ? '风格档案已生成：$label。请确认或修改后再翻译。'
+      : 'Style profile ready: $label. Confirm or edit before translating.';
+  String logStyleProfileConfirmed(String label) => isChinese
+      ? '已确认风格档案：$label。后续翻译将按此风格执行。'
+      : 'Style profile confirmed: $label. Later translation will follow it.';
+  String get logStyleProfileDisabled => isChinese
+      ? '风格档案已关闭，将使用通用翻译风格。'
+      : 'Style profile disabled; using generic translation style.';
+  String get logInspectBeforeStyleProfile => isChinese
+      ? '请先检查 EPUB，再生成风格档案。'
+      : 'Inspect an EPUB before generating a style profile.';
+  String get logStyleProfileEmpty => isChinese
+      ? '未能从前言/前几章抽出稳定风格，可手动填写。'
+      : 'No stable style signal found; you can fill the profile manually.';
+  String logStyleProfileFailed(String error) =>
+      isChinese ? '风格档案生成失败：$error' : 'Style profile generation failed: $error';
+  String get logStyleProfileNeedContent => isChinese
+      ? '请先填写或生成风格档案内容，再确认。'
+      : 'Fill or generate style profile content before confirming.';
 }

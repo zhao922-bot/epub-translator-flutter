@@ -12,12 +12,26 @@ abstract class SettingsSecretStore {
   Future<void> writeApiKey(String value);
 
   Future<void> deleteApiKey();
+
+  Future<String?> readDeepSeekApiKey();
+
+  Future<void> writeDeepSeekApiKey(String value);
+
+  Future<void> deleteDeepSeekApiKey();
+
+  Future<String?> readCustomApiKey();
+
+  Future<void> writeCustomApiKey(String value);
+
+  Future<void> deleteCustomApiKey();
 }
 
 class NativeSettingsSecretStore implements SettingsSecretStore {
   const NativeSettingsSecretStore();
 
   static const String _apiKeyName = 'api_key';
+  static const String _deepSeekApiKeyName = 'deepseek_api_key';
+  static const String _customApiKeyName = 'custom_api_key';
 
   @override
   Future<void> deleteApiKey() {
@@ -33,6 +47,36 @@ class NativeSettingsSecretStore implements SettingsSecretStore {
   Future<void> writeApiKey(String value) {
     return PlatformUtils.writeSecret(_apiKeyName, value);
   }
+
+  @override
+  Future<void> deleteDeepSeekApiKey() {
+    return PlatformUtils.deleteSecret(_deepSeekApiKeyName);
+  }
+
+  @override
+  Future<String?> readDeepSeekApiKey() {
+    return PlatformUtils.readSecret(_deepSeekApiKeyName);
+  }
+
+  @override
+  Future<void> writeDeepSeekApiKey(String value) {
+    return PlatformUtils.writeSecret(_deepSeekApiKeyName, value);
+  }
+
+  @override
+  Future<void> deleteCustomApiKey() {
+    return PlatformUtils.deleteSecret(_customApiKeyName);
+  }
+
+  @override
+  Future<String?> readCustomApiKey() {
+    return PlatformUtils.readSecret(_customApiKeyName);
+  }
+
+  @override
+  Future<void> writeCustomApiKey(String value) {
+    return PlatformUtils.writeSecret(_customApiKeyName, value);
+  }
 }
 
 class SettingsStore {
@@ -44,12 +88,36 @@ class SettingsStore {
 
   Future<TranslationConfig> load() async {
     final TranslationConfig config = await _loadConfigFromFile();
-    final String? storedApiKey = await _readApiKeyOrNull();
-    final String resolvedApiKey = storedApiKey?.isNotEmpty == true
+    final String? storedApiKey = await _readSecretOrNull(
+      _secretStore.readApiKey,
+    );
+    final String? storedDeepSeekKey = await _readSecretOrNull(
+      _secretStore.readDeepSeekApiKey,
+    );
+    final String? storedCustomKey = await _readSecretOrNull(
+      _secretStore.readCustomApiKey,
+    );
+    final String legacyKey = storedApiKey?.isNotEmpty == true
         ? storedApiKey!
         : config.apiKey;
+    final String deepSeekKey = storedDeepSeekKey?.isNotEmpty == true
+        ? storedDeepSeekKey!
+        : config.apiProviderSelection == ApiProviderSelection.deepseek
+        ? legacyKey
+        : config.deepseekApiKey;
+    final String customKey = storedCustomKey?.isNotEmpty == true
+        ? storedCustomKey!
+        : config.apiProviderSelection == ApiProviderSelection.custom
+        ? legacyKey
+        : config.customApiKey;
+    final String resolvedApiKey =
+        config.apiProviderSelection == ApiProviderSelection.deepseek
+        ? deepSeekKey
+        : customKey;
     final TranslationConfig resolvedConfig = config.copyWith(
       apiKey: resolvedApiKey,
+      deepseekApiKey: deepSeekKey,
+      customApiKey: customKey,
     );
     if (config.apiKey.isNotEmpty) {
       try {
@@ -78,26 +146,45 @@ class SettingsStore {
     }
   }
 
-  Future<String?> _readApiKeyOrNull() async {
+  Future<String?> _readSecretOrNull(Future<String?> Function() read) async {
     try {
-      return await _secretStore.readApiKey();
+      return await read();
     } catch (_) {
       return null;
     }
   }
 
   Future<void> save(TranslationConfig config) async {
-    if (config.apiKey.trim().isEmpty) {
-      await _secretStore.deleteApiKey();
-    } else {
-      await _secretStore.writeApiKey(config.apiKey);
-    }
+    await _writeOrDeleteSecret(
+      config.apiKey,
+      write: _secretStore.writeApiKey,
+      delete: _secretStore.deleteApiKey,
+    );
+    await _writeOrDeleteSecret(
+      config.deepseekApiKey,
+      write: _secretStore.writeDeepSeekApiKey,
+      delete: _secretStore.deleteDeepSeekApiKey,
+    );
+    await _writeOrDeleteSecret(
+      config.customApiKey,
+      write: _secretStore.writeCustomApiKey,
+      delete: _secretStore.deleteCustomApiKey,
+    );
     final File file = await _settingsFile();
     await file.parent.create(recursive: true);
     await file.writeAsString(
       const JsonEncoder.withIndent('  ').convert(config.toJson()),
       flush: true,
     );
+  }
+
+  Future<void> _writeOrDeleteSecret(
+    String value, {
+    required Future<void> Function(String value) write,
+    required Future<void> Function() delete,
+  }) {
+    final String trimmed = value.trim();
+    return trimmed.isEmpty ? delete() : write(trimmed);
   }
 
   Future<File> _settingsFile() async {

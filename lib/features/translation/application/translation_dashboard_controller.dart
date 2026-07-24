@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as path;
 
+import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
 import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/security/sensitive_text.dart';
@@ -16,6 +17,7 @@ import '../domain/models/inspection_result.dart';
 import '../domain/models/translation_job.dart';
 import '../domain/models/translation_run_estimate.dart';
 import '../domain/models/translation_run_result.dart';
+import '../domain/models/translation_style_profile.dart';
 import '../domain/repositories/translation_repository.dart';
 import '../infrastructure/job_history_store.dart';
 import '../infrastructure/session_path_store.dart';
@@ -41,11 +43,15 @@ final translationDashboardProvider =
       TranslationDashboardController,
       TranslationDashboardState
     >((ref) {
+      final SettingsController settingsController = ref.read(
+        settingsProvider.notifier,
+      );
       final TranslationDashboardController controller =
           TranslationDashboardController(
             repository: ref.watch(translationRepositoryProvider),
             historyStore: ref.watch(jobHistoryStoreProvider),
             pathStore: ref.watch(sessionPathStoreProvider),
+            settingsReady: () => settingsController.ready,
           )..syncSettings(ref.read(settingsProvider));
       ref.listen<TranslationConfig>(settingsProvider, (
         TranslationConfig? _,
@@ -70,6 +76,9 @@ class TranslationDashboardState {
     required this.inspectedChapters,
     required this.logs,
     this.actionableError,
+    this.styleProfile = TranslationStyleProfile.empty,
+    this.styleProfileConfirmed = false,
+    this.isGeneratingStyleProfile = false,
   });
 
   final TranslationConfig config;
@@ -81,12 +90,22 @@ class TranslationDashboardState {
   final List<InspectedChapter> inspectedChapters;
   final List<String> logs;
   final ActionableError? actionableError;
+  final TranslationStyleProfile styleProfile;
+  final bool styleProfileConfirmed;
+  final bool isGeneratingStyleProfile;
 
   bool get isRunActive {
     final TranslationJobStatus? status = job?.status;
     return status == TranslationJobStatus.queued ||
-        status == TranslationJobStatus.running;
+        status == TranslationJobStatus.running ||
+        isGeneratingStyleProfile;
   }
+
+  bool get hasStyleProfile => !styleProfile.isEmpty;
+
+  /// When style profiles are enabled, translation should wait for confirmation.
+  bool get requiresStyleProfileConfirmation =>
+      config.styleProfileEnabled && !styleProfileConfirmed;
 
   factory TranslationDashboardState.initial() {
     return TranslationDashboardState(
@@ -97,11 +116,11 @@ class TranslationDashboardState {
       jobHistory: const <TranslationJob>[],
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
-      logs: const <String>[
-        'Ready to inspect an EPUB.',
-        'Choose a book and output folder, then inspect the spine to see real progress.',
-      ],
+      logs: const <String>[],
       actionableError: null,
+      styleProfile: TranslationStyleProfile.empty,
+      styleProfileConfirmed: false,
+      isGeneratingStyleProfile: false,
     );
   }
 
@@ -115,6 +134,9 @@ class TranslationDashboardState {
     List<InspectedChapter>? inspectedChapters,
     List<String>? logs,
     Object? actionableError = _unset,
+    Object? styleProfile = _unset,
+    bool? styleProfileConfirmed,
+    bool? isGeneratingStyleProfile,
   }) {
     return TranslationDashboardState(
       config: config ?? this.config,
@@ -130,6 +152,13 @@ class TranslationDashboardState {
       actionableError: identical(actionableError, _unset)
           ? this.actionableError
           : actionableError as ActionableError?,
+      styleProfile: identical(styleProfile, _unset)
+          ? this.styleProfile
+          : styleProfile as TranslationStyleProfile,
+      styleProfileConfirmed:
+          styleProfileConfirmed ?? this.styleProfileConfirmed,
+      isGeneratingStyleProfile:
+          isGeneratingStyleProfile ?? this.isGeneratingStyleProfile,
     );
   }
 
@@ -147,20 +176,35 @@ class TranslationDashboardController
     required this.repository,
     this.historyStore,
     this.pathStore,
+    this.settingsReady,
   }) : super(TranslationDashboardState.initial()) {
-    _loadJobHistory();
+    _initialJobHistoryLoad = _loadJobHistory();
     _loadSessionPaths();
   }
 
   final TranslationRepository repository;
   final JobHistoryStore? historyStore;
   final SessionPathStore? pathStore;
+  final Future<void> Function()? settingsReady;
   bool _cancelRequested = false;
   Stopwatch? _translationStopwatch;
   Future<void> _pendingHistorySave = Future<void>.value();
+  late final Future<void> _initialJobHistoryLoad;
+  int _sessionPathRevision = 0;
+  int _historyClearRevision = 0;
+
+  AppStrings get _s => AppStrings(state.config.uiLanguage);
+
+  Future<bool> _waitForSettingsReady() async {
+    final Future<void> Function()? wait = settingsReady;
+    if (wait != null) {
+      await wait();
+    }
+    return mounted;
+  }
 
   Future<void> pickInputPath() async {
-    if (_logIfRunActive('Select a new EPUB after the current run finishes.')) {
+    if (_logIfRunActive(_s.logSelectAfterRun)) {
       return;
     }
     String? selectedPath;
@@ -170,7 +214,7 @@ class TranslationDashboardController
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          'Could not select EPUB: ${_safeErrorText(error)}',
+          _s.logCouldNotSelectEpub(_safeErrorText(error)),
         ],
       );
       return;
@@ -178,32 +222,29 @@ class TranslationDashboardController
     if (selectedPath == null || selectedPath.isEmpty) {
       return;
     }
-    await _acceptInputPath(selectedPath, sourceLabel: 'Selected EPUB');
+    await _acceptInputPath(selectedPath, dropped: false);
   }
 
-  Future<void> importDroppedEpubPath(String droppedPath) async {
-    if (_logIfRunActive('Drop a new EPUB after the current run finishes.')) {
-      return;
+  /// Returns true when an EPUB path was accepted into state.
+  Future<bool> importDroppedEpubPath(String droppedPath) async {
+    if (_logIfRunActive(_s.logDropAfterRun)) {
+      return false;
     }
-    await _acceptInputPath(droppedPath, sourceLabel: 'Dropped EPUB');
+    return _acceptInputPath(droppedPath, dropped: true);
   }
 
   Future<void> pickOutputDirectory() async {
-    if (_logIfRunActive(
-      'Change the output directory after the current run finishes.',
-    )) {
+    if (_logIfRunActive(_s.logChangeOutputAfterRun)) {
       return;
     }
     if (!PlatformUtils.supportsDirectoryPicker) {
+      _sessionPathRevision += 1;
       final String outputDirectory = await PlatformUtils.defaultOutputDirectory(
         state.inputPath,
       );
       state = state.copyWith(
         outputDirectory: outputDirectory,
-        logs: <String>[
-          ...state.logs,
-          'Android uses an app-managed output directory: $outputDirectory',
-        ],
+        logs: <String>[...state.logs, _s.logAndroidOutputDir(outputDirectory)],
       );
       return;
     }
@@ -212,89 +253,91 @@ class TranslationDashboardController
     if (selectedDirectory == null || selectedDirectory.isEmpty) {
       return;
     }
+    _sessionPathRevision += 1;
     state = state.copyWith(
       outputDirectory: selectedDirectory,
-      logs: <String>[
-        ...state.logs,
-        'Selected output directory: $selectedDirectory',
-      ],
+      logs: <String>[...state.logs, _s.logSelectedOutput(selectedDirectory)],
     );
   }
 
   void setInputPath(String value) {
     if (state.isRunActive) {
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Input path is locked while a run is in progress.',
-        ],
-      );
+      state = state.copyWith(logs: <String>[...state.logs, _s.logInputLocked]);
       return;
     }
+    _sessionPathRevision += 1;
     state = state.copyWith(
       inputPath: value,
       job: null,
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
+      styleProfile: TranslationStyleProfile.empty,
+      styleProfileConfirmed: false,
+      isGeneratingStyleProfile: false,
     );
   }
 
-  Future<void> _acceptInputPath(
-    String value, {
-    required String sourceLabel,
-  }) async {
+  Future<bool> _acceptInputPath(String value, {required bool dropped}) async {
     final String normalizedPath = value.trim();
     if (normalizedPath.isEmpty) {
-      return;
+      return false;
     }
     if (path.extension(normalizedPath).toLowerCase() != '.epub') {
       state = state.copyWith(
-        logs: <String>[...state.logs, 'Please choose a .epub file.'],
+        logs: <String>[...state.logs, _s.logChooseEpubFile],
       );
-      return;
+      return false;
     }
 
+    _sessionPathRevision += 1;
     final String inferredOutput = state.outputDirectory.isEmpty
         ? await PlatformUtils.defaultOutputDirectory(normalizedPath)
         : state.outputDirectory;
+    final String base = path.basename(normalizedPath);
     state = state.copyWith(
       inputPath: normalizedPath,
       outputDirectory: inferredOutput,
       job: null,
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
+      styleProfile: TranslationStyleProfile.empty,
+      styleProfileConfirmed: false,
+      isGeneratingStyleProfile: false,
       actionableError: null,
       logs: <String>[
         ...state.logs,
-        '$sourceLabel: ${path.basename(normalizedPath)}',
+        dropped ? _s.logDroppedEpub(base) : _s.logSelectedEpub(base),
       ],
     );
     _persistSessionPaths(
       inputPath: normalizedPath,
       outputDirectory: inferredOutput,
     );
+    return true;
   }
 
   void setOutputDirectory(String value) {
     if (state.isRunActive) {
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Output directory is locked while a run is in progress.',
-        ],
-      );
+      state = state.copyWith(logs: <String>[...state.logs, _s.logOutputLocked]);
       return;
     }
+    _sessionPathRevision += 1;
     state = state.copyWith(outputDirectory: value);
   }
 
   void setTargetLanguage(String value) {
+    if (state.isRunActive) {
+      return;
+    }
     state = state.copyWith(
       config: state.config.copyWith(targetLanguage: value),
     );
   }
 
   void setBilingual(bool value) {
+    if (state.isRunActive) {
+      return;
+    }
     state = state.copyWith(config: state.config.copyWith(bilingual: value));
   }
 
@@ -314,6 +357,7 @@ class TranslationDashboardController
       retryDelaySeconds: settingsConfig.retryDelaySeconds,
       outputSuffix: settingsConfig.outputSuffix,
       residualQualityCheck: settingsConfig.residualQualityCheck,
+      styleProfileEnabled: settingsConfig.styleProfileEnabled,
       textScale: settingsConfig.textScale,
       lockedGlossary: settingsConfig.lockedGlossary,
     );
@@ -326,10 +370,16 @@ class TranslationDashboardController
   }
 
   void toggleChapterInclusion(String chapterPath, bool includeInTranslation) {
+    if (state.isRunActive) {
+      return;
+    }
     final List<InspectedChapter> nextChapters = state.inspectedChapters
         .map(
           (InspectedChapter chapter) => chapter.path == chapterPath
-              ? chapter.copyWith(includeInTranslation: includeInTranslation)
+              ? chapter.copyWith(
+                  includeInTranslation:
+                      chapter.blocks.isNotEmpty && includeInTranslation,
+                )
               : chapter,
         )
         .toList();
@@ -344,7 +394,7 @@ class TranslationDashboardController
   }
 
   void applyChapterSelectionPreset(ChapterSelectionPreset preset) {
-    if (state.inspectedChapters.isEmpty) {
+    if (state.isRunActive || state.inspectedChapters.isEmpty) {
       return;
     }
     final List<InspectedChapter> nextChapters = preset.apply(
@@ -353,10 +403,7 @@ class TranslationDashboardController
     state = state.copyWith(
       inspectedChapters: nextChapters,
       runEstimate: _buildEstimate(chapters: nextChapters),
-      logs: <String>[
-        ...state.logs,
-        'Applied chapter selection preset: ${preset.name}.',
-      ],
+      logs: <String>[...state.logs, _s.logAppliedPreset(preset.name)],
     );
   }
 
@@ -364,18 +411,176 @@ class TranslationDashboardController
     state = state.copyWith(actionableError: null);
   }
 
-  Future<void> startInspection() async {
-    if (_logIfRunActive(
-      'A run is already in progress. Cancel it or wait before starting inspection.',
-    )) {
+  Future<void> generateStyleProfile() async {
+    if (!await _waitForSettingsReady()) {
+      return;
+    }
+    if (!state.config.styleProfileEnabled) {
+      state = state.copyWith(
+        styleProfile: TranslationStyleProfile.empty,
+        styleProfileConfirmed: true,
+        isGeneratingStyleProfile: false,
+        logs: <String>[...state.logs, _s.logStyleProfileDisabled],
+      );
+      return;
+    }
+    if (state.inspectedChapters.isEmpty) {
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logInspectBeforeStyleProfile],
+      );
+      return;
+    }
+    if (state.isRunActive && !state.isGeneratingStyleProfile) {
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logRunAlreadyActiveGeneric],
+      );
+      return;
+    }
+
+    _cancelRequested = false;
+    state = state.copyWith(
+      isGeneratingStyleProfile: true,
+      styleProfileConfirmed: false,
+      actionableError: null,
+      logs: <String>[...state.logs, _s.logGeneratingStyleProfile],
+    );
+
+    try {
+      final TranslationStyleProfile profile = await repository
+          .generateStyleProfile(
+            config: state.config,
+            chapters: state.inspectedChapters,
+            isCancelled: () => _cancelRequested,
+          );
+      if (_cancelRequested) {
+        state = state.copyWith(isGeneratingStyleProfile: false);
+        return;
+      }
+      state = state.copyWith(
+        styleProfile: profile,
+        // Empty means generic style; keep unconfirmed only when there is content to review.
+        styleProfileConfirmed: profile.isEmpty,
+        isGeneratingStyleProfile: false,
+        logs: <String>[
+          ...state.logs,
+          profile.isEmpty
+              ? _s.logStyleProfileEmpty
+              : _s.logStyleProfileReady(profile.summaryLabel),
+        ],
+      );
+    } catch (error) {
+      if (_cancelRequested) {
+        state = state.copyWith(isGeneratingStyleProfile: false);
+        return;
+      }
+      final String safeError = _safeErrorText(error);
+      AppLogger.error(
+        'Style profile generation failed',
+        tag: 'dashboard',
+        error: safeError,
+      );
+      state = state.copyWith(
+        isGeneratingStyleProfile: false,
+        styleProfileConfirmed: false,
+        logs: <String>[...state.logs, _s.logStyleProfileFailed(safeError)],
+      );
+    }
+  }
+
+  void updateStyleProfile(TranslationStyleProfile profile) {
+    if (state.isRunActive && !state.isGeneratingStyleProfile) {
+      return;
+    }
+    state = state.copyWith(styleProfile: profile, styleProfileConfirmed: false);
+  }
+
+  void setStyleProfileField({
+    String? primaryGenre,
+    String? secondaryGenresCsv,
+    String? tone,
+    String? sentenceStyle,
+    String? constraintsText,
+    String? avoidText,
+    TranslationStyleConfidence? confidence,
+  }) {
+    if (state.isRunActive && !state.isGeneratingStyleProfile) {
+      return;
+    }
+    final TranslationStyleProfile current = state.styleProfile;
+    final List<String> secondary = secondaryGenresCsv == null
+        ? current.secondaryGenres
+        : secondaryGenresCsv
+              .split(RegExp(r'[,;\n]'))
+              .map((String part) => part.trim())
+              .where((String part) => part.isNotEmpty)
+              .toList(growable: false);
+    final List<String> constraints = constraintsText == null
+        ? current.translationConstraints
+        : constraintsText
+              .split('\n')
+              .map((String part) => part.trim())
+              .where((String part) => part.isNotEmpty)
+              .toList(growable: false);
+    final List<String> avoid = avoidText == null
+        ? current.avoid
+        : avoidText
+              .split('\n')
+              .map((String part) => part.trim())
+              .where((String part) => part.isNotEmpty)
+              .toList(growable: false);
+    state = state.copyWith(
+      styleProfile: current.copyWith(
+        primaryGenre: primaryGenre,
+        secondaryGenres: secondary,
+        tone: tone,
+        sentenceStyle: sentenceStyle,
+        translationConstraints: constraints,
+        avoid: avoid,
+        confidence: confidence,
+      ),
+      styleProfileConfirmed: false,
+    );
+  }
+
+  void confirmStyleProfile() {
+    if (state.isRunActive && !state.isGeneratingStyleProfile) {
+      return;
+    }
+    if (!state.config.styleProfileEnabled) {
+      state = state.copyWith(styleProfileConfirmed: true);
+      return;
+    }
+    // Empty profile is allowed: it means use generic translation style.
+    final String label = state.styleProfile.isEmpty
+        ? (state.config.uiLanguage == UiLanguage.chinese
+              ? '通用风格'
+              : 'generic style')
+        : state.styleProfile.summaryLabel;
+    state = state.copyWith(
+      styleProfileConfirmed: true,
+      logs: <String>[...state.logs, _s.logStyleProfileConfirmed(label)],
+    );
+  }
+
+  void clearStyleProfileConfirmation() {
+    if (state.isRunActive && !state.isGeneratingStyleProfile) {
+      return;
+    }
+    state = state.copyWith(styleProfileConfirmed: false);
+  }
+
+  Future<void> startInspection({
+    TranslationStyleProfile? preservedStyleProfile,
+  }) async {
+    if (!await _waitForSettingsReady()) {
+      return;
+    }
+    if (_logIfRunActive(_s.logRunAlreadyActiveInspect)) {
       return;
     }
     if (state.inputPath.isEmpty) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Pick an EPUB file before starting inspection.',
-        ],
+        logs: <String>[...state.logs, _s.logPickEpubBeforeInspect],
       );
       return;
     }
@@ -398,9 +603,12 @@ class TranslationDashboardController
       ),
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
+      styleProfile: preservedStyleProfile ?? TranslationStyleProfile.empty,
+      styleProfileConfirmed: preservedStyleProfile != null,
+      isGeneratingStyleProfile: false,
       logs: <String>[
         ...state.logs,
-        'Starting EPUB inspection for ${path.basename(state.inputPath)}',
+        _s.logStartingInspection(path.basename(state.inputPath)),
       ],
     );
     _persistSessionPaths(
@@ -435,8 +643,15 @@ class TranslationDashboardController
         ),
         runEstimate: _buildEstimate(chapters: result.chapters, job: result.job),
         inspectedChapters: result.chapters,
+        styleProfile: preservedStyleProfile ?? TranslationStyleProfile.empty,
+        styleProfileConfirmed:
+            preservedStyleProfile != null || !state.config.styleProfileEnabled,
+        isGeneratingStyleProfile: false,
         actionableError: null,
       );
+      if (state.config.styleProfileEnabled && preservedStyleProfile == null) {
+        await generateStyleProfile();
+      }
     } catch (error) {
       if (_handleCancellation(error)) {
         return;
@@ -465,33 +680,38 @@ class TranslationDashboardController
         jobHistory: _jobHistoryWith(failedJob),
         runEstimate: null,
         inspectedChapters: const <InspectedChapter>[],
-        logs: <String>[...state.logs, 'Inspection failed: $safeError'],
+        styleProfile: TranslationStyleProfile.empty,
+        styleProfileConfirmed: false,
+        isGeneratingStyleProfile: false,
+        logs: <String>[...state.logs, _s.logInspectionFailed(safeError)],
         actionableError: ActionableErrorFactory.fromMessage(
-          'Inspection failed: $safeError',
+          _s.logInspectionFailed(safeError),
           isChinese: state.config.uiLanguage == UiLanguage.chinese,
+          preferredKind: ActionableErrorKind.retryInspection,
         ),
       );
     }
   }
 
   Future<void> startTranslation() async {
-    if (_logIfRunActive(
-      'A run is already in progress. Cancel it or wait before starting translation.',
-    )) {
+    if (!await _waitForSettingsReady()) {
+      return;
+    }
+    if (_logIfRunActive(_s.logRunAlreadyActiveTranslate)) {
       return;
     }
     if (state.inspectedChapters.isEmpty) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Inspect an EPUB before starting translation.',
-        ],
+        logs: <String>[...state.logs, _s.logInspectBeforeTranslate],
       );
       return;
     }
 
     final List<InspectedChapter> selectedChapters = state.inspectedChapters
-        .where((InspectedChapter chapter) => chapter.includeInTranslation)
+        .where(
+          (InspectedChapter chapter) =>
+              chapter.includeInTranslation && chapter.blocks.isNotEmpty,
+        )
         .toList();
     final int selectedBlocks = selectedChapters.fold<int>(
       0,
@@ -499,10 +719,13 @@ class TranslationDashboardController
     );
     if (selectedChapters.isEmpty) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'No chapters are checked for translation yet.',
-        ],
+        logs: <String>[...state.logs, _s.logNoChaptersChecked],
+      );
+      return;
+    }
+    if (state.requiresStyleProfileConfirmation) {
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logConfirmStyleBeforeTranslate],
       );
       return;
     }
@@ -520,6 +743,9 @@ class TranslationDashboardController
           totalFiles: selectedChapters.length,
           completedBlocks: 0,
           totalBlocks: selectedBlocks,
+          styleProfile: state.styleProfile,
+          styleProfileConfirmed: state.styleProfileConfirmed,
+          styleProfileEnabled: state.config.styleProfileEnabled,
         ) ??
         TranslationJob(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -533,17 +759,25 @@ class TranslationDashboardController
           totalFiles: selectedChapters.length,
           completedBlocks: 0,
           totalBlocks: selectedBlocks,
+          styleProfile: state.styleProfile,
+          styleProfileConfirmed: state.styleProfileConfirmed,
+          styleProfileEnabled: state.config.styleProfileEnabled,
         );
     final TranslationRunEstimate? estimate = _buildEstimate(job: queuedJob);
     state = state.copyWith(
       job: queuedJob,
+      jobHistory: _jobHistoryWith(queuedJob),
       runEstimate: estimate,
       actionableError: null,
       logs: <String>[
         ...state.logs,
-        'Queued translation for ${selectedChapters.length} chapters and $selectedBlocks blocks.',
+        _s.logQueuedTranslation(selectedChapters.length, selectedBlocks),
         if (estimate != null)
-          'Rough load: ~${estimate.estimatedApiBatches} API batches, ~${estimate.estimatedInputTokens} input tokens (source chars ${estimate.estimatedSourceChars}).',
+          _s.logRoughLoad(
+            estimate.estimatedApiBatches,
+            estimate.estimatedInputTokens,
+            estimate.estimatedSourceChars,
+          ),
       ],
     );
 
@@ -553,6 +787,10 @@ class TranslationDashboardController
         outputDirectory: state.outputDirectory,
         config: state.config,
         chapters: state.inspectedChapters,
+        confirmedStyleProfile:
+            state.config.styleProfileEnabled && state.styleProfileConfirmed
+            ? state.styleProfile
+            : null,
         onProgress: (TranslationJob job, String logLine) {
           if (_cancelRequested) {
             return;
@@ -580,10 +818,13 @@ class TranslationDashboardController
         logs: <String>[
           ...state.logs,
           PlatformUtils.isAndroid
-              ? 'Translation complete. Use Share EPUB to export the book from Android.'
-              : 'Translation complete. Use Open EPUB to view the output file.',
+              ? _s.logTranslationCompleteAndroid
+              : _s.logTranslationCompleteDesktop,
           if (result.job.cachedBlocks > 0 || result.job.resumedBlocks > 0)
-            'Cache/resume: ${result.job.cachedBlocks} cached, ${result.job.resumedBlocks} resumed blocks.',
+            _s.logCacheResume(
+              result.job.cachedBlocks,
+              result.job.resumedBlocks,
+            ),
         ],
       );
       _translationStopwatch?.stop();
@@ -618,13 +859,13 @@ class TranslationDashboardController
         jobHistory: _jobHistoryWith(failedJob),
         logs: <String>[
           ...state.logs,
-          'Translation failed: $safeError',
-          if (savedBlocks > 0)
-            'Progress was checkpointed (~$savedBlocks blocks). Tap Translate again to resume from cache.',
+          _s.logTranslationFailed(safeError),
+          if (savedBlocks > 0) _s.logCheckpointed(savedBlocks),
         ],
         actionableError: ActionableErrorFactory.fromMessage(
-          'Translation failed: $safeError',
+          _s.logTranslationFailed(safeError),
           isChinese: state.config.uiLanguage == UiLanguage.chinese,
+          preferredKind: ActionableErrorKind.retryTranslation,
         ),
       );
       _translationStopwatch?.stop();
@@ -635,17 +876,14 @@ class TranslationDashboardController
     final TranslationJob? activeJob = state.job;
     if (activeJob == null || !state.isRunActive) {
       state = state.copyWith(
-        logs: <String>[...state.logs, 'No active run is available to cancel.'],
+        logs: <String>[...state.logs, _s.logNoActiveRunToCancel],
       );
       return;
     }
 
     if (_cancelRequested) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Cancellation is already pending. In-flight HTTP requests are being aborted when possible.',
-        ],
+        logs: <String>[...state.logs, _s.logCancelAlreadyPending],
       );
       return;
     }
@@ -662,9 +900,8 @@ class TranslationDashboardController
       job: cancellingJob,
       logs: <String>[
         ...state.logs,
-        'Cancellation requested. Aborting in-flight API calls when possible.',
-        if (progressBlocks > 0)
-          'Cached progress so far: ~$progressBlocks blocks. After cancel, press Translate selected to resume.',
+        _s.logCancellationRequested,
+        if (progressBlocks > 0) _s.logCachedProgressSoFar(progressBlocks),
       ],
     );
   }
@@ -684,7 +921,7 @@ class TranslationDashboardController
         state = state.copyWith(
           logs: <String>[
             ...state.logs,
-            'Opened Android share sheet for ${path.basename(outputPath)}.',
+            _s.logOpenedShare(path.basename(outputPath)),
           ],
         );
         return;
@@ -695,15 +932,15 @@ class TranslationDashboardController
         logs: <String>[
           ...state.logs,
           result.type == ResultType.done
-              ? 'Opened translated EPUB: ${path.basename(outputPath)}'
-              : 'Could not open translated EPUB: ${result.message}',
+              ? _s.logOpenedEpub(path.basename(outputPath))
+              : _s.logCouldNotOpenEpub(result.message),
         ],
       );
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          'Could not export EPUB: ${_safeErrorText(error)}',
+          _s.logCouldNotExport(_safeErrorText(error)),
         ],
       );
     }
@@ -725,15 +962,15 @@ class TranslationDashboardController
         logs: <String>[
           ...state.logs,
           savedPath == null
-              ? 'Saving to Downloads is only available on Android.'
-              : 'Saved translated EPUB to $savedPath.',
+              ? _s.logDownloadsAndroidOnly
+              : _s.logSavedToDownloads(savedPath),
         ],
       );
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          'Could not save EPUB to Downloads: ${_safeErrorText(error)}',
+          _s.logCouldNotSaveDownloads(_safeErrorText(error)),
         ],
       );
     }
@@ -744,10 +981,7 @@ class TranslationDashboardController
     final String outputPath = job?.outputPath ?? '';
     if (job == null || !job.hasExportableEpub) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'No output file is available for this history item.',
-        ],
+        logs: <String>[...state.logs, _s.logNoOutputForHistory],
       );
       return;
     }
@@ -756,7 +990,7 @@ class TranslationDashboardController
     final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
     if (type != FileSystemEntityType.file || !await outputFile.exists()) {
       state = state.copyWith(
-        logs: <String>[...state.logs, 'Output file was not found: $outputPath'],
+        logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
       );
       return;
     }
@@ -770,7 +1004,7 @@ class TranslationDashboardController
         state = state.copyWith(
           logs: <String>[
             ...state.logs,
-            'Opened Android share sheet for ${path.basename(outputPath)}.',
+            _s.logOpenedShare(path.basename(outputPath)),
           ],
         );
         return;
@@ -780,54 +1014,54 @@ class TranslationDashboardController
         logs: <String>[
           ...state.logs,
           result.type == ResultType.done
-              ? 'Opened translated EPUB: ${path.basename(outputPath)}'
-              : 'Could not open translated EPUB: ${result.message}',
+              ? _s.logOpenedEpub(path.basename(outputPath))
+              : _s.logCouldNotOpenEpub(result.message),
         ],
       );
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          'Could not open job output: ${_safeErrorText(error)}',
+          _s.logCouldNotOpenJobOutput(_safeErrorText(error)),
         ],
       );
     }
   }
 
   Future<void> retryJob(String jobId) async {
-    if (_logIfRunActive(
-      'Wait for the current run to finish before retrying a history item.',
-    )) {
+    if (!await _waitForSettingsReady()) {
+      return;
+    }
+    if (_logIfRunActive(_s.logRetryWait)) {
       return;
     }
     final TranslationJob? job = _findKnownJob(jobId);
     if (job == null) {
       state = state.copyWith(
-        logs: <String>[...state.logs, 'Could not find that history item.'],
+        logs: <String>[...state.logs, _s.logHistoryNotFound],
       );
       return;
     }
     if (job.status != TranslationJobStatus.failed &&
         job.status != TranslationJobStatus.cancelled) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Only failed or cancelled jobs can be retried.',
-        ],
+        logs: <String>[...state.logs, _s.logOnlyFailedOrCancelled],
       );
       return;
     }
     if (job.inputPath.isEmpty) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'This history item does not include an EPUB path to retry.',
-        ],
+        logs: <String>[...state.logs, _s.logHistoryMissingPath],
       );
       return;
     }
 
     final String outputDirectory = _outputDirectoryForRetry(job);
+    final bool styleModeMatches =
+        job.styleProfileEnabled == null ||
+        job.styleProfileEnabled == state.config.styleProfileEnabled;
+    final TranslationStyleProfile? preservedStyleProfile =
+        job.styleProfileConfirmed && styleModeMatches ? job.styleProfile : null;
     final bool wasTranslationFailure =
         (job.currentChapter ?? '').toLowerCase().contains('translation') ||
         job.totalBlocks > 0 ||
@@ -838,12 +1072,15 @@ class TranslationDashboardController
       job: null,
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
+      styleProfile: preservedStyleProfile ?? TranslationStyleProfile.empty,
+      styleProfileConfirmed: preservedStyleProfile != null,
+      isGeneratingStyleProfile: false,
       logs: <String>[
         ...state.logs,
-        'Retrying ${path.basename(job.inputPath)} from history.',
+        _s.logRetrying(path.basename(job.inputPath)),
       ],
     );
-    await startInspection();
+    await startInspection(preservedStyleProfile: preservedStyleProfile);
     if (!mounted) {
       return;
     }
@@ -857,21 +1094,19 @@ class TranslationDashboardController
     if (state.job?.status == TranslationJobStatus.inspected &&
         readyToTranslate) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'Inspection ready. Continuing with translation for the retry.',
-        ],
+        logs: <String>[...state.logs, _s.logRetryContinueTranslate],
       );
       await startTranslation();
     }
   }
 
   void clearJobHistory() {
+    _historyClearRevision += 1;
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
-      logs: <String>[...state.logs, 'Cleared job history.'],
+      logs: <String>[...state.logs, _s.logClearedHistory],
     );
-    _persistJobHistory(const <TranslationJob>[]);
+    _persistJobHistory();
   }
 
   Future<String?> _completedOutputPath() async {
@@ -879,10 +1114,7 @@ class TranslationDashboardController
     final String outputPath = job?.outputPath ?? '';
     if (job == null || !job.hasExportableEpub) {
       state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          'No completed translated EPUB is available yet.',
-        ],
+        logs: <String>[...state.logs, _s.logNoCompletedEpub],
       );
       return null;
     }
@@ -891,7 +1123,7 @@ class TranslationDashboardController
     final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
     if (type != FileSystemEntityType.file || !await outputFile.exists()) {
       state = state.copyWith(
-        logs: <String>[...state.logs, 'Output file was not found: $outputPath'],
+        logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
       );
       return null;
     }
@@ -944,16 +1176,23 @@ class TranslationDashboardController
       jobHistory: _jobHistoryWith(cancelledJob),
       logs: <String>[
         ...state.logs,
-        'Run cancelled.',
+        _s.logRunCancelled,
         if (progressBlocks > 0 &&
             cancelledJob.phase == TranslationJobPhase.translation)
-          'You can resume translation later; about $progressBlocks blocks are already cached.',
+          _s.logResumeHint(progressBlocks),
       ],
       actionableError: ActionableErrorFactory.fromMessage(
         cancelledJob.phase == TranslationJobPhase.translation
-            ? 'Translation cancelled'
-            : 'Inspection cancelled',
+            ? (state.config.uiLanguage == UiLanguage.chinese
+                  ? '翻译已取消'
+                  : 'Translation cancelled')
+            : (state.config.uiLanguage == UiLanguage.chinese
+                  ? '检查已取消'
+                  : 'Inspection cancelled'),
         isChinese: state.config.uiLanguage == UiLanguage.chinese,
+        preferredKind: cancelledJob.phase == TranslationJobPhase.translation
+            ? ActionableErrorKind.retryTranslation
+            : ActionableErrorKind.retryInspection,
       ),
     );
     _translationStopwatch?.stop();
@@ -965,12 +1204,14 @@ class TranslationDashboardController
     if (store == null) {
       return;
     }
+    final int revisionBeforeLoad = _sessionPathRevision;
     final ({String inputPath, String outputDirectory}) paths = await store
         .load();
     if (!mounted) {
       return;
     }
-    if (paths.inputPath.isEmpty && paths.outputDirectory.isEmpty) {
+    if (_sessionPathRevision != revisionBeforeLoad ||
+        (paths.inputPath.isEmpty && paths.outputDirectory.isEmpty)) {
       return;
     }
     state = state.copyWith(
@@ -981,9 +1222,9 @@ class TranslationDashboardController
       logs: <String>[
         ...state.logs,
         if (paths.inputPath.isNotEmpty)
-          'Restored last EPUB: ${path.basename(paths.inputPath)}',
+          _s.logRestoredEpub(path.basename(paths.inputPath)),
         if (paths.outputDirectory.isNotEmpty)
-          'Restored last output directory: ${paths.outputDirectory}',
+          _s.logRestoredOutput(paths.outputDirectory),
       ],
     );
   }
@@ -1014,7 +1255,7 @@ class TranslationDashboardController
         (TranslationJob historyJob) => historyJob.id != job.id,
       ),
     ].take(20).toList(growable: false);
-    _persistJobHistory(history);
+    _persistJobHistory();
     return history;
   }
 
@@ -1064,14 +1305,32 @@ class TranslationDashboardController
     if (store == null) {
       return;
     }
-    final List<TranslationJob> history = await store.load();
+    final int clearRevisionBeforeLoad = _historyClearRevision;
+    final List<TranslationJob> history = (await store.load())
+        .map(_restoreInterruptedJob)
+        .toList(growable: false);
     if (!mounted) {
       return;
     }
-    if (history.isEmpty) {
+    if (_historyClearRevision != clearRevisionBeforeLoad || history.isEmpty) {
       return;
     }
     state = state.copyWith(jobHistory: _mergeJobHistory(history));
+  }
+
+  TranslationJob _restoreInterruptedJob(TranslationJob job) {
+    if (job.status != TranslationJobStatus.queued &&
+        job.status != TranslationJobStatus.running) {
+      return job;
+    }
+    return job.copyWith(
+      status: TranslationJobStatus.cancelled,
+      currentChapter: job.phase == TranslationJobPhase.translation
+          ? 'Translation interrupted'
+          : 'Inspection interrupted',
+      currentBlock: null,
+      errorMessage: 'The application closed before this task finished.',
+    );
   }
 
   List<TranslationJob> _mergeJobHistory(List<TranslationJob> jobs) {
@@ -1086,14 +1345,22 @@ class TranslationDashboardController
         .toList(growable: false);
   }
 
-  void _persistJobHistory(List<TranslationJob> history) {
+  void _persistJobHistory() {
     final JobHistoryStore? store = historyStore;
     if (store == null) {
       return;
     }
+    Future<void> saveLatestHistory() async {
+      await _initialJobHistoryLoad;
+      if (!mounted) {
+        return;
+      }
+      await store.save(state.jobHistory);
+    }
+
     final Future<void> save = _pendingHistorySave.then<void>(
-      (_) => store.save(history),
-      onError: (_) => store.save(history),
+      (_) => saveLatestHistory(),
+      onError: (_) => saveLatestHistory(),
     );
     _pendingHistorySave = save.catchError((_) {});
   }

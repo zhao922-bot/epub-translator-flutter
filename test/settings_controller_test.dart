@@ -4,8 +4,10 @@ import 'package:epub_translator_flutter/features/settings/application/settings_c
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspection_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/api_provider_preset.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -69,11 +71,21 @@ class _FailingConnectionRepository implements TranslationRepository {
   }
 
   @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    return TranslationStyleProfile.empty;
+  }
+
+  @override
   Future<TranslationRunResult> translateChapters({
     required String inputPath,
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) {
@@ -170,6 +182,32 @@ void main() {
     expect(store.saved.last.apiKey, 'sk-secret');
     expect(store.saved.last.model, 'DeepSeek-V4-Flash');
   });
+
+  test(
+    'restores Custom URL, key, and model after switching to DeepSeek',
+    () async {
+      final Completer<TranslationConfig> loadCompleter =
+          Completer<TranslationConfig>();
+      final _ControlledSettingsStore store = _ControlledSettingsStore(
+        loadCompleter,
+      );
+      final SettingsController controller = SettingsController(store);
+      loadCompleter.complete(TranslationConfig.defaults());
+
+      await controller.setApiBaseUrl('https://custom.example/v1');
+      await controller.setApiKey('sk-custom');
+      await controller.setModel('custom-model');
+      await controller.applyApiProviderPreset(ApiProviderPreset.deepseek);
+      expect(controller.state.apiBaseUrl, 'https://api.deepseek.com');
+      expect(controller.state.model, 'deepseek-v4-flash');
+
+      await controller.applyApiProviderPreset(ApiProviderPreset.custom);
+
+      expect(controller.state.apiBaseUrl, 'https://custom.example/v1');
+      expect(controller.state.apiKey, 'sk-custom');
+      expect(controller.state.model, 'custom-model');
+    },
+  );
 
   test('connection test surfaces actionable diagnostics', () async {
     final ConnectionTestController controller = ConnectionTestController(

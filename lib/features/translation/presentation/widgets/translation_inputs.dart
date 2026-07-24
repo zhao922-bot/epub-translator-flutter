@@ -15,6 +15,7 @@ class TranslationInputs extends StatefulWidget {
     required this.outputDirectory,
     required this.targetLanguage,
     required this.bilingual,
+    required this.enabled,
     required this.onInputChanged,
     required this.onOutputChanged,
     required this.onTargetLanguageChanged,
@@ -28,6 +29,7 @@ class TranslationInputs extends StatefulWidget {
   final String outputDirectory;
   final String targetLanguage;
   final bool bilingual;
+  final bool enabled;
   final ValueChanged<String> onInputChanged;
   final ValueChanged<String> onOutputChanged;
   final ValueChanged<String?> onTargetLanguageChanged;
@@ -228,7 +230,9 @@ class _TranslationInputsState extends State<TranslationInputs> {
             builder: (BuildContext context, BoxConstraints constraints) {
               final Widget languageField = DropdownButtonFormField<String>(
                 initialValue: widget.targetLanguage,
-                onChanged: widget.onTargetLanguageChanged,
+                onChanged: widget.enabled
+                    ? widget.onTargetLanguageChanged
+                    : null,
                 items:
                     const <String>[
                           'Chinese',
@@ -262,7 +266,7 @@ class _TranslationInputsState extends State<TranslationInputs> {
                   contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                   title: Text(widget.strings.bilingualOutput),
                   value: widget.bilingual,
-                  onChanged: widget.onBilingualChanged,
+                  onChanged: widget.enabled ? widget.onBilingualChanged : null,
                 ),
               );
 
@@ -300,7 +304,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
             TextFormField(
               key: ValueKey<String>('input-${widget.inputPath}'),
               initialValue: widget.inputPath,
-              onChanged: widget.onInputChanged,
+              enabled: widget.enabled,
+              onChanged: widget.enabled ? widget.onInputChanged : null,
               decoration: InputDecoration(
                 labelText: widget.strings.inputEpub,
                 hintText: widget.strings.inputEpubHint,
@@ -311,7 +316,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
             TextFormField(
               key: ValueKey<String>('output-${widget.outputDirectory}'),
               initialValue: widget.outputDirectory,
-              onChanged: widget.onOutputChanged,
+              enabled: widget.enabled,
+              onChanged: widget.enabled ? widget.onOutputChanged : null,
               decoration: InputDecoration(
                 labelText: widget.strings.outputDirectory,
                 hintText: widget.strings.outputDirectoryHint,

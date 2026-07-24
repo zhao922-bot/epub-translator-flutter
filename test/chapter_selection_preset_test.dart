@@ -38,6 +38,16 @@ void main() {
       recommendedForTranslation: false,
       includeInTranslation: true,
     ),
+    InspectedChapter(
+      path: 'empty.xhtml',
+      title: 'Image-only page',
+      body: '',
+      originalHtml: '<html><body><img src="cover.jpg"/></body></html>',
+      blocks: <ExtractedBlock>[],
+      category: ChapterCategory.content,
+      recommendedForTranslation: true,
+      includeInTranslation: true,
+    ),
   ];
 
   test('recommended preset restores heuristic defaults', () {
@@ -45,6 +55,7 @@ void main() {
         .apply(sample);
     expect(next[0].includeInTranslation, isTrue);
     expect(next[1].includeInTranslation, isFalse);
+    expect(next[2].includeInTranslation, isFalse);
   });
 
   test('content only selects content chapters', () {
@@ -52,14 +63,16 @@ void main() {
         .apply(sample);
     expect(next[0].includeInTranslation, isTrue);
     expect(next[1].includeInTranslation, isFalse);
+    expect(next[2].includeInTranslation, isFalse);
   });
 
   test('all and none work as expected', () {
     expect(
       ChapterSelectionPreset.allChapters
           .apply(sample)
-          .every((c) => c.includeInTranslation),
-      isTrue,
+          .map((c) => c.includeInTranslation)
+          .toList(),
+      <bool>[true, true, false],
     );
     expect(
       ChapterSelectionPreset.none

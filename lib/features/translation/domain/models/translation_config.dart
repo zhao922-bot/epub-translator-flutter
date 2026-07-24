@@ -2,6 +2,8 @@ enum UiLanguage { english, chinese }
 
 enum AppThemeMode { system, light, dark }
 
+enum ApiProviderSelection { deepseek, custom }
+
 enum TranslationTuningPreset { stable, balanced, fast }
 
 class TranslationConfig {
@@ -9,6 +11,11 @@ class TranslationConfig {
     required this.apiBaseUrl,
     required this.apiKey,
     required this.model,
+    required this.apiProviderSelection,
+    required this.deepseekApiKey,
+    required this.customApiBaseUrl,
+    required this.customApiKey,
+    required this.customModel,
     required this.uiLanguage,
     required this.themeMode,
     required this.targetLanguage,
@@ -20,6 +27,7 @@ class TranslationConfig {
     required this.retryDelaySeconds,
     required this.outputSuffix,
     required this.residualQualityCheck,
+    required this.styleProfileEnabled,
     required this.textScale,
     required this.lockedGlossary,
   });
@@ -27,6 +35,14 @@ class TranslationConfig {
   final String apiBaseUrl;
   final String apiKey;
   final String model;
+  final ApiProviderSelection apiProviderSelection;
+
+  /// Provider-specific values retained when the user temporarily switches
+  /// between the built-in DeepSeek profile and Custom.
+  final String deepseekApiKey;
+  final String customApiBaseUrl;
+  final String customApiKey;
+  final String customModel;
   final UiLanguage uiLanguage;
   final AppThemeMode themeMode;
   final String targetLanguage;
@@ -41,7 +57,11 @@ class TranslationConfig {
   /// When true, reject translations that leave long source-language residuals.
   final bool residualQualityCheck;
 
-  /// UI text scale factor (accessibility), 0.9–1.3.
+  /// When true, infer a book style profile from front matter/early chapters
+  /// and inject soft genre/tone constraints into translation prompts.
+  final bool styleProfileEnabled;
+
+  /// UI text scale factor (accessibility), 0.91.3.
   final double textScale;
 
   /// User-locked glossary lines: `source => target` per line.
@@ -51,7 +71,12 @@ class TranslationConfig {
     return const TranslationConfig(
       apiBaseUrl: 'https://api.deepseek.com',
       apiKey: '',
-      model: 'deepseek-chat',
+      model: 'deepseek-v4-flash',
+      apiProviderSelection: ApiProviderSelection.deepseek,
+      deepseekApiKey: '',
+      customApiBaseUrl: '',
+      customApiKey: '',
+      customModel: '',
       uiLanguage: UiLanguage.english,
       themeMode: AppThemeMode.dark,
       targetLanguage: 'Chinese',
@@ -63,6 +88,7 @@ class TranslationConfig {
       retryDelaySeconds: 5,
       outputSuffix: '_translated',
       residualQualityCheck: true,
+      styleProfileEnabled: true,
       textScale: 1.0,
       lockedGlossary: '',
     );
@@ -72,6 +98,11 @@ class TranslationConfig {
     String? apiBaseUrl,
     String? apiKey,
     String? model,
+    ApiProviderSelection? apiProviderSelection,
+    String? deepseekApiKey,
+    String? customApiBaseUrl,
+    String? customApiKey,
+    String? customModel,
     UiLanguage? uiLanguage,
     AppThemeMode? themeMode,
     String? targetLanguage,
@@ -83,6 +114,7 @@ class TranslationConfig {
     int? retryDelaySeconds,
     String? outputSuffix,
     bool? residualQualityCheck,
+    bool? styleProfileEnabled,
     double? textScale,
     String? lockedGlossary,
   }) {
@@ -90,6 +122,11 @@ class TranslationConfig {
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
       apiKey: apiKey ?? this.apiKey,
       model: model ?? this.model,
+      apiProviderSelection: apiProviderSelection ?? this.apiProviderSelection,
+      deepseekApiKey: deepseekApiKey ?? this.deepseekApiKey,
+      customApiBaseUrl: customApiBaseUrl ?? this.customApiBaseUrl,
+      customApiKey: customApiKey ?? this.customApiKey,
+      customModel: customModel ?? this.customModel,
       uiLanguage: uiLanguage ?? this.uiLanguage,
       themeMode: themeMode ?? this.themeMode,
       targetLanguage: targetLanguage ?? this.targetLanguage,
@@ -101,6 +138,7 @@ class TranslationConfig {
       retryDelaySeconds: retryDelaySeconds ?? this.retryDelaySeconds,
       outputSuffix: outputSuffix ?? this.outputSuffix,
       residualQualityCheck: residualQualityCheck ?? this.residualQualityCheck,
+      styleProfileEnabled: styleProfileEnabled ?? this.styleProfileEnabled,
       textScale: textScale ?? this.textScale,
       lockedGlossary: lockedGlossary ?? this.lockedGlossary,
     );
@@ -110,6 +148,9 @@ class TranslationConfig {
     return <String, dynamic>{
       'apiBaseUrl': apiBaseUrl,
       'model': model,
+      'apiProviderSelection': apiProviderSelection.name,
+      'customApiBaseUrl': customApiBaseUrl,
+      'customModel': customModel,
       'uiLanguage': uiLanguage.name,
       'themeMode': themeMode.name,
       'targetLanguage': targetLanguage,
@@ -121,12 +162,32 @@ class TranslationConfig {
       'retryDelaySeconds': retryDelaySeconds,
       'outputSuffix': outputSuffix,
       'residualQualityCheck': residualQualityCheck,
+      'styleProfileEnabled': styleProfileEnabled,
       'textScale': textScale,
       'lockedGlossary': lockedGlossary,
     };
   }
 
   factory TranslationConfig.fromJson(Map<String, dynamic> json) {
+    final bool explicitlyCustom =
+        json['apiProviderSelection'] == ApiProviderSelection.custom.name;
+    final String apiBaseUrl = explicitlyCustom
+        ? _readTrimmedStringAllowEmpty(json['apiBaseUrl'])
+        : _readTrimmedString(
+            json['apiBaseUrl'],
+            fallback: 'https://api.deepseek.com',
+          );
+    final String model = explicitlyCustom
+        ? _readTrimmedStringAllowEmpty(json['model'])
+        : _readTrimmedString(json['model'], fallback: 'deepseek-v4-flash');
+    final ApiProviderSelection providerSelection = ApiProviderSelection.values
+        .firstWhere(
+          (ApiProviderSelection value) =>
+              value.name == json['apiProviderSelection'],
+          orElse: () => _looksLikeDeepSeekProvider(apiBaseUrl)
+              ? ApiProviderSelection.deepseek
+              : ApiProviderSelection.custom,
+        );
     final UiLanguage resolvedLanguage = UiLanguage.values.firstWhere(
       (UiLanguage value) => value.name == json['uiLanguage'],
       orElse: () => UiLanguage.english,
@@ -141,12 +202,22 @@ class TranslationConfig {
       _ => 1.0,
     };
     return TranslationConfig(
-      apiBaseUrl: _readTrimmedString(
-        json['apiBaseUrl'],
-        fallback: 'https://api.deepseek.com',
-      ),
+      apiBaseUrl: apiBaseUrl,
       apiKey: _readTrimmedString(json['apiKey']),
-      model: _readTrimmedString(json['model'], fallback: 'deepseek-chat'),
+      model: model,
+      apiProviderSelection: providerSelection,
+      deepseekApiKey: '',
+      customApiBaseUrl: json['customApiBaseUrl'] is String
+          ? _readTrimmedStringAllowEmpty(json['customApiBaseUrl'])
+          : providerSelection == ApiProviderSelection.custom
+          ? apiBaseUrl
+          : '',
+      customApiKey: '',
+      customModel: json['customModel'] is String
+          ? _readTrimmedStringAllowEmpty(json['customModel'])
+          : providerSelection == ApiProviderSelection.custom
+          ? model
+          : '',
       uiLanguage: resolvedLanguage,
       themeMode: resolvedThemeMode,
       targetLanguage: _readTrimmedString(
@@ -189,6 +260,7 @@ class TranslationConfig {
         fallback: '_translated',
       ),
       residualQualityCheck: json['residualQualityCheck'] as bool? ?? true,
+      styleProfileEnabled: json['styleProfileEnabled'] as bool? ?? true,
       textScale: textScale,
       lockedGlossary: _readTrimmedString(json['lockedGlossary']),
     );
@@ -200,6 +272,19 @@ class TranslationConfig {
     }
     final String trimmed = value.trim();
     return trimmed.isEmpty ? fallback : trimmed;
+  }
+
+  static String _readTrimmedStringAllowEmpty(Object? value) {
+    return value is String ? value.trim() : '';
+  }
+
+  static bool _looksLikeDeepSeekProvider(String apiBaseUrl) {
+    final String url = apiBaseUrl.trim().toLowerCase().replaceAll(
+      RegExp(r'/+$'),
+      '',
+    );
+    return (url == 'https://api.deepseek.com' ||
+        url == 'https://api.deepseek.com/v1');
   }
 
   static int _readBoundedInt(

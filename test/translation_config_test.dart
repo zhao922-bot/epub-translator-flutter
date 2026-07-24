@@ -2,12 +2,55 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('uses deepseek-v4-flash as the default model', () {
+    expect(TranslationConfig.defaults().model, 'deepseek-v4-flash');
+    expect(
+      TranslationConfig.fromJson(<String, dynamic>{}).model,
+      'deepseek-v4-flash',
+    );
+  });
+
+  test('migrates an old deepseek-chat config as the DeepSeek provider', () {
+    final TranslationConfig config = TranslationConfig.fromJson(
+      <String, dynamic>{
+        'apiBaseUrl': 'https://api.deepseek.com',
+        'model': 'deepseek-chat',
+      },
+    );
+
+    expect(config.apiProviderSelection, ApiProviderSelection.deepseek);
+    expect(config.model, 'deepseek-chat');
+  });
+
+  test('preserves intentionally blank Custom identity fields', () {
+    final TranslationConfig config =
+        TranslationConfig.fromJson(<String, dynamic>{
+          'apiProviderSelection': 'custom',
+          'apiBaseUrl': '',
+          'model': '',
+          'customApiBaseUrl': '',
+          'customModel': '',
+        });
+
+    expect(config.apiProviderSelection, ApiProviderSelection.custom);
+    expect(config.apiBaseUrl, isEmpty);
+    expect(config.model, isEmpty);
+    expect(config.customApiBaseUrl, isEmpty);
+    expect(config.customModel, isEmpty);
+  });
+
   test('does not persist secrets or removed provider-specific switches', () {
     final Map<String, dynamic> json = TranslationConfig.defaults()
-        .copyWith(apiKey: 'sk-test-secret')
+        .copyWith(
+          apiKey: 'sk-test-secret',
+          deepseekApiKey: 'sk-deep-secret',
+          customApiKey: 'sk-custom-secret',
+        )
         .toJson();
 
     expect(json, isNot(contains('apiKey')));
+    expect(json.values, isNot(contains('sk-deep-secret')));
+    expect(json.values, isNot(contains('sk-custom-secret')));
     expect(json, isNot(contains('disableThinking')));
   });
 

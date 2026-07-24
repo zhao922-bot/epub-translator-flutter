@@ -21,4 +21,30 @@ void main() {
       isTrue,
     );
   });
+
+  test('allows Chinese labels followed by preserved English proper names', () {
+    expect(
+      TranslationQuality.hasSuspiciousSourceResidual(
+        sourceText:
+            'Book design by Ralph Fowler. Graphics by Rodrigo Corral Design. Illustrations by Matt Buck. Cover design by Michael Nagin.',
+        translatedText:
+            '书籍设计：Ralph Fowler；图形设计：Rodrigo Corral Design；插图：Matt Buck；封面设计：Michael Nagin。',
+        targetLanguage: 'Chinese',
+      ),
+      isFalse,
+    );
+  });
+
+  test('still flags a long English sentence after a short Chinese prefix', () {
+    expect(
+      TranslationQuality.hasSuspiciousSourceResidual(
+        sourceText:
+            'This entire sentence should have been translated into Chinese but was left in English.',
+        translatedText:
+            '译文：This entire sentence should have been translated into Chinese but was left in English.',
+        targetLanguage: 'Chinese',
+      ),
+      isTrue,
+    );
+  });
 }

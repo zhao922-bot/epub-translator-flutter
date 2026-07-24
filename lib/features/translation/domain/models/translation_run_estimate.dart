@@ -67,7 +67,10 @@ class TranslationRunEstimate {
     Duration? elapsed,
   }) {
     final List<InspectedChapter> selected = chapters
-        .where((InspectedChapter chapter) => chapter.includeInTranslation)
+        .where(
+          (InspectedChapter chapter) =>
+              chapter.includeInTranslation && chapter.blocks.isNotEmpty,
+        )
         .toList(growable: false);
     final int totalBlocks = selected.fold<int>(
       0,

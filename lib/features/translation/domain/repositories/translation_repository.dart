@@ -3,6 +3,7 @@ import '../models/inspected_chapter.dart';
 import '../models/translation_config.dart';
 import '../models/translation_job.dart';
 import '../models/translation_run_result.dart';
+import '../models/translation_style_profile.dart';
 
 typedef TranslationProgressCallback =
     void Function(TranslationJob job, String logLine);
@@ -30,7 +31,15 @@ abstract class TranslationRepository {
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  });
+
+  /// Infer a book style profile from front matter / early chapters before translation.
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
     TranslationCancellationCheck? isCancelled,
   });
 

@@ -1,3 +1,5 @@
+import 'translation_style_profile.dart';
+
 enum TranslationJobStatus {
   idle,
   queued,
@@ -34,6 +36,9 @@ class TranslationJob {
     this.cachedBlocks = 0,
     this.resumedBlocks = 0,
     this.errorMessage,
+    this.styleProfile = TranslationStyleProfile.empty,
+    this.styleProfileConfirmed = false,
+    this.styleProfileEnabled,
   });
 
   final String id;
@@ -51,6 +56,11 @@ class TranslationJob {
   final int cachedBlocks;
   final int resumedBlocks;
   final String? errorMessage;
+  final TranslationStyleProfile styleProfile;
+  final bool styleProfileConfirmed;
+
+  /// Null for legacy history entries that predate style-mode persistence.
+  final bool? styleProfileEnabled;
 
   /// True when this job represents a finished translation with an EPUB output.
   bool get hasExportableEpub {
@@ -92,6 +102,9 @@ class TranslationJob {
       cachedBlocks: _readNonNegativeInt(json['cachedBlocks']),
       resumedBlocks: _readNonNegativeInt(json['resumedBlocks']),
       errorMessage: _readNullableString(json['errorMessage']),
+      styleProfile: _readStyleProfile(json['styleProfile']),
+      styleProfileConfirmed: json['styleProfileConfirmed'] as bool? ?? false,
+      styleProfileEnabled: json['styleProfileEnabled'] as bool?,
     );
   }
 
@@ -111,6 +124,9 @@ class TranslationJob {
     int? cachedBlocks,
     int? resumedBlocks,
     Object? errorMessage = _unset,
+    TranslationStyleProfile? styleProfile,
+    bool? styleProfileConfirmed,
+    Object? styleProfileEnabled = _unset,
   }) {
     return TranslationJob(
       id: id ?? this.id,
@@ -134,6 +150,12 @@ class TranslationJob {
       errorMessage: identical(errorMessage, _unset)
           ? this.errorMessage
           : errorMessage as String?,
+      styleProfile: styleProfile ?? this.styleProfile,
+      styleProfileConfirmed:
+          styleProfileConfirmed ?? this.styleProfileConfirmed,
+      styleProfileEnabled: identical(styleProfileEnabled, _unset)
+          ? this.styleProfileEnabled
+          : styleProfileEnabled as bool?,
     );
   }
 
@@ -154,8 +176,23 @@ class TranslationJob {
       'cachedBlocks': cachedBlocks,
       'resumedBlocks': resumedBlocks,
       'errorMessage': errorMessage,
+      if (styleProfileConfirmed) 'styleProfile': styleProfile.toJson(),
+      'styleProfileConfirmed': styleProfileConfirmed,
+      if (styleProfileEnabled != null)
+        'styleProfileEnabled': styleProfileEnabled,
     };
   }
+}
+
+TranslationStyleProfile _readStyleProfile(Object? value) {
+  if (value is! Map) {
+    return TranslationStyleProfile.empty;
+  }
+  return TranslationStyleProfile.fromJson(
+    value.map<String, Object?>(
+      (Object? key, Object? item) => MapEntry<String, Object?>('$key', item),
+    ),
+  );
 }
 
 String _readString(Object? value) => value is String ? value : '';

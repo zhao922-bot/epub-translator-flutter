@@ -6,6 +6,7 @@ import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../../shared/widgets/section_card.dart';
 import '../../../translation/domain/models/api_provider_preset.dart';
 import '../../../translation/domain/models/translation_config.dart';
+import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../application/settings_controller.dart';
 
 class SettingsPage extends ConsumerWidget {
@@ -14,6 +15,11 @@ class SettingsPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final config = ref.watch(settingsProvider);
+    final bool isRunActive = ref.watch(
+      translationDashboardProvider.select(
+        (TranslationDashboardState state) => state.isRunActive,
+      ),
+    );
     final controller = ref.read(settingsProvider.notifier);
     final connectionTestState = ref.watch(connectionTestProvider);
     final connectionTestController = ref.read(connectionTestProvider.notifier);
@@ -102,7 +108,7 @@ class SettingsPage extends ConsumerWidget {
             icon: Icons.cloud_outlined,
             variant: SectionCardVariant.emphasis,
             trailing: FilledButton.tonalIcon(
-              onPressed: connectionTestState.isLoading
+              onPressed: connectionTestState.isLoading || isRunActive
                   ? null
                   : () => connectionTestController.run(
                       ref.read(settingsProvider),
@@ -127,12 +133,13 @@ class SettingsPage extends ConsumerWidget {
                   spacing: 8,
                   runSpacing: 8,
                   children: ApiProviderPreset.values.map((preset) {
-                    final bool selected = preset.matches(config);
                     return ChoiceChip(
+                      key: ValueKey<String>('api-provider-${preset.name}'),
                       label: Text(preset.label),
-                      selected: selected,
-                      onSelected: (_) =>
-                          controller.applyApiProviderPreset(preset),
+                      selected: preset.matches(config),
+                      onSelected: isRunActive
+                          ? null
+                          : (_) => controller.applyApiProviderPreset(preset),
                     );
                   }).toList(),
                 ),
@@ -141,6 +148,7 @@ class SettingsPage extends ConsumerWidget {
                   fieldKey: const ValueKey<String>('settings-api-base-url'),
                   value: config.apiBaseUrl,
                   onChanged: controller.setApiBaseUrl,
+                  enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.baseUrl,
                     prefixIcon: const Icon(Icons.cloud_outlined),
@@ -154,6 +162,7 @@ class SettingsPage extends ConsumerWidget {
                   onChanged: controller.setApiKey,
                   obscureText: true,
                   canToggleObscureText: true,
+                  enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.apiKey,
                     prefixIcon: const Icon(Icons.key_outlined),
@@ -165,6 +174,7 @@ class SettingsPage extends ConsumerWidget {
                   fieldKey: const ValueKey<String>('settings-model'),
                   value: config.model,
                   onChanged: controller.setModel,
+                  enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.model,
                     prefixIcon: const Icon(Icons.memory_rounded),
@@ -203,6 +213,7 @@ class SettingsPage extends ConsumerWidget {
                   config: config,
                   controller: controller,
                   strings: strings,
+                  enabled: !isRunActive,
                 ),
                 const SizedBox(height: 8),
                 SwitchListTile(
@@ -211,7 +222,19 @@ class SettingsPage extends ConsumerWidget {
                   title: Text(strings.residualQualityCheck),
                   subtitle: Text(strings.residualQualityCheckBody),
                   value: config.residualQualityCheck,
-                  onChanged: controller.setResidualQualityCheck,
+                  onChanged: isRunActive
+                      ? null
+                      : controller.setResidualQualityCheck,
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  title: Text(strings.styleProfileEnabled),
+                  subtitle: Text(strings.styleProfileEnabledBody),
+                  value: config.styleProfileEnabled,
+                  onChanged: isRunActive
+                      ? null
+                      : controller.setStyleProfileEnabled,
                 ),
                 ExpansionTile(
                   tilePadding: EdgeInsets.zero,
@@ -226,7 +249,7 @@ class SettingsPage extends ConsumerWidget {
                       max: 12000,
                       divisions: 11,
                       value: config.chunkSize.toDouble(),
-                      onChanged: controller.setChunkSize,
+                      onChanged: isRunActive ? null : controller.setChunkSize,
                     ),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -239,7 +262,9 @@ class SettingsPage extends ConsumerWidget {
                       max: 8,
                       divisions: 7,
                       value: config.maxConcurrent.toDouble(),
-                      onChanged: controller.setMaxConcurrent,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setMaxConcurrent,
                     ),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -250,7 +275,9 @@ class SettingsPage extends ConsumerWidget {
                       max: 300,
                       divisions: 9,
                       value: config.timeoutSeconds.toDouble(),
-                      onChanged: controller.setTimeoutSeconds,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setTimeoutSeconds,
                     ),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -261,7 +288,7 @@ class SettingsPage extends ConsumerWidget {
                       max: 6,
                       divisions: 5,
                       value: config.maxRetries.toDouble(),
-                      onChanged: controller.setMaxRetries,
+                      onChanged: isRunActive ? null : controller.setMaxRetries,
                     ),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -274,7 +301,9 @@ class SettingsPage extends ConsumerWidget {
                       max: 15,
                       divisions: 14,
                       value: config.retryDelaySeconds.toDouble(),
-                      onChanged: controller.setRetryDelaySeconds,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setRetryDelaySeconds,
                     ),
                     _SettingsTextField(
                       fieldKey: const ValueKey<String>(
@@ -282,6 +311,7 @@ class SettingsPage extends ConsumerWidget {
                       ),
                       value: config.outputSuffix,
                       onChanged: controller.setOutputSuffix,
+                      enabled: !isRunActive,
                       decoration: InputDecoration(
                         labelText: strings.outputSuffix,
                         isDense: true,
@@ -294,6 +324,7 @@ class SettingsPage extends ConsumerWidget {
                       ),
                       value: config.lockedGlossary,
                       onChanged: controller.setLockedGlossary,
+                      enabled: !isRunActive,
                       maxLines: 4,
                       decoration: InputDecoration(
                         labelText: strings.lockedGlossary,
@@ -326,11 +357,13 @@ class _TuningPresetSelector extends StatelessWidget {
     required this.config,
     required this.controller,
     required this.strings,
+    required this.enabled,
   });
 
   final TranslationConfig config;
   final SettingsController controller;
   final AppStrings strings;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
@@ -341,20 +374,26 @@ class _TuningPresetSelector extends StatelessWidget {
         _PresetChip(
           label: strings.stablePreset,
           selected: TranslationTuningPreset.stable.matches(config),
-          onTap: () =>
-              controller.applyTuningPreset(TranslationTuningPreset.stable),
+          onTap: enabled
+              ? () =>
+                    controller.applyTuningPreset(TranslationTuningPreset.stable)
+              : null,
         ),
         _PresetChip(
           label: strings.balancedPreset,
           selected: TranslationTuningPreset.balanced.matches(config),
-          onTap: () =>
-              controller.applyTuningPreset(TranslationTuningPreset.balanced),
+          onTap: enabled
+              ? () => controller.applyTuningPreset(
+                  TranslationTuningPreset.balanced,
+                )
+              : null,
         ),
         _PresetChip(
           label: strings.fastPreset,
           selected: TranslationTuningPreset.fast.matches(config),
-          onTap: () =>
-              controller.applyTuningPreset(TranslationTuningPreset.fast),
+          onTap: enabled
+              ? () => controller.applyTuningPreset(TranslationTuningPreset.fast)
+              : null,
         ),
       ],
     );
@@ -370,14 +409,14 @@ class _PresetChip extends StatelessWidget {
 
   final String label;
   final bool selected;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return ChoiceChip(
       label: Text(label),
       selected: selected,
-      onSelected: (_) => onTap(),
+      onSelected: onTap == null ? null : (_) => onTap!(),
     );
   }
 }
@@ -391,6 +430,7 @@ class _SettingsTextField extends StatefulWidget {
     this.obscureText = false,
     this.canToggleObscureText = false,
     this.maxLines = 1,
+    this.enabled = true,
   });
 
   final Key fieldKey;
@@ -400,6 +440,7 @@ class _SettingsTextField extends StatefulWidget {
   final bool obscureText;
   final bool canToggleObscureText;
   final int maxLines;
+  final bool enabled;
 
   @override
   State<_SettingsTextField> createState() => _SettingsTextFieldState();
@@ -462,7 +503,8 @@ class _SettingsTextFieldState extends State<_SettingsTextField> {
       obscureText: widget.maxLines > 1 ? false : _obscureText,
       maxLines: widget.maxLines,
       minLines: widget.maxLines > 1 ? 3 : 1,
-      onChanged: widget.onChanged,
+      enabled: widget.enabled,
+      onChanged: widget.enabled ? widget.onChanged : null,
       decoration: decoration,
     );
   }

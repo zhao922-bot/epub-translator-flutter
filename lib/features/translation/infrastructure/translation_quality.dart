@@ -72,6 +72,9 @@ class TranslationQuality {
       return true;
     }
 
+    final List<String> englishWordValues = RegExp(
+      r"[A-Za-z][A-Za-z'-]*",
+    ).allMatches(text).map((RegExpMatch match) => match.group(0)!).toList();
     final int englishLetters = RegExp(r'[A-Za-z]').allMatches(text).length;
     final int nonLatinChars = RegExp(
       r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
@@ -81,6 +84,17 @@ class TranslationQuality {
     }
     final int languageChars = englishLetters + nonLatinChars;
     if (languageChars == 0) {
+      return false;
+    }
+    final int properNameLikeWords = englishWordValues.where((String word) {
+      final int first = word.codeUnitAt(0);
+      return first >= 0x41 && first <= 0x5A;
+    }).length;
+    final bool mostlyProperNames =
+        nonLatinChars >= 4 &&
+        englishWords >= 4 &&
+        properNameLikeWords / englishWords >= 0.65;
+    if (mostlyProperNames) {
       return false;
     }
     return englishWords >= 10 && englishLetters / languageChars >= 0.65;

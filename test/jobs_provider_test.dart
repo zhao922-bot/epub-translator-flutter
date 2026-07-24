@@ -5,6 +5,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -45,11 +46,21 @@ class _CompletedInspectionRepository implements TranslationRepository {
   }
 
   @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    return TranslationStyleProfile.empty;
+  }
+
+  @override
   Future<TranslationRunResult> translateChapters({
     required String inputPath,
     required String outputDirectory,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) {

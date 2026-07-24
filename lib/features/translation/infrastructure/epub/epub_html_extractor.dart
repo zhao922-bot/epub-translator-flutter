@@ -5,6 +5,7 @@ import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 
 import '../../domain/models/inspected_chapter.dart';
+import 'xhtml_html_compatibility.dart';
 
 /// Shared HTML extraction / chapter categorization for inspect + repack.
 class EpubHtmlExtractor {
@@ -28,6 +29,7 @@ class EpubHtmlExtractor {
     'caption',
     'summary',
     'span',
+    'a',
   };
 
   static const Set<String> nonTextAncestors = <String>{
@@ -51,7 +53,9 @@ class EpubHtmlExtractor {
     required List<int> bytes,
   }) {
     final String decoded = utf8.decode(bytes, allowMalformed: true);
-    final dom.Document document = html_parser.parse(decoded);
+    final dom.Document document = html_parser.parse(
+      XhtmlHtmlCompatibility.normalizeForHtmlParser(decoded),
+    );
     final String title =
         document.querySelector('title')?.text.trim().isNotEmpty == true
         ? document.querySelector('title')!.text.trim()
@@ -77,7 +81,7 @@ class EpubHtmlExtractor {
 
     final ChapterCategory category = categorizeChapter(chapterPath, title);
     final bool recommendedForTranslation =
-        category != ChapterCategory.ancillary;
+        blocks.isNotEmpty && category != ChapterCategory.ancillary;
 
     return InspectedChapter(
       path: chapterPath,
@@ -194,6 +198,8 @@ class EpubHtmlExtractor {
       'promo',
       'z-lib',
       '1lib',
+      '_cvi_',
+      '_cop_',
     ])) {
       return ChapterCategory.ancillary;
     }
@@ -204,6 +210,8 @@ class EpubHtmlExtractor {
       'notes',
       'bibliography',
       'reference',
+      '_ind_',
+      '_ill_',
     ])) {
       return ChapterCategory.reference;
     }
@@ -215,6 +223,8 @@ class EpubHtmlExtractor {
       'about the author',
       'epilogue',
       'appendix',
+      '_ata_',
+      '_ack_',
     ])) {
       return ChapterCategory.backMatter;
     }
@@ -229,6 +239,9 @@ class EpubHtmlExtractor {
       'introduction',
       'fm0',
       'front',
+      '_tp_',
+      '_toc_',
+      '_prf_',
     ])) {
       return ChapterCategory.frontMatter;
     }

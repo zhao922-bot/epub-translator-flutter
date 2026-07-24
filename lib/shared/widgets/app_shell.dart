@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../features/translation/application/translation_dashboard_controller.dart';
 import '../localization/app_strings.dart';
 import '../models/nav_item.dart';
 
-class AppShell extends ConsumerWidget {
+class AppShell extends ConsumerStatefulWidget {
   const AppShell({
     super.key,
     required this.currentLocation,
@@ -19,9 +21,66 @@ class AppShell extends ConsumerWidget {
   static const Key shellKey = ValueKey<String>('app-shell');
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends ConsumerState<AppShell> {
+  static const MethodChannel _windowDropChannel = MethodChannel(
+    'epub_translator/window_drop',
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    // Global handler so drop works on any shell route (Translate/Jobs/Preview/Settings).
+    _windowDropChannel.setMethodCallHandler(_handleWindowDrop);
+  }
+
+  @override
+  void dispose() {
+    _windowDropChannel.setMethodCallHandler(null);
+    super.dispose();
+  }
+
+  Future<void> _handleWindowDrop(MethodCall call) async {
+    if (call.method != 'fileDropped' || call.arguments is! String) {
+      return;
+    }
+    final String droppedPath = call.arguments as String;
+    final bool accepted = await ref
+        .read(translationDashboardProvider.notifier)
+        .importDroppedEpubPath(droppedPath);
+    if (!mounted || !accepted) {
+      return;
+    }
+    // Always land on Translate so the user sees the imported book + logs.
+    if (widget.currentLocation != '/') {
+      context.go('/');
+    }
+    final String name = droppedPath
+        .replaceAll('\\', '/')
+        .split('/')
+        .where((String part) => part.isNotEmpty)
+        .last;
+    final AppStrings strings = ref.read(appStringsProvider);
+    final ScaffoldMessengerState? messenger = ScaffoldMessenger.maybeOf(
+      context,
+    );
+    messenger?.showSnackBar(
+      SnackBar(
+        content: Text(strings.logDroppedEpub(name)),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final TextTheme textTheme = Theme.of(context).textTheme;
     final strings = ref.watch(appStringsProvider);
+    final String currentLocation = widget.currentLocation;
+    final Widget child = widget.child;
     final List<NavItem> items = <NavItem>[
       NavItem(
         label: strings.navTranslate,
@@ -50,7 +109,7 @@ class AppShell extends ConsumerWidget {
     );
 
     return Scaffold(
-      key: shellKey,
+      key: AppShell.shellKey,
       body: SafeArea(
         child: LayoutBuilder(
           builder: (BuildContext context, BoxConstraints constraints) {
@@ -93,7 +152,7 @@ class AppShell extends ConsumerWidget {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
                       Padding(
-                        key: brandKey,
+                        key: AppShell.brandKey,
                         padding: const EdgeInsets.fromLTRB(20, 26, 20, 22),
                         child: Row(
                           children: <Widget>[

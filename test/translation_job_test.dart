@@ -1,7 +1,33 @@
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('persists a confirmed style profile for history resume', () {
+    const TranslationStyleProfile profile = TranslationStyleProfile(
+      primaryGenre: 'business nonfiction',
+      tone: 'concise',
+      confidence: TranslationStyleConfidence.high,
+    );
+    const TranslationJob job = TranslationJob(
+      id: 'resume-style',
+      inputPath: 'book.epub',
+      outputPath: 'book_translated.epub',
+      status: TranslationJobStatus.failed,
+      phase: TranslationJobPhase.translation,
+      progress: 0.5,
+      styleProfile: profile,
+      styleProfileConfirmed: true,
+      styleProfileEnabled: true,
+    );
+
+    final TranslationJob restored = TranslationJob.fromJson(job.toJson());
+
+    expect(restored.styleProfileConfirmed, isTrue);
+    expect(restored.styleProfileEnabled, isTrue);
+    expect(restored.styleProfile.sameContentAs(profile), isTrue);
+  });
+
   test('hasExportableEpub requires completed status and .epub path', () {
     const TranslationJob inspected = TranslationJob(
       id: 'inspected',
