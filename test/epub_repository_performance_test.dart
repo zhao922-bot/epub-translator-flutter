@@ -163,6 +163,11 @@ void main() {
         chapters: inspection.chapters,
       );
 
+      expect(
+        server.totalRequests,
+        1,
+        reason: 'A pure footnote run must not request initial book memory.',
+      );
       expect(server.blockRequestIds, <List<String>>[
         <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
       ]);
@@ -195,6 +200,72 @@ void main() {
 
       expect(server.totalRequests, 0);
       expect(server.blockRequestIds, isEmpty);
+    },
+  );
+
+  test(
+    'rejects malformed multi-footnote ids without single-request fallback',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_footnote_bad_ids_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start(
+        duplicateMultiResponseId: true,
+      );
+      addTearDown(server.close);
+
+      final File epubFile = File('${temp.path}/footnotes_bad_ids.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
+          'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
+          'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'footnote-bad-ids-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 5000,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      Future<void> expectMalformedBatchFailure() async {
+        await expectLater(
+          repository.translateChapters(
+            inputPath: epubFile.path,
+            outputDirectory: temp.path,
+            config: config,
+            chapters: inspection.chapters,
+          ),
+          throwsA(isA<FormatException>()),
+        );
+      }
+
+      await expectMalformedBatchFailure();
+      expect(server.blockRequestIds, <List<String>>[
+        <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+      ]);
+
+      server.resetRequests();
+      await expectMalformedBatchFailure();
+      expect(
+        server.blockRequestIds,
+        <List<String>>[
+          <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+        ],
+        reason: 'The failed response must not create reusable block caches.',
+      );
     },
   );
 
@@ -258,11 +329,13 @@ class _FootnoteFakeServer {
     this._server, {
     required this.reverseResponses,
     required this.rejectMultiBlockWith413,
+    required this.duplicateMultiResponseId,
   });
 
   final HttpServer _server;
   final bool reverseResponses;
   final bool rejectMultiBlockWith413;
+  final bool duplicateMultiResponseId;
   final List<List<String>> blockRequestIds = <List<String>>[];
   int totalRequests = 0;
 
@@ -271,6 +344,7 @@ class _FootnoteFakeServer {
   static Future<_FootnoteFakeServer> start({
     bool reverseResponses = false,
     bool rejectMultiBlockWith413 = false,
+    bool duplicateMultiResponseId = false,
   }) async {
     final HttpServer httpServer = await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -280,6 +354,7 @@ class _FootnoteFakeServer {
       httpServer,
       reverseResponses: reverseResponses,
       rejectMultiBlockWith413: rejectMultiBlockWith413,
+      duplicateMultiResponseId: duplicateMultiResponseId,
     );
     httpServer.listen(server._handle);
     return server;
@@ -334,6 +409,21 @@ class _FootnoteFakeServer {
         jsonEncode(<String, String>{'error': 'too large'}),
       );
       await request.response.close();
+      return;
+    }
+
+    if (duplicateMultiResponseId && blocks.length > 1) {
+      final String duplicateId = blocks.first['id'] as String;
+      await _writeChatResponse(request.response, <String, Object?>{
+        'blocks': blocks
+            .map(
+              (Map<String, dynamic> block) => <String, Object?>{
+                'id': duplicateId,
+                'html': _translatedFootnoteHtml(duplicateId),
+              },
+            )
+            .toList(),
+      });
       return;
     }
 

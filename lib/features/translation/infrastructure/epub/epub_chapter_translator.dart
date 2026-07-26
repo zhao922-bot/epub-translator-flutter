@@ -1009,13 +1009,8 @@ class EpubChapterTranslator {
             );
             await persistTranslations(batch.references, translated);
           } catch (error) {
-            final bool canFallback =
-                error is FormatException ||
-                (error is DioException &&
-                    TranslationApiClient.shouldFallbackBatchDioException(
-                      error,
-                    ));
-            if (!canFallback) {
+            if (error is! DioException ||
+                !TranslationApiClient.shouldFallbackBatchDioException(error)) {
               rethrow;
             }
             for (final FootnoteBlockReference reference in batch.references) {
@@ -1647,7 +1642,11 @@ class EpubChapterTranslator {
     List<InspectedChapter> chapters,
   ) {
     final List<InspectedChapter> eligibleChapters = chapters
-        .where((InspectedChapter chapter) => chapter.includeInTranslation)
+        .where(
+          (InspectedChapter chapter) =>
+              chapter.includeInTranslation &&
+              !FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+        )
         .toList(growable: false);
     final List<InspectedChapter> selected = <InspectedChapter>[];
 

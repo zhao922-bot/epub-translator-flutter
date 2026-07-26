@@ -47,6 +47,50 @@ void main() {
       expect(batches, isEmpty);
     });
 
+    test(
+      'does not treat an ordinary content file titled Notes as standalone',
+      () {
+        final InspectedChapter chapter = _chapter(
+          path: 'text/chapter-10.xhtml',
+          title: 'Notes',
+        );
+
+        expect(
+          FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+          isFalse,
+        );
+      },
+    );
+
+    test('ignores footnote-like text and non-semantic attributes', () {
+      final InspectedChapter chapter = _chapter(
+        path: 'text/chapter-10.xhtml',
+        title: 'Notes',
+        originalHtml: '''
+<html><body>
+  <!-- role="doc-footnote" -->
+  <p data-role="footnote"><code>epub:type="endnote"</code></p>
+</body></html>
+''',
+      );
+
+      expect(
+        FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+        isFalse,
+      );
+    });
+
+    test('accepts a Notes document with explicit footnote semantics', () {
+      final InspectedChapter chapter = _chapter(
+        path: 'text/chapter-10.xhtml',
+        title: 'Notes',
+        originalHtml:
+            '<html><body><aside epub:type="footnote">Note.</aside></body></html>',
+      );
+
+      expect(FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter), isTrue);
+    });
+
     test('keeps supported standalone footnote path variants', () {
       final List<InspectedChapter> chapters = <InspectedChapter>[
         _chapter(path: 'text/footnotes.xhtml', title: 'Chapter 1'),
@@ -173,12 +217,16 @@ void main() {
   });
 }
 
-InspectedChapter _chapter({required String path, required String title}) {
+InspectedChapter _chapter({
+  required String path,
+  required String title,
+  String originalHtml = '<html><body></body></html>',
+}) {
   return InspectedChapter(
     path: path,
     title: title,
     body: '',
-    originalHtml: '<html><body></body></html>',
+    originalHtml: originalHtml,
     blocks: const <ExtractedBlock>[],
     category: ChapterCategory.content,
     recommendedForTranslation: true,

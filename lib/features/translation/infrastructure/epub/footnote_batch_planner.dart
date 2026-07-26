@@ -1,5 +1,8 @@
 import 'dart:math';
 
+import 'package:html/dom.dart' as dom;
+import 'package:html/parser.dart' as html_parser;
+
 import '../../domain/models/inspected_chapter.dart';
 import 'translation_batch_planner.dart';
 
@@ -83,20 +86,44 @@ class FootnoteBatchPlanner {
     final bool hasFootnoteFileMarker = RegExp(
       r'(^|[-_.])fn(?:[-_.]|$)',
     ).hasMatch(filename);
-    final bool hasFootnoteWords =
-        _hasFootnoteWord(path) ||
-        _hasFootnoteWord(title, allowNonPathSeparators: true);
-    return hasFootnoteFileSuffix || hasFootnoteFileMarker || hasFootnoteWords;
+    final bool hasFootnotePath = _hasFootnoteWord(path);
+    if (hasFootnoteFileSuffix || hasFootnoteFileMarker || hasFootnotePath) {
+      return true;
+    }
+    return _hasFootnoteTitleWord(title) &&
+        _hasExplicitFootnoteSemantics(chapter.originalHtml);
   }
 
-  static bool _hasFootnoteWord(
-    String value, {
-    bool allowNonPathSeparators = false,
-  }) {
-    final String separators = allowNonPathSeparators ? r'[^a-z]' : r'[-_./\\]';
+  static bool _hasFootnoteWord(String value) {
+    const String separators = r'[-_./\\]';
     return RegExp(
       '(^|$separators)(?:footnotes?|endnotes?|notes?)(?=\$|$separators)',
     ).hasMatch(value);
+  }
+
+  static bool _hasFootnoteTitleWord(String value) {
+    return RegExp(
+      r'(^|[^a-z])(?:footnotes?|endnotes?|notes?)(?=$|[^a-z])',
+    ).hasMatch(value);
+  }
+
+  static bool _hasExplicitFootnoteSemantics(String originalHtml) {
+    final dom.Document document = html_parser.parse(originalHtml);
+    for (final dom.Element element in document.querySelectorAll('*')) {
+      final Set<String> epubTypes = (element.attributes['epub:type'] ?? '')
+          .toLowerCase()
+          .split(RegExp(r'\s+'))
+          .where((String value) => value.isNotEmpty)
+          .toSet();
+      if (epubTypes.contains('footnote') || epubTypes.contains('endnote')) {
+        return true;
+      }
+      final String role = element.attributes['role']?.toLowerCase() ?? '';
+      if (role == 'doc-footnote' || role == 'doc-endnote') {
+        return true;
+      }
+    }
+    return false;
   }
 
   FootnoteTranslationBatch _createBatch(
