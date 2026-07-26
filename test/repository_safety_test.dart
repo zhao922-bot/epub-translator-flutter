@@ -694,6 +694,46 @@ void main() {
       },
     );
 
+    test('repairs protected anchors for every returned footnote block', () async {
+      final _FootnoteResponseAdapter
+      adapter = _FootnoteResponseAdapter(<Map<String, Object?>>[
+        <String, Object?>{'id': 'f1:p-1', 'html': '<p>第二条脚注。</p>'},
+        <String, Object?>{
+          'id': 'f0:p-1',
+          'html':
+              '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+        },
+      ]);
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final Map<String, String>
+      translated = await EpubChapterTranslator().translateFootnoteBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 1,
+        ),
+        references: <FootnoteBlockReference>[
+          _footnoteReference(
+            0,
+            'Original quotation.',
+            sourceHtml:
+                '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> Original quotation.</p>',
+          ),
+          _footnoteReference(1, 'Second footnote.'),
+        ],
+      );
+
+      expect(translated.keys, <String>['f0:p-1', 'f1:p-1']);
+      expect(translated, <String, String>{
+        'f0:p-1':
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+        'f1:p-1': '<p>第二条脚注。</p>',
+      });
+    });
+
     for (final MapEntry<String, List<Map<String, Object?>>> malformed
         in <String, List<Map<String, Object?>>>{
           'missing id': <Map<String, Object?>>[
@@ -1129,6 +1169,81 @@ void main() {
       expect(locked, '<p>参见<a href="#note-1" id="ref-1">[1]</a>。</p>');
     });
 
+    test('restores a cross-file body marker moved outside its anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>译文*<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+      );
+      expect('*'.allMatches(locked), hasLength(1));
+    });
+
+    test('protects a cross-file footnote anchor by its reference id', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">*</a></p>',
+        translatedHtml:
+            '<p>译文*<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">*</a></p>',
+      );
+    });
+
+    test('protects a class-marked cross-file footnote anchor without an id', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Source<a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>译文*<a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>译文<a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref">*</span></a></p>',
+      );
+    });
+
+    test('moves translated prose out of a doc-backlink marker', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> Original quotation.</p>',
+        translatedHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+      );
+      expect(
+        locked,
+        isNot(contains('<span class="footnote_num">* 译后引文</span>')),
+      );
+    });
+
+    test('keeps a role-only backlink marker when no text slot can accept prose', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">*</a></p>',
+        translatedHtml:
+            '<p>译后<a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"></a>引文</p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">*</a></p>',
+      );
+    });
+
     test('restores protected footnote marker text when structure matches', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml: '<p>See <a href="#note-1" id="ref-1">[1]</a>.</p>',
@@ -1172,6 +1287,16 @@ void main() {
       );
 
       expect(locked, '<p>访问 <a href="https://example.test">这个网站</a>。</p>');
+    });
+
+    test('does not protect an ordinary cross-file hyperlink', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Visit <a href="chapter-2.xhtml#section-1">the next section</a>.</p>',
+        translatedHtml: '<p>访问<a href="chapter-2.xhtml#section-1">下一节</a>。</p>',
+      );
+
+      expect(locked, '<p>访问<a href="chapter-2.xhtml#section-1">下一节</a>。</p>');
     });
 
     test('restores short pagebreak markers when structure matches', () {
@@ -1237,7 +1362,11 @@ InspectedChapter _chapter({
   );
 }
 
-FootnoteBlockReference _footnoteReference(int chapterIndex, String text) {
+FootnoteBlockReference _footnoteReference(
+  int chapterIndex,
+  String text, {
+  String? sourceHtml,
+}) {
   final InspectedChapter chapter = _chapter(
     path: 'OPS/Text/note-$chapterIndex-fn.xhtml',
     title: 'Footnote ${chapterIndex + 1}',
@@ -1250,7 +1379,7 @@ FootnoteBlockReference _footnoteReference(int chapterIndex, String text) {
     block: ExtractedBlock(
       id: 'p-1',
       tagName: 'p',
-      sourceHtml: '<p>$text</p>',
+      sourceHtml: sourceHtml ?? '<p>$text</p>',
       sourceText: text,
     ),
   );

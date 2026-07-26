@@ -1790,10 +1790,13 @@ class EpubChapterTranslator {
   }) {
     final String trimmedTranslation = translatedHtml.trim();
     if (_htmlStructureMatches(sourceHtml, trimmedTranslation)) {
-      return _restoreProtectedTexts(
+      final String? restored = _restoreProtectedTexts(
         sourceHtml: sourceHtml,
         translatedHtml: trimmedTranslation,
       );
+      if (restored != null) {
+        return restored;
+      }
     }
 
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
@@ -1863,13 +1866,10 @@ class EpubChapterTranslator {
         slot.text = '';
       }
     }
-    if (!wroteMainText) {
-      sourceSlots.first.text = plainTranslation;
-    }
     return rebuiltRoot.outerHtml;
   }
 
-  static String _restoreProtectedTexts({
+  static String? _restoreProtectedTexts({
     required String sourceHtml,
     required String translatedHtml,
   }) {
@@ -1882,7 +1882,7 @@ class EpubChapterTranslator {
     final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
     final List<_HtmlTextSlot> translatedSlots = _textSlots(translatedRoot);
     if (sourceSlots.length != translatedSlots.length) {
-      return translatedHtml;
+      return null;
     }
 
     for (int index = 0; index < sourceSlots.length; index += 1) {
@@ -2019,9 +2019,30 @@ class EpubChapterTranslator {
       return _isProtectedPagebreakText(element.text);
     }
     final String href = element.attributes['href'] ?? '';
-    return tag == 'a' &&
-        href.startsWith('#') &&
-        _isProtectedMarkerText(element.text);
+    if (tag != 'a') {
+      return false;
+    }
+    final String id = element.attributes['id']?.toLowerCase() ?? '';
+    if (role == 'doc-backlink' || id.startsWith('footnote_ref_')) {
+      return true;
+    }
+    if (_isCrossFileHref(href) && _containsFootnoteMarkerClass(element)) {
+      return true;
+    }
+    return href.startsWith('#') && _isProtectedMarkerText(element.text);
+  }
+
+  static bool _isCrossFileHref(String href) {
+    final int fragmentIndex = href.indexOf('#');
+    return fragmentIndex > 0 && fragmentIndex < href.length - 1;
+  }
+
+  static bool _containsFootnoteMarkerClass(dom.Element element) {
+    return <dom.Element>[element, ...element.querySelectorAll('*')].any(
+      (dom.Element candidate) =>
+          candidate.classes.contains('footnote_ref') ||
+          candidate.classes.contains('footnote_num'),
+    );
   }
 
   static Set<String> _epubTypes(dom.Element element) {
