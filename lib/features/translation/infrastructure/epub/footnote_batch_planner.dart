@@ -78,10 +78,20 @@ class FootnoteBatchPlanner {
     final bool hasFootnoteFileMarker = RegExp(
       r'(^|[-_.])fn(?:[-_.]|$)',
     ).hasMatch(filename);
-    final bool hasFootnoteWords = RegExp(
-      r'footnotes?|endnotes?|notes?',
-    ).hasMatch('$path $title');
+    final bool hasFootnoteWords =
+        _hasFootnoteWord(path) ||
+        _hasFootnoteWord(title, allowNonPathSeparators: true);
     return hasFootnoteFileSuffix || hasFootnoteFileMarker || hasFootnoteWords;
+  }
+
+  static bool _hasFootnoteWord(
+    String value, {
+    bool allowNonPathSeparators = false,
+  }) {
+    final String separators = allowNonPathSeparators ? r'[^a-z]' : r'[-_./\\]';
+    return RegExp(
+      '(^|$separators)(?:footnotes?|endnotes?|notes?)(?=\$|$separators)',
+    ).hasMatch(value);
   }
 
   FootnoteTranslationBatch _createBatch(

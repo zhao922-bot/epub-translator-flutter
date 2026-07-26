@@ -28,6 +28,41 @@ void main() {
       );
     });
 
+    test('does not mistake notebook files or noteworthy titles for notes', () {
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: <InspectedChapter>[
+          _chapter(path: 'text/notebook.xhtml', title: 'Notebook'),
+          _chapter(
+            path: 'text/chapter-01.xhtml',
+            title: 'A Noteworthy Chapter',
+          ),
+        ],
+        pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+          0: <ExtractedBlock>[_block('p-1')],
+          1: <ExtractedBlock>[_block('p-1')],
+        },
+        chunkSize: 500,
+      );
+
+      expect(batches, isEmpty);
+    });
+
+    test('keeps supported standalone footnote path variants', () {
+      final List<InspectedChapter> chapters = <InspectedChapter>[
+        _chapter(path: 'text/footnotes.xhtml', title: 'Chapter 1'),
+        _chapter(path: 'text/endnotes.xhtml', title: 'Chapter 2'),
+        _chapter(path: 'notes/chapter-03.xhtml', title: 'Chapter 3'),
+        _chapter(path: 'text/chapter-04-fn.xhtml', title: 'Chapter 4'),
+      ];
+
+      for (final InspectedChapter chapter in chapters) {
+        expect(
+          FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+          isTrue,
+        );
+      }
+    });
+
     test(
       'assigns globally unique request ids to duplicate footnote block ids',
       () {
