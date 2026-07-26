@@ -1904,11 +1904,11 @@ class EpubChapterTranslator {
     }
     final dom.Element translatedRoot = normalizedRoot;
     final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
-    if (sourceSlots.isEmpty ||
-        sourceSlots.any((_HtmlTextSlot slot) => !slot.protected)) {
+    if (sourceSlots.isEmpty) {
       return null;
     }
     final List<String> sourceMarkers = sourceSlots
+        .where((_HtmlTextSlot slot) => slot.protected)
         .map((_HtmlTextSlot slot) => slot.text)
         .toList(growable: false);
     final List<String> translatedMarkers = _textSlots(translatedRoot)

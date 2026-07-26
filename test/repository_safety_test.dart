@@ -1426,6 +1426,20 @@ void main() {
       );
     });
 
+    test('keeps nested overflow nodes when source has following prose', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> Original.</p>',
+        translatedHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span><i>译后</i><span>引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a><i>译后</i><span>引文</span></p>',
+      );
+    });
+
     test('keeps only prose explicitly moved out of a protected-only anchor', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
