@@ -87,6 +87,86 @@ void main() {
     expect(text, contains('[Ending]'));
     expect(text, contains('block-19'));
   });
+
+  test('excludes EPUB navigation, footnotes, and promotional matter', () {
+    final List<InspectedChapter> chapters = <InspectedChapter>[
+      _chapter(
+        path: 'Introduction.xhtml',
+        title: 'Introduction',
+        category: ChapterCategory.frontMatter,
+        prefix: 'introduction',
+        blockCount: 30,
+      ),
+      _chapter(
+        path: 'nav.xhtml',
+        title: 'Communion',
+        category: ChapterCategory.content,
+        prefix: 'navigation',
+        blockCount: 100,
+      ),
+      for (int number = 1; number <= 12; number += 1)
+        _chapter(
+          path: 'Chapter_$number.xhtml',
+          title: 'Chapter $number',
+          category: ChapterCategory.content,
+          prefix: 'chapter-$number',
+          blockCount: 30,
+        ),
+      _chapter(
+        path: 'About_the_Publisher.xhtml',
+        title: 'About the Publisher',
+        category: ChapterCategory.content,
+        prefix: 'publisher',
+        blockCount: 30,
+      ),
+      _chapter(
+        path: '9780063575059_Chapter_22_2-fn.xhtml',
+        title: 'Footnote',
+        category: ChapterCategory.content,
+        prefix: 'footnote',
+        blockCount: 1,
+      ),
+    ];
+
+    final List<Map<String, String>> samples =
+        EpubChapterTranslator.styleProfileSourceChaptersForTest(chapters);
+
+    expect(
+      samples.map((Map<String, String> item) => item['title']).toList(),
+      <String>['Introduction', 'Chapter 1', 'Chapter 7', 'Chapter 12'],
+    );
+  });
+
+  test(
+    'tiny trailing documents do not replace a representative late chapter',
+    () {
+      final List<InspectedChapter> chapters = <InspectedChapter>[
+        for (int number = 1; number <= 5; number += 1)
+          _chapter(
+            path: 'chapter-$number.xhtml',
+            title: 'Chapter $number',
+            category: ChapterCategory.content,
+            prefix: 'chapter-$number',
+            blockCount: 30,
+          ),
+        _chapter(
+          path: 'fragment.xhtml',
+          title: 'Untitled',
+          category: ChapterCategory.content,
+          prefix: 'fragment',
+          blockCount: 1,
+        ),
+      ];
+
+      final List<Map<String, String>> samples =
+          EpubChapterTranslator.styleProfileSourceChaptersForTest(chapters);
+
+      expect(
+        samples.map((Map<String, String> item) => item['title']).toList(),
+        <String>['Chapter 1', 'Chapter 3', 'Chapter 5'],
+      );
+    },
+  );
 }
 
 InspectedChapter _chapter({

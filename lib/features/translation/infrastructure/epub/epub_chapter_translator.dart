@@ -47,6 +47,7 @@ class EpubChapterTranslator {
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
+  static const int _minimumRepresentativeStyleCharacters = 240;
   static const int _memoryListLimit = 8;
   static const int _memoryGlossaryLimit = 32;
   static const int _recentChapterMemoryLimit = 2;
@@ -292,9 +293,22 @@ class EpubChapterTranslator {
       add(chapter, 'frontMatter');
     }
 
-    final List<InspectedChapter> content = eligible
+    final List<InspectedChapter> contentCandidates = eligible
         .where((InspectedChapter c) => c.category == ChapterCategory.content)
         .toList(growable: false);
+    final List<InspectedChapter> substantialContent = contentCandidates
+        .where(
+          (InspectedChapter chapter) =>
+              _representativeStyleText(chapter.blocks).length >=
+              _minimumRepresentativeStyleCharacters,
+        )
+        .toList(growable: false);
+    final int desiredRepresentativeCount = min(3, contentCandidates.length);
+    final List<InspectedChapter> content =
+        desiredRepresentativeCount > 0 &&
+            substantialContent.length >= desiredRepresentativeCount
+        ? substantialContent
+        : contentCandidates;
     final List<InspectedChapter> representativeContent =
         _representativeContentChapters(content);
     for (int index = 0; index < representativeContent.length; index += 1) {
@@ -348,7 +362,23 @@ class EpubChapterTranslator {
         chapter.category == ChapterCategory.backMatter) {
       return true;
     }
-    final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
+    final String normalizedPath = chapter.path
+        .replaceAll('\\', '/')
+        .toLowerCase();
+    final String fileName = normalizedPath.split('/').last;
+    final String normalizedTitle = chapter.title.trim().toLowerCase();
+    if (RegExp(r'^(nav|navigation)(\.[^.]+)?$').hasMatch(fileName) ||
+        RegExp(r'(^|[-_.])(fn|footnotes?)([-_.]|$)').hasMatch(fileName) ||
+        <String>{
+          'footnote',
+          'footnotes',
+          'navigation',
+          'table of contents',
+          'contents',
+        }.contains(normalizedTitle)) {
+      return true;
+    }
+    final String token = '$normalizedPath $normalizedTitle';
     return <String>[
       'index',
       '_ind_',
@@ -369,6 +399,12 @@ class EpubChapterTranslator {
       '_ata_',
       'bibliography',
       'endnote',
+      'about the publisher',
+      'book perk',
+      'card page',
+      'advertisement',
+      'also by',
+      'books by',
     ].any(token.contains);
   }
 
