@@ -103,6 +103,41 @@ void main() {
       }
     });
 
+    test('protects repeated symbols and Unicode numeric markers', () {
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        '<p>One'
+        '<a role="doc-noteref" href="#one">**</a>'
+        'Two'
+        '<a epub:type="noteref" href="#two">††</a>'
+        'Three'
+        '<a role="doc-backlink" href="chapter.xhtml#three">１</a>'
+        'Four'
+        '<a id="footnote_ref_four" href="notes.xhtml#four">Ⅳ</a>'
+        'Five'
+        '<a href="notes.xhtml#five">'
+        '<span class="footnote_num">††</span></a>'
+        'Six</p>',
+      );
+
+      expect(template.slotTexts, <String>[
+        'One',
+        'Two',
+        'Three',
+        'Four',
+        'Five',
+        'Six',
+      ]);
+      expect(
+        template.render(<String>['1', '2', '3', '4', '5', '6']),
+        '<p>1<a role="doc-noteref" href="#one">**</a>'
+        '2<a epub:type="noteref" href="#two">††</a>'
+        '3<a role="doc-backlink" href="chapter.xhtml#three">１</a>'
+        '4<a id="footnote_ref_four" href="notes.xhtml#four">Ⅳ</a>'
+        '5<a href="notes.xhtml#five">'
+        '<span class="footnote_num">††</span></a>6</p>',
+      );
+    });
+
     test('keeps bracketed prose and roman-like words translatable', () {
       final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
         '<p><a role="doc-noteref" href="#note">[Note]</a> and '

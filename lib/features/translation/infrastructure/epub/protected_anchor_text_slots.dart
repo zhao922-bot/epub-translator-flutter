@@ -148,7 +148,7 @@ class ProtectedAnchorTextSlots {
     if (compact.isEmpty || compact.length > 10) {
       return false;
     }
-    if (_footnoteSymbolMarkers.contains(compact)) {
+    if (_isFootnoteSymbolMarker(compact)) {
       return true;
     }
 
@@ -182,11 +182,26 @@ class ProtectedAnchorTextSlots {
     if (token.isEmpty) {
       return false;
     }
-    return RegExp(r'^[0-9]+$').hasMatch(token) ||
+    final String normalizedRoman = token.runes
+        .map(
+          (int rune) =>
+              _unicodeRomanToAscii[String.fromCharCode(rune)] ??
+              String.fromCharCode(rune),
+        )
+        .join();
+    return RegExp(r'^[0-9０-９]+$').hasMatch(token) ||
         RegExp(r'^[A-Za-z]$').hasMatch(token) ||
-        _canonicalRomanNumeral.hasMatch(token) ||
+        _canonicalRomanNumeral.hasMatch(normalizedRoman) ||
         RegExp(r'^[⁰¹²³⁴⁵⁶⁷⁸⁹]+$').hasMatch(token) ||
         RegExp(r'^[零一二三四五六七八九十百]+$').hasMatch(token);
+  }
+
+  static bool _isFootnoteSymbolMarker(String token) {
+    return token.isNotEmpty &&
+        token.runes.every(
+          (int rune) =>
+              _footnoteSymbolMarkers.contains(String.fromCharCode(rune)),
+        );
   }
 
   static final RegExp _canonicalRomanNumeral = RegExp(
@@ -204,6 +219,41 @@ class ProtectedAnchorTextSlots {
     '¶',
     '+',
     '↩',
+  };
+
+  static const Map<String, String> _unicodeRomanToAscii = <String, String>{
+    'Ⅰ': 'I',
+    'Ⅱ': 'II',
+    'Ⅲ': 'III',
+    'Ⅳ': 'IV',
+    'Ⅴ': 'V',
+    'Ⅵ': 'VI',
+    'Ⅶ': 'VII',
+    'Ⅷ': 'VIII',
+    'Ⅸ': 'IX',
+    'Ⅹ': 'X',
+    'Ⅺ': 'XI',
+    'Ⅻ': 'XII',
+    'Ⅼ': 'L',
+    'Ⅽ': 'C',
+    'Ⅾ': 'D',
+    'Ⅿ': 'M',
+    'ⅰ': 'I',
+    'ⅱ': 'II',
+    'ⅲ': 'III',
+    'ⅳ': 'IV',
+    'ⅴ': 'V',
+    'ⅵ': 'VI',
+    'ⅶ': 'VII',
+    'ⅷ': 'VIII',
+    'ⅸ': 'IX',
+    'ⅹ': 'X',
+    'ⅺ': 'XI',
+    'ⅻ': 'XII',
+    'ⅼ': 'L',
+    'ⅽ': 'C',
+    'ⅾ': 'D',
+    'ⅿ': 'M',
   };
 
   static String _withSourceBoundaryWhitespace({
