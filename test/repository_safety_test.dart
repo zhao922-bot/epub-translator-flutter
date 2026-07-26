@@ -10,6 +10,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:html/parser.dart' as html_parser;
 
 class _RetryOnceBatchAdapter implements HttpClientAdapter {
   int fetchCount = 0;
@@ -187,6 +188,53 @@ class _FootnoteResponseAdapter implements HttpClientAdapter {
 
   final List<Map<String, Object?>> responseBlocks;
   Map<String, dynamic>? lastPayload;
+  Map<String, dynamic>? lastRequestBody;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    lastRequestBody = request;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    lastPayload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{
+              'content': jsonEncode(<String, Object?>{
+                'blocks': responseBlocks,
+              }),
+            },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _MixedProtocolAdapter implements HttpClientAdapter {
+  final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
 
   @override
   void close({bool force = false}) {}
@@ -206,10 +254,34 @@ class _FootnoteResponseAdapter implements HttpClientAdapter {
     final Map<String, dynamic> request =
         jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
     final List<dynamic> messages = request['messages'] as List<dynamic>;
-    lastPayload =
+    final Map<String, dynamic> payload =
         jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
             as Map<String, dynamic>;
-
+    payloads.add(payload);
+    final List<Map<String, dynamic>> blocks =
+        (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+    final List<Map<String, Object?>> responseBlocks = blocks
+        .map((block) {
+          final String id = block['id'] as String;
+          if (block.containsKey('slots')) {
+            return <String, Object?>{
+              'id': id,
+              'slots': (block['slots'] as List<dynamic>)
+                  .cast<Map<String, dynamic>>()
+                  .map(
+                    (Map<String, dynamic> slot) => <String, Object?>{
+                      'id': slot['id'],
+                      'text': slot['id'] == 's1'
+                          ? '<script>alert("slot")</script>尾部译文'
+                          : '$id 译文',
+                    },
+                  )
+                  .toList(growable: false),
+            };
+          }
+          return <String, Object?>{'id': id, 'html': '<p>普通译文</p>'};
+        })
+        .toList(growable: false);
     return ResponseBody.fromString(
       jsonEncode(<String, Object?>{
         'choices': <Object?>[
@@ -478,7 +550,7 @@ void main() {
     });
 
     test(
-      'block cache key invalidates v9 and v10 footnote structure results',
+      'block cache key invalidates v9 through v11 footnote structure results',
       () {
         final TranslationConfig config = TranslationConfig.defaults().copyWith(
           apiBaseUrl: 'https://api.example.test',
@@ -526,9 +598,28 @@ void main() {
               ),
             )
             .toString();
+        final String v11Key = sha256
+            .convert(
+              utf8.encode(
+                <Object>[
+                  'v11-conservative-footnote-anchor-lock',
+                  'https://api.example.test/v1',
+                  config.model.trim(),
+                  config.targetLanguage.trim(),
+                  config.lockedGlossary.trim(),
+                  config.residualQualityCheck,
+                  config.styleProfileEnabled,
+                  'none',
+                  'chapter-1.xhtml',
+                  block.sourceHtml,
+                ].join('|'),
+              ),
+            )
+            .toString();
 
         expect(currentKey, isNot(equals(v9Key)));
         expect(currentKey, isNot(equals(v10Key)));
+        expect(currentKey, isNot(equals(v11Key)));
       },
     );
 
@@ -710,7 +801,127 @@ void main() {
     );
   });
 
+  test(
+    'mixed chapter batch keeps HTML blocks and groups protected slots',
+    () async {
+      final _MixedProtocolAdapter adapter = _MixedProtocolAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String>
+      translated = await EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 1,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'protected-a',
+            tagName: 'p',
+            sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
+            sourceText: 'First [1] tail.',
+          ),
+          ExtractedBlock(
+            id: 'ordinary',
+            tagName: 'p',
+            sourceHtml: '<p>Ordinary text.</p>',
+            sourceText: 'Ordinary text.',
+          ),
+          ExtractedBlock(
+            id: 'chapter-nav',
+            tagName: 'p',
+            sourceHtml: '<p><a href="#appendix-a">A</a></p>',
+            sourceText: 'A',
+          ),
+          ExtractedBlock(
+            id: 'protected-b',
+            tagName: 'p',
+            sourceHtml:
+                '<p>Second <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+            sourceText: 'Second *',
+          ),
+        ],
+      );
+
+      expect(adapter.payloads, hasLength(2));
+      final List<Map<String, dynamic>> htmlBlocks =
+          (adapter.payloads.first['blocks'] as List<dynamic>)
+              .cast<Map<String, dynamic>>();
+      final List<Map<String, dynamic>> slotBlocks =
+          (adapter.payloads.last['blocks'] as List<dynamic>)
+              .cast<Map<String, dynamic>>();
+      expect(
+        htmlBlocks.map((Map<String, dynamic> block) => block.keys.toSet()),
+        everyElement(<String>{'id', 'html'}),
+      );
+      expect(
+        htmlBlocks.map((Map<String, dynamic> block) => block['id']),
+        <String>['ordinary', 'chapter-nav'],
+      );
+      expect(
+        slotBlocks.map((Map<String, dynamic> block) => block['id']),
+        <String>['protected-a', 'protected-b'],
+      );
+      expect(
+        slotBlocks.map((Map<String, dynamic> block) => block.keys.toSet()),
+        everyElement(<String>{'id', 'slots'}),
+      );
+      expect(jsonEncode(slotBlocks), isNot(contains('href')));
+      expect(translated[0], contains('href="#n1"'));
+      expect(translated[1], '<p>普通译文</p>');
+      expect(translated[2], contains('href="#appendix-a"'));
+      expect(translated[2], contains('普通译文'));
+      expect(translated[3], contains('role="doc-backlink"'));
+      expect(translated[0], contains('&lt;script&gt;'));
+      expect(translated[0], isNot(contains('<script>')));
+    },
+  );
+
   group('cross-file footnote response ids', () {
+    test('same-file short marker uses slots in the footnote batch', () async {
+      final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+        <Map<String, Object?>>[
+          <String, Object?>{
+            'id': 'f0:p-1',
+            'slots': <Object?>[
+              <String, Object?>{'id': 's0', 'text': '正文译文'},
+              <String, Object?>{'id': 's1', 'text': '尾部译文'},
+            ],
+          },
+        ],
+      );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final Map<String, String> translated = await EpubChapterTranslator()
+          .translateFootnoteBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            references: <FootnoteBlockReference>[
+              _footnoteReference(
+                0,
+                'Body [1] tail.',
+                sourceHtml:
+                    '<p>Body <a href="#note-1"><span>[1]</span></a> tail.</p>',
+              ),
+            ],
+          );
+
+      final Map<String, dynamic> requestBlock =
+          (adapter.lastPayload!['blocks'] as List<dynamic>).single
+              as Map<String, dynamic>;
+      expect(requestBlock.keys.toSet(), <String>{'id', 'slots'});
+      expect(jsonEncode(requestBlock), isNot(contains('href')));
+      expect(translated['f0:p-1'], contains('href="#note-1"'));
+      expect(translated['f0:p-1'], contains('>[1]</span>'));
+    });
+
     test(
       'maps a shuffled response by its globally unique request ids',
       () async {
@@ -740,6 +951,12 @@ void main() {
         expect(
           (adapter.lastPayload!['blocks'] as List<dynamic>)
               .cast<Map<String, dynamic>>()
+              .map((Map<String, dynamic> block) => block.keys.toSet()),
+          everyElement(<String>{'id', 'html'}),
+        );
+        expect(
+          (adapter.lastPayload!['blocks'] as List<dynamic>)
+              .cast<Map<String, dynamic>>()
               .map((Map<String, dynamic> block) => block['id']),
           <String>['f0:p-1', 'f1:p-1'],
         );
@@ -750,45 +967,186 @@ void main() {
       },
     );
 
-    test('repairs protected anchors for every returned footnote block', () async {
-      final _FootnoteResponseAdapter
-      adapter = _FootnoteResponseAdapter(<Map<String, Object?>>[
-        <String, Object?>{'id': 'f1:p-1', 'html': '<p>第二条脚注。</p>'},
-        <String, Object?>{
-          'id': 'f0:p-1',
-          'html':
-              '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">＊ 译后引文</span></a></p>',
-        },
-      ]);
-      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
-        ..httpClientAdapter = adapter;
+    test(
+      'uses one strict slot request and renders shuffled text into source anchors',
+      () async {
+        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+          <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 'f1:p-1',
+              'slots': <Object?>[
+                <String, Object?>{
+                  'id': 's0',
+                  'text': '<script>alert("note")</script>脚注译文。',
+                },
+              ],
+            },
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{'id': 's0', 'text': '正文开头'},
+                <String, Object?>{
+                  'id': 's1',
+                  'text': '<script>alert("body")</script>正文结尾',
+                },
+              ],
+            },
+          ],
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
 
-      final Map<String, String>
-      translated = await EpubChapterTranslator().translateFootnoteBatchForTest(
-        dio: dio,
-        config: TranslationConfig.defaults().copyWith(
-          apiKey: 'sk-test',
-          targetLanguage: 'Chinese',
-          maxRetries: 1,
-        ),
-        references: <FootnoteBlockReference>[
-          _footnoteReference(
-            0,
-            'Original quotation.',
-            sourceHtml:
-                '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> Original quotation.</p>',
+        final Map<String, String>
+        translated = await EpubChapterTranslator().translateFootnoteBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 1,
           ),
-          _footnoteReference(1, 'Second footnote.'),
-        ],
-      );
+          references: <FootnoteBlockReference>[
+            _footnoteReference(
+              0,
+              'Body opening [1] body ending.',
+              sourceHtml:
+                  '<p id="body"><span>Body opening </span><a id="footnote_ref_1" href="notes.xhtml#note-1" role="doc-noteref" class="footnote_ref keep"><span aria-hidden="true">[1]</span></a><em> body ending.</em></p>',
+            ),
+            _footnoteReference(
+              1,
+              'Footnote text. *',
+              sourceHtml:
+                  '<p id="note-1" role="doc-footnote">Footnote text. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink" class="return"><span class="footnote_num">*</span></a></p>',
+            ),
+          ],
+        );
 
-      expect(translated.keys, <String>['f0:p-1', 'f1:p-1']);
-      expect(translated, <String, String>{
-        'f0:p-1':
-            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>＊ 译后引文</p>',
-        'f1:p-1': '<p>第二条脚注。</p>',
+        final Map<String, dynamic> payload = adapter.lastPayload!;
+        final List<Map<String, dynamic>> requestBlocks =
+            (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+        expect(
+          requestBlocks.map((Map<String, dynamic> block) => block['id']),
+          <String>['f0:p-1', 'f1:p-1'],
+        );
+        expect(
+          requestBlocks.map((Map<String, dynamic> block) => block.keys.toSet()),
+          everyElement(<String>{'id', 'slots'}),
+        );
+        expect(jsonEncode(payload), isNot(contains('notes.xhtml#note-1')));
+        expect(jsonEncode(payload), isNot(contains('footnote_ref_1')));
+        expect(jsonEncode(payload), isNot(contains('<a')));
+        final List<dynamic> messages =
+            adapter.lastRequestBody!['messages'] as List<dynamic>;
+        final String systemPrompt =
+            (messages.first as Map<String, dynamic>)['content'] as String;
+        expect(systemPrompt, contains('never return HTML'));
+        expect(systemPrompt, contains('strict JSON'));
+
+        expect(translated.keys, <String>['f0:p-1', 'f1:p-1']);
+        final String body = translated['f0:p-1']!;
+        final String note = translated['f1:p-1']!;
+        expect(body, contains('href="notes.xhtml#note-1"'));
+        expect(body, contains('id="footnote_ref_1"'));
+        expect(body, contains('role="doc-noteref"'));
+        expect(body, contains('class="footnote_ref keep"'));
+        expect(body, contains('[1]'));
+        expect(note, contains('href="chapter.xhtml#footnote_ref_1"'));
+        expect(note, contains('role="doc-backlink"'));
+        expect(note, contains('class="footnote_num"'));
+        expect(note, contains('>*</span>'));
+        expect(body, contains('&lt;script&gt;'));
+        expect(note, contains('&lt;script&gt;'));
+        expect(html_parser.parseFragment(body).querySelector('script'), isNull);
+        expect(html_parser.parseFragment(note).querySelector('script'), isNull);
+      },
+    );
+
+    for (final MapEntry<String, List<Map<String, Object?>>> malformed
+        in <String, List<Map<String, Object?>>>{
+          'missing block id': <Map<String, Object?>>[],
+          'duplicate block id': <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{'id': 's0', 'text': '甲'},
+              ],
+            },
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{'id': 's0', 'text': '乙'},
+              ],
+            },
+          ],
+          'slot count mismatch': <Map<String, Object?>>[
+            <String, Object?>{'id': 'f0:p-1', 'slots': <Object?>[]},
+          ],
+          'unknown slot id': <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{'id': 's9', 'text': '甲'},
+              ],
+            },
+          ],
+          'duplicate slot id': <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{'id': 's0', 'text': '甲'},
+                <String, Object?>{'id': 's0', 'text': '乙'},
+              ],
+            },
+          ],
+          'non-string slot text': <Map<String, Object?>>[
+            <String, Object?>{
+              'id': 'f0:p-1',
+              'slots': <Object?>[
+                <String, Object?>{
+                  'id': 's0',
+                  'text': <String, String>{'html': '<b>甲</b>'},
+                },
+              ],
+            },
+          ],
+        }.entries) {
+      test('rejects slot response with ${malformed.key}', () async {
+        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+          malformed.value,
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        final bool duplicateBlock = malformed.key == 'duplicate block id';
+        final bool duplicateSlot = malformed.key == 'duplicate slot id';
+        await expectLater(
+          EpubChapterTranslator().translateFootnoteBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            references: <FootnoteBlockReference>[
+              _footnoteReference(
+                0,
+                duplicateSlot ? 'Before * after' : 'Footnote text. *',
+                sourceHtml: duplicateSlot
+                    ? '<p>Before <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> after</p>'
+                    : '<p>Footnote text. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+              ),
+              if (duplicateBlock)
+                _footnoteReference(
+                  1,
+                  'Second footnote. *',
+                  sourceHtml:
+                      '<p>Second footnote. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+                ),
+            ],
+          ),
+          throwsA(isA<FormatException>()),
+        );
       });
-    });
+    }
 
     for (final MapEntry<String, List<Map<String, Object?>>> malformed
         in <String, List<Map<String, Object?>>>{

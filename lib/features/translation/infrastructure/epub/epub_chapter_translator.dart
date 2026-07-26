@@ -21,6 +21,7 @@ import '../translation_cache_store.dart';
 import '../translation_quality.dart';
 import 'epub_repacker.dart';
 import 'footnote_batch_planner.dart';
+import 'protected_anchor_text_slots.dart';
 import 'translation_api_client.dart';
 import 'translation_batch_planner.dart';
 
@@ -48,8 +49,7 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion =
-      'v11-conservative-footnote-anchor-lock';
+  static const String _cacheSchemaVersion = 'v12-protected-anchor-text-slots';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -2474,7 +2474,7 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
-  }) {
+  }) async {
     final Set<String> requestedIds = batch.references
         .map((FootnoteBlockReference reference) => reference.requestId)
         .toSet();
@@ -2483,9 +2483,79 @@ class EpubChapterTranslator {
         'Cross-file footnote request ids must be unique.',
       );
     }
+
+    final List<FootnoteBlockReference> htmlReferences =
+        <FootnoteBlockReference>[];
+    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
+    for (final FootnoteBlockReference reference in batch.references) {
+      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
+        reference.block.sourceHtml,
+      )) {
+        htmlReferences.add(reference);
+        continue;
+      }
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        reference.block.sourceHtml,
+      );
+      if (template.hasProtectedAnchors) {
+        slotRequests.add(
+          _ProtectedSlotRequest(
+            id: reference.requestId,
+            block: reference.block,
+            template: template,
+          ),
+        );
+      }
+    }
+
+    final Map<String, String> translatedById = <String, String>{};
+    if (htmlReferences.isNotEmpty) {
+      translatedById.addAll(
+        await _translateFootnoteHtmlBatch(
+          dio: dio,
+          config: config,
+          references: htmlReferences,
+          context: batch.context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    if (slotRequests.isNotEmpty) {
+      translatedById.addAll(
+        await _translateProtectedSlotBatch(
+          dio: dio,
+          config: config,
+          requests: slotRequests,
+          context: batch.context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    return <String, String>{
+      for (final FootnoteBlockReference reference in batch.references)
+        reference.requestId: translatedById[reference.requestId]!,
+    };
+  }
+
+  Future<Map<String, String>> _translateFootnoteHtmlBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<FootnoteBlockReference> references,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final Set<String> requestedIds = references
+        .map((FootnoteBlockReference reference) => reference.requestId)
+        .toSet();
     final Map<String, dynamic> payloadMap = <String, dynamic>{
-      if (!batch.context.isEmpty) 'context': batch.context.toJson(),
-      'blocks': batch.references
+      if (!context.isEmpty) 'context': context.toJson(),
+      'blocks': references
           .map(
             (FootnoteBlockReference reference) => <String, String>{
               'id': reference.requestId,
@@ -2506,9 +2576,9 @@ class EpubChapterTranslator {
           throw const TranslationCancelledException();
         }
         final TranslationStyleProfile batchStyleProfile =
-            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+            _styleProfileFromBookMemoryJson(context.bookMemory);
         final bool batchStyleConfirmed =
-            _styleProfileConfirmedFromBookMemoryJson(batch.context.bookMemory);
+            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
         final Map<String, dynamic> requestData = <String, dynamic>{
           'model': config.model,
           'temperature': 0.2,
@@ -2535,7 +2605,7 @@ class EpubChapterTranslator {
         );
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != batch.references.length) {
+            rawBlocks.length != references.length) {
           throw const FormatException(
             'Translated footnote batch length does not match request length.',
           );
@@ -2572,7 +2642,7 @@ class EpubChapterTranslator {
         }
 
         final Map<String, String> translatedById = <String, String>{};
-        for (final FootnoteBlockReference reference in batch.references) {
+        for (final FootnoteBlockReference reference in references) {
           final String? translated = rawTranslatedById[reference.requestId];
           if (translated == null) {
             throw FormatException(
@@ -2595,7 +2665,248 @@ class EpubChapterTranslator {
     );
   }
 
+  Future<Map<String, String>> _translateProtectedSlotBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<_ProtectedSlotRequest> requests,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final Set<String> requestedIds = requests
+        .map((_ProtectedSlotRequest request) => request.id)
+        .toSet();
+    if (requestedIds.length != requests.length) {
+      throw const FormatException('Protected slot request ids must be unique.');
+    }
+    final Map<String, _ProtectedSlotRequest> requestById =
+        <String, _ProtectedSlotRequest>{
+          for (final _ProtectedSlotRequest request in requests)
+            request.id: request,
+        };
+    final String payload = jsonEncode(<String, Object?>{
+      if (!context.isEmpty) 'context': context.toJson(),
+      'blocks': requests
+          .map((_ProtectedSlotRequest request) => request.toJson())
+          .toList(growable: false),
+    });
+
+    return _apiClient.runRetried<Map<String, String>>(
+      config: config,
+      retryDelayOverride: retryDelayOverride,
+      shouldRetry: TranslationApiClient.shouldRetryBatchError,
+      cancelToken: cancelToken,
+      operation: () async {
+        if (cancelToken?.isCancelled ?? false) {
+          throw const TranslationCancelledException();
+        }
+        final TranslationStyleProfile batchStyleProfile =
+            _styleProfileFromBookMemoryJson(context.bookMemory);
+        final bool batchStyleConfirmed =
+            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
+        final Map<String, dynamic> requestData = <String, dynamic>{
+          'model': config.model,
+          'temperature': 0.2,
+          'messages': <Map<String, String>>[
+            <String, String>{
+              'role': 'system',
+              'content':
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+            },
+            <String, String>{'role': 'user', 'content': payload},
+          ],
+        };
+        onRequestAttempt?.call();
+        final Response<dynamic> response = await _apiClient.postChatCompletions(
+          dio: dio,
+          data: requestData,
+          cancelToken: cancelToken,
+        );
+        final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
+          _apiClient.extractMessageContent(response.data),
+        );
+        final Object? rawBlocks = jsonPayload['blocks'];
+        if (rawBlocks is! List<dynamic> ||
+            rawBlocks.length != requests.length) {
+          throw const FormatException(
+            'Translated slot block count does not match request count.',
+          );
+        }
+
+        final Map<String, List<String>> translatedSlotsById =
+            <String, List<String>>{};
+        for (final Object? rawBlock in rawBlocks) {
+          if (rawBlock is! Map<String, dynamic> ||
+              rawBlock.keys.toSet().difference(const <String>{
+                'id',
+                'slots',
+              }).isNotEmpty ||
+              const <String>{
+                'id',
+                'slots',
+              }.difference(rawBlock.keys.toSet()).isNotEmpty) {
+            throw const FormatException(
+              'Translated slot block must contain only id and slots.',
+            );
+          }
+          final Object? rawId = rawBlock['id'];
+          final Object? rawSlots = rawBlock['slots'];
+          if (rawId is! String ||
+              !requestedIds.contains(rawId) ||
+              translatedSlotsById.containsKey(rawId)) {
+            throw const FormatException(
+              'Translated slot response contains an unknown or duplicate block id.',
+            );
+          }
+          final _ProtectedSlotRequest request = requestById[rawId]!;
+          if (rawSlots is! List<dynamic> ||
+              rawSlots.length != request.template.slotTexts.length) {
+            throw FormatException(
+              'Translated slot count does not match block $rawId.',
+            );
+          }
+          final Map<String, String> textBySlotId = <String, String>{};
+          final Set<String> expectedSlotIds = request.slotIds.toSet();
+          for (final Object? rawSlot in rawSlots) {
+            if (rawSlot is! Map<String, dynamic> ||
+                rawSlot.keys.toSet().difference(const <String>{
+                  'id',
+                  'text',
+                }).isNotEmpty ||
+                const <String>{
+                  'id',
+                  'text',
+                }.difference(rawSlot.keys.toSet()).isNotEmpty) {
+              throw const FormatException(
+                'Translated slot must contain only id and text.',
+              );
+            }
+            final Object? rawSlotId = rawSlot['id'];
+            final Object? rawText = rawSlot['text'];
+            if (rawSlotId is! String ||
+                !expectedSlotIds.contains(rawSlotId) ||
+                textBySlotId.containsKey(rawSlotId) ||
+                rawText is! String) {
+              throw const FormatException(
+                'Translated slot contains an unknown or duplicate id, or non-string text.',
+              );
+            }
+            textBySlotId[rawSlotId] = rawText;
+          }
+          translatedSlotsById[rawId] = request.slotIds
+              .map((String slotId) => textBySlotId[slotId]!)
+              .toList(growable: false);
+        }
+
+        return <String, String>{
+          for (final _ProtectedSlotRequest request in requests)
+            request.id: _renderAndValidateProtectedSlots(
+              config: config,
+              request: request,
+              translatedSlots: translatedSlotsById[request.id]!,
+            ),
+        };
+      },
+    );
+  }
+
+  static String _renderAndValidateProtectedSlots({
+    required TranslationConfig config,
+    required _ProtectedSlotRequest request,
+    required List<String> translatedSlots,
+  }) {
+    final String rendered = request.template.render(translatedSlots);
+    _validateTranslatedBlockQuality(
+      config: config,
+      block: request.block,
+      translatedHtml: rendered,
+    );
+    return rendered;
+  }
+
   Future<List<String>> _translateBlockBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required TranslationBlockBatch batch,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+  }) async {
+    final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
+    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
+    for (final ExtractedBlock block in batch.blocks) {
+      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
+        block.sourceHtml,
+      )) {
+        htmlBlocks.add(block);
+        continue;
+      }
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        block.sourceHtml,
+      );
+      if (template.hasProtectedAnchors) {
+        slotRequests.add(
+          _ProtectedSlotRequest(id: block.id, block: block, template: template),
+        );
+      }
+    }
+
+    final Map<String, String> translatedById = <String, String>{};
+    if (htmlBlocks.isNotEmpty) {
+      final List<String> translatedHtml = await _translateHtmlBlockBatch(
+        dio: dio,
+        config: config,
+        batch: TranslationBlockBatch(htmlBlocks, context: batch.context),
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+      );
+      for (int index = 0; index < htmlBlocks.length; index += 1) {
+        translatedById[htmlBlocks[index].id] = translatedHtml[index];
+      }
+    }
+    if (slotRequests.isNotEmpty) {
+      try {
+        translatedById.addAll(
+          await _translateProtectedSlotBatch(
+            dio: dio,
+            config: config,
+            requests: slotRequests,
+            context: batch.context,
+            retryDelayOverride: retryDelayOverride,
+            cancelToken: cancelToken,
+          ),
+        );
+      } on DioException catch (error) {
+        if (_isCancelError(error)) {
+          throw const TranslationCancelledException();
+        }
+        if (!TranslationApiClient.shouldFallbackBatchDioException(error)) {
+          rethrow;
+        }
+        final List<Map<String, String>> individualResults =
+            await Future.wait<Map<String, String>>(
+              slotRequests.map(
+                (_ProtectedSlotRequest request) => _translateProtectedSlotBatch(
+                  dio: dio,
+                  config: config,
+                  requests: <_ProtectedSlotRequest>[request],
+                  context: batch.context,
+                  retryDelayOverride: retryDelayOverride,
+                  cancelToken: cancelToken,
+                ),
+              ),
+            );
+        for (final Map<String, String> result in individualResults) {
+          translatedById.addAll(result);
+        }
+      }
+    }
+    return batch.blocks
+        .map((ExtractedBlock block) => translatedById[block.id]!)
+        .toList(growable: false);
+  }
+
+  Future<List<String>> _translateHtmlBlockBatch({
     required Dio dio,
     required TranslationConfig config,
     required TranslationBlockBatch batch,
@@ -3369,6 +3680,34 @@ class _ChapterMemory {
       if (summary.trim().isNotEmpty) 'summary': summary.trim(),
       'continuityNotes': continuityNotes,
       'glossary': glossary,
+    };
+  }
+}
+
+class _ProtectedSlotRequest {
+  const _ProtectedSlotRequest({
+    required this.id,
+    required this.block,
+    required this.template,
+  });
+
+  final String id;
+  final ExtractedBlock block;
+  final ProtectedAnchorTextSlots template;
+
+  List<String> get slotIds => List<String>.generate(
+    template.slotTexts.length,
+    (int index) => 's$index',
+    growable: false,
+  );
+
+  Map<String, Object?> toJson() {
+    return <String, Object?>{
+      'id': id,
+      'slots': <Map<String, String>>[
+        for (int index = 0; index < template.slotTexts.length; index += 1)
+          <String, String>{'id': 's$index', 'text': template.slotTexts[index]},
+      ],
     };
   }
 }

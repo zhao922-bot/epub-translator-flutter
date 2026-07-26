@@ -9,8 +9,11 @@ import 'package:html/parser.dart' as html_parser;
 /// source DOM and assigns translations to text nodes, so translated strings are
 /// always serialized as text rather than parsed as markup.
 class ProtectedAnchorTextSlots {
-  ProtectedAnchorTextSlots._(this._sourceRoot, List<String> slotTexts)
-    : slotTexts = UnmodifiableListView<String>(slotTexts);
+  ProtectedAnchorTextSlots._(
+    this._sourceRoot,
+    this.hasProtectedAnchors,
+    List<String> slotTexts,
+  ) : slotTexts = UnmodifiableListView<String>(slotTexts);
 
   factory ProtectedAnchorTextSlots.parse(String sourceHtml) {
     final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
@@ -29,11 +32,37 @@ class ProtectedAnchorTextSlots {
     final List<dom.Text> slots = _collectSlots(sourceRoot);
     return ProtectedAnchorTextSlots._(
       sourceRoot,
+      <dom.Element>[
+        sourceRoot,
+        ...sourceRoot.querySelectorAll('a'),
+      ].any(_isProtectedAnchor),
       slots.map((dom.Text slot) => slot.data).toList(growable: false),
     );
   }
 
+  /// Detects protected anchors without imposing [parse]'s single-root
+  /// requirement on ordinary HTML blocks.
+  static bool containsProtectedAnchors(String sourceHtml) {
+    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    for (final dom.Node node in fragment.nodes) {
+      if (node is! dom.Element) {
+        continue;
+      }
+      if (<dom.Element>[
+        node,
+        ...node.querySelectorAll('a'),
+      ].any(_isProtectedAnchor)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   final dom.Element _sourceRoot;
+
+  /// Whether the source contains at least one anchor whose marker and
+  /// semantics must stay source-owned.
+  final bool hasProtectedAnchors;
 
   /// Source text for each translatable slot in document order.
   final List<String> slotTexts;
@@ -102,6 +131,9 @@ class ProtectedAnchorTextSlots {
     }
 
     final String href = element.attributes['href'] ?? '';
+    if (href.startsWith('#') && _isLegacyFragmentMarker(element.text)) {
+      return true;
+    }
     return _isCrossFileHref(href) && _containsFootnoteMarkerClass(element);
   }
 
@@ -202,6 +234,32 @@ class ProtectedAnchorTextSlots {
           (int rune) =>
               _footnoteSymbolMarkers.contains(String.fromCharCode(rune)),
         );
+  }
+
+  static bool _isLegacyFragmentMarker(String value) {
+    final String compact = value.replaceAll(RegExp(r'\s+'), '');
+    if (compact.isEmpty || compact.length > 10) {
+      return false;
+    }
+    return compact == '＊' ||
+        const <String>{
+          '零',
+          '一',
+          '二',
+          '三',
+          '四',
+          '五',
+          '六',
+          '七',
+          '八',
+          '九',
+          '十',
+          '十一',
+        }.contains(compact) ||
+        RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
+        RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
+        RegExp(r'^[*†‡§¶]+$').hasMatch(compact) ||
+        compact == '↩';
   }
 
   static final RegExp _canonicalRomanNumeral = RegExp(
