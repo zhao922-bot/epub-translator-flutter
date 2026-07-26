@@ -66,6 +66,7 @@ app.*.map.json
 # Local diagnostics, live-test reports, and private EPUB fixtures
 /work/
 /dist/
+/.worktrees/
 
 # Local AI-assistant configuration (not part of the application)
 /.claude/
