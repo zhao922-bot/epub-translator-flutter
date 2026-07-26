@@ -148,14 +148,63 @@ class ProtectedAnchorTextSlots {
     if (compact.isEmpty || compact.length > 10) {
       return false;
     }
-    return RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
-        RegExp(r'^[\[({（【].+[\])}）】]$').hasMatch(compact) ||
-        RegExp(r'^[*†‡+]+$').hasMatch(compact) ||
-        RegExp(r'^[A-Za-z][.)]?$').hasMatch(compact) ||
-        RegExp(r'^[ivxlcdmIVXLCDM]+[.)]?$').hasMatch(compact) ||
-        RegExp(r'^[⁰¹²³⁴⁵⁶⁷⁸⁹]+$').hasMatch(compact) ||
-        RegExp(r'^[零一二三四五六七八九十百]+[.)]?$').hasMatch(compact);
+    if (_footnoteSymbolMarkers.contains(compact)) {
+      return true;
+    }
+
+    final String? bracketedToken = _matchedBracketToken(compact);
+    if (bracketedToken != null) {
+      return _isTraditionalMarkerToken(bracketedToken);
+    }
+
+    final String token = compact.endsWith('.') || compact.endsWith(')')
+        ? compact.substring(0, compact.length - 1)
+        : compact;
+    return _isTraditionalMarkerToken(token);
   }
+
+  static String? _matchedBracketToken(String value) {
+    const Map<String, String> pairs = <String, String>{
+      '[': ']',
+      '(': ')',
+      '{': '}',
+      '（': '）',
+      '【': '】',
+    };
+    final String? closing = pairs[value[0]];
+    if (closing == null || value.length < 3 || !value.endsWith(closing)) {
+      return null;
+    }
+    return value.substring(1, value.length - 1);
+  }
+
+  static bool _isTraditionalMarkerToken(String token) {
+    if (token.isEmpty) {
+      return false;
+    }
+    return RegExp(r'^[0-9]+$').hasMatch(token) ||
+        RegExp(r'^[A-Za-z]$').hasMatch(token) ||
+        _canonicalRomanNumeral.hasMatch(token) ||
+        RegExp(r'^[⁰¹²³⁴⁵⁶⁷⁸⁹]+$').hasMatch(token) ||
+        RegExp(r'^[零一二三四五六七八九十百]+$').hasMatch(token);
+  }
+
+  static final RegExp _canonicalRomanNumeral = RegExp(
+    r'^(?=[MDCLXVI]+$)M{0,3}(?:CM|CD|D?C{0,3})'
+    r'(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$',
+    caseSensitive: false,
+  );
+
+  static const Set<String> _footnoteSymbolMarkers = <String>{
+    '*',
+    '＊',
+    '†',
+    '‡',
+    '§',
+    '¶',
+    '+',
+    '↩',
+  };
 
   static String _withSourceBoundaryWhitespace({
     required String source,

@@ -73,6 +73,64 @@ void main() {
       );
     });
 
+    test('protects legacy footnote symbol markers and their subtrees', () {
+      for (final String marker in <String>[
+        '*',
+        '＊',
+        '†',
+        '‡',
+        '§',
+        '¶',
+        '+',
+        '↩',
+      ]) {
+        final ProtectedAnchorTextSlots template =
+            ProtectedAnchorTextSlots.parse(
+              '<p>Before<a id="footnote_ref_symbol" href="notes.xhtml#one">'
+              '<span class="marker" data-source="yes">$marker</span></a>'
+              'After</p>',
+            );
+
+        expect(template.slotTexts, <String>['Before', 'After']);
+        expect(
+          template.render(<String>['Translated', 'Text']),
+          '<p>Translated'
+          '<a id="footnote_ref_symbol" href="notes.xhtml#one">'
+          '<span class="marker" data-source="yes">$marker</span></a>'
+          'Text</p>',
+          reason: 'marker $marker must remain source-owned',
+        );
+      }
+    });
+
+    test('keeps bracketed prose and roman-like words translatable', () {
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        '<p><a role="doc-noteref" href="#note">[Note]</a> and '
+        '<a role="doc-noteref" href="#civil">civil</a> but '
+        '<a role="doc-noteref" href="#four">[IV]</a>.</p>',
+      );
+
+      expect(template.slotTexts, <String>[
+        '[Note]',
+        ' and ',
+        'civil',
+        ' but ',
+        '.',
+      ]);
+      expect(
+        template.render(<String>[
+          '[Remarque]',
+          ' et ',
+          'civilisé',
+          ' mais ',
+          '!',
+        ]),
+        '<p><a role="doc-noteref" href="#note">[Remarque]</a> et '
+        '<a role="doc-noteref" href="#civil">civilisé</a> mais '
+        '<a role="doc-noteref" href="#four">[IV]</a>!</p>',
+      );
+    });
+
     test('keeps prose links and non-marker semantic links translatable', () {
       final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
         '<p><a href="#section">Introduction</a> and '
