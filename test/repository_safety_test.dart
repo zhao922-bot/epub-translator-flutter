@@ -1412,7 +1412,7 @@ void main() {
       );
     });
 
-    test('moves every nested overflow node out of a protected anchor', () {
+    test('keeps nested overflow text without moving model nodes', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
@@ -1422,11 +1422,12 @@ void main() {
 
       expect(
         locked,
-        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a><i>译后</i><span>引文</span></p>',
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
       );
+      expect(locked, isNot(contains('<i>')));
     });
 
-    test('keeps nested overflow nodes when source has following prose', () {
+    test('keeps nested overflow text when source has following prose', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> Original.</p>',
@@ -1436,8 +1437,62 @@ void main() {
 
       expect(
         locked,
-        '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a><i>译后</i><span>引文</span></p>',
+        '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a>译后引文</p>',
       );
+    });
+
+    test('keeps translated body slots while placing overflow in source text', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> First <em>second</em>.</p>',
+        translatedHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*译后</span></a> Translated <em>第二</em>.</p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a>译后 Translated <em>第二</em>.</p>',
+      );
+    });
+
+    test('extracts safe overflow text without model element nodes', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> Original.</p>',
+        translatedHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span><i>译后</i><span>引文</span></a></p>',
+      );
+
+      expect(locked, contains('译后引文'));
+      expect(locked, isNot(contains('<i>')));
+      expect(locked, isNot(contains('<span>引文</span>')));
+    });
+
+    test('drops unsafe overflow elements while keeping safe text', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> Original.</p>',
+        translatedHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span><script>alert(1)</script><img onerror="x">安全文本</a></p>',
+      );
+
+      expect(locked, contains('安全文本'));
+      expect(locked, isNot(contains('<script')));
+      expect(locked, isNot(contains('<img')));
+      expect(locked, isNot(contains('onerror')));
+      expect(locked, isNot(contains('alert(1)')));
+    });
+
+    test('keeps a word boundary between overflow and following text', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>*</span></a> quotation</p>',
+        translatedHtml:
+            '<p><a href="chapter.xhtml#ref" role="doc-backlink"><span>* Translated</span></a> quotation</p>',
+      );
+
+      expect(locked, contains('Translated quotation'));
+      expect(locked, isNot(contains('Translatedquotation')));
     });
 
     test('keeps only prose explicitly moved out of a protected-only anchor', () {

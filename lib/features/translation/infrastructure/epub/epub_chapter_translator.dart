@@ -1795,6 +1795,19 @@ class EpubChapterTranslator {
           translatedHtml: translatedHtml,
         );
     final String trimmedTranslation = normalizedTranslation.html.trim();
+    if (normalizedTranslation.hasOverflow &&
+        normalizedTranslation.root != null &&
+        _elementSkeletonMatches(
+          _singleRootElement(sourceHtml)!,
+          normalizedTranslation.root!,
+        ) &&
+        _overflowTextFitsSourceSlots(
+          sourceRoot: _singleRootElement(sourceHtml)!,
+          translatedRoot: normalizedTranslation.root!,
+          trustedOverflowTexts: normalizedTranslation.trustedOverflowTexts,
+        )) {
+      return normalizedTranslation.root!.outerHtml;
+    }
     if (_htmlStructureMatches(sourceHtml, trimmedTranslation)) {
       final String? restored = _restoreProtectedTexts(
         sourceHtml: sourceHtml,
@@ -1804,17 +1817,6 @@ class EpubChapterTranslator {
         return restored;
       }
     }
-    final String? protectedOnlyTranslation =
-        _keepNormalizedProtectedOnlyTranslation(
-          sourceHtml: sourceHtml,
-          translatedHtml: trimmedTranslation,
-          normalizedRoot: normalizedTranslation.root,
-          movedOverflow: normalizedTranslation.movedOverflow,
-        );
-    if (protectedOnlyTranslation != null) {
-      return protectedOnlyTranslation;
-    }
-
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
     if (sourceRoot == null) {
       return trimmedTranslation;
@@ -1861,6 +1863,33 @@ class EpubChapterTranslator {
     return rebuiltRoot.outerHtml;
   }
 
+  static bool _overflowTextFitsSourceSlots({
+    required dom.Element sourceRoot,
+    required dom.Element translatedRoot,
+    required List<dom.Text> trustedOverflowTexts,
+  }) {
+    final int sourceTextSlots = _textSlots(
+      sourceRoot,
+    ).where((_HtmlTextSlot slot) => !slot.protected).length;
+    final List<_HtmlTextSlot> untrustedTranslatedSlots =
+        _textSlots(translatedRoot)
+            .where(
+              (_HtmlTextSlot slot) =>
+                  !slot.protected && !trustedOverflowTexts.contains(slot.node),
+            )
+            .toList(growable: false);
+    if (untrustedTranslatedSlots.length <= sourceTextSlots) {
+      return true;
+    }
+    if (sourceTextSlots != 0) {
+      return false;
+    }
+    for (final _HtmlTextSlot slot in untrustedTranslatedSlots) {
+      slot.text = '';
+    }
+    return true;
+  }
+
   static String? _restoreProtectedTexts({
     required String sourceHtml,
     required String translatedHtml,
@@ -1880,55 +1909,6 @@ class EpubChapterTranslator {
     for (int index = 0; index < sourceSlots.length; index += 1) {
       if (sourceSlots[index].protected) {
         translatedSlots[index].text = sourceSlots[index].text;
-      }
-    }
-    return translatedRoot.outerHtml;
-  }
-
-  static String? _keepNormalizedProtectedOnlyTranslation({
-    required String sourceHtml,
-    required String translatedHtml,
-    required dom.Element? normalizedRoot,
-    required List<dom.Node> movedOverflow,
-  }) {
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
-    if (sourceRoot == null ||
-        normalizedRoot == null ||
-        movedOverflow.isEmpty ||
-        !_elementSkeletonMatches(
-          sourceRoot,
-          normalizedRoot,
-          ignoredTranslatedNodes: movedOverflow,
-        )) {
-      return null;
-    }
-    final dom.Element translatedRoot = normalizedRoot;
-    final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
-    if (sourceSlots.isEmpty) {
-      return null;
-    }
-    final List<String> sourceMarkers = sourceSlots
-        .where((_HtmlTextSlot slot) => slot.protected)
-        .map((_HtmlTextSlot slot) => slot.text)
-        .toList(growable: false);
-    final List<String> translatedMarkers = _textSlots(translatedRoot)
-        .where((_HtmlTextSlot slot) => slot.protected)
-        .map((_HtmlTextSlot slot) => slot.text)
-        .toList(growable: false);
-    if (sourceMarkers.length != translatedMarkers.length) {
-      return null;
-    }
-    for (int index = 0; index < sourceMarkers.length; index += 1) {
-      if (sourceMarkers[index] != translatedMarkers[index]) {
-        return null;
-      }
-    }
-    for (final _HtmlTextSlot slot in _textSlots(translatedRoot)) {
-      if (slot.protected) {
-        continue;
-      }
-      if (!_isDescendantOfMovedOverflow(slot.node, movedOverflow)) {
-        slot.text = '';
       }
     }
     return translatedRoot.outerHtml;
@@ -1964,22 +1944,6 @@ class EpubChapterTranslator {
     return true;
   }
 
-  static bool _isDescendantOfMovedOverflow(
-    dom.Node node,
-    Iterable<dom.Node> movedOverflow,
-  ) {
-    for (
-      dom.Node? current = node;
-      current != null;
-      current = current.parentNode
-    ) {
-      if (movedOverflow.contains(current)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
     required String sourceHtml,
     required String translatedHtml,
@@ -1989,19 +1953,27 @@ class EpubChapterTranslator {
     if (sourceRoot == null || translatedRoot == null) {
       return _NormalizedAnchorHtml(html: translatedHtml);
     }
-    final List<dom.Node> movedOverflow = <dom.Node>[];
-    _normalizePairedProtectedAnchors(sourceRoot, translatedRoot, movedOverflow);
+    final List<String> overflowTexts = <String>[];
+    final List<dom.Text> trustedOverflowTexts = <dom.Text>[];
+    _normalizePairedProtectedAnchors(
+      sourceRoot,
+      translatedRoot,
+      overflowTexts,
+      trustedOverflowTexts,
+    );
     return _NormalizedAnchorHtml(
       html: translatedRoot.outerHtml,
       root: translatedRoot,
-      movedOverflow: movedOverflow,
+      hasOverflow: overflowTexts.isNotEmpty,
+      trustedOverflowTexts: trustedOverflowTexts,
     );
   }
 
   static void _normalizePairedProtectedAnchors(
     dom.Element source,
     dom.Element translated,
-    List<dom.Node> movedOverflow,
+    List<String> overflowTexts,
+    List<dom.Text> trustedOverflowTexts,
   ) {
     if (source.localName != translated.localName ||
         !_attributesMatch(source, translated)) {
@@ -2015,7 +1987,8 @@ class EpubChapterTranslator {
         source: source,
         translated: translated,
         sourceMarker: sourceMarker,
-        movedOverflow: movedOverflow,
+        overflowTexts: overflowTexts,
+        trustedOverflowTexts: trustedOverflowTexts,
       );
       return;
     }
@@ -2033,7 +2006,8 @@ class EpubChapterTranslator {
       _normalizePairedProtectedAnchors(
         sourceChildren[index],
         translatedChildren[index],
-        movedOverflow,
+        overflowTexts,
+        trustedOverflowTexts,
       );
     }
   }
@@ -2042,7 +2016,8 @@ class EpubChapterTranslator {
     required dom.Element source,
     required dom.Element translated,
     required String sourceMarker,
-    required List<dom.Node> movedOverflow,
+    required List<String> overflowTexts,
+    required List<dom.Text> trustedOverflowTexts,
   }) {
     final dom.Text? markerText = _firstNonWhitespaceTextDescendant(translated);
     if (markerText == null) {
@@ -2061,7 +2036,7 @@ class EpubChapterTranslator {
     if (markerRange == null) {
       return;
     }
-    final List<dom.Node> overflow = _overflowNodesAfterMarker(
+    final String overflowText = _overflowTextAfterMarker(
       anchor: translated,
       markerText: markerText,
       markerEnd: markerRange[1],
@@ -2077,22 +2052,25 @@ class EpubChapterTranslator {
     final dom.Element restoredAnchor = source.clone(true);
     parent.nodes.removeAt(anchorIndex);
     parent.nodes.insert(anchorIndex, restoredAnchor);
-    for (int index = 0; index < overflow.length; index += 1) {
-      parent.nodes.insert(anchorIndex + index + 1, overflow[index]);
+    if (overflowText.isNotEmpty) {
+      final dom.Text? insertedOverflow = _placeOverflowTextAfter(
+        parent: parent,
+        anchorIndex: anchorIndex,
+        overflowText: overflowText,
+      );
+      overflowTexts.add(overflowText);
+      if (insertedOverflow != null) {
+        trustedOverflowTexts.add(insertedOverflow);
+      }
     }
-    movedOverflow.addAll(overflow);
   }
 
-  static List<dom.Node> _overflowNodesAfterMarker({
+  static String _overflowTextAfterMarker({
     required dom.Element anchor,
     required dom.Text markerText,
     required int markerEnd,
   }) {
-    final List<dom.Node> overflow = <dom.Node>[];
-    final String trailingText = markerText.data.substring(markerEnd).trim();
-    if (trailingText.isNotEmpty) {
-      overflow.add(dom.Text(trailingText));
-    }
+    String overflow = markerText.data.substring(markerEnd).trimLeft();
 
     dom.Node branch = markerText;
     while (true) {
@@ -2106,13 +2084,63 @@ class EpubChapterTranslator {
         siblingIndex < parent.nodes.length;
         siblingIndex += 1
       ) {
-        overflow.add(parent.nodes[siblingIndex].clone(true));
+        overflow += _safeOverflowText(parent.nodes[siblingIndex]);
       }
       if (parent == anchor) {
         return overflow;
       }
       branch = parent;
     }
+  }
+
+  static String _safeOverflowText(dom.Node node) {
+    if (node is dom.Text) {
+      return node.data;
+    }
+    if (node is! dom.Element) {
+      return '';
+    }
+    const Set<String> unsafeTags = <String>{
+      'script',
+      'style',
+      'iframe',
+      'object',
+      'embed',
+      'img',
+    };
+    if (unsafeTags.contains(node.localName)) {
+      return '';
+    }
+    return node.nodes.map(_safeOverflowText).join();
+  }
+
+  static dom.Text? _placeOverflowTextAfter({
+    required dom.Node parent,
+    required int anchorIndex,
+    required String overflowText,
+  }) {
+    final int nextIndex = anchorIndex + 1;
+    if (nextIndex < parent.nodes.length &&
+        parent.nodes[nextIndex] is dom.Text) {
+      final dom.Text nextText = parent.nodes[nextIndex] as dom.Text;
+      nextText.data = _joinOverflowText(overflowText, nextText.data);
+      return null;
+    }
+    final dom.Text inserted = dom.Text(overflowText);
+    parent.nodes.insert(nextIndex, inserted);
+    return inserted;
+  }
+
+  static String _joinOverflowText(String overflow, String followingText) {
+    if (overflow.isEmpty || followingText.isEmpty) {
+      return '$overflow$followingText';
+    }
+    final bool needsSeparator =
+        RegExp(r'[A-Za-z0-9]$').hasMatch(overflow) &&
+        RegExp(r'^[A-Za-z0-9]').hasMatch(followingText);
+    return needsSeparator
+        ? '$overflow $followingText'
+        : '$overflow$followingText';
   }
 
   static dom.Text? _firstNonWhitespaceTextDescendant(dom.Node node) {
@@ -3098,12 +3126,14 @@ class _NormalizedAnchorHtml {
   const _NormalizedAnchorHtml({
     required this.html,
     this.root,
-    this.movedOverflow = const <dom.Node>[],
+    this.hasOverflow = false,
+    this.trustedOverflowTexts = const <dom.Text>[],
   });
 
   final String html;
   final dom.Element? root;
-  final List<dom.Node> movedOverflow;
+  final bool hasOverflow;
+  final List<dom.Text> trustedOverflowTexts;
 }
 
 class _HtmlTextSlot {
