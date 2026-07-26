@@ -109,6 +109,271 @@ void main() {
       expect(requestKinds, isNot(contains('chapterMemory')));
     },
   );
+
+  test(
+    'batches duplicate p-1 footnotes across files and reuses their caches',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_footnote_batch_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start(
+        reverseResponses: true,
+      );
+      addTearDown(server.close);
+
+      final File epubFile = File('${temp.path}/footnotes.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/01-fn.xhtml':
+              '<p id="note-1">Footnote one. <a href="chapter.xhtml#ref-1">Back</a></p>',
+          'OPS/Text/02-fn.xhtml':
+              '<p id="note-2">Footnote two. <a href="chapter.xhtml#ref-2">Back</a></p>',
+          'OPS/Text/03-fn.xhtml':
+              '<p id="note-3">Footnote three. <a href="chapter.xhtml#ref-3">Back</a></p>',
+        },
+      );
+
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'footnote-batch-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 5000,
+        maxConcurrent: 2,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      expect(
+        inspection.chapters.map((chapter) => chapter.blocks.single.id),
+        <String>['p-1', 'p-1', 'p-1'],
+      );
+      final firstRun = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      expect(server.blockRequestIds, <List<String>>[
+        <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+      ]);
+      final String first = await _readXhtml(
+        firstRun.job.outputPath,
+        'OPS/Text/01-fn.xhtml',
+      );
+      final String second = await _readXhtml(
+        firstRun.job.outputPath,
+        'OPS/Text/02-fn.xhtml',
+      );
+      final String third = await _readXhtml(
+        firstRun.job.outputPath,
+        'OPS/Text/03-fn.xhtml',
+      );
+      expect(first, contains('脚注甲'));
+      expect(second, contains('脚注乙'));
+      expect(third, contains('脚注丙'));
+      expect(first, contains('id="note-1"'));
+      expect(second, contains('href="chapter.xhtml#ref-2"'));
+      expect(third, contains('id="note-3"'));
+
+      server.resetRequests();
+      await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      expect(server.totalRequests, 0);
+      expect(server.blockRequestIds, isEmpty);
+    },
+  );
+
+  test('413 fallback keeps every global footnote request id unique', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_repository_footnote_413_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final _FootnoteFakeServer server = await _FootnoteFakeServer.start(
+      rejectMultiBlockWith413: true,
+    );
+    addTearDown(server.close);
+
+    final File epubFile = File('${temp.path}/footnotes_413.epub');
+    await _writeTestEpub(
+      epubFile,
+      chapters: const <String, String>{
+        'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
+        'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
+        'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+      },
+    );
+    final TranslationConfig config = TranslationConfig.defaults().copyWith(
+      apiBaseUrl: 'http://127.0.0.1:${server.port}',
+      apiKey: 'sk-test',
+      model: 'footnote-413-model-${server.port}',
+      targetLanguage: 'Chinese',
+      chunkSize: 5000,
+      maxRetries: 1,
+    );
+    final EpubTranslationRepository repository = EpubTranslationRepository();
+    final inspection = await repository.startJob(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+    );
+
+    await repository.translateChapters(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+      chapters: inspection.chapters,
+    );
+
+    expect(server.blockRequestIds.map((List<String> ids) => ids.length), <int>[
+      3,
+      1,
+      1,
+      1,
+    ]);
+    expect(
+      server.blockRequestIds.skip(1).expand((List<String> ids) => ids),
+      <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+    );
+  });
+}
+
+class _FootnoteFakeServer {
+  _FootnoteFakeServer._(
+    this._server, {
+    required this.reverseResponses,
+    required this.rejectMultiBlockWith413,
+  });
+
+  final HttpServer _server;
+  final bool reverseResponses;
+  final bool rejectMultiBlockWith413;
+  final List<List<String>> blockRequestIds = <List<String>>[];
+  int totalRequests = 0;
+
+  int get port => _server.port;
+
+  static Future<_FootnoteFakeServer> start({
+    bool reverseResponses = false,
+    bool rejectMultiBlockWith413 = false,
+  }) async {
+    final HttpServer httpServer = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+    );
+    final _FootnoteFakeServer server = _FootnoteFakeServer._(
+      httpServer,
+      reverseResponses: reverseResponses,
+      rejectMultiBlockWith413: rejectMultiBlockWith413,
+    );
+    httpServer.listen(server._handle);
+    return server;
+  }
+
+  Future<void> close() => _server.close(force: true);
+
+  void resetRequests() {
+    totalRequests = 0;
+    blockRequestIds.clear();
+  }
+
+  Future<void> _handle(HttpRequest request) async {
+    totalRequests += 1;
+    final String rawBody = await utf8.decoder.bind(request).join();
+    final Map<String, dynamic> requestBody =
+        jsonDecode(rawBody) as Map<String, dynamic>;
+    final List<dynamic> messages = requestBody['messages'] as List<dynamic>;
+    final Map<String, dynamic> payload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+    final String kind = payload['kind'] as String? ?? 'blocks';
+
+    if (kind != 'blocks') {
+      final Object responsePayload = kind == 'initialBookMemory'
+          ? <String, Object?>{
+              'bookSummary': 'A book with three footnotes.',
+              'styleGuide': <Object?>[],
+              'glossary': <Object?>[],
+              'recentChapters': <Object?>[],
+            }
+          : <String, Object?>{
+              'title': 'Footnote',
+              'summary': 'A translated footnote.',
+              'continuityNotes': <Object?>[],
+              'glossary': <Object?>[],
+            };
+      await _writeChatResponse(request.response, responsePayload);
+      return;
+    }
+
+    final List<Map<String, dynamic>> blocks =
+        (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+    final List<String> ids = blocks
+        .map((Map<String, dynamic> block) => block['id'] as String)
+        .toList();
+    blockRequestIds.add(ids);
+    if (rejectMultiBlockWith413 && blocks.length > 1) {
+      request.response.statusCode = HttpStatus.requestEntityTooLarge;
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode(<String, String>{'error': 'too large'}),
+      );
+      await request.response.close();
+      return;
+    }
+
+    Iterable<Map<String, dynamic>> responseBlocks = blocks;
+    if (reverseResponses) {
+      responseBlocks = responseBlocks.toList().reversed;
+    }
+    await _writeChatResponse(request.response, <String, Object?>{
+      'blocks': responseBlocks.map((Map<String, dynamic> block) {
+        final String id = block['id'] as String;
+        return <String, Object?>{'id': id, 'html': _translatedFootnoteHtml(id)};
+      }).toList(),
+    });
+  }
+
+  static String _translatedFootnoteHtml(String id) {
+    return switch (id) {
+      'f0:p-1' => '<p id="note-1">脚注甲。<a href="chapter.xhtml#ref-1">返回</a></p>',
+      'f1:p-1' => '<p id="note-2">脚注乙。<a href="chapter.xhtml#ref-2">返回</a></p>',
+      'f2:p-1' => '<p id="note-3">脚注丙。<a href="chapter.xhtml#ref-3">返回</a></p>',
+      _ => '<p>脚注译文。</p>',
+    };
+  }
+
+  static Future<void> _writeChatResponse(
+    HttpResponse response,
+    Object payload,
+  ) async {
+    response.headers.contentType = ContentType.json;
+    response.write(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': jsonEncode(payload)},
+          },
+        ],
+      }),
+    );
+    await response.close();
+  }
 }
 
 Future<HttpServer> _startFakeTranslationServer(
@@ -228,4 +493,15 @@ Future<void> _writeTestEpub(
   }
 
   await epubFile.writeAsBytes(ZipEncoder().encodeBytes(archive), flush: true);
+}
+
+Future<String> _readXhtml(String epubPath, String entryPath) async {
+  final Archive archive = ZipDecoder().decodeBytes(
+    await File(epubPath).readAsBytes(),
+  );
+  final ArchiveFile? entry = archive.findFile(entryPath);
+  if (entry == null) {
+    throw StateError('Missing EPUB entry: $entryPath');
+  }
+  return utf8.decode(entry.content as List<int>);
 }

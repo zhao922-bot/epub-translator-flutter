@@ -6,6 +6,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -167,6 +168,54 @@ class _RecordingBatchAdapter implements HttpClientAdapter {
                       },
                     )
                     .toList(),
+              }),
+            },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _FootnoteResponseAdapter implements HttpClientAdapter {
+  _FootnoteResponseAdapter(this.responseBlocks);
+
+  final List<Map<String, Object?>> responseBlocks;
+  Map<String, dynamic>? lastPayload;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    lastPayload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{
+              'content': jsonEncode(<String, Object?>{
+                'blocks': responseBlocks,
               }),
             },
           },
@@ -603,6 +652,90 @@ void main() {
         expect(translated, <String>['<p>Translated after rate limit.</p>']);
       },
     );
+  });
+
+  group('cross-file footnote response ids', () {
+    test(
+      'maps a shuffled response by its globally unique request ids',
+      () async {
+        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+          <Map<String, Object?>>[
+            <String, Object?>{'id': 'f1:p-1', 'html': '<p>第二条脚注。</p>'},
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+          ],
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        final Map<String, String> translated = await EpubChapterTranslator()
+            .translateFootnoteBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 1,
+              ),
+              references: <FootnoteBlockReference>[
+                _footnoteReference(0, 'First footnote.'),
+                _footnoteReference(1, 'Second footnote.'),
+              ],
+            );
+
+        expect(
+          (adapter.lastPayload!['blocks'] as List<dynamic>)
+              .cast<Map<String, dynamic>>()
+              .map((Map<String, dynamic> block) => block['id']),
+          <String>['f0:p-1', 'f1:p-1'],
+        );
+        expect(translated, <String, String>{
+          'f0:p-1': '<p>第一条脚注。</p>',
+          'f1:p-1': '<p>第二条脚注。</p>',
+        });
+      },
+    );
+
+    for (final MapEntry<String, List<Map<String, Object?>>> malformed
+        in <String, List<Map<String, Object?>>>{
+          'missing id': <Map<String, Object?>>[
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+          ],
+          'duplicate id': <Map<String, Object?>>[
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>重复脚注。</p>'},
+          ],
+          'unknown id': <Map<String, Object?>>[
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+            <String, Object?>{'id': 'f9:p-1', 'html': '<p>未知脚注。</p>'},
+          ],
+          'empty html': <Map<String, Object?>>[
+            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+            <String, Object?>{'id': 'f1:p-1', 'html': ' '},
+          ],
+        }.entries) {
+      test('rejects ${malformed.key} instead of guessing ownership', () async {
+        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+          malformed.value,
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        await expectLater(
+          EpubChapterTranslator().translateFootnoteBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            references: <FootnoteBlockReference>[
+              _footnoteReference(0, 'First footnote.'),
+              _footnoteReference(1, 'Second footnote.'),
+            ],
+          ),
+          throwsA(isA<FormatException>()),
+        );
+      });
+    }
   });
 
   group('translation residual detection', () {
@@ -1101,5 +1234,24 @@ InspectedChapter _chapter({
     category: category,
     recommendedForTranslation: true,
     includeInTranslation: includeInTranslation,
+  );
+}
+
+FootnoteBlockReference _footnoteReference(int chapterIndex, String text) {
+  final InspectedChapter chapter = _chapter(
+    path: 'OPS/Text/note-$chapterIndex-fn.xhtml',
+    title: 'Footnote ${chapterIndex + 1}',
+    category: ChapterCategory.reference,
+    text: text,
+  );
+  return FootnoteBlockReference(
+    chapterIndex: chapterIndex,
+    chapter: chapter,
+    block: ExtractedBlock(
+      id: 'p-1',
+      tagName: 'p',
+      sourceHtml: '<p>$text</p>',
+      sourceText: text,
+    ),
   );
 }
