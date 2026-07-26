@@ -48,7 +48,7 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion = 'v9-cjk-inline-typography';
+  static const String _cacheSchemaVersion = 'v10-footnote-anchor-lock';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -2011,8 +2011,10 @@ class EpubChapterTranslator {
     final String tag = element.localName ?? '';
     final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
+    final bool protectedMarkerText = _isProtectedMarkerText(element.text);
 
-    if (roles.contains('doc-noteref') || epubTypes.contains('noteref')) {
+    if ((roles.contains('doc-noteref') || epubTypes.contains('noteref')) &&
+        protectedMarkerText) {
       return true;
     }
     if (roles.contains('doc-pagebreak') || epubTypes.contains('pagebreak')) {
@@ -2022,7 +2024,6 @@ class EpubChapterTranslator {
     if (tag != 'a') {
       return false;
     }
-    final bool protectedMarkerText = _isProtectedMarkerText(element.text);
     final String id = element.attributes['id']?.toLowerCase() ?? '';
     if (protectedMarkerText &&
         (roles.contains('doc-backlink') || id.startsWith('footnote_ref_'))) {
@@ -2133,16 +2134,25 @@ class EpubChapterTranslator {
   }
 
   static List<int>? _protectedMarkerRange(String value, String marker) {
-    final int exactIndex = value.indexOf(marker);
-    if (exactIndex >= 0) {
-      return <int>[exactIndex, exactIndex + marker.length];
+    final List<String> equivalents = _equivalentMarkerForms(marker);
+    if (equivalents.isNotEmpty) {
+      final List<List<int>> equivalentRanges = equivalents
+          .expand((String equivalent) => _allMarkerRanges(value, equivalent))
+          .toList(growable: false);
+      if (equivalentRanges.length == 1) {
+        return equivalentRanges.single;
+      }
+      if (equivalentRanges.length > 1) {
+        return null;
+      }
     }
 
-    for (final String equivalent in _equivalentMarkerForms(marker)) {
-      final int equivalentIndex = value.indexOf(equivalent);
-      if (equivalentIndex >= 0) {
-        return <int>[equivalentIndex, equivalentIndex + equivalent.length];
-      }
+    final List<List<int>> exactRanges = _allMarkerRanges(value, marker);
+    if (exactRanges.length == 1) {
+      return exactRanges.single;
+    }
+    if (exactRanges.length > 1) {
+      return null;
     }
 
     if (!RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(marker)) {
@@ -2156,6 +2166,23 @@ class EpubChapterTranslator {
       return null;
     }
     return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
+  }
+
+  static List<List<int>> _allMarkerRanges(String value, String marker) {
+    if (marker.isEmpty) {
+      return const <List<int>>[];
+    }
+    final List<List<int>> ranges = <List<int>>[];
+    int searchStart = 0;
+    while (searchStart < value.length) {
+      final int index = value.indexOf(marker, searchStart);
+      if (index < 0) {
+        break;
+      }
+      ranges.add(<int>[index, index + marker.length]);
+      searchStart = index + marker.length;
+    }
+    return ranges;
   }
 
   static const Map<String, String> _chineseNumberMarkerToAscii =

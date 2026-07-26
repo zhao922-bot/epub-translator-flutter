@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
@@ -474,6 +475,39 @@ void main() {
       expect(withoutGlossary, isNot(equals(withGlossary)));
       expect(withoutGlossary, hasLength(64));
       expect(withGlossary, hasLength(64));
+    });
+
+    test('block cache key invalidates v9 footnote structure results', () {
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test',
+        model: 'example-model',
+        targetLanguage: 'Chinese',
+      );
+      final String currentKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block,
+        chapterPath: 'chapter-1.xhtml',
+      );
+      final String v9Key = sha256
+          .convert(
+            utf8.encode(
+              <Object>[
+                'v9-cjk-inline-typography',
+                'https://api.example.test/v1',
+                config.model.trim(),
+                config.targetLanguage.trim(),
+                config.lockedGlossary.trim(),
+                config.residualQualityCheck,
+                config.styleProfileEnabled,
+                'none',
+                'chapter-1.xhtml',
+                block.sourceHtml,
+              ].join('|'),
+            ),
+          )
+          .toString();
+
+      expect(currentKey, isNot(equals(v9Key)));
     });
 
     test('job key changes when lockedGlossary changes', () {
@@ -1214,6 +1248,21 @@ void main() {
       expect(locked, isNot(contains('译文一')));
     });
 
+    test('preserves body symbols while removing a unique moved marker variant', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Body *<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>正文*＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>正文*<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+      );
+      expect(locked, isNot(contains('＊')));
+    });
+
     test('protects a cross-file footnote anchor by its reference id', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
@@ -1287,6 +1336,22 @@ void main() {
         '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">返回正文</a></p>',
       );
     });
+
+    for (final String attribute in <String>[
+      'role="doc-noteref"',
+      'epub:type="noteref"',
+    ]) {
+      test('keeps prose-bearing noteref links translatable: $attribute', () {
+        final String locked =
+            EpubTranslationRepository.lockHtmlStructureForTest(
+              sourceHtml:
+                  '<p><a href="#note-1" $attribute>Read the note</a></p>',
+              translatedHtml: '<p><a href="#note-1" $attribute>阅读注释</a></p>',
+            );
+
+        expect(locked, '<p><a href="#note-1" $attribute>阅读注释</a></p>');
+      });
+    }
 
     test('keeps prose-bearing class-marked cross-file links translatable', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
