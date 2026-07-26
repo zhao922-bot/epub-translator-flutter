@@ -1788,7 +1788,12 @@ class EpubChapterTranslator {
     required String sourceHtml,
     required String translatedHtml,
   }) {
-    final String trimmedTranslation = translatedHtml.trim();
+    final _NormalizedAnchorHtml normalizedTranslation =
+        _normalizeProtectedAnchorMarkers(
+          sourceHtml: sourceHtml,
+          translatedHtml: translatedHtml,
+        );
+    final String trimmedTranslation = normalizedTranslation.html.trim();
     if (_htmlStructureMatches(sourceHtml, trimmedTranslation)) {
       final String? restored = _restoreProtectedTexts(
         sourceHtml: sourceHtml,
@@ -1797,6 +1802,16 @@ class EpubChapterTranslator {
       if (restored != null) {
         return restored;
       }
+    }
+    final String? protectedOnlyTranslation =
+        _keepNormalizedProtectedOnlyTranslation(
+          sourceHtml: sourceHtml,
+          translatedHtml: trimmedTranslation,
+          normalizedRoot: normalizedTranslation.root,
+          movedOverflow: normalizedTranslation.movedOverflow,
+        );
+    if (protectedOnlyTranslation != null) {
+      return protectedOnlyTranslation;
     }
 
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
@@ -1891,6 +1906,359 @@ class EpubChapterTranslator {
       }
     }
     return translatedRoot.outerHtml;
+  }
+
+  static String? _keepNormalizedProtectedOnlyTranslation({
+    required String sourceHtml,
+    required String translatedHtml,
+    required dom.Element? normalizedRoot,
+    required List<dom.Text> movedOverflow,
+  }) {
+    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
+    if (sourceRoot == null ||
+        normalizedRoot == null ||
+        movedOverflow.isEmpty ||
+        !_elementSkeletonMatches(sourceRoot, normalizedRoot)) {
+      return null;
+    }
+    final dom.Element translatedRoot = normalizedRoot;
+    final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
+    if (sourceSlots.isEmpty ||
+        sourceSlots.any((_HtmlTextSlot slot) => !slot.protected)) {
+      return null;
+    }
+    final List<String> sourceMarkers = sourceSlots
+        .map((_HtmlTextSlot slot) => slot.text)
+        .toList(growable: false);
+    final List<String> translatedMarkers = _textSlots(translatedRoot)
+        .where((_HtmlTextSlot slot) => slot.protected)
+        .map((_HtmlTextSlot slot) => slot.text)
+        .toList(growable: false);
+    if (sourceMarkers.length != translatedMarkers.length) {
+      return null;
+    }
+    for (int index = 0; index < sourceMarkers.length; index += 1) {
+      if (sourceMarkers[index] != translatedMarkers[index]) {
+        return null;
+      }
+    }
+    for (final _HtmlTextSlot slot in _textSlots(translatedRoot)) {
+      if (slot.protected) {
+        continue;
+      }
+      if (!movedOverflow.contains(slot.node)) {
+        slot.text = '';
+      }
+    }
+    return translatedRoot.outerHtml;
+  }
+
+  static bool _elementSkeletonMatches(
+    dom.Element source,
+    dom.Element translated,
+  ) {
+    if (source.localName != translated.localName ||
+        !_attributesMatch(source, translated)) {
+      return false;
+    }
+    final List<dom.Element> sourceChildren = source.children.toList(
+      growable: false,
+    );
+    final List<dom.Element> translatedChildren = translated.children.toList(
+      growable: false,
+    );
+    if (sourceChildren.length != translatedChildren.length) {
+      return false;
+    }
+    for (int index = 0; index < sourceChildren.length; index += 1) {
+      if (!_elementSkeletonMatches(
+        sourceChildren[index],
+        translatedChildren[index],
+      )) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
+    required String sourceHtml,
+    required String translatedHtml,
+  }) {
+    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
+    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    if (sourceRoot == null || translatedRoot == null) {
+      return _NormalizedAnchorHtml(html: translatedHtml);
+    }
+    final List<dom.Text> movedOverflow = <dom.Text>[];
+    _normalizePairedProtectedAnchors(sourceRoot, translatedRoot, movedOverflow);
+    return _NormalizedAnchorHtml(
+      html: translatedRoot.outerHtml,
+      root: translatedRoot,
+      movedOverflow: movedOverflow,
+    );
+  }
+
+  static void _normalizePairedProtectedAnchors(
+    dom.Element source,
+    dom.Element translated,
+    List<dom.Text> movedOverflow,
+  ) {
+    if (source.localName != translated.localName ||
+        !_attributesMatch(source, translated)) {
+      return;
+    }
+
+    final String sourceMarker = source.text.trim();
+    if (_isProtectedTextElement(source) &&
+        _isProtectedMarkerText(sourceMarker)) {
+      _normalizeProtectedAnchor(
+        source: source,
+        translated: translated,
+        sourceMarker: sourceMarker,
+        movedOverflow: movedOverflow,
+      );
+      return;
+    }
+
+    final List<dom.Element> sourceChildren = source.children.toList(
+      growable: false,
+    );
+    final List<dom.Element> translatedChildren = translated.children.toList(
+      growable: false,
+    );
+    if (sourceChildren.length != translatedChildren.length) {
+      return;
+    }
+    for (int index = 0; index < sourceChildren.length; index += 1) {
+      _normalizePairedProtectedAnchors(
+        sourceChildren[index],
+        translatedChildren[index],
+        movedOverflow,
+      );
+    }
+  }
+
+  static void _normalizeProtectedAnchor({
+    required dom.Element source,
+    required dom.Element translated,
+    required String sourceMarker,
+    required List<dom.Text> movedOverflow,
+  }) {
+    final dom.Text? markerText = _firstNonWhitespaceTextDescendant(translated);
+    if (markerText == null) {
+      _removeAdjacentMarker(
+        source: source,
+        translated: translated,
+        marker: sourceMarker,
+      );
+      return;
+    }
+
+    final List<int>? markerRange = _markerRangeAtTextStart(
+      markerText.data,
+      sourceMarker,
+    );
+    if (markerRange == null) {
+      return;
+    }
+    final String overflow = markerText.data.substring(markerRange[1]).trim();
+    markerText.data =
+        '${markerText.data.substring(0, markerRange[0])}$sourceMarker';
+    if (overflow.isNotEmpty) {
+      final dom.Text? insertedOverflow = _insertTextAfter(translated, overflow);
+      if (insertedOverflow != null) {
+        movedOverflow.add(insertedOverflow);
+      }
+    }
+  }
+
+  static dom.Text? _firstNonWhitespaceTextDescendant(dom.Node node) {
+    if (node is dom.Text) {
+      return node.data.trim().isEmpty ? null : node;
+    }
+    for (final dom.Node child in node.nodes) {
+      final dom.Text? text = _firstNonWhitespaceTextDescendant(child);
+      if (text != null) {
+        return text;
+      }
+    }
+    return null;
+  }
+
+  static void _removeAdjacentMarker({
+    required dom.Element source,
+    required dom.Element translated,
+    required String marker,
+  }) {
+    final dom.Text? translatedPrevious = _adjacentText(
+      translated,
+      before: true,
+    );
+    final dom.Text? sourcePrevious = _adjacentText(source, before: true);
+    if (translatedPrevious != null &&
+        _markerCountAtTextEnd(translatedPrevious.data, marker) >
+            _markerCountAtTextEnd(sourcePrevious?.data ?? '', marker) &&
+        _removeMarkerAtTextEnd(translatedPrevious, marker)) {
+      return;
+    }
+
+    final dom.Text? translatedNext = _adjacentText(translated, before: false);
+    final dom.Text? sourceNext = _adjacentText(source, before: false);
+    if (translatedNext != null &&
+        _markerCountAtTextStart(translatedNext.data, marker) >
+            _markerCountAtTextStart(sourceNext?.data ?? '', marker)) {
+      _removeMarkerAtTextStart(translatedNext, marker);
+    }
+  }
+
+  static dom.Text? _adjacentText(dom.Element element, {required bool before}) {
+    final dom.Node? parent = element.parentNode;
+    if (parent == null) {
+      return null;
+    }
+    final int index = parent.nodes.indexOf(element);
+    final int adjacentIndex = before ? index - 1 : index + 1;
+    if (index < 0 ||
+        adjacentIndex < 0 ||
+        adjacentIndex >= parent.nodes.length) {
+      return null;
+    }
+    final dom.Node adjacent = parent.nodes[adjacentIndex];
+    return adjacent is dom.Text ? adjacent : null;
+  }
+
+  static int _markerCountAtTextEnd(String value, String marker) {
+    int count = 0;
+    int end = value.length;
+    while (true) {
+      while (end > 0 && value[end - 1].trim().isEmpty) {
+        end -= 1;
+      }
+      final String? matched = _markerFormAtTextEnd(value, end, marker);
+      if (matched == null) {
+        return count;
+      }
+      count += 1;
+      end -= matched.length;
+    }
+  }
+
+  static int _markerCountAtTextStart(String value, String marker) {
+    int count = 0;
+    int start = 0;
+    while (true) {
+      while (start < value.length && value[start].trim().isEmpty) {
+        start += 1;
+      }
+      final String? matched = _markerFormAtTextStart(value, start, marker);
+      if (matched == null) {
+        return count;
+      }
+      count += 1;
+      start += matched.length;
+    }
+  }
+
+  static String? _markerFormAtTextEnd(String value, int end, String marker) {
+    for (final String candidate in _markerFormsByLength(marker)) {
+      final int start = end - candidate.length;
+      if (start >= 0 && value.substring(start, end) == candidate) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  static String? _markerFormAtTextStart(
+    String value,
+    int start,
+    String marker,
+  ) {
+    for (final String candidate in _markerFormsByLength(marker)) {
+      final int end = start + candidate.length;
+      if (end <= value.length && value.substring(start, end) == candidate) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  static List<String> _markerFormsByLength(String marker) {
+    final List<String> forms = _markerForms(marker).toList(growable: false);
+    forms.sort(
+      (String left, String right) => right.length.compareTo(left.length),
+    );
+    return forms;
+  }
+
+  static bool _removeMarkerAtTextEnd(dom.Text textNode, String marker) {
+    final String value = textNode.data;
+    int end = value.length;
+    while (end > 0 && value[end - 1].trim().isEmpty) {
+      end -= 1;
+    }
+    for (final String candidate in _markerForms(marker)) {
+      final int start = end - candidate.length;
+      if (start >= 0 && value.substring(start, end) == candidate) {
+        textNode.data = value.substring(0, start) + value.substring(end);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _removeMarkerAtTextStart(dom.Text textNode, String marker) {
+    final String value = textNode.data;
+    int start = 0;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
+    }
+    for (final String candidate in _markerForms(marker)) {
+      final int end = start + candidate.length;
+      if (end <= value.length && value.substring(start, end) == candidate) {
+        textNode.data = value.substring(0, start) + value.substring(end);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static List<int>? _markerRangeAtTextStart(String value, String marker) {
+    int start = 0;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
+    }
+    for (final String candidate in _markerForms(marker)) {
+      final int end = start + candidate.length;
+      if (end <= value.length && value.substring(start, end) == candidate) {
+        return <int>[start, end];
+      }
+    }
+    return null;
+  }
+
+  static Iterable<String> _markerForms(String marker) sync* {
+    yield marker;
+    for (final String equivalent in _equivalentMarkerForms(marker)) {
+      if (equivalent != marker) {
+        yield equivalent;
+      }
+    }
+  }
+
+  static dom.Text? _insertTextAfter(dom.Element element, String value) {
+    final dom.Node? parent = element.parentNode;
+    if (parent == null) {
+      return null;
+    }
+    final int index = parent.nodes.indexOf(element);
+    if (index < 0) {
+      return null;
+    }
+    final dom.Text inserted = dom.Text(value);
+    parent.nodes.insert(index + 1, inserted);
+    return inserted;
   }
 
   static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) {
@@ -2134,24 +2502,7 @@ class EpubChapterTranslator {
   }
 
   static List<int>? _protectedMarkerRange(String value, String marker) {
-    final List<String> equivalents = _equivalentMarkerForms(marker);
-    if (equivalents.isNotEmpty) {
-      final List<List<int>> equivalentRanges = equivalents
-          .expand((String equivalent) => _allMarkerRanges(value, equivalent))
-          .toList(growable: false);
-      if (equivalentRanges.length == 1) {
-        return equivalentRanges.single;
-      }
-      if (equivalentRanges.length > 1) {
-        return null;
-      }
-    }
-
-    final List<List<int>> exactRanges = _allMarkerRanges(value, marker);
-    if (exactRanges.length == 1) {
-      return exactRanges.single;
-    }
-    if (exactRanges.length > 1) {
+    if (_equivalentMarkerForms(marker).isNotEmpty) {
       return null;
     }
 
@@ -2168,23 +2519,6 @@ class EpubChapterTranslator {
     return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
   }
 
-  static List<List<int>> _allMarkerRanges(String value, String marker) {
-    if (marker.isEmpty) {
-      return const <List<int>>[];
-    }
-    final List<List<int>> ranges = <List<int>>[];
-    int searchStart = 0;
-    while (searchStart < value.length) {
-      final int index = value.indexOf(marker, searchStart);
-      if (index < 0) {
-        break;
-      }
-      ranges.add(<int>[index, index + marker.length]);
-      searchStart = index + marker.length;
-    }
-    return ranges;
-  }
-
   static const Map<String, String> _chineseNumberMarkerToAscii =
       <String, String>{
         '零': '0',
@@ -2198,6 +2532,7 @@ class EpubChapterTranslator {
         '八': '8',
         '九': '9',
         '十': '10',
+        '十一': '11',
       };
 
   static List<String> _equivalentMarkerForms(String marker) {
@@ -2210,7 +2545,7 @@ class EpubChapterTranslator {
     }
 
     final RegExpMatch? asciiNumber = RegExp(
-      r'^(10|[0-9])([.)]?)$',
+      r'^(11|10|[0-9])([.)]?)$',
     ).firstMatch(compact);
     if (asciiNumber != null) {
       for (final MapEntry<String, String> entry
@@ -2222,7 +2557,7 @@ class EpubChapterTranslator {
     }
 
     final RegExpMatch? chineseNumber = RegExp(
-      r'^([零一二三四五六七八九十])([.)]?)$',
+      r'^(十一|[零一二三四五六七八九十])([.)]?)$',
     ).firstMatch(compact);
     if (chineseNumber != null) {
       final String? ascii = _chineseNumberMarkerToAscii[chineseNumber.group(1)];
@@ -2886,6 +3221,18 @@ class EpubChapterTranslator {
         elapsed.inMilliseconds / Duration.millisecondsPerMinute;
     return (blockCount / minutes).toStringAsFixed(1);
   }
+}
+
+class _NormalizedAnchorHtml {
+  const _NormalizedAnchorHtml({
+    required this.html,
+    this.root,
+    this.movedOverflow = const <dom.Text>[],
+  });
+
+  final String html;
+  final dom.Element? root;
+  final List<dom.Text> movedOverflow;
 }
 
 class _HtmlTextSlot {

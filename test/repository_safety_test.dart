@@ -1263,6 +1263,48 @@ void main() {
       expect(locked, isNot(contains('＊')));
     });
 
+    test('removes only the marker adjacent to an empty protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Body＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>正文＊*<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>正文＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+      );
+    });
+
+    test('does not remove a source body symbol beside an empty protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Body＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>正文＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>正文＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+      );
+    });
+
+    test('removes an eleven marker only beside its empty protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Body<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref">11</span></a></p>',
+        translatedHtml:
+            '<p>正文十一<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>正文<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref">11</span></a></p>',
+      );
+    });
+
     test('protects a cross-file footnote anchor by its reference id', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
@@ -1306,6 +1348,48 @@ void main() {
       expect(
         locked,
         isNot(contains('<span class="footnote_num">* 译后引文</span>')),
+      );
+    });
+
+    test('moves overflow prose out of a structurally matching doc-backlink', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        translatedHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+      );
+    });
+
+    test('keeps only prose explicitly moved out of a protected-only anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        translatedHtml:
+            '<p>unexpected<a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+      );
+    });
+
+    test('keeps the inserted overflow instead of an identical outside text', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        translatedHtml:
+            '<p>译后引文<a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
       );
     });
 
