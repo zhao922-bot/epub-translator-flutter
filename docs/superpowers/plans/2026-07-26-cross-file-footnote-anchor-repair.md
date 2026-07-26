@@ -1,147 +1,82 @@
-# 跨文件脚注锚点修复实施计划
+# 跨文件脚注锚点安全架构实施计划
 
-> **面向 AI 工作者：** 执行时使用 `executing-plans`，按任务顺序完成，每步保留测试证据。
+> **面向 AI 工作者：** 按任务顺序执行，每个代码任务使用 TDD，并保留红灯、绿灯和静态分析证据。
 
-**目标：** 防止翻译结果把跨文件脚注标记移出链接，并无 API 修复现有 Communion 译本的正文跳转与脚注回跳。
+**目标：** 模型只翻译源 DOM 中允许翻译的纯文本槽；脚注锚点 HTML 永远不交给模型修改，最终 HTML 结构只来自源 DOM。
 
-**架构：** 在现有 `EpubChapterTranslator` 的 HTML 结构锁中识别 EPUB 的跨文件脚注锚点，并在受保护文本槽失配时改用源 HTML 骨架重建。独立的本地修复脚本从原书取得锚点标记与结构，只修改译后 EPUB 的相关 `<a>` 内容和相邻文本，不调用翻译服务。
+**架构：** 先把单 root 源 HTML 解析为“源 DOM 骨架 + 文档顺序稳定的可翻译 text slots”。受保护脚注锚点的完整子树不进入 slots。模型只接收与返回 slot 纯文本；回填时严格校验 slot 数量，在源 DOM clone 上仅设置 `Text.data`。不再把“模型返回 HTML 后再修复”作为安全边界，也不继续扩展旧 post-hoc anchor lock 的复杂逻辑。
 
-**技术栈：** Dart/Flutter 测试、`package:html` DOM、PowerShell/.NET ZIP 读写（仅一次性本地修复脚本）。
+**技术栈：** Dart、Flutter tests、`package:html` DOM。组件与测试不访问网络或真实翻译 API。
 
 ---
 
-### 任务 1：锁定跨文件脚注锚点的回归用例
+### 任务 1：构建独立的受保护锚点文本槽组件
 
 **文件：**
-- 修改：`test/repository_safety_test.dart`（`strict HTML structure lock` 组）
-- 修改：`lib/features/translation/infrastructure/epub/epub_chapter_translator.dart`
 
-- [ ] **步骤 1：编写两个失败测试**
+- 创建：`lib/features/translation/infrastructure/epub/protected_anchor_text_slots.dart`
+- 创建：`test/protected_anchor_text_slots_test.dart`
+- 修改：本设计文档与计划
 
-```dart
-test('rebuilds a cross-file body footnote marker moved outside its link', () {
-  final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
-    sourceHtml:
-        '<p>Source<a href="chapter-fn.xhtml#note-1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
-    translatedHtml:
-        '<p>译文*<a href="chapter-fn.xhtml#note-1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
-  );
-  expect(locked, '<p>译文<a href="chapter-fn.xhtml#note-1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>');
-});
+- [x] **步骤 1：先写失败测试并确认红灯**
 
-test('rebuilds a doc-backlink whose marker contains citation prose', () {
-  final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
-    sourceHtml:
-        '<p><a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> Citation <i>title</i>.</p>',
-    translatedHtml:
-        '<p><a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a><i></i></p>',
-  );
-  expect(locked, contains('<span class="footnote_num">*</span>'));
-  expect(locked, isNot(contains('<span class="footnote_num">* 译后引文</span>')));
-});
-```
+测试覆盖：
 
-- [ ] **步骤 2：运行测试，确认当前实现失败**
+- 短 marker `a#footnote_ref_*`；
+- token 化的 `role~="doc-backlink"` 与 `role~="doc-noteref"`；
+- `epub:type~="noteref"`；
+- 跨文件链接中的 `footnote_ref` / `footnote_num` marker class；
+- 字母、罗马数字与上标数字等常见短 marker；
+- 普通 prose link 仍是可翻译 slot；
+- slot 顺序、严格数量校验、源边界空格与 marker 原样保留；
+- `<script>`、`<img>`、`<span>` 等输入只能成为转义文本；
+- `script`、`style` 等 raw-text 源子树不进入 slots；
+- 无受保护 anchor 的普通 HTML 仍保留源元素骨架。
 
 运行：
-`E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat test test/repository_safety_test.dart --plain-name "cross-file"`
 
-预期：两个测试因标记仍在链接外或引文仍位于 `doc-backlink` 内而失败。
+`E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat test test/protected_anchor_text_slots_test.dart --reporter expanded`
 
-- [ ] **步骤 3：最小实现保护与失配回退**
+预期红灯原因：组件文件与类型尚不存在，而不是测试语法或环境错误。
 
-在 `_isProtectedTextElement` 中新增锚点判定：
+- [x] **步骤 2：最小实现模板 API**
+
+公开 API：
 
 ```dart
-if (tag == 'a' &&
-    (role == 'doc-backlink' ||
-     element.attributes['id']?.startsWith('footnote_ref_') == true ||
-     _hasFootnoteMarkerClass(element))) {
-  return true;
-}
+final template = ProtectedAnchorTextSlots.parse(sourceHtml);
+final sourceTexts = template.slotTexts;
+final renderedHtml = template.render(translatedSlotTexts);
 ```
 
-将 `_restoreProtectedTexts` 改为可失败的恢复：当源/译文文本槽数量不一致且源存在受保护槽时，返回 `null`；`_lockHtmlStructure` 遇到 `null` 时进入既有源骨架重建路径。这样可把可见 `*` 放回源 `<a>`，而不是接受空锚点。
+`parse` 只接受单 root fragment；`slotTexts` 为只读且按 DOM 顺序稳定；`render` 必须收到完全相同数量的字符串。
 
-- [ ] **步骤 4：运行定向测试，确认通过**
+- [x] **步骤 3：以源 DOM clone 安全回填**
+
+每次 `render` 都重新 clone 源 root，并只把译文赋给未受保护的 `dom.Text.data`。禁止把译文传给 `innerHtml`、`parseFragment` 或属性 API。保留源 slot 的前导与尾随空白，避免内联元素和锚点两侧粘词。
+
+- [x] **步骤 4：运行最终验证并提交相关文件**
 
 运行：
-`E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat test test/repository_safety_test.dart`
-
-预期：结构锁测试全部通过，既有普通外链与脚注正文可翻译用例不回归。
-
-- [ ] **步骤 5：提交代码与测试**
 
 ```powershell
-git add lib/features/translation/infrastructure/epub/epub_chapter_translator.dart test/repository_safety_test.dart
-git commit -m "fix: 保护跨文件脚注锚点"
+E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat test test/protected_anchor_text_slots_test.dart --reporter expanded
+E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat analyze lib/features/translation/infrastructure/epub/protected_anchor_text_slots.dart test/protected_anchor_text_slots_test.dart
+git diff --check
 ```
 
-### 任务 2：无 API 修复现有 Communion 译本
+只暂存本任务的组件、测试和两份文档；不暂存 worktree 中既有的生成文件改动。
 
-**文件：**
-- 创建（忽略、不提交）：`work/repair_communion_footnote_anchors.dart`
-- 输入：`D:\下载\Chrome\Communion Finding My Way Back to Faith (J. D. Vance) (z-library.sk, 1lib.sk, z-lib.sk).epub`
-- 输入：`C:\Books\Communion Finding My Way Back to Faith (J. D. Vance) (z-library.sk, 1lib.sk, z-lib.sk)_translated.epub`
-- 输出：`C:\Books\Communion Finding My Way Back to Faith (J. D. Vance) (z-library.sk, 1lib.sk, z-lib.sk)_translated_anchors-fixed.epub`
+### 任务 2：把翻译管线切换为 slot-only 协议（后续任务）
 
-- [ ] **步骤 1：实现只改变锚点节点的修复脚本**
+当前组件提交不修改 `EpubChapterTranslator`，也不调用真实 API。后续集成必须遵守以下边界：
 
-脚本按 XHTML 路径配对原书与译本；对于源 `a#footnote_ref_*` 和 `a[role="doc-backlink"]`：
+1. 请求只包含 slot ID/顺序与纯文本，不包含源 HTML 或 protected anchor HTML；
+2. 响应只读取对应 slot 的纯文本；
+3. slot 缺失、重复或数量不一致时整块失败，不能退回接受模型 HTML；
+4. 最终 HTML 只通过 `ProtectedAnchorTextSlots.render` 生成；
+5. 旧 structure lock 可作为迁移期兼容代码，但不得成为新路径的正确性依赖。
 
-```dart
-final String marker = sourceAnchor.text.trim();
-final String targetText = targetAnchor.text.trim();
-targetAnchor.innerHtml = sourceAnchor.innerHtml;
-removeTrailingMarkerFromPreviousTextNode(targetAnchor, marker);
-insertOverflowAfterAnchor(targetAnchor, targetText.substring(marker.length));
-```
+### 任务 3：既有损坏译本的无 API 一次性修复（独立任务）
 
-仅在译文锚点为空或包含超过源标记的文本时操作。复制所有其他 ZIP 条目与元数据，保留 `mimetype` 为存储条目；不触发网络请求。
-
-- [ ] **步骤 2：运行脚本并核验输出存在**
-
-运行：
-`dart run work/repair_communion_footnote_anchors.dart`
-
-预期：输出文件存在，脚本报告修复的正文标记数与回跳链接数，不打印 API 配置。
-
-- [ ] **步骤 3：执行归档审计**
-
-使用只读 ZIP 审计脚本验证：
-
-```text
-内部 href#fragment 的目标缺失数：0
-空的 a#footnote_ref_* 数：0
-doc-backlink 中超出源标记的文本数：0
-```
-
-- [ ] **步骤 4：抽样人工复核**
-
-检查 `Chapter_9.xhtml#footnote_ref_1` 与
-`9780063575059_Chapter_18_1-fn.xhtml#footnote_1`：正文 `*` 位于前往脚注的链接内；脚注只有 `*` 为回正文链接，译后引文不在该链接内。
-
-### 任务 3：完整回归验证
-
-**文件：**
-- 修改：无（仅验证）
-
-- [ ] **步骤 1：运行完整测试**
-
-运行：
-`E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat test --reporter compact`
-
-预期：所有常规测试通过；仅既有的环境保护 live tests 跳过。
-
-- [ ] **步骤 2：运行静态分析与差异检查**
-
-运行：
-`E:\flutter_windows_3.44.0-stable\flutter\bin\flutter.bat analyze lib test`
-
-运行：`git diff --check`
-
-预期：静态分析无问题，差异无空白错误。
-
-- [ ] **步骤 3：报告结果**
-
-报告软件提交、修复 EPUB 的绝对路径、修复计数、归档审计结果及测试结果；明确说明未调用 API。
+既有 Communion 译本可继续由只读源 EPUB 驱动的本地脚本修复并执行 ZIP 审计。该脚本不属于在线翻译架构，不调用翻译服务，也不能替代任务 2 的 slot-only 集成。
