@@ -197,6 +197,28 @@ void main() {
       );
     });
 
+    for (final MapEntry<String, String> semantic in <String, String>{
+      'epub footnotes': 'epub:type="footnotes"',
+      'epub endnotes': 'epub:type="endnotes"',
+      'role footnotes': 'role="doc-footnotes"',
+      'role endnotes': 'role="doc-endnotes"',
+      'role token list': 'role="doc-footnotes note"',
+    }.entries) {
+      test('accepts collection-level ${semantic.key} semantics', () {
+        final InspectedChapter chapter = _chapter(
+          path: 'text/chapter-10.xhtml',
+          title: 'Notes',
+          originalHtml:
+              '<html><body><section ${semantic.value}>Notes.</section></body></html>',
+        );
+
+        expect(
+          FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+          isTrue,
+        );
+      });
+    }
+
     test('keeps an oversized individual footnote in its own batch', () {
       final List<FootnoteTranslationBatch> batches = planner.plan(
         chapters: <InspectedChapter>[

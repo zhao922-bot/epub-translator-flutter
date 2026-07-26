@@ -115,11 +115,24 @@ class FootnoteBatchPlanner {
           .split(RegExp(r'\s+'))
           .where((String value) => value.isNotEmpty)
           .toSet();
-      if (epubTypes.contains('footnote') || epubTypes.contains('endnote')) {
+      if (epubTypes.any(
+        const <String>{'footnote', 'endnote', 'footnotes', 'endnotes'}.contains,
+      )) {
         return true;
       }
-      final String role = element.attributes['role']?.toLowerCase() ?? '';
-      if (role == 'doc-footnote' || role == 'doc-endnote') {
+      final Set<String> roles = (element.attributes['role'] ?? '')
+          .toLowerCase()
+          .split(RegExp(r'\s+'))
+          .where((String value) => value.isNotEmpty)
+          .toSet();
+      if (roles.any(
+        const <String>{
+          'doc-footnote',
+          'doc-endnote',
+          'doc-footnotes',
+          'doc-endnotes',
+        }.contains,
+      )) {
         return true;
       }
     }

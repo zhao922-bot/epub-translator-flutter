@@ -696,6 +696,9 @@ class EpubChapterTranslator {
         initialBookMemoryAttempted = true;
         throwIfCancelled();
         try {
+          final bool hasInitialMemorySources = _initialMemorySourceChapters(
+            chapters,
+          ).isNotEmpty;
           final Stopwatch memoryStopwatch = Stopwatch()..start();
           final _BookMemory initialMemory = await _generateInitialBookMemory(
             dio: dio,
@@ -710,8 +713,10 @@ class EpubChapterTranslator {
                   styleProfileConfirmed: true,
                 );
           memoryStopwatch.stop();
-          totalMemoryElapsed += memoryStopwatch.elapsed;
-          memoryRequestCount += 1;
+          if (hasInitialMemorySources) {
+            totalMemoryElapsed += memoryStopwatch.elapsed;
+            memoryRequestCount += 1;
+          }
           if (initialMemory.isEmpty &&
               (userStyleProfile == null || userStyleProfile.isEmpty)) {
             emit(
@@ -968,7 +973,6 @@ class EpubChapterTranslator {
               cachedBlocks: cachedBlocks,
               resumedBlocks: resumedBlocks,
             );
-            await saveResumeState(currentJob, force: true);
           }
           cacheStopwatch.stop();
           totalCacheWriteElapsed += cacheStopwatch.elapsed;
@@ -1008,9 +1012,13 @@ class EpubChapterTranslator {
               batch,
             );
             await persistTranslations(batch.references, translated);
+            await saveResumeState(currentJob, force: true);
           } catch (error) {
             if (error is! DioException ||
                 !TranslationApiClient.shouldFallbackBatchDioException(error)) {
+              rethrow;
+            }
+            if (batch.references.length <= 1) {
               rethrow;
             }
             for (final FootnoteBlockReference reference in batch.references) {
@@ -1024,6 +1032,7 @@ class EpubChapterTranslator {
                 reference,
               ], translated);
             }
+            await saveResumeState(currentJob, force: true);
           }
           batchStopwatch.stop();
           footnoteBatchCount += 1;

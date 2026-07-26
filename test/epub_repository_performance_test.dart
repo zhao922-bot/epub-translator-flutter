@@ -2,8 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
+import 'package:dio/dio.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -156,17 +159,27 @@ void main() {
         inspection.chapters.map((chapter) => chapter.blocks.single.id),
         <String>['p-1', 'p-1', 'p-1'],
       );
+      final List<String> progressLogs = <String>[];
       final firstRun = await repository.translateChapters(
         inputPath: epubFile.path,
         outputDirectory: temp.path,
         config: config,
         chapters: inspection.chapters,
+        onProgress: (_, String logLine) => progressLogs.add(logLine),
       );
 
       expect(
         server.totalRequests,
         1,
         reason: 'A pure footnote run must not request initial book memory.',
+      );
+      expect(
+        progressLogs.any(
+          (String logLine) =>
+              RegExp(r'book memory .* across 0 requests').hasMatch(logLine),
+        ),
+        isTrue,
+        reason: 'No-op memory preparation must not increment request metrics.',
       );
       expect(server.blockRequestIds, <List<String>>[
         <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
@@ -269,6 +282,69 @@ void main() {
     },
   );
 
+  test('persists one recoverable checkpoint after a footnote batch', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_repository_footnote_checkpoint_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final _FootnoteFakeServer server = await _FootnoteFakeServer.start();
+    addTearDown(server.close);
+    final _RecordingCheckpointCacheStore cacheStore =
+        _RecordingCheckpointCacheStore();
+
+    final File epubFile = File('${temp.path}/footnote_checkpoint.epub');
+    await _writeTestEpub(
+      epubFile,
+      chapters: const <String, String>{
+        'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
+        'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
+        'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+      },
+    );
+    final TranslationConfig config = TranslationConfig.defaults().copyWith(
+      apiBaseUrl: 'http://127.0.0.1:${server.port}',
+      apiKey: 'sk-test',
+      model: 'footnote-checkpoint-model-${server.port}',
+      targetLanguage: 'Chinese',
+      chunkSize: 5000,
+      maxRetries: 1,
+    );
+    final EpubTranslationRepository repository = EpubTranslationRepository(
+      cacheStore: cacheStore,
+    );
+    final inspection = await repository.startJob(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+    );
+
+    await repository.translateChapters(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+      chapters: inspection.chapters,
+    );
+
+    expect(
+      cacheStore.savedStates.where(
+        (JobResumeState state) =>
+            state.completedBlocks > 0 && state.completedBlocks < 3,
+      ),
+      isEmpty,
+      reason:
+          'A multi-block batch should not force one job-state flush per block.',
+    );
+    expect(
+      cacheStore.savedStates.any(
+        (JobResumeState state) =>
+            state.status == 'running' && state.completedBlocks == 3,
+      ),
+      isTrue,
+      reason: 'The completed batch must be recoverable before EPUB repacking.',
+    );
+  });
+
   test('413 fallback keeps every global footnote request id unique', () async {
     final Directory temp = await Directory.systemTemp.createTemp(
       'epub_repository_footnote_413_test_',
@@ -279,6 +355,8 @@ void main() {
       rejectMultiBlockWith413: true,
     );
     addTearDown(server.close);
+    final _RecordingCheckpointCacheStore cacheStore =
+        _RecordingCheckpointCacheStore();
 
     final File epubFile = File('${temp.path}/footnotes_413.epub');
     await _writeTestEpub(
@@ -297,7 +375,9 @@ void main() {
       chunkSize: 5000,
       maxRetries: 1,
     );
-    final EpubTranslationRepository repository = EpubTranslationRepository();
+    final EpubTranslationRepository repository = EpubTranslationRepository(
+      cacheStore: cacheStore,
+    );
     final inspection = await repository.startJob(
       inputPath: epubFile.path,
       outputDirectory: temp.path,
@@ -321,7 +401,83 @@ void main() {
       server.blockRequestIds.skip(1).expand((List<String> ids) => ids),
       <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
     );
+    expect(
+      cacheStore.savedStates.where(
+        (JobResumeState state) =>
+            state.completedBlocks > 0 && state.completedBlocks < 3,
+      ),
+      isEmpty,
+      reason: '413 fallback must checkpoint once after the planned batch.',
+    );
   });
+
+  test(
+    'single oversized footnote preserves 413 without resending it',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_single_footnote_413_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start(
+        rejectAllBlocksWith413: true,
+      );
+      addTearDown(server.close);
+
+      final File epubFile = File('${temp.path}/single_footnote_413.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/01-fn.xhtml': '<p>One oversized footnote.</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'single-footnote-413-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 1,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      await expectLater(
+        repository.translateChapters(
+          inputPath: epubFile.path,
+          outputDirectory: temp.path,
+          config: config,
+          chapters: inspection.chapters,
+        ),
+        throwsA(
+          isA<DioException>().having(
+            (DioException error) => error.response?.statusCode,
+            'statusCode',
+            HttpStatus.requestEntityTooLarge,
+          ),
+        ),
+      );
+
+      expect(server.totalRequests, 1);
+      expect(server.blockRequestIds, <List<String>>[
+        <String>['f0:p-1'],
+      ]);
+    },
+  );
+}
+
+class _RecordingCheckpointCacheStore extends TranslationCacheStore {
+  final List<JobResumeState> savedStates = <JobResumeState>[];
+
+  @override
+  Future<void> saveJobState(JobResumeState state) async {
+    savedStates.add(state);
+    await super.saveJobState(state);
+  }
 }
 
 class _FootnoteFakeServer {
@@ -330,12 +486,14 @@ class _FootnoteFakeServer {
     required this.reverseResponses,
     required this.rejectMultiBlockWith413,
     required this.duplicateMultiResponseId,
+    required this.rejectAllBlocksWith413,
   });
 
   final HttpServer _server;
   final bool reverseResponses;
   final bool rejectMultiBlockWith413;
   final bool duplicateMultiResponseId;
+  final bool rejectAllBlocksWith413;
   final List<List<String>> blockRequestIds = <List<String>>[];
   int totalRequests = 0;
 
@@ -345,6 +503,7 @@ class _FootnoteFakeServer {
     bool reverseResponses = false,
     bool rejectMultiBlockWith413 = false,
     bool duplicateMultiResponseId = false,
+    bool rejectAllBlocksWith413 = false,
   }) async {
     final HttpServer httpServer = await HttpServer.bind(
       InternetAddress.loopbackIPv4,
@@ -355,6 +514,7 @@ class _FootnoteFakeServer {
       reverseResponses: reverseResponses,
       rejectMultiBlockWith413: rejectMultiBlockWith413,
       duplicateMultiResponseId: duplicateMultiResponseId,
+      rejectAllBlocksWith413: rejectAllBlocksWith413,
     );
     httpServer.listen(server._handle);
     return server;
@@ -402,7 +562,8 @@ class _FootnoteFakeServer {
         .map((Map<String, dynamic> block) => block['id'] as String)
         .toList();
     blockRequestIds.add(ids);
-    if (rejectMultiBlockWith413 && blocks.length > 1) {
+    if (rejectAllBlocksWith413 ||
+        (rejectMultiBlockWith413 && blocks.length > 1)) {
       request.response.statusCode = HttpStatus.requestEntityTooLarge;
       request.response.headers.contentType = ContentType.json;
       request.response.write(
