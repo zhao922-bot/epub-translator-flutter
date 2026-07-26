@@ -1,0 +1,142 @@
+import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  const FootnoteBatchPlanner planner = FootnoteBatchPlanner();
+
+  group('FootnoteBatchPlanner', () {
+    test('does not include ordinary body chapters', () {
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: <InspectedChapter>[
+          _chapter(path: 'text/chapter-01.xhtml', title: 'Chapter 1'),
+          _chapter(path: 'text/chapter-01-fn.xhtml', title: 'Notes'),
+        ],
+        pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+          0: <ExtractedBlock>[_block('p-1')],
+          1: <ExtractedBlock>[_block('p-1')],
+        },
+        chunkSize: 500,
+      );
+
+      expect(batches, hasLength(1));
+      expect(
+        batches.single.references.map(
+          (FootnoteBlockReference item) => item.requestId,
+        ),
+        <String>['f1:p-1'],
+      );
+    });
+
+    test(
+      'assigns globally unique request ids to duplicate footnote block ids',
+      () {
+        final List<FootnoteTranslationBatch> batches = planner.plan(
+          chapters: <InspectedChapter>[
+            _chapter(path: 'notes/ch01-fn.xhtml', title: 'Notes'),
+            _chapter(path: 'notes/ch02-fn.xhtml', title: 'Notes'),
+          ],
+          pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+            0: <ExtractedBlock>[_block('p-1')],
+            1: <ExtractedBlock>[_block('p-1')],
+          },
+          chunkSize: 500,
+        );
+
+        final List<FootnoteBlockReference> references =
+            batches.single.references;
+        expect(
+          references.map((FootnoteBlockReference item) => item.requestId),
+          <String>['f0:p-1', 'f1:p-1'],
+        );
+        expect(references[0].chapter.path, 'notes/ch01-fn.xhtml');
+        expect(references[1].chapter.path, 'notes/ch02-fn.xhtml');
+        expect(batches.single.context.chapterTitle, '跨文件脚注');
+      },
+    );
+
+    test('splits batches using the existing block budget', () {
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: <InspectedChapter>[
+          _chapter(path: 'notes/ch01-fn.xhtml', title: 'Notes'),
+          _chapter(path: 'notes/ch02-fn.xhtml', title: 'Notes'),
+        ],
+        pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+          0: <ExtractedBlock>[_block('p-1', textLength: 150)],
+          1: <ExtractedBlock>[_block('p-1', textLength: 150)],
+        },
+        chunkSize: 400,
+      );
+
+      expect(batches, hasLength(2));
+      expect(batches[0].references.single.requestId, 'f0:p-1');
+      expect(batches[1].references.single.requestId, 'f1:p-1');
+    });
+
+    test('limits a cross-file footnote batch to twelve references', () {
+      final List<InspectedChapter> chapters = List<InspectedChapter>.generate(
+        13,
+        (int index) => _chapter(path: 'notes/$index-fn.xhtml', title: 'Notes'),
+      );
+      final Map<int, List<ExtractedBlock>> pending =
+          <int, List<ExtractedBlock>>{
+            for (int index = 0; index < 13; index += 1)
+              index: <ExtractedBlock>[_block('p-1')],
+          };
+
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: chapters,
+        pendingBlocksByChapter: pending,
+        chunkSize: 5000,
+      );
+
+      expect(
+        batches.map(
+          (FootnoteTranslationBatch batch) => batch.references.length,
+        ),
+        <int>[12, 1],
+      );
+    });
+
+    test('keeps an oversized individual footnote in its own batch', () {
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: <InspectedChapter>[
+          _chapter(path: 'notes/ch01-fn.xhtml', title: 'Notes'),
+          _chapter(path: 'notes/ch02-fn.xhtml', title: 'Notes'),
+        ],
+        pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+          0: <ExtractedBlock>[_block('p-1', textLength: 1000)],
+          1: <ExtractedBlock>[_block('p-1')],
+        },
+        chunkSize: 300,
+      );
+
+      expect(batches, hasLength(2));
+      expect(batches[0].references.single.requestId, 'f0:p-1');
+      expect(batches[1].references.single.requestId, 'f1:p-1');
+    });
+  });
+}
+
+InspectedChapter _chapter({required String path, required String title}) {
+  return InspectedChapter(
+    path: path,
+    title: title,
+    body: '',
+    originalHtml: '<html><body></body></html>',
+    blocks: const <ExtractedBlock>[],
+    category: ChapterCategory.content,
+    recommendedForTranslation: true,
+    includeInTranslation: true,
+  );
+}
+
+ExtractedBlock _block(String id, {int textLength = 20}) {
+  final String text = List<String>.filled(textLength, 'a').join();
+  return ExtractedBlock(
+    id: id,
+    tagName: 'p',
+    sourceHtml: '<p>$text</p>',
+    sourceText: text,
+  );
+}
