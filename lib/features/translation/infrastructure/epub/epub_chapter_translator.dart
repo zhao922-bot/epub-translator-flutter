@@ -20,6 +20,7 @@ import '../../domain/repositories/translation_repository.dart';
 import '../translation_cache_store.dart';
 import '../translation_quality.dart';
 import 'epub_repacker.dart';
+import 'footnote_batch_planner.dart';
 import 'translation_api_client.dart';
 import 'translation_batch_planner.dart';
 
@@ -33,15 +34,19 @@ class EpubChapterTranslator {
     EpubRepacker? repacker,
     TranslationApiClient? apiClient,
     TranslationBatchPlanner? batchPlanner,
+    FootnoteBatchPlanner? footnoteBatchPlanner,
   }) : _cacheStore = cacheStore ?? TranslationCacheStore(),
        _repacker = repacker ?? EpubRepacker(),
        _apiClient = apiClient ?? const TranslationApiClient(),
-       _batchPlanner = batchPlanner ?? const TranslationBatchPlanner();
+       _batchPlanner = batchPlanner ?? const TranslationBatchPlanner(),
+       _footnoteBatchPlanner =
+           footnoteBatchPlanner ?? const FootnoteBatchPlanner();
 
   final TranslationCacheStore _cacheStore;
   final EpubRepacker _repacker;
   final TranslationApiClient _apiClient;
   final TranslationBatchPlanner _batchPlanner;
+  final FootnoteBatchPlanner _footnoteBatchPlanner;
 
   static const String _cacheSchemaVersion = 'v9-cjk-inline-typography';
   static const int _initialMemoryFrontMatterLimit = 2;
@@ -169,6 +174,26 @@ class EpubChapterTranslator {
           chapterTitle: chapterTitle,
           before: _batchPlanner.contextSnippets(contextBefore),
           after: _batchPlanner.contextSnippets(contextAfter),
+          bookMemory: bookMemory,
+        ),
+      ),
+      retryDelayOverride: Duration.zero,
+    );
+  }
+
+  Future<Map<String, String>> translateFootnoteBatchForTest({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<FootnoteBlockReference> references,
+    Map<String, Object?>? bookMemory,
+  }) {
+    return _translateFootnoteBatch(
+      dio: dio,
+      config: config,
+      batch: FootnoteTranslationBatch(
+        references,
+        context: TranslationBatchContext(
+          chapterTitle: 'Cross-file footnotes',
           bookMemory: bookMemory,
         ),
       ),
@@ -584,6 +609,8 @@ class EpubChapterTranslator {
       int apiTranslatedBlocks = 0;
       int cacheWriteCount = 0;
       int memoryRequestCount = 0;
+      int footnoteBatchCount = 0;
+      int footnoteRequestCount = 0;
       DateTime lastResumeSaveAt = DateTime.now();
       int blocksSinceResumeSave = 0;
 
@@ -705,6 +732,9 @@ class EpubChapterTranslator {
         initialBookMemoryAttempted = true;
         throwIfCancelled();
         try {
+          final bool hasInitialMemorySources = _initialMemorySourceChapters(
+            chapters,
+          ).isNotEmpty;
           final Stopwatch memoryStopwatch = Stopwatch()..start();
           final _BookMemory initialMemory = await _generateInitialBookMemory(
             dio: dio,
@@ -719,8 +749,10 @@ class EpubChapterTranslator {
                   styleProfileConfirmed: true,
                 );
           memoryStopwatch.stop();
-          totalMemoryElapsed += memoryStopwatch.elapsed;
-          memoryRequestCount += 1;
+          if (hasInitialMemorySources) {
+            totalMemoryElapsed += memoryStopwatch.elapsed;
+            memoryRequestCount += 1;
+          }
           if (initialMemory.isEmpty &&
               (userStyleProfile == null || userStyleProfile.isEmpty)) {
             emit(
@@ -824,6 +856,273 @@ class EpubChapterTranslator {
       int cachedBlocks = 0;
       int resumedBlocks = 0;
       final bool resumingFromCheckpoint = previousState != null;
+
+      Future<int> translateFootnoteRun(int startChapterIndex) async {
+        int endChapterIndex = startChapterIndex;
+        while (endChapterIndex + 1 < selectedChapters.length &&
+            FootnoteBatchPlanner.isStandaloneFootnoteChapter(
+              selectedChapters[endChapterIndex + 1],
+            )) {
+          endChapterIndex += 1;
+        }
+
+        final Map<int, Map<String, ExtractedBlock>> translatedByChapterIndex =
+            <int, Map<String, ExtractedBlock>>{};
+        final Map<int, List<ExtractedBlock>> pendingBlocksByChapter =
+            <int, List<ExtractedBlock>>{};
+        int runCacheHits = 0;
+
+        for (
+          int chapterIndex = startChapterIndex;
+          chapterIndex <= endChapterIndex;
+          chapterIndex += 1
+        ) {
+          throwIfCancelled();
+          final InspectedChapter chapter = selectedChapters[chapterIndex];
+          emit(
+            currentJob.copyWith(
+              currentChapter: chapter.title,
+              currentBlock: null,
+              completedFiles: completedFiles,
+              completedBlocks: completedBlocks,
+            ),
+            'Translating chapter ${chapterIndex + 1}/${selectedChapters.length}: ${chapter.title}',
+          );
+          final Map<String, ExtractedBlock> translatedById =
+              <String, ExtractedBlock>{};
+          final List<ExtractedBlock> pendingBlocks = <ExtractedBlock>[];
+          int chapterCacheHits = 0;
+          for (final ExtractedBlock block in chapter.blocks) {
+            throwIfCancelled();
+            final String cacheKey = _blockCacheKey(
+              config,
+              block,
+              chapterPath: chapter.path,
+              confirmedStyleProfile: userStyleProfile,
+            );
+            final String? cachedTranslation = await _cacheStore
+                .getBlockTranslation(cacheKey);
+            if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
+              pendingBlocks.add(block);
+              continue;
+            }
+            translatedById[block.id] = block.copyWith(
+              translatedHtml: cachedTranslation,
+            );
+            chapterCacheHits += 1;
+            runCacheHits += 1;
+            cachedBlocks += 1;
+            if (resumingFromCheckpoint) {
+              resumedBlocks += 1;
+            }
+            completedBlocks += 1;
+          }
+          translatedByChapterIndex[chapterIndex] = translatedById;
+          pendingBlocksByChapter[chapterIndex] = pendingBlocks;
+          chapterPendingCache[chapterIndex] = pendingBlocks.isNotEmpty;
+
+          if (chapterCacheHits > 0) {
+            final TranslationJob cachedJob = currentJob.copyWith(
+              progress: completedBlocks / totalBlocks,
+              currentChapter: chapter.title,
+              currentBlock: null,
+              completedFiles: completedFiles,
+              totalFiles: selectedChapters.length,
+              completedBlocks: completedBlocks,
+              totalBlocks: totalBlocks,
+              cachedBlocks: cachedBlocks,
+              resumedBlocks: resumedBlocks,
+            );
+            emit(
+              cachedJob,
+              'Reused $chapterCacheHits cached blocks for ${chapter.title}.',
+            );
+            blocksSinceResumeSave += chapterCacheHits;
+            await saveResumeState(cachedJob);
+          }
+        }
+
+        final int pendingCount = pendingBlocksByChapter.values.fold<int>(
+          0,
+          (int sum, List<ExtractedBlock> blocks) => sum + blocks.length,
+        );
+        if (pendingCount > 0) {
+          await ensureInitialBookMemory();
+          throwIfCancelled();
+        }
+        final List<FootnoteTranslationBatch> batches = _footnoteBatchPlanner
+            .plan(
+              chapters: selectedChapters,
+              pendingBlocksByChapter: pendingBlocksByChapter,
+              chunkSize: config.chunkSize,
+              bookMemory: bookMemory?.toJson(),
+            );
+        emit(
+          currentJob.copyWith(
+            currentChapter: selectedChapters[startChapterIndex].title,
+            completedFiles: completedFiles,
+            completedBlocks: completedBlocks,
+          ),
+          'Prepared ${batches.length} cross-file footnote batches for $pendingCount blocks across ${endChapterIndex - startChapterIndex + 1} files${runCacheHits == 0 ? '' : ' after $runCacheHits cache hits'}.',
+        );
+
+        Future<void> persistTranslations(
+          List<FootnoteBlockReference> references,
+          Map<String, String> translatedByRequestId,
+        ) async {
+          final Stopwatch cacheStopwatch = Stopwatch()..start();
+          for (final FootnoteBlockReference reference in references) {
+            throwIfCancelled();
+            final String? translated =
+                translatedByRequestId[reference.requestId];
+            if (translated == null || translated.isEmpty) {
+              throw FormatException(
+                'Translated footnote ${reference.requestId} is missing before cache write.',
+              );
+            }
+            await _cacheStore.putBlockTranslation(
+              _blockCacheKey(
+                config,
+                reference.block,
+                chapterPath: reference.chapter.path,
+                confirmedStyleProfile: userStyleProfile,
+              ),
+              translated,
+            );
+            translatedByChapterIndex[reference.chapterIndex]![reference
+                .block
+                .id] = reference.block.copyWith(
+              translatedHtml: translated,
+            );
+            completedBlocks += 1;
+            apiTranslatedBlocks += 1;
+            cacheWriteCount += 1;
+            blocksSinceResumeSave += 1;
+            currentJob = currentJob.copyWith(
+              progress: completedBlocks / totalBlocks,
+              currentChapter: reference.chapter.title,
+              currentBlock: _linePreview(reference.block.sourceText),
+              completedFiles: completedFiles,
+              totalFiles: selectedChapters.length,
+              completedBlocks: completedBlocks,
+              totalBlocks: totalBlocks,
+              cachedBlocks: cachedBlocks,
+              resumedBlocks: resumedBlocks,
+            );
+          }
+          cacheStopwatch.stop();
+          totalCacheWriteElapsed += cacheStopwatch.elapsed;
+        }
+
+        for (int batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+          throwIfCancelled();
+          final FootnoteTranslationBatch batch = batches[batchIndex];
+          final Stopwatch batchStopwatch = Stopwatch()..start();
+          Duration batchApiElapsed = Duration.zero;
+          int requestCount = 0;
+
+          Future<Map<String, String>> sendFootnoteRequest(
+            FootnoteTranslationBatch requestBatch,
+          ) async {
+            final Stopwatch requestStopwatch = Stopwatch()..start();
+            try {
+              return await _translateFootnoteBatch(
+                dio: dio,
+                config: config,
+                batch: requestBatch,
+                cancelToken: cancelToken,
+                onRequestAttempt: () {
+                  requestCount += 1;
+                  footnoteRequestCount += 1;
+                },
+              );
+            } finally {
+              requestStopwatch.stop();
+              batchApiElapsed += requestStopwatch.elapsed;
+              totalApiElapsed += requestStopwatch.elapsed;
+            }
+          }
+
+          try {
+            final Map<String, String> translated = await sendFootnoteRequest(
+              batch,
+            );
+            await persistTranslations(batch.references, translated);
+            await saveResumeState(currentJob, force: true);
+          } catch (error) {
+            if (error is! DioException ||
+                !TranslationApiClient.shouldFallbackBatchDioException(error)) {
+              rethrow;
+            }
+            if (batch.references.length <= 1) {
+              rethrow;
+            }
+            for (final FootnoteBlockReference reference in batch.references) {
+              throwIfCancelled();
+              final Map<String, String> translated = await sendFootnoteRequest(
+                FootnoteTranslationBatch(<FootnoteBlockReference>[
+                  reference,
+                ], context: batch.context),
+              );
+              await persistTranslations(<FootnoteBlockReference>[
+                reference,
+              ], translated);
+            }
+            await saveResumeState(currentJob, force: true);
+          }
+          batchStopwatch.stop();
+          footnoteBatchCount += 1;
+          emit(
+            currentJob,
+            'Performance: footnote batch ${batchIndex + 1}/${batches.length} (${batch.references.length} blocks, $requestCount API ${requestCount == 1 ? 'request' : 'requests'}) took ${_formatDuration(batchStopwatch.elapsed)}; API time ${_formatDuration(batchApiElapsed)}.',
+          );
+          emit(
+            currentJob,
+            'Translated $completedBlocks/$totalBlocks blocks after cross-file footnote batch ${batchIndex + 1}/${batches.length}.',
+          );
+        }
+
+        for (
+          int chapterIndex = startChapterIndex;
+          chapterIndex <= endChapterIndex;
+          chapterIndex += 1
+        ) {
+          throwIfCancelled();
+          final InspectedChapter chapter = selectedChapters[chapterIndex];
+          final Map<String, ExtractedBlock> translatedById =
+              translatedByChapterIndex[chapterIndex]!;
+          final List<ExtractedBlock> translatedBlocks = chapter.blocks
+              .map((ExtractedBlock block) => translatedById[block.id] ?? block)
+              .toList();
+          updatedByPath[chapter.path] = chapter.copyWith(
+            blocks: translatedBlocks,
+            body: _previewBodyFromBlocks(
+              translatedBlocks,
+              fallback: chapter.body,
+            ),
+          );
+          chapterPendingCache[chapterIndex] = false;
+          completedFiles += 1;
+          final TranslationJob chapterDoneJob = currentJob.copyWith(
+            progress: completedBlocks / totalBlocks,
+            currentChapter: chapter.title,
+            currentBlock: null,
+            completedFiles: completedFiles,
+            totalFiles: selectedChapters.length,
+            completedBlocks: completedBlocks,
+            totalBlocks: totalBlocks,
+            cachedBlocks: cachedBlocks,
+            resumedBlocks: resumedBlocks,
+          );
+          emit(
+            chapterDoneJob,
+            'Completed chapter $completedFiles/${selectedChapters.length}: ${chapter.title}',
+          );
+          await saveResumeState(chapterDoneJob, force: true);
+        }
+        return endChapterIndex;
+      }
+
       try {
         for (
           int chapterIndex = 0;
@@ -832,6 +1131,10 @@ class EpubChapterTranslator {
         ) {
           throwIfCancelled();
           final InspectedChapter chapter = selectedChapters[chapterIndex];
+          if (FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter)) {
+            chapterIndex = await translateFootnoteRun(chapterIndex);
+            continue;
+          }
           final Stopwatch chapterStopwatch = Stopwatch()..start();
           Duration chapterApiElapsed = Duration.zero;
           Duration chapterCacheWriteElapsed = Duration.zero;
@@ -1177,7 +1480,7 @@ class EpubChapterTranslator {
       );
       emit(
         completedJob,
-        'Performance: Translation run took ${_formatDuration(translationStopwatch.elapsed)}. Translated $apiTranslatedBlocks new blocks at ${_formatBlocksPerMinute(apiTranslatedBlocks, translationStopwatch.elapsed)} blocks/min on average, excluding cache and resume hits. Total API time ${_formatDuration(totalApiElapsed)}; book memory ${_formatDuration(totalMemoryElapsed)} across $memoryRequestCount requests; block cache writes ${_formatDuration(totalCacheWriteElapsed)} across $cacheWriteCount writes.',
+        'Performance: Translation run took ${_formatDuration(translationStopwatch.elapsed)}. Translated $apiTranslatedBlocks new blocks at ${_formatBlocksPerMinute(apiTranslatedBlocks, translationStopwatch.elapsed)} blocks/min on average, excluding cache and resume hits. Total API time ${_formatDuration(totalApiElapsed)}; book memory ${_formatDuration(totalMemoryElapsed)} across $memoryRequestCount requests; block cache writes ${_formatDuration(totalCacheWriteElapsed)} across $cacheWriteCount writes.${footnoteBatchCount == 0 ? '' : ' Cross-file footnotes used $footnoteBatchCount batches across $footnoteRequestCount API requests.'}',
       );
       await _cacheStore.saveJobState(
         _resumeStateFromJob(
@@ -1384,7 +1687,11 @@ class EpubChapterTranslator {
     List<InspectedChapter> chapters,
   ) {
     final List<InspectedChapter> eligibleChapters = chapters
-        .where((InspectedChapter chapter) => chapter.includeInTranslation)
+        .where(
+          (InspectedChapter chapter) =>
+              chapter.includeInTranslation &&
+              !FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
+        )
         .toList(growable: false);
     final List<InspectedChapter> selected = <InspectedChapter>[];
 
@@ -1807,6 +2114,134 @@ class EpubChapterTranslator {
       return null;
     }
     return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
+  }
+
+  Future<Map<String, String>> _translateFootnoteBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required FootnoteTranslationBatch batch,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final Set<String> requestedIds = batch.references
+        .map((FootnoteBlockReference reference) => reference.requestId)
+        .toSet();
+    if (requestedIds.length != batch.references.length) {
+      throw const FormatException(
+        'Cross-file footnote request ids must be unique.',
+      );
+    }
+    final Map<String, dynamic> payloadMap = <String, dynamic>{
+      if (!batch.context.isEmpty) 'context': batch.context.toJson(),
+      'blocks': batch.references
+          .map(
+            (FootnoteBlockReference reference) => <String, String>{
+              'id': reference.requestId,
+              'html': reference.block.sourceHtml,
+            },
+          )
+          .toList(),
+    };
+    final String payload = jsonEncode(payloadMap);
+
+    return _apiClient.runRetried<Map<String, String>>(
+      config: config,
+      retryDelayOverride: retryDelayOverride,
+      shouldRetry: TranslationApiClient.shouldRetryBatchError,
+      cancelToken: cancelToken,
+      operation: () async {
+        if (cancelToken?.isCancelled ?? false) {
+          throw const TranslationCancelledException();
+        }
+        final TranslationStyleProfile batchStyleProfile =
+            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+        final bool batchStyleConfirmed =
+            _styleProfileConfirmedFromBookMemoryJson(batch.context.bookMemory);
+        final Map<String, dynamic> requestData = <String, dynamic>{
+          'model': config.model,
+          'temperature': 0.2,
+          'messages': <Map<String, String>>[
+            <String, String>{
+              'role': 'system',
+              'content':
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+            },
+            <String, String>{'role': 'user', 'content': payload},
+          ],
+        };
+        onRequestAttempt?.call();
+        final Response<dynamic> response = await _apiClient.postChatCompletions(
+          dio: dio,
+          data: requestData,
+          cancelToken: cancelToken,
+        );
+        final String parsedContent = _apiClient.extractMessageContent(
+          response.data,
+        );
+        final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
+          parsedContent,
+        );
+        final Object? rawBlocks = jsonPayload['blocks'];
+        if (rawBlocks is! List<dynamic> ||
+            rawBlocks.length != batch.references.length) {
+          throw const FormatException(
+            'Translated footnote batch length does not match request length.',
+          );
+        }
+
+        final Map<String, String> rawTranslatedById = <String, String>{};
+        for (final Object? item in rawBlocks) {
+          if (item is! Map<String, dynamic>) {
+            throw const FormatException(
+              'Translated footnote batch item is not a JSON object.',
+            );
+          }
+          final Object? rawId = item['id'];
+          final Object? rawHtml = item['html'];
+          if (rawId is! String ||
+              rawId.isEmpty ||
+              rawHtml is! String ||
+              rawHtml.trim().isEmpty) {
+            throw const FormatException(
+              'Translated footnote batch item is missing id or html.',
+            );
+          }
+          if (!requestedIds.contains(rawId)) {
+            throw FormatException(
+              'Translated footnote batch contains unknown id $rawId.',
+            );
+          }
+          if (rawTranslatedById.containsKey(rawId)) {
+            throw FormatException(
+              'Translated footnote batch contains duplicate id $rawId.',
+            );
+          }
+          rawTranslatedById[rawId] = rawHtml.trim();
+        }
+
+        final Map<String, String> translatedById = <String, String>{};
+        for (final FootnoteBlockReference reference in batch.references) {
+          final String? translated = rawTranslatedById[reference.requestId];
+          if (translated == null) {
+            throw FormatException(
+              'Translated footnote ${reference.requestId} is missing from the batch response.',
+            );
+          }
+          final String locked = _lockTranslatedHtmlStructure(
+            reference.block,
+            translated,
+          );
+          _validateTranslatedBlockQuality(
+            config: config,
+            block: reference.block,
+            translatedHtml: locked,
+          );
+          translatedById[reference.requestId] = locked;
+        }
+        return translatedById;
+      },
+    );
   }
 
   Future<List<String>> _translateBlockBatch({
