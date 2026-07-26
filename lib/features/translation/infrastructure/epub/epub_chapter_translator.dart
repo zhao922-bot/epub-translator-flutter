@@ -48,7 +48,8 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion = 'v10-footnote-anchor-lock';
+  static const String _cacheSchemaVersion =
+      'v11-conservative-footnote-anchor-lock';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -1842,32 +1843,8 @@ class EpubChapterTranslator {
       return rebuiltRoot.outerHtml;
     }
 
-    final List<String> protectedTexts = sourceSlots
-        .where((_HtmlTextSlot slot) => slot.protected)
-        .map((_HtmlTextSlot slot) => slot.text.trim())
-        .where((String text) => text.isNotEmpty)
-        .toList(growable: false);
     final String translatedPlainText = _plainTextFromHtmlFragment(
       trimmedTranslation,
-    );
-    final List<_HtmlTextSlot> translatableSourceSlots = sourceSlots
-        .where((_HtmlTextSlot slot) => !slot.protected)
-        .toList(growable: false);
-    final List<String>? splitText = _splitAroundProtectedMarkers(
-      translatedPlainText,
-      protectedTexts,
-    );
-    if (splitText != null &&
-        splitText.length == translatableSourceSlots.length) {
-      for (int index = 0; index < translatableSourceSlots.length; index += 1) {
-        translatableSourceSlots[index].text = splitText[index];
-      }
-      return rebuiltRoot.outerHtml;
-    }
-
-    final String plainTranslation = _removeProtectedMarkers(
-      translatedPlainText,
-      protectedTexts,
     );
     bool wroteMainText = false;
     for (final _HtmlTextSlot slot in sourceSlots) {
@@ -1875,7 +1852,7 @@ class EpubChapterTranslator {
         continue;
       }
       if (!wroteMainText) {
-        slot.text = plainTranslation;
+        slot.text = translatedPlainText;
         wroteMainText = true;
       } else {
         slot.text = '';
@@ -1912,13 +1889,17 @@ class EpubChapterTranslator {
     required String sourceHtml,
     required String translatedHtml,
     required dom.Element? normalizedRoot,
-    required List<dom.Text> movedOverflow,
+    required List<dom.Node> movedOverflow,
   }) {
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
     if (sourceRoot == null ||
         normalizedRoot == null ||
         movedOverflow.isEmpty ||
-        !_elementSkeletonMatches(sourceRoot, normalizedRoot)) {
+        !_elementSkeletonMatches(
+          sourceRoot,
+          normalizedRoot,
+          ignoredTranslatedNodes: movedOverflow,
+        )) {
       return null;
     }
     final dom.Element translatedRoot = normalizedRoot;
@@ -1946,7 +1927,7 @@ class EpubChapterTranslator {
       if (slot.protected) {
         continue;
       }
-      if (!movedOverflow.contains(slot.node)) {
+      if (!_isDescendantOfMovedOverflow(slot.node, movedOverflow)) {
         slot.text = '';
       }
     }
@@ -1955,8 +1936,9 @@ class EpubChapterTranslator {
 
   static bool _elementSkeletonMatches(
     dom.Element source,
-    dom.Element translated,
-  ) {
+    dom.Element translated, {
+    Iterable<dom.Node> ignoredTranslatedNodes = const <dom.Node>[],
+  }) {
     if (source.localName != translated.localName ||
         !_attributesMatch(source, translated)) {
       return false;
@@ -1965,8 +1947,8 @@ class EpubChapterTranslator {
       growable: false,
     );
     final List<dom.Element> translatedChildren = translated.children.toList(
-      growable: false,
-    );
+      growable: true,
+    )..removeWhere(ignoredTranslatedNodes.contains);
     if (sourceChildren.length != translatedChildren.length) {
       return false;
     }
@@ -1974,11 +1956,28 @@ class EpubChapterTranslator {
       if (!_elementSkeletonMatches(
         sourceChildren[index],
         translatedChildren[index],
+        ignoredTranslatedNodes: ignoredTranslatedNodes,
       )) {
         return false;
       }
     }
     return true;
+  }
+
+  static bool _isDescendantOfMovedOverflow(
+    dom.Node node,
+    Iterable<dom.Node> movedOverflow,
+  ) {
+    for (
+      dom.Node? current = node;
+      current != null;
+      current = current.parentNode
+    ) {
+      if (movedOverflow.contains(current)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
@@ -1990,7 +1989,7 @@ class EpubChapterTranslator {
     if (sourceRoot == null || translatedRoot == null) {
       return _NormalizedAnchorHtml(html: translatedHtml);
     }
-    final List<dom.Text> movedOverflow = <dom.Text>[];
+    final List<dom.Node> movedOverflow = <dom.Node>[];
     _normalizePairedProtectedAnchors(sourceRoot, translatedRoot, movedOverflow);
     return _NormalizedAnchorHtml(
       html: translatedRoot.outerHtml,
@@ -2002,7 +2001,7 @@ class EpubChapterTranslator {
   static void _normalizePairedProtectedAnchors(
     dom.Element source,
     dom.Element translated,
-    List<dom.Text> movedOverflow,
+    List<dom.Node> movedOverflow,
   ) {
     if (source.localName != translated.localName ||
         !_attributesMatch(source, translated)) {
@@ -2043,7 +2042,7 @@ class EpubChapterTranslator {
     required dom.Element source,
     required dom.Element translated,
     required String sourceMarker,
-    required List<dom.Text> movedOverflow,
+    required List<dom.Node> movedOverflow,
   }) {
     final dom.Text? markerText = _firstNonWhitespaceTextDescendant(translated);
     if (markerText == null) {
@@ -2062,14 +2061,57 @@ class EpubChapterTranslator {
     if (markerRange == null) {
       return;
     }
-    final String overflow = markerText.data.substring(markerRange[1]).trim();
-    markerText.data =
-        '${markerText.data.substring(0, markerRange[0])}$sourceMarker';
-    if (overflow.isNotEmpty) {
-      final dom.Text? insertedOverflow = _insertTextAfter(translated, overflow);
-      if (insertedOverflow != null) {
-        movedOverflow.add(insertedOverflow);
+    final List<dom.Node> overflow = _overflowNodesAfterMarker(
+      anchor: translated,
+      markerText: markerText,
+      markerEnd: markerRange[1],
+    );
+    final dom.Node? parent = translated.parentNode;
+    if (parent == null) {
+      return;
+    }
+    final int anchorIndex = parent.nodes.indexOf(translated);
+    if (anchorIndex < 0) {
+      return;
+    }
+    final dom.Element restoredAnchor = source.clone(true);
+    parent.nodes.removeAt(anchorIndex);
+    parent.nodes.insert(anchorIndex, restoredAnchor);
+    for (int index = 0; index < overflow.length; index += 1) {
+      parent.nodes.insert(anchorIndex + index + 1, overflow[index]);
+    }
+    movedOverflow.addAll(overflow);
+  }
+
+  static List<dom.Node> _overflowNodesAfterMarker({
+    required dom.Element anchor,
+    required dom.Text markerText,
+    required int markerEnd,
+  }) {
+    final List<dom.Node> overflow = <dom.Node>[];
+    final String trailingText = markerText.data.substring(markerEnd).trim();
+    if (trailingText.isNotEmpty) {
+      overflow.add(dom.Text(trailingText));
+    }
+
+    dom.Node branch = markerText;
+    while (true) {
+      final dom.Node? parent = branch.parentNode;
+      if (parent == null) {
+        return overflow;
       }
+      final int index = parent.nodes.indexOf(branch);
+      for (
+        int siblingIndex = index + 1;
+        siblingIndex < parent.nodes.length;
+        siblingIndex += 1
+      ) {
+        overflow.add(parent.nodes[siblingIndex].clone(true));
+      }
+      if (parent == anchor) {
+        return overflow;
+      }
+      branch = parent;
     }
   }
 
@@ -2097,8 +2139,8 @@ class EpubChapterTranslator {
     );
     final dom.Text? sourcePrevious = _adjacentText(source, before: true);
     if (translatedPrevious != null &&
-        _markerCountAtTextEnd(translatedPrevious.data, marker) >
-            _markerCountAtTextEnd(sourcePrevious?.data ?? '', marker) &&
+        !_textEndsWithMarker(sourcePrevious?.data ?? '', marker) &&
+        _textEndsWithMarker(translatedPrevious.data, marker) &&
         _removeMarkerAtTextEnd(translatedPrevious, marker)) {
       return;
     }
@@ -2106,8 +2148,8 @@ class EpubChapterTranslator {
     final dom.Text? translatedNext = _adjacentText(translated, before: false);
     final dom.Text? sourceNext = _adjacentText(source, before: false);
     if (translatedNext != null &&
-        _markerCountAtTextStart(translatedNext.data, marker) >
-            _markerCountAtTextStart(sourceNext?.data ?? '', marker)) {
+        !_textStartsWithMarker(sourceNext?.data ?? '', marker) &&
+        _textStartsWithMarker(translatedNext.data, marker)) {
       _removeMarkerAtTextStart(translatedNext, marker);
     }
   }
@@ -2128,68 +2170,22 @@ class EpubChapterTranslator {
     return adjacent is dom.Text ? adjacent : null;
   }
 
-  static int _markerCountAtTextEnd(String value, String marker) {
-    int count = 0;
+  static bool _textEndsWithMarker(String value, String marker) {
     int end = value.length;
-    while (true) {
-      while (end > 0 && value[end - 1].trim().isEmpty) {
-        end -= 1;
-      }
-      final String? matched = _markerFormAtTextEnd(value, end, marker);
-      if (matched == null) {
-        return count;
-      }
-      count += 1;
-      end -= matched.length;
+    while (end > 0 && value[end - 1].trim().isEmpty) {
+      end -= 1;
     }
+    final int start = end - marker.length;
+    return start >= 0 && value.substring(start, end) == marker;
   }
 
-  static int _markerCountAtTextStart(String value, String marker) {
-    int count = 0;
+  static bool _textStartsWithMarker(String value, String marker) {
     int start = 0;
-    while (true) {
-      while (start < value.length && value[start].trim().isEmpty) {
-        start += 1;
-      }
-      final String? matched = _markerFormAtTextStart(value, start, marker);
-      if (matched == null) {
-        return count;
-      }
-      count += 1;
-      start += matched.length;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
     }
-  }
-
-  static String? _markerFormAtTextEnd(String value, int end, String marker) {
-    for (final String candidate in _markerFormsByLength(marker)) {
-      final int start = end - candidate.length;
-      if (start >= 0 && value.substring(start, end) == candidate) {
-        return candidate;
-      }
-    }
-    return null;
-  }
-
-  static String? _markerFormAtTextStart(
-    String value,
-    int start,
-    String marker,
-  ) {
-    for (final String candidate in _markerFormsByLength(marker)) {
-      final int end = start + candidate.length;
-      if (end <= value.length && value.substring(start, end) == candidate) {
-        return candidate;
-      }
-    }
-    return null;
-  }
-
-  static List<String> _markerFormsByLength(String marker) {
-    final List<String> forms = _markerForms(marker).toList(growable: false);
-    forms.sort(
-      (String left, String right) => right.length.compareTo(left.length),
-    );
-    return forms;
+    final int end = start + marker.length;
+    return end <= value.length && value.substring(start, end) == marker;
   }
 
   static bool _removeMarkerAtTextEnd(dom.Text textNode, String marker) {
@@ -2198,12 +2194,10 @@ class EpubChapterTranslator {
     while (end > 0 && value[end - 1].trim().isEmpty) {
       end -= 1;
     }
-    for (final String candidate in _markerForms(marker)) {
-      final int start = end - candidate.length;
-      if (start >= 0 && value.substring(start, end) == candidate) {
-        textNode.data = value.substring(0, start) + value.substring(end);
-        return true;
-      }
+    final int start = end - marker.length;
+    if (start >= 0 && value.substring(start, end) == marker) {
+      textNode.data = value.substring(0, start) + value.substring(end);
+      return true;
     }
     return false;
   }
@@ -2214,12 +2208,10 @@ class EpubChapterTranslator {
     while (start < value.length && value[start].trim().isEmpty) {
       start += 1;
     }
-    for (final String candidate in _markerForms(marker)) {
-      final int end = start + candidate.length;
-      if (end <= value.length && value.substring(start, end) == candidate) {
-        textNode.data = value.substring(0, start) + value.substring(end);
-        return true;
-      }
+    final int end = start + marker.length;
+    if (end <= value.length && value.substring(start, end) == marker) {
+      textNode.data = value.substring(0, start) + value.substring(end);
+      return true;
     }
     return false;
   }
@@ -2229,36 +2221,11 @@ class EpubChapterTranslator {
     while (start < value.length && value[start].trim().isEmpty) {
       start += 1;
     }
-    for (final String candidate in _markerForms(marker)) {
-      final int end = start + candidate.length;
-      if (end <= value.length && value.substring(start, end) == candidate) {
-        return <int>[start, end];
-      }
+    final int end = start + marker.length;
+    if (end <= value.length && value.substring(start, end) == marker) {
+      return <int>[start, end];
     }
     return null;
-  }
-
-  static Iterable<String> _markerForms(String marker) sync* {
-    yield marker;
-    for (final String equivalent in _equivalentMarkerForms(marker)) {
-      if (equivalent != marker) {
-        yield equivalent;
-      }
-    }
-  }
-
-  static dom.Text? _insertTextAfter(dom.Element element, String value) {
-    final dom.Node? parent = element.parentNode;
-    if (parent == null) {
-      return null;
-    }
-    final int index = parent.nodes.indexOf(element);
-    if (index < 0) {
-      return null;
-    }
-    final dom.Text inserted = dom.Text(value);
-    parent.nodes.insert(index + 1, inserted);
-    return inserted;
   }
 
   static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) {
@@ -2456,69 +2423,6 @@ class EpubChapterTranslator {
         compact == '↩';
   }
 
-  static List<String>? _splitAroundProtectedMarkers(
-    String value,
-    List<String> protectedTexts,
-  ) {
-    if (protectedTexts.isEmpty) {
-      return null;
-    }
-
-    String remaining = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    final List<String> parts = <String>[];
-    for (final String marker in protectedTexts) {
-      if (marker.isEmpty) {
-        continue;
-      }
-      final List<int>? markerRange = _protectedMarkerRange(remaining, marker);
-      if (markerRange == null) {
-        return null;
-      }
-      parts.add(remaining.substring(0, markerRange[0]));
-      remaining = remaining.substring(markerRange[1]);
-    }
-    parts.add(remaining);
-    return parts;
-  }
-
-  static String _removeProtectedMarkers(
-    String value,
-    Iterable<String> protectedTexts,
-  ) {
-    String result = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    for (final String marker in protectedTexts) {
-      if (marker.isEmpty) {
-        continue;
-      }
-      final List<int>? markerRange = _protectedMarkerRange(result, marker);
-      if (markerRange == null) {
-        continue;
-      }
-      result =
-          result.substring(0, markerRange[0]) +
-          result.substring(markerRange[1]);
-    }
-    return result.replaceAll(RegExp(r'\s+'), ' ').trim();
-  }
-
-  static List<int>? _protectedMarkerRange(String value, String marker) {
-    if (_equivalentMarkerForms(marker).isNotEmpty) {
-      return null;
-    }
-
-    if (!RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(marker)) {
-      return null;
-    }
-    final RegExpMatch? translatedMarkerMatch = RegExp(
-      r'[\[\(（【][^\]\)）】]{1,10}[\]\)）】]',
-    ).firstMatch(value);
-    if (translatedMarkerMatch == null ||
-        !_isProtectedMarkerText(translatedMarkerMatch.group(0)!)) {
-      return null;
-    }
-    return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
-  }
-
   static const Map<String, String> _chineseNumberMarkerToAscii =
       <String, String>{
         '零': '0',
@@ -2534,39 +2438,6 @@ class EpubChapterTranslator {
         '十': '10',
         '十一': '11',
       };
-
-  static List<String> _equivalentMarkerForms(String marker) {
-    final String compact = marker.replaceAll(RegExp(r'\s+'), '');
-    if (compact == '*') {
-      return const <String>['＊'];
-    }
-    if (compact == '＊') {
-      return const <String>['*'];
-    }
-
-    final RegExpMatch? asciiNumber = RegExp(
-      r'^(11|10|[0-9])([.)]?)$',
-    ).firstMatch(compact);
-    if (asciiNumber != null) {
-      for (final MapEntry<String, String> entry
-          in _chineseNumberMarkerToAscii.entries) {
-        if (entry.value == asciiNumber.group(1)) {
-          return <String>['${entry.key}${asciiNumber.group(2)!}'];
-        }
-      }
-    }
-
-    final RegExpMatch? chineseNumber = RegExp(
-      r'^(十一|[零一二三四五六七八九十])([.)]?)$',
-    ).firstMatch(compact);
-    if (chineseNumber != null) {
-      final String? ascii = _chineseNumberMarkerToAscii[chineseNumber.group(1)];
-      if (ascii != null) {
-        return <String>['$ascii${chineseNumber.group(2)!}'];
-      }
-    }
-    return const <String>[];
-  }
 
   Future<Map<String, String>> _translateFootnoteBatch({
     required Dio dio,
@@ -3227,12 +3098,12 @@ class _NormalizedAnchorHtml {
   const _NormalizedAnchorHtml({
     required this.html,
     this.root,
-    this.movedOverflow = const <dom.Text>[],
+    this.movedOverflow = const <dom.Node>[],
   });
 
   final String html;
   final dom.Element? root;
-  final List<dom.Text> movedOverflow;
+  final List<dom.Node> movedOverflow;
 }
 
 class _HtmlTextSlot {

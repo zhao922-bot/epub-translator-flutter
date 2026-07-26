@@ -477,38 +477,60 @@ void main() {
       expect(withGlossary, hasLength(64));
     });
 
-    test('block cache key invalidates v9 footnote structure results', () {
-      final TranslationConfig config = TranslationConfig.defaults().copyWith(
-        apiBaseUrl: 'https://api.example.test',
-        model: 'example-model',
-        targetLanguage: 'Chinese',
-      );
-      final String currentKey = EpubChapterTranslator.blockCacheKeyForTest(
-        config: config,
-        block: block,
-        chapterPath: 'chapter-1.xhtml',
-      );
-      final String v9Key = sha256
-          .convert(
-            utf8.encode(
-              <Object>[
-                'v9-cjk-inline-typography',
-                'https://api.example.test/v1',
-                config.model.trim(),
-                config.targetLanguage.trim(),
-                config.lockedGlossary.trim(),
-                config.residualQualityCheck,
-                config.styleProfileEnabled,
-                'none',
-                'chapter-1.xhtml',
-                block.sourceHtml,
-              ].join('|'),
-            ),
-          )
-          .toString();
+    test(
+      'block cache key invalidates v9 and v10 footnote structure results',
+      () {
+        final TranslationConfig config = TranslationConfig.defaults().copyWith(
+          apiBaseUrl: 'https://api.example.test',
+          model: 'example-model',
+          targetLanguage: 'Chinese',
+        );
+        final String currentKey = EpubChapterTranslator.blockCacheKeyForTest(
+          config: config,
+          block: block,
+          chapterPath: 'chapter-1.xhtml',
+        );
+        final String v9Key = sha256
+            .convert(
+              utf8.encode(
+                <Object>[
+                  'v9-cjk-inline-typography',
+                  'https://api.example.test/v1',
+                  config.model.trim(),
+                  config.targetLanguage.trim(),
+                  config.lockedGlossary.trim(),
+                  config.residualQualityCheck,
+                  config.styleProfileEnabled,
+                  'none',
+                  'chapter-1.xhtml',
+                  block.sourceHtml,
+                ].join('|'),
+              ),
+            )
+            .toString();
+        final String v10Key = sha256
+            .convert(
+              utf8.encode(
+                <Object>[
+                  'v10-footnote-anchor-lock',
+                  'https://api.example.test/v1',
+                  config.model.trim(),
+                  config.targetLanguage.trim(),
+                  config.lockedGlossary.trim(),
+                  config.residualQualityCheck,
+                  config.styleProfileEnabled,
+                  'none',
+                  'chapter-1.xhtml',
+                  block.sourceHtml,
+                ].join('|'),
+              ),
+            )
+            .toString();
 
-      expect(currentKey, isNot(equals(v9Key)));
-    });
+        expect(currentKey, isNot(equals(v9Key)));
+        expect(currentKey, isNot(equals(v10Key)));
+      },
+    );
 
     test('job key changes when lockedGlossary changes', () {
       final TranslationConfig base = TranslationConfig.defaults().copyWith(
@@ -763,7 +785,7 @@ void main() {
       expect(translated.keys, <String>['f0:p-1', 'f1:p-1']);
       expect(translated, <String, String>{
         'f0:p-1':
-            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>＊ 译后引文</p>',
         'f1:p-1': '<p>第二条脚注。</p>',
       });
     });
@@ -1200,7 +1222,7 @@ void main() {
       expect(locked, contains('href="#note-1"'));
       expect(locked, contains('id="ref-1"'));
       expect(locked, contains('<a href="#note-1" id="ref-1">[1]</a>'));
-      expect(locked, '<p>参见<a href="#note-1" id="ref-1">[1]</a>。</p>');
+      expect(locked, '<p>参见[1]。<a href="#note-1" id="ref-1">[1]</a></p>');
     });
 
     test('restores a cross-file body marker moved outside its anchor', () {
@@ -1218,7 +1240,7 @@ void main() {
       expect('*'.allMatches(locked), hasLength(1));
     });
 
-    test('removes a fullwidth star moved out of a protected anchor', () {
+    test('keeps a fullwidth star beside an empty protected anchor', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
@@ -1228,12 +1250,11 @@ void main() {
 
       expect(
         locked,
-        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        '<p>译文＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
       );
-      expect(locked, isNot(contains('＊')));
     });
 
-    test('removes a Chinese numeral moved out of a protected anchor', () {
+    test('keeps a Chinese numeral beside an empty protected anchor', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">1</span></a></p>',
@@ -1243,12 +1264,11 @@ void main() {
 
       expect(
         locked,
-        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">1</span></a></p>',
+        '<p>译文一<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">1</span></a></p>',
       );
-      expect(locked, isNot(contains('译文一')));
     });
 
-    test('preserves body symbols while removing a unique moved marker variant', () {
+    test('keeps nonliteral marker variants beside an empty protected anchor', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p>Body *<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
@@ -1258,9 +1278,8 @@ void main() {
 
       expect(
         locked,
-        '<p>正文*<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        '<p>正文*＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
       );
-      expect(locked, isNot(contains('＊')));
     });
 
     test('removes only the marker adjacent to an empty protected anchor', () {
@@ -1291,7 +1310,7 @@ void main() {
       );
     });
 
-    test('removes an eleven marker only beside its empty protected anchor', () {
+    test('keeps an eleven marker variant beside its empty protected anchor', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
             '<p>Body<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref">11</span></a></p>',
@@ -1301,7 +1320,35 @@ void main() {
 
       expect(
         locked,
-        '<p>正文<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref">11</span></a></p>',
+        '<p>正文十一<a href="chapter-fn.xhtml#footnote_11" id="footnote_ref_11"><span class="footnote_ref">11</span></a></p>',
+      );
+    });
+
+    test('keeps Chinese body text beside an empty numeric anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>First<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">1</a></p>',
+        translatedHtml:
+            '<p>第一<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>第一<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">1</a></p>',
+      );
+    });
+
+    test('keeps bracketed body prose beside an empty bracketed anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Body [important]<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">[1]</a></p>',
+        translatedHtml:
+            '<p>正文[重要]<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>正文[重要]<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1">[1]</a></p>',
       );
     });
 
@@ -1362,6 +1409,20 @@ void main() {
       expect(
         locked,
         '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a>译后引文</p>',
+      );
+    });
+
+    test('moves every nested overflow node out of a protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        translatedHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span><i>译后</i><span>引文</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a><i>译后</i><span>引文</span></p>',
       );
     });
 
@@ -1477,14 +1538,18 @@ void main() {
       expect(locked, '<p>参见<a href="#note-1" id="ref-1">[1]</a>。</p>');
     });
 
-    test('uses translated-looking markers only to place original anchors', () {
-      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
-        sourceHtml: '<p>See <a href="#note-1" id="ref-1">[1]</a>.</p>',
-        translatedHtml: '<p>参见[一]。</p>',
-      );
+    test(
+      'keeps translated-looking body text when rebuilding original anchors',
+      () {
+        final String locked =
+            EpubTranslationRepository.lockHtmlStructureForTest(
+              sourceHtml: '<p>See <a href="#note-1" id="ref-1">[1]</a>.</p>',
+              translatedHtml: '<p>参见[一]。</p>',
+            );
 
-      expect(locked, '<p>参见<a href="#note-1" id="ref-1">[1]</a>。</p>');
-    });
+        expect(locked, '<p>参见[一]。<a href="#note-1" id="ref-1">[1]</a></p>');
+      },
+    );
 
     test('restores protected marker text when rebuilding same text slots', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
