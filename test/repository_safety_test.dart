@@ -701,7 +701,7 @@ void main() {
         <String, Object?>{
           'id': 'f0:p-1',
           'html':
-              '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">* 译后引文</span></a></p>',
+              '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">＊ 译后引文</span></a></p>',
         },
       ]);
       final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
@@ -1184,6 +1184,36 @@ void main() {
       expect('*'.allMatches(locked), hasLength(1));
     });
 
+    test('removes a fullwidth star moved out of a protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+        translatedHtml:
+            '<p>译文＊<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">*</span></a></p>',
+      );
+      expect(locked, isNot(contains('＊')));
+    });
+
+    test('removes a Chinese numeral moved out of a protected anchor', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p>Source<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">1</span></a></p>',
+        translatedHtml:
+            '<p>译文一<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref"></span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p>译文<a href="chapter-fn.xhtml#footnote_1" id="footnote_ref_1"><span class="footnote_ref">1</span></a></p>',
+      );
+      expect(locked, isNot(contains('译文一')));
+    });
+
     test('protects a cross-file footnote anchor by its reference id', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
         sourceHtml:
@@ -1243,6 +1273,51 @@ void main() {
         '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">*</a></p>',
       );
     });
+
+    test('keeps prose-bearing doc-backlinks translatable', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">Back to text</a></p>',
+        translatedHtml:
+            '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">返回正文</a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="Chapter.xhtml#footnote_ref_1" role="doc-backlink">返回正文</a></p>',
+      );
+    });
+
+    test('keeps prose-bearing class-marked cross-file links translatable', () {
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml:
+            '<p><a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref">See note</span></a></p>',
+        translatedHtml:
+            '<p><a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref">参见注释</span></a></p>',
+      );
+
+      expect(
+        locked,
+        '<p><a href="chapter-fn.xhtml#footnote_1"><span class="footnote_ref">参见注释</span></a></p>',
+      );
+    });
+
+    for (final String role in <String>[' doc-backlink ', 'link doc-backlink']) {
+      test('protects a marker when role tokens include doc-backlink: $role', () {
+        final String
+        locked = EpubTranslationRepository.lockHtmlStructureForTest(
+          sourceHtml:
+              '<p>Source<a href="Chapter.xhtml#footnote_ref_1" role="$role">*</a></p>',
+          translatedHtml:
+              '<p>译文*<a href="Chapter.xhtml#footnote_ref_1" role="$role"></a></p>',
+        );
+
+        expect(
+          locked,
+          '<p>译文<a href="Chapter.xhtml#footnote_ref_1" role="$role">*</a></p>',
+        );
+      });
+    }
 
     test('restores protected footnote marker text when structure matches', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(

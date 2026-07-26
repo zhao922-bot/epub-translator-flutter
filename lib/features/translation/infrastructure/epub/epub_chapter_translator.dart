@@ -2009,27 +2009,31 @@ class EpubChapterTranslator {
 
   static bool _isProtectedTextElement(dom.Element element) {
     final String tag = element.localName ?? '';
-    final String role = element.attributes['role']?.toLowerCase() ?? '';
+    final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
 
-    if (role == 'doc-noteref' || epubTypes.contains('noteref')) {
+    if (roles.contains('doc-noteref') || epubTypes.contains('noteref')) {
       return true;
     }
-    if (role == 'doc-pagebreak' || epubTypes.contains('pagebreak')) {
+    if (roles.contains('doc-pagebreak') || epubTypes.contains('pagebreak')) {
       return _isProtectedPagebreakText(element.text);
     }
     final String href = element.attributes['href'] ?? '';
     if (tag != 'a') {
       return false;
     }
+    final bool protectedMarkerText = _isProtectedMarkerText(element.text);
     final String id = element.attributes['id']?.toLowerCase() ?? '';
-    if (role == 'doc-backlink' || id.startsWith('footnote_ref_')) {
+    if (protectedMarkerText &&
+        (roles.contains('doc-backlink') || id.startsWith('footnote_ref_'))) {
       return true;
     }
-    if (_isCrossFileHref(href) && _containsFootnoteMarkerClass(element)) {
+    if (protectedMarkerText &&
+        _isCrossFileHref(href) &&
+        _containsFootnoteMarkerClass(element)) {
       return true;
     }
-    return href.startsWith('#') && _isProtectedMarkerText(element.text);
+    return href.startsWith('#') && protectedMarkerText;
   }
 
   static bool _isCrossFileHref(String href) {
@@ -2052,6 +2056,13 @@ class EpubChapterTranslator {
         .toSet();
   }
 
+  static Set<String> _roleTokens(dom.Element element) {
+    return (element.attributes['role']?.toLowerCase() ?? '')
+        .split(RegExp(r'\s+'))
+        .where((String role) => role.isNotEmpty)
+        .toSet();
+  }
+
   static bool _isProtectedPagebreakText(String value) {
     final String compact = value.replaceAll(RegExp(r'\s+'), '');
     if (compact.isEmpty || compact.length > 12) {
@@ -2066,6 +2077,9 @@ class EpubChapterTranslator {
     final String compact = value.replaceAll(RegExp(r'\s+'), '');
     if (compact.isEmpty || compact.length > 10) {
       return false;
+    }
+    if (compact == '＊' || _chineseNumberMarkerToAscii.containsKey(compact)) {
+      return true;
     }
     return RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
         RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
@@ -2124,6 +2138,13 @@ class EpubChapterTranslator {
       return <int>[exactIndex, exactIndex + marker.length];
     }
 
+    for (final String equivalent in _equivalentMarkerForms(marker)) {
+      final int equivalentIndex = value.indexOf(equivalent);
+      if (equivalentIndex >= 0) {
+        return <int>[equivalentIndex, equivalentIndex + equivalent.length];
+      }
+    }
+
     if (!RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(marker)) {
       return null;
     }
@@ -2135,6 +2156,54 @@ class EpubChapterTranslator {
       return null;
     }
     return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
+  }
+
+  static const Map<String, String> _chineseNumberMarkerToAscii =
+      <String, String>{
+        '零': '0',
+        '一': '1',
+        '二': '2',
+        '三': '3',
+        '四': '4',
+        '五': '5',
+        '六': '6',
+        '七': '7',
+        '八': '8',
+        '九': '9',
+        '十': '10',
+      };
+
+  static List<String> _equivalentMarkerForms(String marker) {
+    final String compact = marker.replaceAll(RegExp(r'\s+'), '');
+    if (compact == '*') {
+      return const <String>['＊'];
+    }
+    if (compact == '＊') {
+      return const <String>['*'];
+    }
+
+    final RegExpMatch? asciiNumber = RegExp(
+      r'^(10|[0-9])([.)]?)$',
+    ).firstMatch(compact);
+    if (asciiNumber != null) {
+      for (final MapEntry<String, String> entry
+          in _chineseNumberMarkerToAscii.entries) {
+        if (entry.value == asciiNumber.group(1)) {
+          return <String>['${entry.key}${asciiNumber.group(2)!}'];
+        }
+      }
+    }
+
+    final RegExpMatch? chineseNumber = RegExp(
+      r'^([零一二三四五六七八九十])([.)]?)$',
+    ).firstMatch(compact);
+    if (chineseNumber != null) {
+      final String? ascii = _chineseNumberMarkerToAscii[chineseNumber.group(1)];
+      if (ascii != null) {
+        return <String>['$ascii${chineseNumber.group(2)!}'];
+      }
+    }
+    return const <String>[];
   }
 
   Future<Map<String, String>> _translateFootnoteBatch({
