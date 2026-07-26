@@ -36,6 +36,11 @@ class FootnoteBatchPlanner {
     ) {
       final InspectedChapter chapter = chapters[chapterIndex];
       if (!isStandaloneFootnoteChapter(chapter)) {
+        if (current.isNotEmpty) {
+          batches.add(_createBatch(current, bookMemory: bookMemory));
+          current = <FootnoteBlockReference>[];
+          currentBudget = 0;
+        }
         continue;
       }
 

@@ -90,6 +90,26 @@ void main() {
       },
     );
 
+    test('does not batch footnotes across an intervening body chapter', () {
+      final List<FootnoteTranslationBatch> batches = planner.plan(
+        chapters: <InspectedChapter>[
+          _chapter(path: 'notes/ch01-fn.xhtml', title: 'Notes'),
+          _chapter(path: 'text/chapter-01.xhtml', title: 'Chapter 1'),
+          _chapter(path: 'notes/ch02-fn.xhtml', title: 'Notes'),
+        ],
+        pendingBlocksByChapter: <int, List<ExtractedBlock>>{
+          0: <ExtractedBlock>[_block('p-1')],
+          1: <ExtractedBlock>[_block('p-1')],
+          2: <ExtractedBlock>[_block('p-1')],
+        },
+        chunkSize: 500,
+      );
+
+      expect(batches, hasLength(2));
+      expect(batches[0].references.single.requestId, 'f0:p-1');
+      expect(batches[1].references.single.requestId, 'f2:p-1');
+    });
+
     test('splits batches using the existing block budget', () {
       final List<FootnoteTranslationBatch> batches = planner.plan(
         chapters: <InspectedChapter>[
