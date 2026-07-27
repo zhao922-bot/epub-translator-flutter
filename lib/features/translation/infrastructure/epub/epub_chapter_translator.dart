@@ -3305,6 +3305,9 @@ class EpubChapterTranslator {
         .querySelectorAll('span[class]')
         .toList(growable: false);
     for (final dom.Element span in spans) {
+      if (_isInsideFootnoteMarkerAnchor(span)) {
+        continue;
+      }
       final bool isDropCap = span.classes.any(
         (String className) => className.toLowerCase().startsWith('dropcap'),
       );
@@ -3318,6 +3321,17 @@ class EpubChapterTranslator {
       changed = true;
     }
     return changed ? fragment.outerHtml : sourceHtml;
+  }
+
+  static bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
+    dom.Node? current = element;
+    while (current is dom.Element) {
+      if (current.localName == 'a' && _containsFootnoteMarkerClass(current)) {
+        return true;
+      }
+      current = current.parentNode;
+    }
+    return false;
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {

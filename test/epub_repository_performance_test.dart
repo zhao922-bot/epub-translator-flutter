@@ -233,9 +233,9 @@ void main() {
         epubFile,
         chapters: const <String, String>{
           'OPS/Text/01-fn.xhtml':
-              '<p id="body"><span>Body opening </span><a id="footnote_ref_1" href="notes.xhtml#note-1" role="doc-noteref" class="footnote_ref keep"><span aria-hidden="true">[1]</span></a><em> body ending.</em></p>',
+              '<p id="body">x<a href="notes.xhtml#n"><span class="footnote_ref small">A</span></a>y</p>',
           'OPS/Text/02-fn.xhtml':
-              '<p id="note-1" role="doc-footnote">Footnote text. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink" class="return"><span class="footnote_num">*</span></a></p>',
+              '<p id="note-1">z<a href="chapter.xhtml#ref"><span class="footnote_num dropcap">1</span></a>w</p>',
         },
       );
       final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -271,8 +271,8 @@ void main() {
         blocks.map((Map<String, dynamic> block) => block.keys.toSet()),
         everyElement(<String>{'id', 'slots'}),
       );
-      expect(jsonEncode(payload), isNot(contains('notes.xhtml#note-1')));
-      expect(jsonEncode(payload), isNot(contains('footnote_ref_1')));
+      expect(jsonEncode(payload), isNot(contains('notes.xhtml#n')));
+      expect(jsonEncode(payload), isNot(contains('chapter.xhtml#ref')));
       expect(jsonEncode(payload), isNot(contains('<a')));
 
       final String body = await _readXhtml(
@@ -283,17 +283,73 @@ void main() {
         result.job.outputPath,
         'OPS/Text/02-fn.xhtml',
       );
-      expect(body, contains('href="notes.xhtml#note-1"'));
-      expect(body, contains('id="footnote_ref_1"'));
-      expect(body, contains('class="footnote_ref keep"'));
-      expect(body, contains('[1]'));
-      expect(note, contains('href="chapter.xhtml#footnote_ref_1"'));
-      expect(note, contains('role="doc-backlink"'));
-      expect(note, contains('class="footnote_num"'));
+      expect(body, contains('href="notes.xhtml#n"'));
+      expect(body, contains('class="footnote_ref small"'));
+      expect(body, contains('>A</span>'));
+      expect(note, contains('href="chapter.xhtml#ref"'));
+      expect(note, contains('class="footnote_num dropcap"'));
+      expect(note, contains('>1</span>'));
       expect(body, contains('&lt;script&gt;'));
       expect(note, contains('&lt;script&gt;'));
       expect(body, isNot(contains('<script>')));
       expect(note, isNot(contains('<script>')));
+    },
+  );
+
+  test(
+    'CJK chapter preparation keeps class-only footnote markers on the slot path',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_cjk_protected_slot_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start();
+      addTearDown(server.close);
+      final File epubFile = File('${temp.path}/cjk_protected_slot.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/chapter.xhtml':
+              '<p>x<a href="notes.xhtml#n"><span class="footnote_ref small">A</span></a>y</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'cjk-protected-slot-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 5000,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      final result = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      final Map<String, dynamic> payload = server.blockPayloads.single;
+      final Map<String, dynamic> block =
+          (payload['blocks'] as List<dynamic>).single as Map<String, dynamic>;
+      expect(block.keys.toSet(), <String>{'id', 'slots'});
+      expect(jsonEncode(payload), isNot(contains('<a')));
+      expect(jsonEncode(payload), isNot(contains('href')));
+      expect(jsonEncode(payload), isNot(contains('notes.xhtml#n')));
+      final String chapter = await _readXhtml(
+        result.job.outputPath,
+        'OPS/Text/chapter.xhtml',
+      );
+      expect(chapter, contains('href="notes.xhtml#n"'));
+      expect(chapter, contains('class="footnote_ref small"'));
+      expect(chapter, contains('>A</span>'));
     },
   );
 
