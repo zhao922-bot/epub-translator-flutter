@@ -134,7 +134,7 @@ class ProtectedAnchorTextSlots {
     if (href.startsWith('#') && _isLegacyFragmentMarker(element.text)) {
       return true;
     }
-    return _isCrossFileHref(href) && _containsFootnoteMarkerClass(element);
+    return _isCrossFileHref(href) && hasFootnoteMarkerClass(element);
   }
 
   static bool _isRawTextElement(dom.Element element) {
@@ -163,8 +163,12 @@ class ProtectedAnchorTextSlots {
     return fragmentIndex > 0 && fragmentIndex < href.length - 1;
   }
 
-  static bool _containsFootnoteMarkerClass(dom.Element anchor) {
-    return <dom.Element>[anchor, ...anchor.querySelectorAll('*')].any((
+  /// Whether [element] or a descendant has a footnote marker class.
+  ///
+  /// EPUB class tokens are case-insensitive for this detection so the CJK
+  /// preprocessor and source-owned slot renderer share one definition.
+  static bool hasFootnoteMarkerClass(dom.Element element) {
+    return <dom.Element>[element, ...element.querySelectorAll('*')].any((
       dom.Element element,
     ) {
       final Set<String> classes = element.classes

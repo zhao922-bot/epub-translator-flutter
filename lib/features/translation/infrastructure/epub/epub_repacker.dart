@@ -12,6 +12,7 @@ import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'protected_anchor_text_slots.dart';
 import 'xhtml_html_compatibility.dart';
 
 /// Renders translated chapters and writes a new EPUB via isolate ZIP work.
@@ -272,11 +273,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
   }
 
   bool _containsFootnoteMarkerClass(dom.Element element) {
-    return <dom.Element>[element, ...element.querySelectorAll('*')].any(
-      (dom.Element candidate) =>
-          candidate.classes.contains('footnote_ref') ||
-          candidate.classes.contains('footnote_num'),
-    );
+    return ProtectedAnchorTextSlots.hasFootnoteMarkerClass(element);
   }
 
   dom.Element? _nextNonWhitespaceElement(dom.Element element) {

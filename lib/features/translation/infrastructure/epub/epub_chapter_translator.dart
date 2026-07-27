@@ -2406,11 +2406,7 @@ class EpubChapterTranslator {
   }
 
   static bool _containsFootnoteMarkerClass(dom.Element element) {
-    return <dom.Element>[element, ...element.querySelectorAll('*')].any(
-      (dom.Element candidate) =>
-          candidate.classes.contains('footnote_ref') ||
-          candidate.classes.contains('footnote_num'),
-    );
+    return ProtectedAnchorTextSlots.hasFootnoteMarkerClass(element);
   }
 
   static Set<String> _epubTypes(dom.Element element) {

@@ -233,9 +233,9 @@ void main() {
         epubFile,
         chapters: const <String, String>{
           'OPS/Text/01-fn.xhtml':
-              '<p id="body">x<a href="notes.xhtml#n"><span class="footnote_ref small">A</span></a>y</p>',
+              '<p id="body">x<a href="notes.xhtml#n"><span class="FOOTNOTE_REF small">A</span></a>y</p>',
           'OPS/Text/02-fn.xhtml':
-              '<p id="note-1">z<a href="chapter.xhtml#ref"><span class="footnote_num dropcap">1</span></a>w</p>',
+              '<p id="note-1">z<a href="chapter.xhtml#ref"><span class="Footnote_Num dropcap">1</span></a>w</p>',
         },
       );
       final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -284,10 +284,10 @@ void main() {
         'OPS/Text/02-fn.xhtml',
       );
       expect(body, contains('href="notes.xhtml#n"'));
-      expect(body, contains('class="footnote_ref small"'));
+      expect(body, contains('class="FOOTNOTE_REF small"'));
       expect(body, contains('>A</span>'));
       expect(note, contains('href="chapter.xhtml#ref"'));
-      expect(note, contains('class="footnote_num dropcap"'));
+      expect(note, contains('class="Footnote_Num dropcap"'));
       expect(note, contains('>1</span>'));
       expect(body, contains('&lt;script&gt;'));
       expect(note, contains('&lt;script&gt;'));
@@ -311,7 +311,7 @@ void main() {
         epubFile,
         chapters: const <String, String>{
           'OPS/Text/chapter.xhtml':
-              '<p>x<a href="notes.xhtml#n"><span class="footnote_ref small">A</span></a>y</p>',
+              '<p>x<a href="notes.xhtml#n"><span class="FOOTNOTE_REF small">A</span></a>y</p>',
         },
       );
       final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -348,7 +348,7 @@ void main() {
         'OPS/Text/chapter.xhtml',
       );
       expect(chapter, contains('href="notes.xhtml#n"'));
-      expect(chapter, contains('class="footnote_ref small"'));
+      expect(chapter, contains('class="FOOTNOTE_REF small"'));
       expect(chapter, contains('>A</span>'));
     },
   );
