@@ -59,6 +59,7 @@ String _statusLabel(TranslationJobStatus status) {
 String phaseLabel(TranslationJobPhase phase) {
   return switch (phase) {
     TranslationJobPhase.inspection => 'Inspection',
+    TranslationJobPhase.cacheRestoration => 'Cache restoration',
     TranslationJobPhase.translation => 'Translation',
   };
 }

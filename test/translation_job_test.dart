@@ -134,4 +134,20 @@ void main() {
     expect(restored.cacheScanScannedBlocks, 0);
     expect(restored.cacheScanTotalBlocks, 0);
   });
+
+  test('cancelled cache restoration jobs remain resumable', () {
+    const TranslationJob job = TranslationJob(
+      id: 'cancelled-restoration',
+      inputPath: 'book.epub',
+      outputPath: 'out.epub',
+      status: TranslationJobStatus.cancelled,
+      phase: TranslationJobPhase.cacheRestoration,
+      progress: 0.37,
+      completedBlocks: 605,
+      totalBlocks: 1643,
+      resumeCheckpointBlocks: 605,
+    );
+
+    expect(job.canResumeTranslation, isTrue);
+  });
 }

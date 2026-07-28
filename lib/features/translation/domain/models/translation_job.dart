@@ -81,7 +81,8 @@ class TranslationJob {
   }
 
   bool get canResumeTranslation {
-    return phase == TranslationJobPhase.translation &&
+    return (phase == TranslationJobPhase.translation ||
+            phase == TranslationJobPhase.cacheRestoration) &&
         (status == TranslationJobStatus.failed ||
             status == TranslationJobStatus.cancelled) &&
         (cachedBlocks > 0 || resumedBlocks > 0 || completedBlocks > 0);
