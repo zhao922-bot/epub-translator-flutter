@@ -15,7 +15,7 @@ enum TranslationJobStatus {
 }
 
 /// Distinguishes inspection runs from translation runs in history/UI.
-enum TranslationJobPhase { inspection, translation }
+enum TranslationJobPhase { inspection, cacheRestoration, translation }
 
 const Object _unset = Object();
 
@@ -35,6 +35,9 @@ class TranslationJob {
     this.totalBlocks = 0,
     this.cachedBlocks = 0,
     this.resumedBlocks = 0,
+    this.resumeCheckpointBlocks = 0,
+    this.cacheScanScannedBlocks = 0,
+    this.cacheScanTotalBlocks = 0,
     this.errorMessage,
     this.styleProfile = TranslationStyleProfile.empty,
     this.styleProfileConfirmed = false,
@@ -55,6 +58,9 @@ class TranslationJob {
   final int totalBlocks;
   final int cachedBlocks;
   final int resumedBlocks;
+  final int resumeCheckpointBlocks;
+  final int cacheScanScannedBlocks;
+  final int cacheScanTotalBlocks;
   final String? errorMessage;
   final TranslationStyleProfile styleProfile;
   final bool styleProfileConfirmed;
@@ -101,6 +107,13 @@ class TranslationJob {
       totalBlocks: _readNonNegativeInt(json['totalBlocks']),
       cachedBlocks: _readNonNegativeInt(json['cachedBlocks']),
       resumedBlocks: _readNonNegativeInt(json['resumedBlocks']),
+      resumeCheckpointBlocks: _readNonNegativeInt(
+        json['resumeCheckpointBlocks'],
+      ),
+      cacheScanScannedBlocks: _readNonNegativeInt(
+        json['cacheScanScannedBlocks'],
+      ),
+      cacheScanTotalBlocks: _readNonNegativeInt(json['cacheScanTotalBlocks']),
       errorMessage: _readNullableString(json['errorMessage']),
       styleProfile: _readStyleProfile(json['styleProfile']),
       styleProfileConfirmed: json['styleProfileConfirmed'] as bool? ?? false,
@@ -123,6 +136,9 @@ class TranslationJob {
     int? totalBlocks,
     int? cachedBlocks,
     int? resumedBlocks,
+    int? resumeCheckpointBlocks,
+    int? cacheScanScannedBlocks,
+    int? cacheScanTotalBlocks,
     Object? errorMessage = _unset,
     TranslationStyleProfile? styleProfile,
     bool? styleProfileConfirmed,
@@ -147,6 +163,11 @@ class TranslationJob {
       totalBlocks: totalBlocks ?? this.totalBlocks,
       cachedBlocks: cachedBlocks ?? this.cachedBlocks,
       resumedBlocks: resumedBlocks ?? this.resumedBlocks,
+      resumeCheckpointBlocks:
+          resumeCheckpointBlocks ?? this.resumeCheckpointBlocks,
+      cacheScanScannedBlocks:
+          cacheScanScannedBlocks ?? this.cacheScanScannedBlocks,
+      cacheScanTotalBlocks: cacheScanTotalBlocks ?? this.cacheScanTotalBlocks,
       errorMessage: identical(errorMessage, _unset)
           ? this.errorMessage
           : errorMessage as String?,
@@ -175,6 +196,9 @@ class TranslationJob {
       'totalBlocks': totalBlocks,
       'cachedBlocks': cachedBlocks,
       'resumedBlocks': resumedBlocks,
+      'resumeCheckpointBlocks': resumeCheckpointBlocks,
+      'cacheScanScannedBlocks': cacheScanScannedBlocks,
+      'cacheScanTotalBlocks': cacheScanTotalBlocks,
       'errorMessage': errorMessage,
       if (styleProfileConfirmed) 'styleProfile': styleProfile.toJson(),
       'styleProfileConfirmed': styleProfileConfirmed,

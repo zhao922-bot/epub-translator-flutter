@@ -94,4 +94,44 @@ void main() {
     expect(restored.errorMessage, 'HTTP 429: rate limited');
     expect(restored.copyWith(errorMessage: null).errorMessage, isNull);
   });
+
+  test('round-trips cache restoration progress', () {
+    const TranslationJob job = TranslationJob(
+      id: 'resume-1',
+      inputPath: 'book.epub',
+      outputPath: 'out.epub',
+      status: TranslationJobStatus.running,
+      phase: TranslationJobPhase.cacheRestoration,
+      progress: 0.37,
+      completedBlocks: 605,
+      totalBlocks: 1643,
+      resumeCheckpointBlocks: 605,
+      cacheScanScannedBlocks: 820,
+      cacheScanTotalBlocks: 1643,
+      cachedBlocks: 354,
+      resumedBlocks: 354,
+    );
+
+    final TranslationJob restored = TranslationJob.fromJson(job.toJson());
+
+    expect(restored.phase, TranslationJobPhase.cacheRestoration);
+    expect(restored.resumeCheckpointBlocks, 605);
+    expect(restored.cacheScanScannedBlocks, 820);
+    expect(restored.cacheScanTotalBlocks, 1643);
+  });
+
+  test('legacy jobs default cache restoration counters to zero', () {
+    final TranslationJob restored = TranslationJob.fromJson(<String, dynamic>{
+      'id': 'legacy',
+      'status': 'failed',
+      'phase': 'translation',
+      'progress': 0.37,
+      'completedBlocks': 605,
+      'totalBlocks': 1643,
+    });
+
+    expect(restored.resumeCheckpointBlocks, 0);
+    expect(restored.cacheScanScannedBlocks, 0);
+    expect(restored.cacheScanTotalBlocks, 0);
+  });
 }
