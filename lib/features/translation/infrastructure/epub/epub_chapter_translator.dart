@@ -21,6 +21,7 @@ import '../translation_cache_store.dart';
 import '../translation_quality.dart';
 import 'epub_repacker.dart';
 import 'footnote_batch_planner.dart';
+import 'protected_anchor_text_slots.dart';
 import 'translation_api_client.dart';
 import 'translation_batch_planner.dart';
 
@@ -48,7 +49,7 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion = 'v9-cjk-inline-typography';
+  static const String _cacheSchemaVersion = 'v12-protected-anchor-text-slots';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -1788,14 +1789,34 @@ class EpubChapterTranslator {
     required String sourceHtml,
     required String translatedHtml,
   }) {
-    final String trimmedTranslation = translatedHtml.trim();
+    final _NormalizedAnchorHtml normalizedTranslation =
+        _normalizeProtectedAnchorMarkers(
+          sourceHtml: sourceHtml,
+          translatedHtml: translatedHtml,
+        );
+    final String trimmedTranslation = normalizedTranslation.html.trim();
+    if (normalizedTranslation.hasOverflow &&
+        normalizedTranslation.root != null &&
+        _elementSkeletonMatches(
+          _singleRootElement(sourceHtml)!,
+          normalizedTranslation.root!,
+        ) &&
+        _overflowTextFitsSourceSlots(
+          sourceRoot: _singleRootElement(sourceHtml)!,
+          translatedRoot: normalizedTranslation.root!,
+          trustedOverflowTexts: normalizedTranslation.trustedOverflowTexts,
+        )) {
+      return normalizedTranslation.root!.outerHtml;
+    }
     if (_htmlStructureMatches(sourceHtml, trimmedTranslation)) {
-      return _restoreProtectedTexts(
+      final String? restored = _restoreProtectedTexts(
         sourceHtml: sourceHtml,
         translatedHtml: trimmedTranslation,
       );
+      if (restored != null) {
+        return restored;
+      }
     }
-
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
     if (sourceRoot == null) {
       return trimmedTranslation;
@@ -1824,32 +1845,8 @@ class EpubChapterTranslator {
       return rebuiltRoot.outerHtml;
     }
 
-    final List<String> protectedTexts = sourceSlots
-        .where((_HtmlTextSlot slot) => slot.protected)
-        .map((_HtmlTextSlot slot) => slot.text.trim())
-        .where((String text) => text.isNotEmpty)
-        .toList(growable: false);
     final String translatedPlainText = _plainTextFromHtmlFragment(
       trimmedTranslation,
-    );
-    final List<_HtmlTextSlot> translatableSourceSlots = sourceSlots
-        .where((_HtmlTextSlot slot) => !slot.protected)
-        .toList(growable: false);
-    final List<String>? splitText = _splitAroundProtectedMarkers(
-      translatedPlainText,
-      protectedTexts,
-    );
-    if (splitText != null &&
-        splitText.length == translatableSourceSlots.length) {
-      for (int index = 0; index < translatableSourceSlots.length; index += 1) {
-        translatableSourceSlots[index].text = splitText[index];
-      }
-      return rebuiltRoot.outerHtml;
-    }
-
-    final String plainTranslation = _removeProtectedMarkers(
-      translatedPlainText,
-      protectedTexts,
     );
     bool wroteMainText = false;
     for (final _HtmlTextSlot slot in sourceSlots) {
@@ -1857,19 +1854,43 @@ class EpubChapterTranslator {
         continue;
       }
       if (!wroteMainText) {
-        slot.text = plainTranslation;
+        slot.text = translatedPlainText;
         wroteMainText = true;
       } else {
         slot.text = '';
       }
     }
-    if (!wroteMainText) {
-      sourceSlots.first.text = plainTranslation;
-    }
     return rebuiltRoot.outerHtml;
   }
 
-  static String _restoreProtectedTexts({
+  static bool _overflowTextFitsSourceSlots({
+    required dom.Element sourceRoot,
+    required dom.Element translatedRoot,
+    required List<dom.Text> trustedOverflowTexts,
+  }) {
+    final int sourceTextSlots = _textSlots(
+      sourceRoot,
+    ).where((_HtmlTextSlot slot) => !slot.protected).length;
+    final List<_HtmlTextSlot> untrustedTranslatedSlots =
+        _textSlots(translatedRoot)
+            .where(
+              (_HtmlTextSlot slot) =>
+                  !slot.protected && !trustedOverflowTexts.contains(slot.node),
+            )
+            .toList(growable: false);
+    if (untrustedTranslatedSlots.length <= sourceTextSlots) {
+      return true;
+    }
+    if (sourceTextSlots != 0) {
+      return false;
+    }
+    for (final _HtmlTextSlot slot in untrustedTranslatedSlots) {
+      slot.text = '';
+    }
+    return true;
+  }
+
+  static String? _restoreProtectedTexts({
     required String sourceHtml,
     required String translatedHtml,
   }) {
@@ -1882,7 +1903,7 @@ class EpubChapterTranslator {
     final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
     final List<_HtmlTextSlot> translatedSlots = _textSlots(translatedRoot);
     if (sourceSlots.length != translatedSlots.length) {
-      return translatedHtml;
+      return null;
     }
 
     for (int index = 0; index < sourceSlots.length; index += 1) {
@@ -1891,6 +1912,348 @@ class EpubChapterTranslator {
       }
     }
     return translatedRoot.outerHtml;
+  }
+
+  static bool _elementSkeletonMatches(
+    dom.Element source,
+    dom.Element translated, {
+    Iterable<dom.Node> ignoredTranslatedNodes = const <dom.Node>[],
+  }) {
+    if (source.localName != translated.localName ||
+        !_attributesMatch(source, translated)) {
+      return false;
+    }
+    final List<dom.Element> sourceChildren = source.children.toList(
+      growable: false,
+    );
+    final List<dom.Element> translatedChildren = translated.children.toList(
+      growable: true,
+    )..removeWhere(ignoredTranslatedNodes.contains);
+    if (sourceChildren.length != translatedChildren.length) {
+      return false;
+    }
+    for (int index = 0; index < sourceChildren.length; index += 1) {
+      if (!_elementSkeletonMatches(
+        sourceChildren[index],
+        translatedChildren[index],
+        ignoredTranslatedNodes: ignoredTranslatedNodes,
+      )) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
+    required String sourceHtml,
+    required String translatedHtml,
+  }) {
+    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
+    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    if (sourceRoot == null || translatedRoot == null) {
+      return _NormalizedAnchorHtml(html: translatedHtml);
+    }
+    final List<String> overflowTexts = <String>[];
+    final List<dom.Text> trustedOverflowTexts = <dom.Text>[];
+    _normalizePairedProtectedAnchors(
+      sourceRoot,
+      translatedRoot,
+      overflowTexts,
+      trustedOverflowTexts,
+    );
+    return _NormalizedAnchorHtml(
+      html: translatedRoot.outerHtml,
+      root: translatedRoot,
+      hasOverflow: overflowTexts.isNotEmpty,
+      trustedOverflowTexts: trustedOverflowTexts,
+    );
+  }
+
+  static void _normalizePairedProtectedAnchors(
+    dom.Element source,
+    dom.Element translated,
+    List<String> overflowTexts,
+    List<dom.Text> trustedOverflowTexts,
+  ) {
+    if (source.localName != translated.localName ||
+        !_attributesMatch(source, translated)) {
+      return;
+    }
+
+    final String sourceMarker = source.text.trim();
+    if (_isProtectedTextElement(source) &&
+        _isProtectedMarkerText(sourceMarker)) {
+      _normalizeProtectedAnchor(
+        source: source,
+        translated: translated,
+        sourceMarker: sourceMarker,
+        overflowTexts: overflowTexts,
+        trustedOverflowTexts: trustedOverflowTexts,
+      );
+      return;
+    }
+
+    final List<dom.Element> sourceChildren = source.children.toList(
+      growable: false,
+    );
+    final List<dom.Element> translatedChildren = translated.children.toList(
+      growable: false,
+    );
+    if (sourceChildren.length != translatedChildren.length) {
+      return;
+    }
+    for (int index = 0; index < sourceChildren.length; index += 1) {
+      _normalizePairedProtectedAnchors(
+        sourceChildren[index],
+        translatedChildren[index],
+        overflowTexts,
+        trustedOverflowTexts,
+      );
+    }
+  }
+
+  static void _normalizeProtectedAnchor({
+    required dom.Element source,
+    required dom.Element translated,
+    required String sourceMarker,
+    required List<String> overflowTexts,
+    required List<dom.Text> trustedOverflowTexts,
+  }) {
+    final dom.Text? markerText = _firstNonWhitespaceTextDescendant(translated);
+    if (markerText == null) {
+      _removeAdjacentMarker(
+        source: source,
+        translated: translated,
+        marker: sourceMarker,
+      );
+      return;
+    }
+
+    final List<int>? markerRange = _markerRangeAtTextStart(
+      markerText.data,
+      sourceMarker,
+    );
+    if (markerRange == null) {
+      return;
+    }
+    final String overflowText = _overflowTextAfterMarker(
+      anchor: translated,
+      markerText: markerText,
+      markerEnd: markerRange[1],
+    );
+    final dom.Node? parent = translated.parentNode;
+    if (parent == null) {
+      return;
+    }
+    final int anchorIndex = parent.nodes.indexOf(translated);
+    if (anchorIndex < 0) {
+      return;
+    }
+    final dom.Element restoredAnchor = source.clone(true);
+    parent.nodes.removeAt(anchorIndex);
+    parent.nodes.insert(anchorIndex, restoredAnchor);
+    if (overflowText.isNotEmpty) {
+      final dom.Text? insertedOverflow = _placeOverflowTextAfter(
+        parent: parent,
+        anchorIndex: anchorIndex,
+        overflowText: overflowText,
+      );
+      overflowTexts.add(overflowText);
+      if (insertedOverflow != null) {
+        trustedOverflowTexts.add(insertedOverflow);
+      }
+    }
+  }
+
+  static String _overflowTextAfterMarker({
+    required dom.Element anchor,
+    required dom.Text markerText,
+    required int markerEnd,
+  }) {
+    String overflow = markerText.data.substring(markerEnd).trimLeft();
+
+    dom.Node branch = markerText;
+    while (true) {
+      final dom.Node? parent = branch.parentNode;
+      if (parent == null) {
+        return overflow;
+      }
+      final int index = parent.nodes.indexOf(branch);
+      for (
+        int siblingIndex = index + 1;
+        siblingIndex < parent.nodes.length;
+        siblingIndex += 1
+      ) {
+        overflow += _safeOverflowText(parent.nodes[siblingIndex]);
+      }
+      if (parent == anchor) {
+        return overflow;
+      }
+      branch = parent;
+    }
+  }
+
+  static String _safeOverflowText(dom.Node node) {
+    if (node is dom.Text) {
+      return node.data;
+    }
+    if (node is! dom.Element) {
+      return '';
+    }
+    const Set<String> unsafeTags = <String>{
+      'script',
+      'style',
+      'iframe',
+      'object',
+      'embed',
+      'img',
+    };
+    if (unsafeTags.contains(node.localName)) {
+      return '';
+    }
+    return node.nodes.map(_safeOverflowText).join();
+  }
+
+  static dom.Text? _placeOverflowTextAfter({
+    required dom.Node parent,
+    required int anchorIndex,
+    required String overflowText,
+  }) {
+    final int nextIndex = anchorIndex + 1;
+    if (nextIndex < parent.nodes.length &&
+        parent.nodes[nextIndex] is dom.Text) {
+      final dom.Text nextText = parent.nodes[nextIndex] as dom.Text;
+      nextText.data = _joinOverflowText(overflowText, nextText.data);
+      return null;
+    }
+    final dom.Text inserted = dom.Text(overflowText);
+    parent.nodes.insert(nextIndex, inserted);
+    return inserted;
+  }
+
+  static String _joinOverflowText(String overflow, String followingText) {
+    if (overflow.isEmpty || followingText.isEmpty) {
+      return '$overflow$followingText';
+    }
+    final bool needsSeparator =
+        RegExp(r'[A-Za-z0-9]$').hasMatch(overflow) &&
+        RegExp(r'^[A-Za-z0-9]').hasMatch(followingText);
+    return needsSeparator
+        ? '$overflow $followingText'
+        : '$overflow$followingText';
+  }
+
+  static dom.Text? _firstNonWhitespaceTextDescendant(dom.Node node) {
+    if (node is dom.Text) {
+      return node.data.trim().isEmpty ? null : node;
+    }
+    for (final dom.Node child in node.nodes) {
+      final dom.Text? text = _firstNonWhitespaceTextDescendant(child);
+      if (text != null) {
+        return text;
+      }
+    }
+    return null;
+  }
+
+  static void _removeAdjacentMarker({
+    required dom.Element source,
+    required dom.Element translated,
+    required String marker,
+  }) {
+    final dom.Text? translatedPrevious = _adjacentText(
+      translated,
+      before: true,
+    );
+    final dom.Text? sourcePrevious = _adjacentText(source, before: true);
+    if (translatedPrevious != null &&
+        !_textEndsWithMarker(sourcePrevious?.data ?? '', marker) &&
+        _textEndsWithMarker(translatedPrevious.data, marker) &&
+        _removeMarkerAtTextEnd(translatedPrevious, marker)) {
+      return;
+    }
+
+    final dom.Text? translatedNext = _adjacentText(translated, before: false);
+    final dom.Text? sourceNext = _adjacentText(source, before: false);
+    if (translatedNext != null &&
+        !_textStartsWithMarker(sourceNext?.data ?? '', marker) &&
+        _textStartsWithMarker(translatedNext.data, marker)) {
+      _removeMarkerAtTextStart(translatedNext, marker);
+    }
+  }
+
+  static dom.Text? _adjacentText(dom.Element element, {required bool before}) {
+    final dom.Node? parent = element.parentNode;
+    if (parent == null) {
+      return null;
+    }
+    final int index = parent.nodes.indexOf(element);
+    final int adjacentIndex = before ? index - 1 : index + 1;
+    if (index < 0 ||
+        adjacentIndex < 0 ||
+        adjacentIndex >= parent.nodes.length) {
+      return null;
+    }
+    final dom.Node adjacent = parent.nodes[adjacentIndex];
+    return adjacent is dom.Text ? adjacent : null;
+  }
+
+  static bool _textEndsWithMarker(String value, String marker) {
+    int end = value.length;
+    while (end > 0 && value[end - 1].trim().isEmpty) {
+      end -= 1;
+    }
+    final int start = end - marker.length;
+    return start >= 0 && value.substring(start, end) == marker;
+  }
+
+  static bool _textStartsWithMarker(String value, String marker) {
+    int start = 0;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
+    }
+    final int end = start + marker.length;
+    return end <= value.length && value.substring(start, end) == marker;
+  }
+
+  static bool _removeMarkerAtTextEnd(dom.Text textNode, String marker) {
+    final String value = textNode.data;
+    int end = value.length;
+    while (end > 0 && value[end - 1].trim().isEmpty) {
+      end -= 1;
+    }
+    final int start = end - marker.length;
+    if (start >= 0 && value.substring(start, end) == marker) {
+      textNode.data = value.substring(0, start) + value.substring(end);
+      return true;
+    }
+    return false;
+  }
+
+  static bool _removeMarkerAtTextStart(dom.Text textNode, String marker) {
+    final String value = textNode.data;
+    int start = 0;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
+    }
+    final int end = start + marker.length;
+    if (end <= value.length && value.substring(start, end) == marker) {
+      textNode.data = value.substring(0, start) + value.substring(end);
+      return true;
+    }
+    return false;
+  }
+
+  static List<int>? _markerRangeAtTextStart(String value, String marker) {
+    int start = 0;
+    while (start < value.length && value[start].trim().isEmpty) {
+      start += 1;
+    }
+    final int end = start + marker.length;
+    if (end <= value.length && value.substring(start, end) == marker) {
+      return <int>[start, end];
+    }
+    return null;
   }
 
   static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) {
@@ -2009,25 +2372,54 @@ class EpubChapterTranslator {
 
   static bool _isProtectedTextElement(dom.Element element) {
     final String tag = element.localName ?? '';
-    final String role = element.attributes['role']?.toLowerCase() ?? '';
+    final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
+    final bool protectedMarkerText = _isProtectedMarkerText(element.text);
 
-    if (role == 'doc-noteref' || epubTypes.contains('noteref')) {
+    if ((roles.contains('doc-noteref') || epubTypes.contains('noteref')) &&
+        protectedMarkerText) {
       return true;
     }
-    if (role == 'doc-pagebreak' || epubTypes.contains('pagebreak')) {
+    if (roles.contains('doc-pagebreak') || epubTypes.contains('pagebreak')) {
       return _isProtectedPagebreakText(element.text);
     }
     final String href = element.attributes['href'] ?? '';
-    return tag == 'a' &&
-        href.startsWith('#') &&
-        _isProtectedMarkerText(element.text);
+    if (tag != 'a') {
+      return false;
+    }
+    final String id = element.attributes['id']?.toLowerCase() ?? '';
+    if (protectedMarkerText &&
+        (roles.contains('doc-backlink') || id.startsWith('footnote_ref_'))) {
+      return true;
+    }
+    if (protectedMarkerText &&
+        _isCrossFileHref(href) &&
+        _containsFootnoteMarkerClass(element)) {
+      return true;
+    }
+    return href.startsWith('#') && protectedMarkerText;
+  }
+
+  static bool _isCrossFileHref(String href) {
+    final int fragmentIndex = href.indexOf('#');
+    return fragmentIndex > 0 && fragmentIndex < href.length - 1;
+  }
+
+  static bool _containsFootnoteMarkerClass(dom.Element element) {
+    return ProtectedAnchorTextSlots.hasFootnoteMarkerClass(element);
   }
 
   static Set<String> _epubTypes(dom.Element element) {
     return (element.attributes['epub:type']?.toLowerCase() ?? '')
         .split(RegExp(r'\s+'))
         .where((String type) => type.isNotEmpty)
+        .toSet();
+  }
+
+  static Set<String> _roleTokens(dom.Element element) {
+    return (element.attributes['role']?.toLowerCase() ?? '')
+        .split(RegExp(r'\s+'))
+        .where((String role) => role.isNotEmpty)
         .toSet();
   }
 
@@ -2046,75 +2438,30 @@ class EpubChapterTranslator {
     if (compact.isEmpty || compact.length > 10) {
       return false;
     }
+    if (compact == '＊' || _chineseNumberMarkerToAscii.containsKey(compact)) {
+      return true;
+    }
     return RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
         RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
         RegExp(r'^[*†‡§¶]+$').hasMatch(compact) ||
         compact == '↩';
   }
 
-  static List<String>? _splitAroundProtectedMarkers(
-    String value,
-    List<String> protectedTexts,
-  ) {
-    if (protectedTexts.isEmpty) {
-      return null;
-    }
-
-    String remaining = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    final List<String> parts = <String>[];
-    for (final String marker in protectedTexts) {
-      if (marker.isEmpty) {
-        continue;
-      }
-      final List<int>? markerRange = _protectedMarkerRange(remaining, marker);
-      if (markerRange == null) {
-        return null;
-      }
-      parts.add(remaining.substring(0, markerRange[0]));
-      remaining = remaining.substring(markerRange[1]);
-    }
-    parts.add(remaining);
-    return parts;
-  }
-
-  static String _removeProtectedMarkers(
-    String value,
-    Iterable<String> protectedTexts,
-  ) {
-    String result = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    for (final String marker in protectedTexts) {
-      if (marker.isEmpty) {
-        continue;
-      }
-      final List<int>? markerRange = _protectedMarkerRange(result, marker);
-      if (markerRange == null) {
-        continue;
-      }
-      result =
-          result.substring(0, markerRange[0]) +
-          result.substring(markerRange[1]);
-    }
-    return result.replaceAll(RegExp(r'\s+'), ' ').trim();
-  }
-
-  static List<int>? _protectedMarkerRange(String value, String marker) {
-    final int exactIndex = value.indexOf(marker);
-    if (exactIndex >= 0) {
-      return <int>[exactIndex, exactIndex + marker.length];
-    }
-
-    if (!RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(marker)) {
-      return null;
-    }
-    final RegExpMatch? translatedMarkerMatch = RegExp(
-      r'[\[\(（【][^\]\)）】]{1,10}[\]\)）】]',
-    ).firstMatch(value);
-    if (translatedMarkerMatch == null ||
-        !_isProtectedMarkerText(translatedMarkerMatch.group(0)!)) {
-      return null;
-    }
-    return <int>[translatedMarkerMatch.start, translatedMarkerMatch.end];
-  }
+  static const Map<String, String> _chineseNumberMarkerToAscii =
+      <String, String>{
+        '零': '0',
+        '一': '1',
+        '二': '2',
+        '三': '3',
+        '四': '4',
+        '五': '5',
+        '六': '6',
+        '七': '7',
+        '八': '8',
+        '九': '9',
+        '十': '10',
+        '十一': '11',
+      };
 
   Future<Map<String, String>> _translateFootnoteBatch({
     required Dio dio,
@@ -2123,7 +2470,7 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
-  }) {
+  }) async {
     final Set<String> requestedIds = batch.references
         .map((FootnoteBlockReference reference) => reference.requestId)
         .toSet();
@@ -2132,9 +2479,79 @@ class EpubChapterTranslator {
         'Cross-file footnote request ids must be unique.',
       );
     }
+
+    final List<FootnoteBlockReference> htmlReferences =
+        <FootnoteBlockReference>[];
+    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
+    for (final FootnoteBlockReference reference in batch.references) {
+      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
+        reference.block.sourceHtml,
+      )) {
+        htmlReferences.add(reference);
+        continue;
+      }
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        reference.block.sourceHtml,
+      );
+      if (template.hasProtectedAnchors) {
+        slotRequests.add(
+          _ProtectedSlotRequest(
+            id: reference.requestId,
+            block: reference.block,
+            template: template,
+          ),
+        );
+      }
+    }
+
+    final Map<String, String> translatedById = <String, String>{};
+    if (htmlReferences.isNotEmpty) {
+      translatedById.addAll(
+        await _translateFootnoteHtmlBatch(
+          dio: dio,
+          config: config,
+          references: htmlReferences,
+          context: batch.context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    if (slotRequests.isNotEmpty) {
+      translatedById.addAll(
+        await _translateProtectedSlotBatch(
+          dio: dio,
+          config: config,
+          requests: slotRequests,
+          context: batch.context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    return <String, String>{
+      for (final FootnoteBlockReference reference in batch.references)
+        reference.requestId: translatedById[reference.requestId]!,
+    };
+  }
+
+  Future<Map<String, String>> _translateFootnoteHtmlBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<FootnoteBlockReference> references,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final Set<String> requestedIds = references
+        .map((FootnoteBlockReference reference) => reference.requestId)
+        .toSet();
     final Map<String, dynamic> payloadMap = <String, dynamic>{
-      if (!batch.context.isEmpty) 'context': batch.context.toJson(),
-      'blocks': batch.references
+      if (!context.isEmpty) 'context': context.toJson(),
+      'blocks': references
           .map(
             (FootnoteBlockReference reference) => <String, String>{
               'id': reference.requestId,
@@ -2155,9 +2572,9 @@ class EpubChapterTranslator {
           throw const TranslationCancelledException();
         }
         final TranslationStyleProfile batchStyleProfile =
-            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+            _styleProfileFromBookMemoryJson(context.bookMemory);
         final bool batchStyleConfirmed =
-            _styleProfileConfirmedFromBookMemoryJson(batch.context.bookMemory);
+            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
         final Map<String, dynamic> requestData = <String, dynamic>{
           'model': config.model,
           'temperature': 0.2,
@@ -2184,7 +2601,7 @@ class EpubChapterTranslator {
         );
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != batch.references.length) {
+            rawBlocks.length != references.length) {
           throw const FormatException(
             'Translated footnote batch length does not match request length.',
           );
@@ -2221,7 +2638,7 @@ class EpubChapterTranslator {
         }
 
         final Map<String, String> translatedById = <String, String>{};
-        for (final FootnoteBlockReference reference in batch.references) {
+        for (final FootnoteBlockReference reference in references) {
           final String? translated = rawTranslatedById[reference.requestId];
           if (translated == null) {
             throw FormatException(
@@ -2244,7 +2661,248 @@ class EpubChapterTranslator {
     );
   }
 
+  Future<Map<String, String>> _translateProtectedSlotBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<_ProtectedSlotRequest> requests,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final Set<String> requestedIds = requests
+        .map((_ProtectedSlotRequest request) => request.id)
+        .toSet();
+    if (requestedIds.length != requests.length) {
+      throw const FormatException('Protected slot request ids must be unique.');
+    }
+    final Map<String, _ProtectedSlotRequest> requestById =
+        <String, _ProtectedSlotRequest>{
+          for (final _ProtectedSlotRequest request in requests)
+            request.id: request,
+        };
+    final String payload = jsonEncode(<String, Object?>{
+      if (!context.isEmpty) 'context': context.toJson(),
+      'blocks': requests
+          .map((_ProtectedSlotRequest request) => request.toJson())
+          .toList(growable: false),
+    });
+
+    return _apiClient.runRetried<Map<String, String>>(
+      config: config,
+      retryDelayOverride: retryDelayOverride,
+      shouldRetry: TranslationApiClient.shouldRetryBatchError,
+      cancelToken: cancelToken,
+      operation: () async {
+        if (cancelToken?.isCancelled ?? false) {
+          throw const TranslationCancelledException();
+        }
+        final TranslationStyleProfile batchStyleProfile =
+            _styleProfileFromBookMemoryJson(context.bookMemory);
+        final bool batchStyleConfirmed =
+            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
+        final Map<String, dynamic> requestData = <String, dynamic>{
+          'model': config.model,
+          'temperature': 0.2,
+          'messages': <Map<String, String>>[
+            <String, String>{
+              'role': 'system',
+              'content':
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+            },
+            <String, String>{'role': 'user', 'content': payload},
+          ],
+        };
+        onRequestAttempt?.call();
+        final Response<dynamic> response = await _apiClient.postChatCompletions(
+          dio: dio,
+          data: requestData,
+          cancelToken: cancelToken,
+        );
+        final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
+          _apiClient.extractMessageContent(response.data),
+        );
+        final Object? rawBlocks = jsonPayload['blocks'];
+        if (rawBlocks is! List<dynamic> ||
+            rawBlocks.length != requests.length) {
+          throw const FormatException(
+            'Translated slot block count does not match request count.',
+          );
+        }
+
+        final Map<String, List<String>> translatedSlotsById =
+            <String, List<String>>{};
+        for (final Object? rawBlock in rawBlocks) {
+          if (rawBlock is! Map<String, dynamic> ||
+              rawBlock.keys.toSet().difference(const <String>{
+                'id',
+                'slots',
+              }).isNotEmpty ||
+              const <String>{
+                'id',
+                'slots',
+              }.difference(rawBlock.keys.toSet()).isNotEmpty) {
+            throw const FormatException(
+              'Translated slot block must contain only id and slots.',
+            );
+          }
+          final Object? rawId = rawBlock['id'];
+          final Object? rawSlots = rawBlock['slots'];
+          if (rawId is! String ||
+              !requestedIds.contains(rawId) ||
+              translatedSlotsById.containsKey(rawId)) {
+            throw const FormatException(
+              'Translated slot response contains an unknown or duplicate block id.',
+            );
+          }
+          final _ProtectedSlotRequest request = requestById[rawId]!;
+          if (rawSlots is! List<dynamic> ||
+              rawSlots.length != request.template.slotTexts.length) {
+            throw FormatException(
+              'Translated slot count does not match block $rawId.',
+            );
+          }
+          final Map<String, String> textBySlotId = <String, String>{};
+          final Set<String> expectedSlotIds = request.slotIds.toSet();
+          for (final Object? rawSlot in rawSlots) {
+            if (rawSlot is! Map<String, dynamic> ||
+                rawSlot.keys.toSet().difference(const <String>{
+                  'id',
+                  'text',
+                }).isNotEmpty ||
+                const <String>{
+                  'id',
+                  'text',
+                }.difference(rawSlot.keys.toSet()).isNotEmpty) {
+              throw const FormatException(
+                'Translated slot must contain only id and text.',
+              );
+            }
+            final Object? rawSlotId = rawSlot['id'];
+            final Object? rawText = rawSlot['text'];
+            if (rawSlotId is! String ||
+                !expectedSlotIds.contains(rawSlotId) ||
+                textBySlotId.containsKey(rawSlotId) ||
+                rawText is! String) {
+              throw const FormatException(
+                'Translated slot contains an unknown or duplicate id, or non-string text.',
+              );
+            }
+            textBySlotId[rawSlotId] = rawText;
+          }
+          translatedSlotsById[rawId] = request.slotIds
+              .map((String slotId) => textBySlotId[slotId]!)
+              .toList(growable: false);
+        }
+
+        return <String, String>{
+          for (final _ProtectedSlotRequest request in requests)
+            request.id: _renderAndValidateProtectedSlots(
+              config: config,
+              request: request,
+              translatedSlots: translatedSlotsById[request.id]!,
+            ),
+        };
+      },
+    );
+  }
+
+  static String _renderAndValidateProtectedSlots({
+    required TranslationConfig config,
+    required _ProtectedSlotRequest request,
+    required List<String> translatedSlots,
+  }) {
+    final String rendered = request.template.render(translatedSlots);
+    _validateTranslatedBlockQuality(
+      config: config,
+      block: request.block,
+      translatedHtml: rendered,
+    );
+    return rendered;
+  }
+
   Future<List<String>> _translateBlockBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required TranslationBlockBatch batch,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+  }) async {
+    final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
+    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
+    for (final ExtractedBlock block in batch.blocks) {
+      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
+        block.sourceHtml,
+      )) {
+        htmlBlocks.add(block);
+        continue;
+      }
+      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+        block.sourceHtml,
+      );
+      if (template.hasProtectedAnchors) {
+        slotRequests.add(
+          _ProtectedSlotRequest(id: block.id, block: block, template: template),
+        );
+      }
+    }
+
+    final Map<String, String> translatedById = <String, String>{};
+    if (htmlBlocks.isNotEmpty) {
+      final List<String> translatedHtml = await _translateHtmlBlockBatch(
+        dio: dio,
+        config: config,
+        batch: TranslationBlockBatch(htmlBlocks, context: batch.context),
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+      );
+      for (int index = 0; index < htmlBlocks.length; index += 1) {
+        translatedById[htmlBlocks[index].id] = translatedHtml[index];
+      }
+    }
+    if (slotRequests.isNotEmpty) {
+      try {
+        translatedById.addAll(
+          await _translateProtectedSlotBatch(
+            dio: dio,
+            config: config,
+            requests: slotRequests,
+            context: batch.context,
+            retryDelayOverride: retryDelayOverride,
+            cancelToken: cancelToken,
+          ),
+        );
+      } on DioException catch (error) {
+        if (_isCancelError(error)) {
+          throw const TranslationCancelledException();
+        }
+        if (!TranslationApiClient.shouldFallbackBatchDioException(error)) {
+          rethrow;
+        }
+        final List<Map<String, String>> individualResults =
+            await Future.wait<Map<String, String>>(
+              slotRequests.map(
+                (_ProtectedSlotRequest request) => _translateProtectedSlotBatch(
+                  dio: dio,
+                  config: config,
+                  requests: <_ProtectedSlotRequest>[request],
+                  context: batch.context,
+                  retryDelayOverride: retryDelayOverride,
+                  cancelToken: cancelToken,
+                ),
+              ),
+            );
+        for (final Map<String, String> result in individualResults) {
+          translatedById.addAll(result);
+        }
+      }
+    }
+    return batch.blocks
+        .map((ExtractedBlock block) => translatedById[block.id]!)
+        .toList(growable: false);
+  }
+
+  Future<List<String>> _translateHtmlBlockBatch({
     required Dio dio,
     required TranslationConfig config,
     required TranslationBlockBatch batch,
@@ -2643,6 +3301,9 @@ class EpubChapterTranslator {
         .querySelectorAll('span[class]')
         .toList(growable: false);
     for (final dom.Element span in spans) {
+      if (_isInsideFootnoteMarkerAnchor(span)) {
+        continue;
+      }
       final bool isDropCap = span.classes.any(
         (String className) => className.toLowerCase().startsWith('dropcap'),
       );
@@ -2656,6 +3317,17 @@ class EpubChapterTranslator {
       changed = true;
     }
     return changed ? fragment.outerHtml : sourceHtml;
+  }
+
+  static bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
+    dom.Node? current = element;
+    while (current is dom.Element) {
+      if (current.localName == 'a' && _containsFootnoteMarkerClass(current)) {
+        return true;
+      }
+      current = current.parentNode;
+    }
+    return false;
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -2769,6 +3441,20 @@ class EpubChapterTranslator {
         elapsed.inMilliseconds / Duration.millisecondsPerMinute;
     return (blockCount / minutes).toStringAsFixed(1);
   }
+}
+
+class _NormalizedAnchorHtml {
+  const _NormalizedAnchorHtml({
+    required this.html,
+    this.root,
+    this.hasOverflow = false,
+    this.trustedOverflowTexts = const <dom.Text>[],
+  });
+
+  final String html;
+  final dom.Element? root;
+  final bool hasOverflow;
+  final List<dom.Text> trustedOverflowTexts;
 }
 
 class _HtmlTextSlot {
@@ -3004,6 +3690,34 @@ class _ChapterMemory {
       if (summary.trim().isNotEmpty) 'summary': summary.trim(),
       'continuityNotes': continuityNotes,
       'glossary': glossary,
+    };
+  }
+}
+
+class _ProtectedSlotRequest {
+  const _ProtectedSlotRequest({
+    required this.id,
+    required this.block,
+    required this.template,
+  });
+
+  final String id;
+  final ExtractedBlock block;
+  final ProtectedAnchorTextSlots template;
+
+  List<String> get slotIds => List<String>.generate(
+    template.slotTexts.length,
+    (int index) => 's$index',
+    growable: false,
+  );
+
+  Map<String, Object?> toJson() {
+    return <String, Object?>{
+      'id': id,
+      'slots': <Map<String, String>>[
+        for (int index = 0; index < template.slotTexts.length; index += 1)
+          <String, String>{'id': 's$index', 'text': template.slotTexts[index]},
+      ],
     };
   }
 }

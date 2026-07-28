@@ -12,6 +12,7 @@ import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'protected_anchor_text_slots.dart';
 import 'xhtml_html_compatibility.dart';
 
 /// Renders translated chapters and writes a new EPUB via isolate ZIP work.
@@ -221,9 +222,12 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     final List<dom.Element> dropCaps = fragment
         .querySelectorAll('[class]')
         .where(
-          (dom.Element element) => element.classes.any(
-            (String className) => className.toLowerCase().startsWith('dropcap'),
-          ),
+          (dom.Element element) =>
+              !_isInsideFootnoteMarkerAnchor(element) &&
+              element.classes.any(
+                (String className) =>
+                    className.toLowerCase().startsWith('dropcap'),
+              ),
         )
         .toList();
     for (final dom.Element dropCap in dropCaps) {
@@ -242,17 +246,34 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
 
       if (followingElement != null &&
           _containsCjk(followingElement.text) &&
+          !_isInsideFootnoteMarkerAnchor(followingElement) &&
           followingElement.classes.any(_isInitialSmallCapsClass)) {
         _removeClassesWhere(followingElement, _isInitialSmallCapsClass);
       }
     }
     for (final dom.Element element in fragment.querySelectorAll('[class]')) {
-      if (_containsCjk(element.text) &&
+      if (!_isInsideFootnoteMarkerAnchor(element) &&
+          _containsCjk(element.text) &&
           element.classes.any(_isInitialSmallCapsClass)) {
         _removeClassesWhere(element, _isInitialSmallCapsClass);
       }
     }
     return fragment.outerHtml;
+  }
+
+  bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
+    dom.Node? current = element;
+    while (current is dom.Element) {
+      if (current.localName == 'a' && _containsFootnoteMarkerClass(current)) {
+        return true;
+      }
+      current = current.parentNode;
+    }
+    return false;
+  }
+
+  bool _containsFootnoteMarkerClass(dom.Element element) {
+    return ProtectedAnchorTextSlots.hasFootnoteMarkerClass(element);
   }
 
   dom.Element? _nextNonWhitespaceElement(dom.Element element) {

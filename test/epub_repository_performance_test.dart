@@ -217,6 +217,143 @@ void main() {
   );
 
   test(
+    'protected cross-file footnotes use one shuffled slot request and source skeletons',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_protected_slot_batch_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start(
+        reverseResponses: true,
+      );
+      addTearDown(server.close);
+      final File epubFile = File('${temp.path}/protected_slots.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/01-fn.xhtml':
+              '<p id="body">x<a href="notes.xhtml#n"><span class="FOOTNOTE_REF small">A</span></a>y</p>',
+          'OPS/Text/02-fn.xhtml':
+              '<p id="note-1">z<a href="chapter.xhtml#ref"><span class="Footnote_Num dropcap">1</span></a>w</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'protected-slot-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 5000,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      final result = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      expect(server.totalRequests, 1);
+      expect(server.blockRequestIds, <List<String>>[
+        <String>['f0:p-1', 'f1:p-1'],
+      ]);
+      final Map<String, dynamic> payload = server.blockPayloads.single;
+      final List<Map<String, dynamic>> blocks =
+          (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+      expect(
+        blocks.map((Map<String, dynamic> block) => block.keys.toSet()),
+        everyElement(<String>{'id', 'slots'}),
+      );
+      expect(jsonEncode(payload), isNot(contains('notes.xhtml#n')));
+      expect(jsonEncode(payload), isNot(contains('chapter.xhtml#ref')));
+      expect(jsonEncode(payload), isNot(contains('<a')));
+
+      final String body = await _readXhtml(
+        result.job.outputPath,
+        'OPS/Text/01-fn.xhtml',
+      );
+      final String note = await _readXhtml(
+        result.job.outputPath,
+        'OPS/Text/02-fn.xhtml',
+      );
+      expect(body, contains('href="notes.xhtml#n"'));
+      expect(body, contains('class="FOOTNOTE_REF small"'));
+      expect(body, contains('>A</span>'));
+      expect(note, contains('href="chapter.xhtml#ref"'));
+      expect(note, contains('class="Footnote_Num dropcap"'));
+      expect(note, contains('>1</span>'));
+      expect(body, contains('&lt;script&gt;'));
+      expect(note, contains('&lt;script&gt;'));
+      expect(body, isNot(contains('<script>')));
+      expect(note, isNot(contains('<script>')));
+    },
+  );
+
+  test(
+    'CJK chapter preparation keeps class-only footnote markers on the slot path',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_cjk_protected_slot_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final _FootnoteFakeServer server = await _FootnoteFakeServer.start();
+      addTearDown(server.close);
+      final File epubFile = File('${temp.path}/cjk_protected_slot.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/chapter.xhtml':
+              '<p>x<a href="notes.xhtml#n"><span class="FOOTNOTE_REF small">A</span></a>y</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'cjk-protected-slot-model-${server.port}',
+        targetLanguage: 'Chinese',
+        chunkSize: 5000,
+        maxRetries: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      final result = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      final Map<String, dynamic> payload = server.blockPayloads.single;
+      final Map<String, dynamic> block =
+          (payload['blocks'] as List<dynamic>).single as Map<String, dynamic>;
+      expect(block.keys.toSet(), <String>{'id', 'slots'});
+      expect(jsonEncode(payload), isNot(contains('<a')));
+      expect(jsonEncode(payload), isNot(contains('href')));
+      expect(jsonEncode(payload), isNot(contains('notes.xhtml#n')));
+      final String chapter = await _readXhtml(
+        result.job.outputPath,
+        'OPS/Text/chapter.xhtml',
+      );
+      expect(chapter, contains('href="notes.xhtml#n"'));
+      expect(chapter, contains('class="FOOTNOTE_REF small"'));
+      expect(chapter, contains('>A</span>'));
+    },
+  );
+
+  test(
     'rejects malformed multi-footnote ids without single-request fallback',
     () async {
       final Directory temp = await Directory.systemTemp.createTemp(
@@ -233,9 +370,12 @@ void main() {
       await _writeTestEpub(
         epubFile,
         chapters: const <String, String>{
-          'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
-          'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
-          'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+          'OPS/Text/01-fn.xhtml':
+              '<p>Footnote one. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+          'OPS/Text/02-fn.xhtml':
+              '<p>Footnote two. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+          'OPS/Text/03-fn.xhtml':
+              '<p>Footnote three. <a href="chapter.xhtml#footnote_ref_3" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
         },
       );
       final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -297,9 +437,12 @@ void main() {
     await _writeTestEpub(
       epubFile,
       chapters: const <String, String>{
-        'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
-        'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
-        'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+        'OPS/Text/01-fn.xhtml':
+            '<p>Footnote one. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        'OPS/Text/02-fn.xhtml':
+            '<p>Footnote two. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        'OPS/Text/03-fn.xhtml':
+            '<p>Footnote three. <a href="chapter.xhtml#footnote_ref_3" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
       },
     );
     final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -362,9 +505,12 @@ void main() {
     await _writeTestEpub(
       epubFile,
       chapters: const <String, String>{
-        'OPS/Text/01-fn.xhtml': '<p>Footnote one.</p>',
-        'OPS/Text/02-fn.xhtml': '<p>Footnote two.</p>',
-        'OPS/Text/03-fn.xhtml': '<p>Footnote three.</p>',
+        'OPS/Text/01-fn.xhtml':
+            '<p>Footnote one. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        'OPS/Text/02-fn.xhtml':
+            '<p>Footnote two. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+        'OPS/Text/03-fn.xhtml':
+            '<p>Footnote three. <a href="chapter.xhtml#footnote_ref_3" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
       },
     );
     final TranslationConfig config = TranslationConfig.defaults().copyWith(
@@ -495,6 +641,7 @@ class _FootnoteFakeServer {
   final bool duplicateMultiResponseId;
   final bool rejectAllBlocksWith413;
   final List<List<String>> blockRequestIds = <List<String>>[];
+  final List<Map<String, dynamic>> blockPayloads = <Map<String, dynamic>>[];
   int totalRequests = 0;
 
   int get port => _server.port;
@@ -525,6 +672,7 @@ class _FootnoteFakeServer {
   void resetRequests() {
     totalRequests = 0;
     blockRequestIds.clear();
+    blockPayloads.clear();
   }
 
   Future<void> _handle(HttpRequest request) async {
@@ -558,6 +706,7 @@ class _FootnoteFakeServer {
 
     final List<Map<String, dynamic>> blocks =
         (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+    blockPayloads.add(payload);
     final List<String> ids = blocks
         .map((Map<String, dynamic> block) => block['id'] as String)
         .toList();
@@ -578,10 +727,15 @@ class _FootnoteFakeServer {
       await _writeChatResponse(request.response, <String, Object?>{
         'blocks': blocks
             .map(
-              (Map<String, dynamic> block) => <String, Object?>{
-                'id': duplicateId,
-                'html': _translatedFootnoteHtml(duplicateId),
-              },
+              (Map<String, dynamic> block) => block.containsKey('slots')
+                  ? <String, Object?>{
+                      'id': duplicateId,
+                      'slots': _translatedSlots(block),
+                    }
+                  : <String, Object?>{
+                      'id': duplicateId,
+                      'html': _translatedFootnoteHtml(duplicateId),
+                    },
             )
             .toList(),
       });
@@ -595,9 +749,31 @@ class _FootnoteFakeServer {
     await _writeChatResponse(request.response, <String, Object?>{
       'blocks': responseBlocks.map((Map<String, dynamic> block) {
         final String id = block['id'] as String;
-        return <String, Object?>{'id': id, 'html': _translatedFootnoteHtml(id)};
+        return block.containsKey('slots')
+            ? <String, Object?>{'id': id, 'slots': _translatedSlots(block)}
+            : <String, Object?>{'id': id, 'html': _translatedFootnoteHtml(id)};
       }).toList(),
     });
+  }
+
+  static List<Map<String, String>> _translatedSlots(
+    Map<String, dynamic> block,
+  ) {
+    final String id = block['id'] as String;
+    return (block['slots'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .map((Map<String, dynamic> slot) {
+          final String slotId = slot['id'] as String;
+          final String text = switch ((id, slotId)) {
+            ('f0:p-1', 's0') => '正文甲',
+            ('f0:p-1', 's1') => '<script>alert("body")</script>正文乙',
+            ('f1:p-1', 's0') => '<script>alert("note")</script>脚注乙',
+            ('f2:p-1', 's0') => '脚注丙',
+            _ => '脚注译文',
+          };
+          return <String, String>{'id': slotId, 'text': text};
+        })
+        .toList(growable: false);
   }
 
   static String _translatedFootnoteHtml(String id) {

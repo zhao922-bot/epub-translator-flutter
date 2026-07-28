@@ -1,0 +1,329 @@
+import 'dart:collection';
+
+import 'package:html/dom.dart' as dom;
+import 'package:html/parser.dart' as html_parser;
+
+/// A source-owned HTML skeleton with translatable text slots.
+///
+/// Protected footnote anchors are never exposed as slots. Rendering clones the
+/// source DOM and assigns translations to text nodes, so translated strings are
+/// always serialized as text rather than parsed as markup.
+class ProtectedAnchorTextSlots {
+  ProtectedAnchorTextSlots._(
+    this._sourceRoot,
+    this.hasProtectedAnchors,
+    List<String> slotTexts,
+  ) : slotTexts = UnmodifiableListView<String>(slotTexts);
+
+  factory ProtectedAnchorTextSlots.parse(String sourceHtml) {
+    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    final List<dom.Node> roots = fragment.nodes
+        .where(
+          (dom.Node node) => node is! dom.Text || node.data.trim().isNotEmpty,
+        )
+        .toList(growable: false);
+    if (roots.length != 1 || roots.single is! dom.Element) {
+      throw const FormatException(
+        'ProtectedAnchorTextSlots requires exactly one root element.',
+      );
+    }
+
+    final dom.Element sourceRoot = roots.single as dom.Element;
+    final List<dom.Text> slots = _collectSlots(sourceRoot);
+    return ProtectedAnchorTextSlots._(
+      sourceRoot,
+      <dom.Element>[
+        sourceRoot,
+        ...sourceRoot.querySelectorAll('a'),
+      ].any(_isProtectedAnchor),
+      slots.map((dom.Text slot) => slot.data).toList(growable: false),
+    );
+  }
+
+  /// Detects protected anchors without imposing [parse]'s single-root
+  /// requirement on ordinary HTML blocks.
+  static bool containsProtectedAnchors(String sourceHtml) {
+    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    for (final dom.Node node in fragment.nodes) {
+      if (node is! dom.Element) {
+        continue;
+      }
+      if (<dom.Element>[
+        node,
+        ...node.querySelectorAll('a'),
+      ].any(_isProtectedAnchor)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  final dom.Element _sourceRoot;
+
+  /// Whether the source contains at least one anchor whose marker and
+  /// semantics must stay source-owned.
+  final bool hasProtectedAnchors;
+
+  /// Source text for each translatable slot in document order.
+  final List<String> slotTexts;
+
+  /// Renders translations into a fresh clone of the source DOM.
+  ///
+  /// The number of translations must exactly match [slotTexts]. Source leading
+  /// and trailing whitespace is retained at every slot boundary.
+  String render(List<String> translatedSlotTexts) {
+    if (translatedSlotTexts.length != slotTexts.length) {
+      throw ArgumentError.value(
+        translatedSlotTexts.length,
+        'translatedSlotTexts.length',
+        'Expected ${slotTexts.length} translated slot texts.',
+      );
+    }
+
+    final dom.Element renderedRoot = _sourceRoot.clone(true);
+    final List<dom.Text> renderedSlots = _collectSlots(renderedRoot);
+    for (int index = 0; index < renderedSlots.length; index += 1) {
+      renderedSlots[index].data = _withSourceBoundaryWhitespace(
+        source: slotTexts[index],
+        translated: translatedSlotTexts[index],
+      );
+    }
+    return renderedRoot.outerHtml;
+  }
+
+  static List<dom.Text> _collectSlots(dom.Node root) {
+    final List<dom.Text> slots = <dom.Text>[];
+    void visit(dom.Node node, {required bool protected}) {
+      if (node is dom.Text) {
+        if (!protected && node.data.trim().isNotEmpty) {
+          slots.add(node);
+        }
+        return;
+      }
+      if (node is! dom.Element) {
+        return;
+      }
+
+      final bool childProtected =
+          protected || _isRawTextElement(node) || _isProtectedAnchor(node);
+      for (final dom.Node child in node.nodes) {
+        visit(child, protected: childProtected);
+      }
+    }
+
+    visit(root, protected: false);
+    return slots;
+  }
+
+  static bool _isProtectedAnchor(dom.Element element) {
+    if (element.localName != 'a' || !_isShortMarker(element.text)) {
+      return false;
+    }
+
+    final Set<String> roles = _tokens(element.attributes['role']);
+    final Set<String> epubTypes = _tokens(element.attributes['epub:type']);
+    final String id = element.attributes['id']?.toLowerCase() ?? '';
+    if (id.startsWith('footnote_ref_') ||
+        roles.contains('doc-backlink') ||
+        roles.contains('doc-noteref') ||
+        epubTypes.contains('noteref')) {
+      return true;
+    }
+
+    final String href = element.attributes['href'] ?? '';
+    if (href.startsWith('#') && _isLegacyFragmentMarker(element.text)) {
+      return true;
+    }
+    return _isCrossFileHref(href) && hasFootnoteMarkerClass(element);
+  }
+
+  static bool _isRawTextElement(dom.Element element) {
+    return const <String>{
+      'iframe',
+      'noembed',
+      'noframes',
+      'noscript',
+      'plaintext',
+      'script',
+      'style',
+      'xmp',
+    }.contains(element.localName);
+  }
+
+  static Set<String> _tokens(String? value) {
+    return (value ?? '')
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((String token) => token.isNotEmpty)
+        .toSet();
+  }
+
+  static bool _isCrossFileHref(String href) {
+    final int fragmentIndex = href.indexOf('#');
+    return fragmentIndex > 0 && fragmentIndex < href.length - 1;
+  }
+
+  /// Whether [element] or a descendant has a footnote marker class.
+  ///
+  /// EPUB class tokens are case-insensitive for this detection so the CJK
+  /// preprocessor and source-owned slot renderer share one definition.
+  static bool hasFootnoteMarkerClass(dom.Element element) {
+    return <dom.Element>[element, ...element.querySelectorAll('*')].any((
+      dom.Element element,
+    ) {
+      final Set<String> classes = element.classes
+          .map((String value) => value.toLowerCase())
+          .toSet();
+      return classes.contains('footnote_ref') ||
+          classes.contains('footnote_num');
+    });
+  }
+
+  static bool _isShortMarker(String value) {
+    final String compact = value.replaceAll(RegExp(r'\s+'), '');
+    if (compact.isEmpty || compact.length > 10) {
+      return false;
+    }
+    if (_isFootnoteSymbolMarker(compact)) {
+      return true;
+    }
+
+    final String? bracketedToken = _matchedBracketToken(compact);
+    if (bracketedToken != null) {
+      return _isTraditionalMarkerToken(bracketedToken);
+    }
+
+    final String token = compact.endsWith('.') || compact.endsWith(')')
+        ? compact.substring(0, compact.length - 1)
+        : compact;
+    return _isTraditionalMarkerToken(token);
+  }
+
+  static String? _matchedBracketToken(String value) {
+    const Map<String, String> pairs = <String, String>{
+      '[': ']',
+      '(': ')',
+      '{': '}',
+      '（': '）',
+      '【': '】',
+    };
+    final String? closing = pairs[value[0]];
+    if (closing == null || value.length < 3 || !value.endsWith(closing)) {
+      return null;
+    }
+    return value.substring(1, value.length - 1);
+  }
+
+  static bool _isTraditionalMarkerToken(String token) {
+    if (token.isEmpty) {
+      return false;
+    }
+    final String normalizedRoman = token.runes
+        .map(
+          (int rune) =>
+              _unicodeRomanToAscii[String.fromCharCode(rune)] ??
+              String.fromCharCode(rune),
+        )
+        .join();
+    return RegExp(r'^[0-9０-９]+$').hasMatch(token) ||
+        RegExp(r'^[A-Za-z]$').hasMatch(token) ||
+        _canonicalRomanNumeral.hasMatch(normalizedRoman) ||
+        RegExp(r'^[⁰¹²³⁴⁵⁶⁷⁸⁹]+$').hasMatch(token) ||
+        RegExp(r'^[零一二三四五六七八九十百]+$').hasMatch(token);
+  }
+
+  static bool _isFootnoteSymbolMarker(String token) {
+    return token.isNotEmpty &&
+        token.runes.every(
+          (int rune) =>
+              _footnoteSymbolMarkers.contains(String.fromCharCode(rune)),
+        );
+  }
+
+  static bool _isLegacyFragmentMarker(String value) {
+    final String compact = value.replaceAll(RegExp(r'\s+'), '');
+    if (compact.isEmpty || compact.length > 10) {
+      return false;
+    }
+    return compact == '＊' ||
+        const <String>{
+          '零',
+          '一',
+          '二',
+          '三',
+          '四',
+          '五',
+          '六',
+          '七',
+          '八',
+          '九',
+          '十',
+          '十一',
+        }.contains(compact) ||
+        RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
+        RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
+        RegExp(r'^[*†‡§¶]+$').hasMatch(compact) ||
+        compact == '↩';
+  }
+
+  static final RegExp _canonicalRomanNumeral = RegExp(
+    r'^(?=[MDCLXVI]+$)M{0,3}(?:CM|CD|D?C{0,3})'
+    r'(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$',
+    caseSensitive: false,
+  );
+
+  static const Set<String> _footnoteSymbolMarkers = <String>{
+    '*',
+    '＊',
+    '†',
+    '‡',
+    '§',
+    '¶',
+    '+',
+    '↩',
+  };
+
+  static const Map<String, String> _unicodeRomanToAscii = <String, String>{
+    'Ⅰ': 'I',
+    'Ⅱ': 'II',
+    'Ⅲ': 'III',
+    'Ⅳ': 'IV',
+    'Ⅴ': 'V',
+    'Ⅵ': 'VI',
+    'Ⅶ': 'VII',
+    'Ⅷ': 'VIII',
+    'Ⅸ': 'IX',
+    'Ⅹ': 'X',
+    'Ⅺ': 'XI',
+    'Ⅻ': 'XII',
+    'Ⅼ': 'L',
+    'Ⅽ': 'C',
+    'Ⅾ': 'D',
+    'Ⅿ': 'M',
+    'ⅰ': 'I',
+    'ⅱ': 'II',
+    'ⅲ': 'III',
+    'ⅳ': 'IV',
+    'ⅴ': 'V',
+    'ⅵ': 'VI',
+    'ⅶ': 'VII',
+    'ⅷ': 'VIII',
+    'ⅸ': 'IX',
+    'ⅹ': 'X',
+    'ⅺ': 'XI',
+    'ⅻ': 'XII',
+    'ⅼ': 'L',
+    'ⅽ': 'C',
+    'ⅾ': 'D',
+    'ⅿ': 'M',
+  };
+
+  static String _withSourceBoundaryWhitespace({
+    required String source,
+    required String translated,
+  }) {
+    final String leading = RegExp(r'^\s*').firstMatch(source)!.group(0)!;
+    final String trailing = RegExp(r'\s*$').firstMatch(source)!.group(0)!;
+    return '$leading${translated.trim()}$trailing';
+  }
+}
