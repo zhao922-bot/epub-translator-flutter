@@ -170,6 +170,16 @@ class TranslationDashboardState {
   }
 }
 
+class _ResumeProgressHint {
+  const _ResumeProgressHint({
+    required this.completedBlocks,
+    required this.totalBlocks,
+  });
+
+  final int completedBlocks;
+  final int totalBlocks;
+}
+
 class TranslationDashboardController
     extends StateNotifier<TranslationDashboardState> {
   TranslationDashboardController({
@@ -192,6 +202,7 @@ class TranslationDashboardController
   late final Future<void> _initialJobHistoryLoad;
   int _sessionPathRevision = 0;
   int _historyClearRevision = 0;
+  _ResumeProgressHint? _pendingResumeProgressHint;
 
   AppStrings get _s => AppStrings(state.config.uiLanguage);
 
@@ -732,17 +743,34 @@ class TranslationDashboardController
 
     _cancelRequested = false;
     _translationStopwatch = Stopwatch()..start();
+    final _ResumeProgressHint? resumeHint =
+        _pendingResumeProgressHint?.totalBlocks == selectedBlocks
+        ? _pendingResumeProgressHint
+        : null;
+    _pendingResumeProgressHint = null;
+    final int checkpointBlocks = (resumeHint?.completedBlocks ?? 0).clamp(
+      0,
+      selectedBlocks,
+    );
+    final double checkpointProgress = selectedBlocks == 0
+        ? 0
+        : checkpointBlocks / selectedBlocks;
     final TranslationJob queuedJob =
         state.job?.copyWith(
           status: TranslationJobStatus.queued,
-          phase: TranslationJobPhase.translation,
-          progress: 0,
-          currentChapter: 'Queued for translation',
+          phase: TranslationJobPhase.cacheRestoration,
+          progress: checkpointProgress,
+          currentChapter: 'Restoring cached translations',
           currentBlock: null,
           completedFiles: 0,
           totalFiles: selectedChapters.length,
-          completedBlocks: 0,
+          completedBlocks: checkpointBlocks,
           totalBlocks: selectedBlocks,
+          cachedBlocks: 0,
+          resumedBlocks: 0,
+          resumeCheckpointBlocks: checkpointBlocks,
+          cacheScanScannedBlocks: 0,
+          cacheScanTotalBlocks: selectedBlocks,
           styleProfile: state.styleProfile,
           styleProfileConfirmed: state.styleProfileConfirmed,
           styleProfileEnabled: state.config.styleProfileEnabled,
@@ -752,13 +780,16 @@ class TranslationDashboardController
           inputPath: state.inputPath,
           outputPath: state.outputDirectory,
           status: TranslationJobStatus.queued,
-          phase: TranslationJobPhase.translation,
-          progress: 0,
-          currentChapter: 'Queued for translation',
+          phase: TranslationJobPhase.cacheRestoration,
+          progress: checkpointProgress,
+          currentChapter: 'Restoring cached translations',
           completedFiles: 0,
           totalFiles: selectedChapters.length,
-          completedBlocks: 0,
+          completedBlocks: checkpointBlocks,
           totalBlocks: selectedBlocks,
+          resumeCheckpointBlocks: checkpointBlocks,
+          cacheScanScannedBlocks: 0,
+          cacheScanTotalBlocks: selectedBlocks,
           styleProfile: state.styleProfile,
           styleProfileConfirmed: state.styleProfileConfirmed,
           styleProfileEnabled: state.config.styleProfileEnabled,
@@ -1066,6 +1097,12 @@ class TranslationDashboardController
         (job.currentChapter ?? '').toLowerCase().contains('translation') ||
         job.totalBlocks > 0 ||
         job.completedBlocks > 0;
+    _pendingResumeProgressHint = wasTranslationFailure && job.totalBlocks > 0
+        ? _ResumeProgressHint(
+            completedBlocks: job.completedBlocks,
+            totalBlocks: job.totalBlocks,
+          )
+        : null;
     state = state.copyWith(
       inputPath: job.inputPath,
       outputDirectory: outputDirectory,
@@ -1085,6 +1122,7 @@ class TranslationDashboardController
       return;
     }
     if (!wasTranslationFailure) {
+      _pendingResumeProgressHint = null;
       return;
     }
     final bool readyToTranslate = state.inspectedChapters.any(
@@ -1097,7 +1135,9 @@ class TranslationDashboardController
         logs: <String>[...state.logs, _s.logRetryContinueTranslate],
       );
       await startTranslation();
+      return;
     }
+    _pendingResumeProgressHint = null;
   }
 
   void clearJobHistory() {

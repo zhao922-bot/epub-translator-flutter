@@ -78,6 +78,9 @@ class _BlockingRepository implements TranslationRepository {
 }
 
 class _SuccessfulInspectionRepository implements TranslationRepository {
+  _SuccessfulInspectionRepository({this.blockCount = 1});
+
+  final int blockCount;
   int startCount = 0;
   String? lastInputPath;
   String? lastOutputDirectory;
@@ -104,14 +107,15 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
         title: 'Chapter',
         body: '',
         originalHtml: '',
-        blocks: <ExtractedBlock>[
-          const ExtractedBlock(
-            id: 'block-1',
+        blocks: List<ExtractedBlock>.generate(
+          blockCount,
+          (int index) => ExtractedBlock(
+            id: 'block-$index',
             tagName: 'p',
-            sourceHtml: 'short text',
-            sourceText: 'short text',
+            sourceHtml: 'short text $index',
+            sourceText: 'short text $index',
           ),
-        ],
+        ),
         category: ChapterCategory.content,
         recommendedForTranslation: true,
         includeInTranslation: true,
@@ -125,8 +129,8 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
       progress: 1,
       completedFiles: 1,
       totalFiles: 1,
-      completedBlocks: 1,
-      totalBlocks: 1,
+      completedBlocks: blockCount,
+      totalBlocks: blockCount,
     );
     onProgress?.call(job, 'Inspection complete.');
     return InspectionResult(job: job, chapters: chapters);
@@ -177,6 +181,36 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     );
     onProgress?.call(job, 'Translation complete.');
     return TranslationRunResult(job: job, chapters: chapters);
+  }
+}
+
+class _BlockingTranslationRepository extends _SuccessfulInspectionRepository {
+  _BlockingTranslationRepository({required super.blockCount});
+
+  final Completer<void> translationStarted = Completer<void>();
+  final Completer<void> releaseTranslation = Completer<void>();
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    translationStarted.complete();
+    await releaseTranslation.future;
+    return super.translateChapters(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      config: config,
+      chapters: chapters,
+      confirmedStyleProfile: confirmedStyleProfile,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
   }
 }
 
@@ -500,6 +534,51 @@ void main() {
           'Inspection ready. Continuing with translation for the retry.',
         ),
       );
+    },
+  );
+
+  test(
+    'retry immediately exposes checkpoint as cache restoration progress',
+    () async {
+      final _BlockingTranslationRepository repository =
+          _BlockingTranslationRepository(blockCount: 1643);
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(
+              initial: const <TranslationJob>[
+                TranslationJob(
+                  id: 'failed-605',
+                  inputPath: r'C:\Books\book.epub',
+                  outputPath: r'C:\Books',
+                  status: TranslationJobStatus.failed,
+                  phase: TranslationJobPhase.translation,
+                  progress: 605 / 1643,
+                  currentChapter: 'Translation failed',
+                  completedBlocks: 605,
+                  totalBlocks: 1643,
+                  styleProfile: TranslationStyleProfile(
+                    primaryGenre: 'memoir',
+                    confidence: TranslationStyleConfidence.high,
+                  ),
+                  styleProfileConfirmed: true,
+                  styleProfileEnabled: true,
+                ),
+              ],
+            ),
+          );
+      await Future<void>.delayed(Duration.zero);
+
+      final Future<void> retry = controller.retryJob('failed-605');
+      await repository.translationStarted.future;
+
+      expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
+      expect(controller.state.job?.completedBlocks, 605);
+      expect(controller.state.job?.resumeCheckpointBlocks, 605);
+      expect(controller.state.job?.progress, closeTo(605 / 1643, 0.0001));
+
+      repository.releaseTranslation.complete();
+      await retry;
     },
   );
 
