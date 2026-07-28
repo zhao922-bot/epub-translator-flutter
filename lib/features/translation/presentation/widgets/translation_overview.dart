@@ -51,6 +51,18 @@ class TranslationOverview extends StatelessWidget {
     final String statusText = strings.jobStatusLabel(status);
     final double progress = (job?.progress ?? 0).clamp(0.0, 1.0);
     final int percent = (progress * 100).round();
+    final bool restoringCache =
+        job?.phase == TranslationJobPhase.cacheRestoration;
+    final bool continuingFromCache =
+        job?.phase == TranslationJobPhase.translation &&
+        (job?.cachedBlocks ?? 0) > 0 &&
+        (job?.cacheScanTotalBlocks ?? 0) > 0 &&
+        job!.cacheScanScannedBlocks >= job!.cacheScanTotalBlocks;
+    final String? progressTitle = restoringCache
+        ? strings.cacheRestorationTitle
+        : continuingFromCache
+        ? strings.continuingTranslation
+        : job?.currentChapter;
 
     return SectionCard(
       title: strings.runOverview,
@@ -97,10 +109,10 @@ class TranslationOverview extends StatelessWidget {
               ),
             ],
           ),
-          if (job?.currentChapter?.isNotEmpty == true) ...<Widget>[
+          if (progressTitle?.isNotEmpty == true) ...<Widget>[
             const SizedBox(height: 8),
             Text(
-              job!.currentChapter!,
+              progressTitle!,
               style: theme.textTheme.bodyMedium?.copyWith(
                 color: scheme.onSurfaceVariant,
               ),
@@ -117,6 +129,28 @@ class TranslationOverview extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
+          if (restoringCache) ...<Widget>[
+            Wrap(
+              spacing: 12,
+              runSpacing: 6,
+              children: <Widget>[
+                _MetaText(
+                  strings.resumeCheckpointSummary(
+                    job!.resumeCheckpointBlocks,
+                    job!.totalBlocks,
+                  ),
+                ),
+                _MetaText(
+                  strings.cacheScanSummary(
+                    job!.cacheScanScannedBlocks,
+                    job!.cacheScanTotalBlocks,
+                  ),
+                ),
+                _MetaText(strings.verifiedCacheSummary(job!.cachedBlocks)),
+              ],
+            ),
+            const SizedBox(height: 12),
+          ],
           Wrap(
             spacing: 8,
             runSpacing: 6,

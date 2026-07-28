@@ -812,6 +812,7 @@ class TranslationDashboardController
       ],
     );
 
+    bool cacheRestorationLogged = false;
     try {
       final TranslationRunResult result = await repository.translateChapters(
         inputPath: state.inputPath,
@@ -826,10 +827,26 @@ class TranslationDashboardController
           if (_cancelRequested) {
             return;
           }
+          final List<String> nextLogs = <String>[
+            ...state.logs,
+            _safeLogText(logLine),
+          ];
+          final bool cacheScanComplete =
+              job.phase == TranslationJobPhase.cacheRestoration &&
+              job.cacheScanTotalBlocks > 0 &&
+              job.cacheScanScannedBlocks >= job.cacheScanTotalBlocks;
+          if (!cacheRestorationLogged && cacheScanComplete) {
+            cacheRestorationLogged = true;
+            nextLogs.add(
+              job.cachedBlocks >= job.totalBlocks
+                  ? _s.logAllBlocksRestoredNoApi(job.totalBlocks)
+                  : _s.logCacheRestoredNoApi(job.cachedBlocks),
+            );
+          }
           state = state.copyWith(
             job: job,
             runEstimate: _buildEstimate(job: job),
-            logs: <String>[...state.logs, _safeLogText(logLine)],
+            logs: nextLogs,
           );
         },
         isCancelled: () => _cancelRequested,

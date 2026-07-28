@@ -214,6 +214,47 @@ class _BlockingTranslationRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+class _CacheProgressRepository extends _SuccessfulInspectionRepository {
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    onProgress?.call(
+      TranslationJob(
+        id: 'cache-progress',
+        inputPath: inputPath,
+        outputPath: outputDirectory,
+        status: TranslationJobStatus.running,
+        phase: TranslationJobPhase.cacheRestoration,
+        progress: 1,
+        completedBlocks: 1,
+        totalBlocks: 1,
+        cachedBlocks: 1,
+        resumedBlocks: 1,
+        resumeCheckpointBlocks: 1,
+        cacheScanScannedBlocks: 1,
+        cacheScanTotalBlocks: 1,
+      ),
+      'Cache scan 1/1: verified 1 reusable block.',
+    );
+    return super.translateChapters(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      config: config,
+      chapters: chapters,
+      confirmedStyleProfile: confirmedStyleProfile,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
+  }
+}
+
 class _ControlledSessionPathStore extends SessionPathStore {
   final Completer<({String inputPath, String outputDirectory})> loadCompleter =
       Completer<({String inputPath, String outputDirectory})>();
@@ -581,6 +622,42 @@ void main() {
       await retry;
     },
   );
+
+  test('logs that completed cache restoration made no API requests', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _CacheProgressRepository(),
+          historyStore: _MemoryJobHistoryStore(
+            initial: const <TranslationJob>[
+              TranslationJob(
+                id: 'failed-cache',
+                inputPath: r'C:\Books\book.epub',
+                outputPath: r'C:\Books',
+                status: TranslationJobStatus.failed,
+                phase: TranslationJobPhase.translation,
+                progress: 1,
+                currentChapter: 'Translation failed',
+                completedBlocks: 1,
+                totalBlocks: 1,
+                styleProfile: TranslationStyleProfile(
+                  primaryGenre: 'memoir',
+                  confidence: TranslationStyleConfidence.high,
+                ),
+                styleProfileConfirmed: true,
+                styleProfileEnabled: true,
+              ),
+            ],
+          ),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(uiLanguage: UiLanguage.chinese),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    await controller.retryJob('failed-cache');
+
+    expect(controller.state.logs, contains('已复用全部 1 块，本次未产生 API 请求。'));
+  });
 
   test('inspection alone does not mark exportable output ready', () async {
     final TranslationDashboardController controller =

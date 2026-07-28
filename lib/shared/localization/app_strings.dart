@@ -89,10 +89,23 @@ class AppStrings {
   String get stepChooseEpub => isChinese ? '选择 EPUB' : 'Choose EPUB';
   String get stepReadyToInspect => isChinese ? '待检查' : 'Ready to inspect';
   String get stepInspecting => isChinese ? '检查中' : 'Inspecting…';
+  String get stepRestoringCache => isChinese ? '恢复缓存中' : 'Restoring cache…';
   String get stepReviewChapters => isChinese ? '确认章节' : 'Review chapters';
   String get stepReadyToTranslate => isChinese ? '待翻译' : 'Ready to translate';
   String get stepTranslating => isChinese ? '翻译中' : 'Translating…';
   String get stepExportDone => isChinese ? '已完成' : 'Done';
+
+  String get cacheRestorationTitle =>
+      isChinese ? '正在恢复缓存' : 'Restoring cached translations';
+  String resumeCheckpointSummary(int checkpoint, int total) => isChinese
+      ? '待校验断点：$checkpoint/$total'
+      : 'Checkpoint to verify: $checkpoint/$total';
+  String cacheScanSummary(int scanned, int total) =>
+      isChinese ? '缓存扫描：$scanned/$total' : 'Cache scan: $scanned/$total';
+  String verifiedCacheSummary(int verified) =>
+      isChinese ? '已确认复用：$verified 块' : 'Verified reusable: $verified blocks';
+  String get continuingTranslation =>
+      isChinese ? '继续翻译' : 'Continuing translation';
 
   String get logsTitle => isChinese ? '日志' : 'Logs';
   String get expandLogs => isChinese ? '展开' : 'Expand';
@@ -259,6 +272,12 @@ class AppStrings {
   String logCacheResume(int cached, int resumed) => isChinese
       ? '缓存/续传：$cached 缓存块 · $resumed 续传块。'
       : 'Cache/resume: $cached cached, $resumed resumed blocks.';
+  String logCacheRestoredNoApi(int reused) => isChinese
+      ? '已复用 $reused 块；缓存恢复阶段未产生 API 请求。'
+      : 'Reused $reused blocks; cache restoration made no API requests.';
+  String logAllBlocksRestoredNoApi(int total) => isChinese
+      ? '已复用全部 $total 块，本次未产生 API 请求。'
+      : 'Reused all $total blocks; this run made no API requests.';
   String logTranslationFailed(String error) =>
       isChinese ? '翻译失败：$error' : 'Translation failed: $error';
   String logCheckpointed(int blocks) => isChinese

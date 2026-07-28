@@ -42,6 +42,9 @@ class TranslationWorkflowSteps extends StatelessWidget {
     } else if (runActive && phase == TranslationJobPhase.inspection) {
       step = 2;
       label = strings.stepInspecting;
+    } else if (runActive && phase == TranslationJobPhase.cacheRestoration) {
+      step = 3;
+      label = strings.stepRestoringCache;
     } else if (runActive && phase == TranslationJobPhase.translation) {
       step = 3;
       label = strings.stepTranslating;
