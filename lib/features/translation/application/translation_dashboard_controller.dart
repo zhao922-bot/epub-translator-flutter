@@ -65,6 +65,17 @@ final translationDashboardProvider =
 const Object _unset = Object();
 const int _maxLogLines = 400;
 
+bool _isTranslationRunPhase(TranslationJobPhase phase) {
+  return phase == TranslationJobPhase.translation ||
+      phase == TranslationJobPhase.cacheRestoration;
+}
+
+int _confirmedProgressBlocks(TranslationJob job) {
+  return job.phase == TranslationJobPhase.cacheRestoration
+      ? job.cachedBlocks
+      : job.completedBlocks;
+}
+
 class TranslationDashboardState {
   const TranslationDashboardState({
     required this.config,
@@ -743,9 +754,24 @@ class TranslationDashboardController
 
     _cancelRequested = false;
     _translationStopwatch = Stopwatch()..start();
+    final TranslationJob? currentJob = state.job;
+    final bool currentJobIsResumable =
+        currentJob != null &&
+        (currentJob.status == TranslationJobStatus.failed ||
+            currentJob.status == TranslationJobStatus.cancelled) &&
+        currentJob.phase != TranslationJobPhase.inspection &&
+        currentJob.totalBlocks > 0;
+    final _ResumeProgressHint? currentJobHint = currentJobIsResumable
+        ? _ResumeProgressHint(
+            completedBlocks: currentJob.completedBlocks,
+            totalBlocks: currentJob.totalBlocks,
+          )
+        : null;
+    final _ResumeProgressHint? candidateResumeHint =
+        _pendingResumeProgressHint ?? currentJobHint;
     final _ResumeProgressHint? resumeHint =
-        _pendingResumeProgressHint?.totalBlocks == selectedBlocks
-        ? _pendingResumeProgressHint
+        candidateResumeHint?.totalBlocks == selectedBlocks
+        ? candidateResumeHint
         : null;
     _pendingResumeProgressHint = null;
     final int checkpointBlocks = (resumeHint?.completedBlocks ?? 0).clamp(
@@ -942,8 +968,7 @@ class TranslationDashboardController
       currentChapter: 'Cancellation requested',
       currentBlock: null,
     );
-    // completedBlocks already includes cache hits; do not sum cache/resume/done.
-    final int progressBlocks = activeJob.completedBlocks;
+    final int progressBlocks = _confirmedProgressBlocks(activeJob);
     state = state.copyWith(
       job: cancellingJob,
       logs: <String>[
@@ -1226,20 +1251,19 @@ class TranslationDashboardController
           progress: 0,
           currentChapter: 'Cancelled',
         );
-    // completedBlocks already includes cache hits; do not sum cache/resume/done.
-    final int progressBlocks = cancelledJob.completedBlocks;
+    final bool translationRun = _isTranslationRunPhase(cancelledJob.phase);
+    final int progressBlocks = _confirmedProgressBlocks(cancelledJob);
     state = state.copyWith(
       job: cancelledJob,
       jobHistory: _jobHistoryWith(cancelledJob),
       logs: <String>[
         ...state.logs,
         _s.logRunCancelled,
-        if (progressBlocks > 0 &&
-            cancelledJob.phase == TranslationJobPhase.translation)
+        if (progressBlocks > 0 && translationRun)
           _s.logResumeHint(progressBlocks),
       ],
       actionableError: ActionableErrorFactory.fromMessage(
-        cancelledJob.phase == TranslationJobPhase.translation
+        translationRun
             ? (state.config.uiLanguage == UiLanguage.chinese
                   ? '翻译已取消'
                   : 'Translation cancelled')
@@ -1247,7 +1271,7 @@ class TranslationDashboardController
                   ? '检查已取消'
                   : 'Inspection cancelled'),
         isChinese: state.config.uiLanguage == UiLanguage.chinese,
-        preferredKind: cancelledJob.phase == TranslationJobPhase.translation
+        preferredKind: translationRun
             ? ActionableErrorKind.retryTranslation
             : ActionableErrorKind.retryInspection,
       ),
@@ -1382,7 +1406,7 @@ class TranslationDashboardController
     }
     return job.copyWith(
       status: TranslationJobStatus.cancelled,
-      currentChapter: job.phase == TranslationJobPhase.translation
+      currentChapter: _isTranslationRunPhase(job.phase)
           ? 'Translation interrupted'
           : 'Inspection interrupted',
       currentBlock: null,

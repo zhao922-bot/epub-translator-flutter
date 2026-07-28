@@ -255,6 +255,96 @@ class _CacheProgressRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+class _FailThenBlockTranslationRepository
+    extends _SuccessfulInspectionRepository {
+  _FailThenBlockTranslationRepository() : super(blockCount: 10);
+
+  final Completer<void> secondTranslationStarted = Completer<void>();
+  final Completer<void> releaseSecondTranslation = Completer<void>();
+  int attempts = 0;
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    attempts += 1;
+    if (attempts == 1) {
+      onProgress?.call(
+        TranslationJob(
+          id: 'failed-progress',
+          inputPath: inputPath,
+          outputPath: outputDirectory,
+          status: TranslationJobStatus.running,
+          phase: TranslationJobPhase.translation,
+          progress: 0.2,
+          completedBlocks: 2,
+          totalBlocks: 10,
+        ),
+        'Translated 2/10 blocks.',
+      );
+      throw StateError('temporary failure');
+    }
+    secondTranslationStarted.complete();
+    await releaseSecondTranslation.future;
+    return super.translateChapters(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      config: config,
+      chapters: chapters,
+      confirmedStyleProfile: confirmedStyleProfile,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
+  }
+}
+
+class _RestorationCancellationRepository
+    extends _SuccessfulInspectionRepository {
+  _RestorationCancellationRepository() : super(blockCount: 10);
+
+  final Completer<void> restorationStarted = Completer<void>();
+  final Completer<void> releaseTranslation = Completer<void>();
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    onProgress?.call(
+      TranslationJob(
+        id: 'restoring-cancel',
+        inputPath: inputPath,
+        outputPath: outputDirectory,
+        status: TranslationJobStatus.running,
+        phase: TranslationJobPhase.cacheRestoration,
+        progress: 0.6,
+        completedBlocks: 6,
+        totalBlocks: 10,
+        cachedBlocks: 2,
+        resumedBlocks: 2,
+        resumeCheckpointBlocks: 6,
+        cacheScanScannedBlocks: 2,
+        cacheScanTotalBlocks: 10,
+      ),
+      'Cache scan 2/10: verified 2 reusable blocks.',
+    );
+    restorationStarted.complete();
+    await releaseTranslation.future;
+    throw const TranslationCancelledException();
+  }
+}
+
 class _ControlledSessionPathStore extends SessionPathStore {
   final Completer<({String inputPath, String outputDirectory})> loadCompleter =
       Completer<({String inputPath, String outputDirectory})>();
@@ -657,6 +747,111 @@ void main() {
     await controller.retryJob('failed-cache');
 
     expect(controller.state.logs, contains('已复用全部 1 块，本次未产生 API 请求。'));
+  });
+
+  test(
+    'direct translation retry preserves the failed job checkpoint',
+    () async {
+      final _FailThenBlockTranslationRepository repository =
+          _FailThenBlockTranslationRepository();
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      controller.setInputPath(r'C:\Books\book.epub');
+      await controller.startInspection();
+      await controller.startTranslation();
+      expect(controller.state.job?.status, TranslationJobStatus.failed);
+      expect(controller.state.job?.completedBlocks, 2);
+
+      final Future<void> retry = controller.startTranslation();
+      await repository.secondTranslationStarted.future;
+
+      expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
+      expect(controller.state.job?.completedBlocks, 2);
+      expect(controller.state.job?.resumeCheckpointBlocks, 2);
+
+      repository.releaseSecondTranslation.complete();
+      await retry;
+    },
+  );
+
+  test(
+    'cache restoration cancellation keeps translation resume semantics',
+    () async {
+      final _RestorationCancellationRepository repository =
+          _RestorationCancellationRepository();
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      controller.setInputPath(r'C:\Books\book.epub');
+      await controller.startInspection();
+
+      final Future<void> run = controller.startTranslation();
+      await repository.restorationStarted.future;
+      await controller.requestCancel();
+
+      expect(
+        controller.state.logs,
+        contains(
+          'Cached progress so far: ~2 blocks. After cancel, press Translate selected to resume.',
+        ),
+      );
+      expect(
+        controller.state.logs,
+        isNot(
+          contains(
+            'Cached progress so far: ~6 blocks. After cancel, press Translate selected to resume.',
+          ),
+        ),
+      );
+
+      repository.releaseTranslation.complete();
+      await run;
+
+      expect(
+        controller.state.actionableError?.actionKind.name,
+        'retryTranslation',
+      );
+      expect(controller.state.job?.canResumeTranslation, isTrue);
+    },
+  );
+
+  test('startup restores cache scanning as interrupted translation', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          historyStore: _MemoryJobHistoryStore(
+            initial: const <TranslationJob>[
+              TranslationJob(
+                id: 'interrupted-cache',
+                inputPath: r'C:\Books\book.epub',
+                outputPath: r'C:\Books',
+                status: TranslationJobStatus.running,
+                phase: TranslationJobPhase.cacheRestoration,
+                progress: 0.6,
+                completedBlocks: 6,
+                totalBlocks: 10,
+                cachedBlocks: 2,
+              ),
+            ],
+          ),
+        );
+    await Future<void>.delayed(Duration.zero);
+
+    final TranslationJob restored = controller.state.jobHistory.single;
+    expect(restored.status, TranslationJobStatus.cancelled);
+    expect(restored.currentChapter, 'Translation interrupted');
+    expect(restored.canResumeTranslation, isTrue);
   });
 
   test('inspection alone does not mark exportable output ready', () async {

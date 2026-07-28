@@ -635,9 +635,17 @@ class EpubChapterTranslator {
         chapters: selectedChapters,
         confirmedStyleProfile: userStyleProfile,
       );
-      final JobResumeState? previousState = await _cacheStore.loadJobState(
-        jobKey,
-      );
+      JobResumeState? previousState;
+      bool unreadableResumeState = false;
+      try {
+        previousState = await _cacheStore.loadJobState(jobKey);
+      } catch (error) {
+        unreadableResumeState = true;
+        AppLogger.warn(
+          'Saved checkpoint could not be read (${error.runtimeType}); scanning block caches without it.',
+          tag: 'translate',
+        );
+      }
       final int checkpointBlocks = min(
         previousState?.completedBlocks ?? 0,
         totalBlocks,
@@ -702,6 +710,11 @@ class EpubChapterTranslator {
         emit(
           currentJob,
           'Found a saved translation checkpoint with $checkpointBlocks/$totalBlocks blocks from ${previousState.updatedAtIso8601}. Verifying local cache before new API calls.',
+        );
+      } else if (unreadableResumeState) {
+        emit(
+          currentJob,
+          'Saved checkpoint is unreadable. Scanning block caches without checkpoint metadata.',
         );
       }
 
@@ -1497,6 +1510,7 @@ class EpubChapterTranslator {
 
       final TranslationJob completedJob = currentJob.copyWith(
         status: TranslationJobStatus.completed,
+        phase: TranslationJobPhase.translation,
         progress: 1,
         currentChapter: 'EPUB ready',
         currentBlock: null,

@@ -5,6 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -73,6 +74,52 @@ void main() {
     },
   );
 
+  test('unreadable job state still allows block cache restoration', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_repository_unreadable_job_state_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final List<String> events = <String>[];
+    final HttpServer server = await _startFakeTranslationServer(events);
+    addTearDown(() => server.close(force: true));
+    final _EventRecordingCacheStore cacheStore = _EventRecordingCacheStore(
+      events,
+      throwOnLoadJobState: true,
+    );
+    final File epubFile = File('${temp.path}/broken_state.epub');
+    await _writeTestEpub(
+      epubFile,
+      chapters: const <String, String>{
+        'OPS/Text/chapter.xhtml': '<p>Recover me.</p>',
+      },
+    );
+    final TranslationConfig config = TranslationConfig.defaults().copyWith(
+      apiBaseUrl: 'http://127.0.0.1:${server.port}',
+      apiKey: 'sk-test',
+      model: 'broken-state-model-${server.port}',
+      chunkSize: 1000,
+    );
+    final EpubTranslationRepository repository = EpubTranslationRepository(
+      cacheStore: cacheStore,
+    );
+    final inspection = await repository.startJob(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+    );
+
+    final result = await repository.translateChapters(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+      chapters: inspection.chapters,
+    );
+
+    expect(result.job.status, TranslationJobStatus.completed);
+    expect(events.first, 'cache');
+  });
+
   test(
     'reuses cached translations without extra memory or translation requests',
     () async {
@@ -118,7 +165,7 @@ void main() {
       expect(requestKinds, contains('blocks'));
       requestKinds.clear();
 
-      await repository.translateChapters(
+      final secondRun = await repository.translateChapters(
         inputPath: epubFile.path,
         outputDirectory: temp.path,
         config: config,
@@ -126,6 +173,8 @@ void main() {
       );
 
       expect(requestKinds, isEmpty);
+      expect(secondRun.job.phase, TranslationJobPhase.translation);
+      expect(secondRun.job.hasExportableEpub, isTrue);
     },
   );
 
@@ -690,9 +739,10 @@ class _RecordingCheckpointCacheStore extends TranslationCacheStore {
 }
 
 class _EventRecordingCacheStore extends TranslationCacheStore {
-  _EventRecordingCacheStore(this.events);
+  _EventRecordingCacheStore(this.events, {this.throwOnLoadJobState = false});
 
   final List<String> events;
+  final bool throwOnLoadJobState;
   final Map<String, String> translations = <String, String>{};
   JobResumeState? jobState;
 
@@ -711,7 +761,12 @@ class _EventRecordingCacheStore extends TranslationCacheStore {
   }
 
   @override
-  Future<JobResumeState?> loadJobState(String jobKey) async => jobState;
+  Future<JobResumeState?> loadJobState(String jobKey) async {
+    if (throwOnLoadJobState) {
+      throw const FormatException('corrupt job state');
+    }
+    return jobState;
+  }
 
   @override
   Future<void> saveJobState(JobResumeState state) async {
