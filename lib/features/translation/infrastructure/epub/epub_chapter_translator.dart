@@ -19,6 +19,7 @@ import '../../domain/models/translation_style_profile.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../translation_cache_store.dart';
 import '../translation_quality.dart';
+import '../cache_restoration_scanner.dart';
 import 'epub_repacker.dart';
 import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
@@ -637,20 +638,27 @@ class EpubChapterTranslator {
       final JobResumeState? previousState = await _cacheStore.loadJobState(
         jobKey,
       );
+      final int checkpointBlocks = min(
+        previousState?.completedBlocks ?? 0,
+        totalBlocks,
+      );
       TranslationJob currentJob = TranslationJob(
         id: jobId,
         inputPath: inputPath,
         outputPath: outputFilePath,
         status: TranslationJobStatus.running,
-        phase: TranslationJobPhase.translation,
-        progress: 0,
-        currentChapter: 'Preparing translation run',
+        phase: TranslationJobPhase.cacheRestoration,
+        progress: checkpointBlocks / totalBlocks,
+        currentChapter: 'Restoring cached translations',
         completedFiles: 0,
         totalFiles: selectedChapters.length,
-        completedBlocks: 0,
+        completedBlocks: checkpointBlocks,
         totalBlocks: totalBlocks,
         cachedBlocks: 0,
         resumedBlocks: 0,
+        resumeCheckpointBlocks: checkpointBlocks,
+        cacheScanScannedBlocks: 0,
+        cacheScanTotalBlocks: totalBlocks,
         styleProfile: confirmedProfile ?? TranslationStyleProfile.empty,
         styleProfileConfirmed:
             !config.styleProfileEnabled || confirmedProfile != null,
@@ -693,16 +701,77 @@ class EpubChapterTranslator {
       if (previousState != null) {
         emit(
           currentJob,
-          'Found a saved translation checkpoint from ${previousState.updatedAtIso8601}. Cached blocks will be reused before new API calls.',
+          'Found a saved translation checkpoint with $checkpointBlocks/$totalBlocks blocks from ${previousState.updatedAtIso8601}. Verifying local cache before new API calls.',
         );
       }
 
       emit(
         currentJob,
-        'Starting translation for ${selectedChapters.length} chapters and $totalBlocks extracted blocks.',
+        'Restoring local cache for ${selectedChapters.length} chapters and $totalBlocks extracted blocks.',
+      );
+      throwIfCancelled();
+
+      final CacheRestorationResult restoration =
+          await CacheRestorationScanner(
+            readTranslation: _cacheStore.getBlockTranslation,
+          ).scan(
+            chapters: selectedChapters,
+            cacheKeyFor: (InspectedChapter chapter, ExtractedBlock block) =>
+                _blockCacheKey(
+                  config,
+                  block,
+                  chapterPath: chapter.path,
+                  confirmedStyleProfile: userStyleProfile,
+                ),
+            throwIfCancelled: throwIfCancelled,
+            onProgress: (CacheRestorationProgress progress) {
+              emit(
+                currentJob.copyWith(
+                  phase: TranslationJobPhase.cacheRestoration,
+                  progress: checkpointBlocks / totalBlocks,
+                  completedBlocks: checkpointBlocks,
+                  cachedBlocks: progress.cachedBlocks,
+                  resumedBlocks: previousState == null
+                      ? 0
+                      : progress.cachedBlocks,
+                  cacheScanScannedBlocks: progress.scannedBlocks,
+                  cacheScanTotalBlocks: progress.totalBlocks,
+                  currentChapter: 'Restoring cached translations',
+                  currentBlock: null,
+                ),
+                'Cache scan ${progress.scannedBlocks}/${progress.totalBlocks}: verified ${progress.cachedBlocks} reusable blocks.',
+              );
+            },
+          );
+      throwIfCancelled();
+
+      int completedBlocks = restoration.cachedBlocks;
+      int completedFiles = 0;
+      int cachedBlocks = restoration.cachedBlocks;
+      int resumedBlocks = previousState == null ? 0 : restoration.cachedBlocks;
+      final bool hasPendingBlocks = cachedBlocks < totalBlocks;
+      currentJob = currentJob.copyWith(
+        phase: hasPendingBlocks
+            ? TranslationJobPhase.translation
+            : TranslationJobPhase.cacheRestoration,
+        progress: completedBlocks / totalBlocks,
+        completedBlocks: completedBlocks,
+        cachedBlocks: cachedBlocks,
+        resumedBlocks: resumedBlocks,
+        cacheScanScannedBlocks: restoration.scannedBlocks,
+        cacheScanTotalBlocks: totalBlocks,
+        currentChapter: hasPendingBlocks
+            ? 'Continuing translation'
+            : 'All translations restored from cache',
+        currentBlock: null,
+      );
+      emit(
+        currentJob,
+        hasPendingBlocks
+            ? 'Reused $cachedBlocks cached blocks; cache restoration made no API requests. Continuing with ${totalBlocks - cachedBlocks} blocks.'
+            : 'Reused all $totalBlocks blocks; this run made no API requests.',
       );
       await saveResumeState(currentJob, force: true);
-      throwIfCancelled();
 
       final Map<String, InspectedChapter> updatedByPath =
           <String, InspectedChapter>{
@@ -821,14 +890,10 @@ class EpubChapterTranslator {
         final InspectedChapter chapter = selectedChapters[chapterIndex];
         for (final ExtractedBlock block in chapter.blocks) {
           throwIfCancelled();
-          final String cacheKey = _blockCacheKey(
-            config,
-            block,
-            chapterPath: chapter.path,
-            confirmedStyleProfile: userStyleProfile,
+          final String? cachedTranslation = restoration.translationFor(
+            chapter.path,
+            block.id,
           );
-          final String? cachedTranslation = await _cacheStore
-              .getBlockTranslation(cacheKey);
           if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
             chapterPendingCache[chapterIndex] = true;
             return true;
@@ -851,12 +916,6 @@ class EpubChapterTranslator {
         }
         return false;
       }
-
-      int completedBlocks = 0;
-      int completedFiles = 0;
-      int cachedBlocks = 0;
-      int resumedBlocks = 0;
-      final bool resumingFromCheckpoint = previousState != null;
 
       Future<int> translateFootnoteRun(int startChapterIndex) async {
         int endChapterIndex = startChapterIndex;
@@ -895,14 +954,10 @@ class EpubChapterTranslator {
           int chapterCacheHits = 0;
           for (final ExtractedBlock block in chapter.blocks) {
             throwIfCancelled();
-            final String cacheKey = _blockCacheKey(
-              config,
-              block,
-              chapterPath: chapter.path,
-              confirmedStyleProfile: userStyleProfile,
+            final String? cachedTranslation = restoration.translationFor(
+              chapter.path,
+              block.id,
             );
-            final String? cachedTranslation = await _cacheStore
-                .getBlockTranslation(cacheKey);
             if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
               pendingBlocks.add(block);
               continue;
@@ -912,11 +967,6 @@ class EpubChapterTranslator {
             );
             chapterCacheHits += 1;
             runCacheHits += 1;
-            cachedBlocks += 1;
-            if (resumingFromCheckpoint) {
-              resumedBlocks += 1;
-            }
-            completedBlocks += 1;
           }
           translatedByChapterIndex[chapterIndex] = translatedById;
           pendingBlocksByChapter[chapterIndex] = pendingBlocks;
@@ -938,8 +988,6 @@ class EpubChapterTranslator {
               cachedJob,
               'Reused $chapterCacheHits cached blocks for ${chapter.title}.',
             );
-            blocksSinceResumeSave += chapterCacheHits;
-            await saveResumeState(cachedJob);
           }
         }
 
@@ -1157,14 +1205,10 @@ class EpubChapterTranslator {
           final List<ExtractedBlock> pendingBlocks = <ExtractedBlock>[];
           for (final ExtractedBlock block in chapter.blocks) {
             throwIfCancelled();
-            final String cacheKey = _blockCacheKey(
-              config,
-              block,
-              chapterPath: chapter.path,
-              confirmedStyleProfile: userStyleProfile,
+            final String? cachedTranslation = restoration.translationFor(
+              chapter.path,
+              block.id,
             );
-            final String? cachedTranslation = await _cacheStore
-                .getBlockTranslation(cacheKey);
             if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
               pendingBlocks.add(block);
               continue;
@@ -1173,11 +1217,6 @@ class EpubChapterTranslator {
               translatedHtml: cachedTranslation,
             );
             chapterCacheHits += 1;
-            cachedBlocks += 1;
-            if (resumingFromCheckpoint) {
-              resumedBlocks += 1;
-            }
-            completedBlocks += 1;
           }
 
           if (chapterCacheHits > 0) {
@@ -1196,8 +1235,6 @@ class EpubChapterTranslator {
               cachedJob,
               'Reused $chapterCacheHits cached blocks for ${chapter.title}.',
             );
-            blocksSinceResumeSave += chapterCacheHits;
-            await saveResumeState(cachedJob);
           }
           chapterPendingCache[chapterIndex] = pendingBlocks.isNotEmpty;
 

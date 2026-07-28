@@ -11,6 +11,69 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'cache restoration scans every block before the first API request',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_cache_order_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final List<String> events = <String>[];
+      final HttpServer server = await _startFakeTranslationServer(events);
+      addTearDown(() => server.close(force: true));
+      final _EventRecordingCacheStore cacheStore = _EventRecordingCacheStore(
+        events,
+      );
+
+      final File epubFile = File('${temp.path}/cache_order.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/01.xhtml': '<p>First chapter.</p>',
+          'OPS/Text/02.xhtml': '<p>Second chapter.</p>',
+        },
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'cache-order-model-${server.port}',
+        chunkSize: 1000,
+        maxConcurrent: 1,
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository(
+        cacheStore: cacheStore,
+      );
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      final int firstApiIndex = events.indexWhere(
+        (String event) => event != 'cache',
+      );
+      expect(firstApiIndex, greaterThanOrEqualTo(0));
+      expect(
+        events.take(firstApiIndex),
+        hasLength(
+          inspection.chapters.fold<int>(
+            0,
+            (int sum, chapter) => sum + chapter.blocks.length,
+          ),
+        ),
+      );
+      expect(events.take(firstApiIndex), everyElement('cache'));
+    },
+  );
+
+  test(
     'reuses cached translations without extra memory or translation requests',
     () async {
       final Directory temp = await Directory.systemTemp.createTemp(
@@ -623,6 +686,36 @@ class _RecordingCheckpointCacheStore extends TranslationCacheStore {
   Future<void> saveJobState(JobResumeState state) async {
     savedStates.add(state);
     await super.saveJobState(state);
+  }
+}
+
+class _EventRecordingCacheStore extends TranslationCacheStore {
+  _EventRecordingCacheStore(this.events);
+
+  final List<String> events;
+  final Map<String, String> translations = <String, String>{};
+  JobResumeState? jobState;
+
+  @override
+  Future<String?> getBlockTranslation(String cacheKey) async {
+    events.add('cache');
+    return translations[cacheKey];
+  }
+
+  @override
+  Future<void> putBlockTranslation(
+    String cacheKey,
+    String translatedHtml,
+  ) async {
+    translations[cacheKey] = translatedHtml;
+  }
+
+  @override
+  Future<JobResumeState?> loadJobState(String jobKey) async => jobState;
+
+  @override
+  Future<void> saveJobState(JobResumeState state) async {
+    jobState = state;
   }
 }
 
