@@ -767,6 +767,7 @@ void main() {
       await controller.startTranslation();
       expect(controller.state.job?.status, TranslationJobStatus.failed);
       expect(controller.state.job?.completedBlocks, 2);
+      expect(controller.state.job?.errorMessage, contains('temporary failure'));
 
       final Future<void> retry = controller.startTranslation();
       await repository.secondTranslationStarted.future;
@@ -774,6 +775,9 @@ void main() {
       expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
       expect(controller.state.job?.completedBlocks, 2);
       expect(controller.state.job?.resumeCheckpointBlocks, 2);
+      expect(controller.state.job?.errorMessage, isNull);
+      expect(controller.state.jobHistory.first.errorMessage, isNull);
+      expect(controller.state.jobHistory.first.completedBlocks, 2);
 
       repository.releaseSecondTranslation.complete();
       await retry;
@@ -785,10 +789,11 @@ void main() {
     () async {
       final _RestorationCancellationRepository repository =
           _RestorationCancellationRepository();
+      final _MemoryJobHistoryStore historyStore = _MemoryJobHistoryStore();
       final TranslationDashboardController controller =
           TranslationDashboardController(
             repository: repository,
-            historyStore: _MemoryJobHistoryStore(),
+            historyStore: historyStore,
           );
       controller.syncSettings(
         TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
@@ -798,6 +803,18 @@ void main() {
 
       final Future<void> run = controller.startTranslation();
       await repository.restorationStarted.future;
+
+      expect(controller.state.job?.completedBlocks, 6);
+      expect(
+        controller.state.jobHistory.first.phase,
+        TranslationJobPhase.cacheRestoration,
+      );
+      expect(controller.state.jobHistory.first.completedBlocks, 6);
+      expect(controller.state.jobHistory.first.cachedBlocks, 2);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      expect(historyStore.saved.first.completedBlocks, 6);
+
       await controller.requestCancel();
 
       expect(

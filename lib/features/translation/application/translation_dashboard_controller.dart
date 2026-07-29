@@ -214,6 +214,8 @@ class TranslationDashboardController
   int _sessionPathRevision = 0;
   int _historyClearRevision = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
+  String? _activeTranslationHistoryJobId;
+  DateTime? _lastProgressHistoryPersistAt;
 
   AppStrings get _s => AppStrings(state.config.uiLanguage);
 
@@ -797,6 +799,7 @@ class TranslationDashboardController
           resumeCheckpointBlocks: checkpointBlocks,
           cacheScanScannedBlocks: 0,
           cacheScanTotalBlocks: selectedBlocks,
+          errorMessage: null,
           styleProfile: state.styleProfile,
           styleProfileConfirmed: state.styleProfileConfirmed,
           styleProfileEnabled: state.config.styleProfileEnabled,
@@ -820,6 +823,8 @@ class TranslationDashboardController
           styleProfileConfirmed: state.styleProfileConfirmed,
           styleProfileEnabled: state.config.styleProfileEnabled,
         );
+    _activeTranslationHistoryJobId = queuedJob.id;
+    _lastProgressHistoryPersistAt = null;
     final TranslationRunEstimate? estimate = _buildEstimate(job: queuedJob);
     state = state.copyWith(
       job: queuedJob,
@@ -853,27 +858,32 @@ class TranslationDashboardController
           if (_cancelRequested) {
             return;
           }
+          final TranslationJob progressJob = job.copyWith(errorMessage: null);
+          final TranslationJob historyJob = _translationHistoryJob(progressJob);
           final List<String> nextLogs = <String>[
             ...state.logs,
             _safeLogText(logLine),
           ];
           final bool cacheScanComplete =
-              job.phase == TranslationJobPhase.cacheRestoration &&
-              job.cacheScanTotalBlocks > 0 &&
-              job.cacheScanScannedBlocks >= job.cacheScanTotalBlocks;
+              progressJob.phase == TranslationJobPhase.cacheRestoration &&
+              progressJob.cacheScanTotalBlocks > 0 &&
+              progressJob.cacheScanScannedBlocks >=
+                  progressJob.cacheScanTotalBlocks;
           if (!cacheRestorationLogged && cacheScanComplete) {
             cacheRestorationLogged = true;
             nextLogs.add(
-              job.cachedBlocks >= job.totalBlocks
-                  ? _s.logAllBlocksRestoredNoApi(job.totalBlocks)
-                  : _s.logCacheRestoredNoApi(job.cachedBlocks),
+              progressJob.cachedBlocks >= progressJob.totalBlocks
+                  ? _s.logAllBlocksRestoredNoApi(progressJob.totalBlocks)
+                  : _s.logCacheRestoredNoApi(progressJob.cachedBlocks),
             );
           }
           state = state.copyWith(
-            job: job,
-            runEstimate: _buildEstimate(job: job),
+            job: progressJob,
+            jobHistory: _jobHistoryWith(historyJob, persist: false),
+            runEstimate: _buildEstimate(job: progressJob),
             logs: nextLogs,
           );
+          _persistProgressHistoryIfDue();
         },
         isCancelled: () => _cancelRequested,
       );
@@ -881,12 +891,13 @@ class TranslationDashboardController
         _handleCancellation(const TranslationCancelledException());
         return;
       }
+      final TranslationJob completedJob = _translationHistoryJob(
+        result.job.copyWith(phase: TranslationJobPhase.translation),
+      );
       state = state.copyWith(
-        job: result.job.copyWith(phase: TranslationJobPhase.translation),
-        jobHistory: _jobHistoryWith(
-          result.job.copyWith(phase: TranslationJobPhase.translation),
-        ),
-        runEstimate: _buildEstimate(job: result.job),
+        job: completedJob,
+        jobHistory: _jobHistoryWith(completedJob),
+        runEstimate: _buildEstimate(job: completedJob),
         inspectedChapters: result.chapters,
         actionableError: null,
         logs: <String>[
@@ -901,6 +912,7 @@ class TranslationDashboardController
             ),
         ],
       );
+      _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
     } catch (error) {
       if (_handleCancellation(error)) {
@@ -908,24 +920,25 @@ class TranslationDashboardController
       }
       final String safeError = _safeErrorText(error);
       AppLogger.error('Translation failed', tag: 'dashboard', error: safeError);
-      final TranslationJob failedJob =
-          state.job?.copyWith(
-            status: TranslationJobStatus.failed,
-            phase: TranslationJobPhase.translation,
-            currentChapter: 'Translation failed',
-            currentBlock: null,
-            errorMessage: safeError,
-          ) ??
-          TranslationJob(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
-            inputPath: state.inputPath,
-            outputPath: state.outputDirectory,
-            status: TranslationJobStatus.failed,
-            phase: TranslationJobPhase.translation,
-            progress: 0,
-            currentChapter: 'Translation failed',
-            errorMessage: safeError,
-          );
+      final TranslationJob failedJob = _translationHistoryJob(
+        state.job?.copyWith(
+              status: TranslationJobStatus.failed,
+              phase: TranslationJobPhase.translation,
+              currentChapter: 'Translation failed',
+              currentBlock: null,
+              errorMessage: safeError,
+            ) ??
+            TranslationJob(
+              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              inputPath: state.inputPath,
+              outputPath: state.outputDirectory,
+              status: TranslationJobStatus.failed,
+              phase: TranslationJobPhase.translation,
+              progress: 0,
+              currentChapter: 'Translation failed',
+              errorMessage: safeError,
+            ),
+      );
       // completedBlocks already includes cache hits and newly translated blocks.
       final int savedBlocks = failedJob.completedBlocks;
       state = state.copyWith(
@@ -942,6 +955,7 @@ class TranslationDashboardController
           preferredKind: ActionableErrorKind.retryTranslation,
         ),
       );
+      _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
     }
   }
@@ -1237,20 +1251,21 @@ class TranslationDashboardController
       return false;
     }
     final TranslationJob? currentJob = state.job;
-    final TranslationJob cancelledJob =
-        currentJob?.copyWith(
-          status: TranslationJobStatus.cancelled,
-          currentChapter: 'Cancelled',
-          currentBlock: null,
-        ) ??
-        TranslationJob(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          inputPath: state.inputPath,
-          outputPath: state.outputDirectory,
-          status: TranslationJobStatus.cancelled,
-          progress: 0,
-          currentChapter: 'Cancelled',
-        );
+    final TranslationJob cancelledJob = _translationHistoryJob(
+      currentJob?.copyWith(
+            status: TranslationJobStatus.cancelled,
+            currentChapter: 'Cancelled',
+            currentBlock: null,
+          ) ??
+          TranslationJob(
+            id: DateTime.now().millisecondsSinceEpoch.toString(),
+            inputPath: state.inputPath,
+            outputPath: state.outputDirectory,
+            status: TranslationJobStatus.cancelled,
+            progress: 0,
+            currentChapter: 'Cancelled',
+          ),
+    );
     final bool translationRun = _isTranslationRunPhase(cancelledJob.phase);
     final int progressBlocks = _confirmedProgressBlocks(cancelledJob);
     state = state.copyWith(
@@ -1276,6 +1291,7 @@ class TranslationDashboardController
             : ActionableErrorKind.retryInspection,
       ),
     );
+    _clearActiveTranslationHistory();
     _translationStopwatch?.stop();
     return true;
   }
@@ -1329,14 +1345,40 @@ class TranslationDashboardController
         });
   }
 
-  List<TranslationJob> _jobHistoryWith(TranslationJob job) {
+  TranslationJob _translationHistoryJob(TranslationJob job) {
+    final String? historyJobId = _activeTranslationHistoryJobId;
+    return historyJobId == null ? job : job.copyWith(id: historyJobId);
+  }
+
+  void _clearActiveTranslationHistory() {
+    _activeTranslationHistoryJobId = null;
+    _lastProgressHistoryPersistAt = null;
+  }
+
+  void _persistProgressHistoryIfDue() {
+    final DateTime now = DateTime.now();
+    final DateTime? lastPersist = _lastProgressHistoryPersistAt;
+    if (lastPersist != null &&
+        now.difference(lastPersist) < const Duration(seconds: 1)) {
+      return;
+    }
+    _lastProgressHistoryPersistAt = now;
+    _persistJobHistory();
+  }
+
+  List<TranslationJob> _jobHistoryWith(
+    TranslationJob job, {
+    bool persist = true,
+  }) {
     final List<TranslationJob> history = <TranslationJob>[
       job,
       ...state.jobHistory.where(
         (TranslationJob historyJob) => historyJob.id != job.id,
       ),
     ].take(20).toList(growable: false);
-    _persistJobHistory();
+    if (persist) {
+      _persistJobHistory();
+    }
     return history;
   }
 
