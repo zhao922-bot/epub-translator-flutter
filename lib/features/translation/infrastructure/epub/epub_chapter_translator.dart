@@ -2720,6 +2720,61 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+  }) async {
+    try {
+      return await _translateProtectedSlotBatchOnce(
+        dio: dio,
+        config: config,
+        requests: requests,
+        context: context,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+        onRequestAttempt: onRequestAttempt,
+      );
+    } on FormatException {
+      if (requests.length == 1) {
+        rethrow;
+      }
+    } on DioException catch (error) {
+      if (_isCancelError(error)) {
+        throw const TranslationCancelledException();
+      }
+      if (!TranslationApiClient.shouldFallbackBatchDioException(error) ||
+          requests.length == 1) {
+        rethrow;
+      }
+    }
+
+    final int midpoint = requests.length ~/ 2;
+    final Map<String, String> left = await _translateProtectedSlotBatch(
+      dio: dio,
+      config: config,
+      requests: requests.sublist(0, midpoint),
+      context: context,
+      retryDelayOverride: retryDelayOverride,
+      cancelToken: cancelToken,
+      onRequestAttempt: onRequestAttempt,
+    );
+    final Map<String, String> right = await _translateProtectedSlotBatch(
+      dio: dio,
+      config: config,
+      requests: requests.sublist(midpoint),
+      context: context,
+      retryDelayOverride: retryDelayOverride,
+      cancelToken: cancelToken,
+      onRequestAttempt: onRequestAttempt,
+    );
+    return <String, String>{...left, ...right};
+  }
+
+  Future<Map<String, String>> _translateProtectedSlotBatchOnce({
+    required Dio dio,
+    required TranslationConfig config,
+    required List<_ProtectedSlotRequest> requests,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
   }) {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
@@ -2912,41 +2967,16 @@ class EpubChapterTranslator {
       }
     }
     if (slotRequests.isNotEmpty) {
-      try {
-        translatedById.addAll(
-          await _translateProtectedSlotBatch(
-            dio: dio,
-            config: config,
-            requests: slotRequests,
-            context: batch.context,
-            retryDelayOverride: retryDelayOverride,
-            cancelToken: cancelToken,
-          ),
-        );
-      } on DioException catch (error) {
-        if (_isCancelError(error)) {
-          throw const TranslationCancelledException();
-        }
-        if (!TranslationApiClient.shouldFallbackBatchDioException(error)) {
-          rethrow;
-        }
-        final List<Map<String, String>> individualResults =
-            await Future.wait<Map<String, String>>(
-              slotRequests.map(
-                (_ProtectedSlotRequest request) => _translateProtectedSlotBatch(
-                  dio: dio,
-                  config: config,
-                  requests: <_ProtectedSlotRequest>[request],
-                  context: batch.context,
-                  retryDelayOverride: retryDelayOverride,
-                  cancelToken: cancelToken,
-                ),
-              ),
-            );
-        for (final Map<String, String> result in individualResults) {
-          translatedById.addAll(result);
-        }
-      }
+      translatedById.addAll(
+        await _translateProtectedSlotBatch(
+          dio: dio,
+          config: config,
+          requests: slotRequests,
+          context: batch.context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+        ),
+      );
     }
     return batch.blocks
         .map((ExtractedBlock block) => translatedById[block.id]!)

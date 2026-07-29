@@ -302,6 +302,84 @@ class _MixedProtocolAdapter implements HttpClientAdapter {
   }
 }
 
+class _ProtectedSlotSplitAdapter implements HttpClientAdapter {
+  _ProtectedSlotSplitAdapter({this.alwaysDropLast = false});
+
+  final bool alwaysDropLast;
+  final List<List<String>> requestIds = <List<String>>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final Map<String, dynamic> payload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+    final List<Map<String, dynamic>> blocks =
+        (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+    requestIds.add(
+      blocks
+          .map((Map<String, dynamic> block) => block['id'] as String)
+          .toList(growable: false),
+    );
+
+    final bool dropLast = blocks.length > 1 || alwaysDropLast;
+    final Iterable<Map<String, dynamic>> returned = dropLast
+        ? blocks.take(blocks.length - 1)
+        : blocks;
+    final List<Map<String, Object?>> responseBlocks = returned
+        .map((block) {
+          final String blockId = block['id'] as String;
+          return <String, Object?>{
+            'id': blockId,
+            'slots': (block['slots'] as List<dynamic>)
+                .map((Object? rawSlot) {
+                  final Map<String, dynamic> slot =
+                      rawSlot as Map<String, dynamic>;
+                  return <String, Object?>{
+                    'id': slot['id'],
+                    'text': blockId == 'protected-a' ? '第一段译文' : '第二段译文',
+                  };
+                })
+                .toList(growable: false),
+          };
+        })
+        .toList(growable: false);
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{
+              'content': jsonEncode(<String, Object?>{
+                'blocks': responseBlocks,
+              }),
+            },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _ResidualThenTranslatedBatchAdapter implements HttpClientAdapter {
   int fetchCount = 0;
 
@@ -878,6 +956,79 @@ void main() {
       expect(translated[0], isNot(contains('<script>')));
     },
   );
+
+  test(
+    'splits malformed protected slot batches and preserves every result',
+    () async {
+      final _ProtectedSlotSplitAdapter adapter = _ProtectedSlotSplitAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String> translated = await EpubChapterTranslator()
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'protected-a',
+                tagName: 'p',
+                sourceHtml:
+                    '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
+                sourceText: 'First [1] tail.',
+              ),
+              ExtractedBlock(
+                id: 'protected-b',
+                tagName: 'p',
+                sourceHtml:
+                    '<p>Second <a href="#n2"><span>[2]</span></a> ending.</p>',
+                sourceText: 'Second [2] ending.',
+              ),
+            ],
+          );
+
+      expect(adapter.requestIds, <List<String>>[
+        <String>['protected-a', 'protected-b'],
+        <String>['protected-a'],
+        <String>['protected-b'],
+      ]);
+      expect(translated[0], contains('href="#n1"'));
+      expect(translated[0], contains('第一段译文'));
+      expect(translated[1], contains('href="#n2"'));
+      expect(translated[1], contains('第二段译文'));
+    },
+  );
+
+  test('still fails when a single protected slot response is incomplete', () {
+    final _ProtectedSlotSplitAdapter adapter = _ProtectedSlotSplitAdapter(
+      alwaysDropLast: true,
+    );
+    final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+      ..httpClientAdapter = adapter;
+
+    expect(
+      () => EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'protected-a',
+            tagName: 'p',
+            sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
+            sourceText: 'First [1] tail.',
+          ),
+        ],
+      ),
+      throwsA(isA<FormatException>()),
+    );
+  });
 
   group('cross-file footnote response ids', () {
     test('same-file short marker uses slots in the footnote batch', () async {
