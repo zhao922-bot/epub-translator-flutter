@@ -197,11 +197,85 @@ class TranslationApiClient {
       r'```(?:json)?\s*([\s\S]*?)\s*```',
     ).firstMatch(normalized);
     final String candidate = fenced?.group(1)?.trim() ?? normalized;
+    try {
+      return _decodeJsonObjectStrict(candidate);
+    } on FormatException catch (original, stackTrace) {
+      final String repaired = _escapeBareQuotesInsideJsonStrings(candidate);
+      if (repaired == candidate) {
+        Error.throwWithStackTrace(original, stackTrace);
+      }
+      try {
+        return _decodeJsonObjectStrict(repaired);
+      } on FormatException {
+        Error.throwWithStackTrace(original, stackTrace);
+      }
+    }
+  }
+
+  Map<String, dynamic> _decodeJsonObjectStrict(String candidate) {
     final Object? decoded = jsonDecode(candidate);
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('Model response is not a JSON object.');
     }
     return decoded;
+  }
+
+  String _escapeBareQuotesInsideJsonStrings(String source) {
+    final StringBuffer repaired = StringBuffer();
+    bool inString = false;
+    bool escaped = false;
+
+    for (int index = 0; index < source.length; index += 1) {
+      final String character = source[index];
+      if (!inString) {
+        repaired.write(character);
+        if (character == '"') {
+          inString = true;
+        }
+        continue;
+      }
+
+      if (escaped) {
+        repaired.write(character);
+        escaped = false;
+        continue;
+      }
+      if (character == r'\') {
+        repaired.write(character);
+        escaped = true;
+        continue;
+      }
+      if (character != '"') {
+        repaired.write(character);
+        continue;
+      }
+
+      final String? next = _nextNonWhitespaceCharacter(source, index + 1);
+      final bool closesString =
+          next == null ||
+          next == ':' ||
+          next == ',' ||
+          next == '}' ||
+          next == ']';
+      if (closesString) {
+        repaired.write(character);
+        inString = false;
+      } else {
+        repaired.write(r'\"');
+      }
+    }
+
+    return repaired.toString();
+  }
+
+  String? _nextNonWhitespaceCharacter(String source, int start) {
+    for (int index = start; index < source.length; index += 1) {
+      final String character = source[index];
+      if (!RegExp(r'\s').hasMatch(character)) {
+        return character;
+      }
+    }
+    return null;
   }
 
   String normalizedBaseUrl(String value) {
