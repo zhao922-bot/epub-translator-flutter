@@ -214,16 +214,75 @@ class TranslationApiClient {
 
   Map<String, dynamic> _decodeJsonObjectStrict(String candidate) {
     final Object? decoded = jsonDecode(candidate);
+    _ensureNoDuplicateObjectKeys(candidate);
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('Model response is not a JSON object.');
     }
     return decoded;
   }
 
+  void _ensureNoDuplicateObjectKeys(String source) {
+    final List<Set<String>?> containerKeys = <Set<String>?>[];
+    for (int index = 0; index < source.length; index += 1) {
+      final String character = source[index];
+      if (character == '{') {
+        containerKeys.add(<String>{});
+        continue;
+      }
+      if (character == '[') {
+        containerKeys.add(null);
+        continue;
+      }
+      if (character == '}' || character == ']') {
+        containerKeys.removeLast();
+        continue;
+      }
+      if (character != '"') {
+        continue;
+      }
+
+      final int end = _jsonStringEnd(source, index);
+      final String? next = _nextNonWhitespaceCharacter(source, end + 1);
+      if (next == ':' && containerKeys.isNotEmpty) {
+        final Set<String>? keys = containerKeys.last;
+        if (keys != null) {
+          final String key =
+              jsonDecode(source.substring(index, end + 1)) as String;
+          if (!keys.add(key)) {
+            throw FormatException(
+              'Model response contains duplicate object key "$key".',
+            );
+          }
+        }
+      }
+      index = end;
+    }
+  }
+
+  int _jsonStringEnd(String source, int start) {
+    bool escaped = false;
+    for (int index = start + 1; index < source.length; index += 1) {
+      final String character = source[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character == r'\') {
+        escaped = true;
+        continue;
+      }
+      if (character == '"') {
+        return index;
+      }
+    }
+    throw const FormatException('Unterminated JSON string.');
+  }
+
   String _escapeBareQuotesInsideJsonStrings(String source) {
     final StringBuffer repaired = StringBuffer();
     bool inString = false;
     bool escaped = false;
+    int repairedQuoteCount = 0;
 
     for (int index = 0; index < source.length; index += 1) {
       final String character = source[index];
@@ -231,6 +290,7 @@ class TranslationApiClient {
         repaired.write(character);
         if (character == '"') {
           inString = true;
+          repairedQuoteCount = 0;
         }
         continue;
       }
@@ -258,14 +318,21 @@ class TranslationApiClient {
           next == '}' ||
           next == ']';
       if (closesString) {
+        if (repairedQuoteCount.isOdd) {
+          return source;
+        }
         repaired.write(character);
         inString = false;
       } else {
+        if (index + 1 >= source.length || source[index + 1].trim().isEmpty) {
+          return source;
+        }
         repaired.write(r'\"');
+        repairedQuoteCount += 1;
       }
     }
 
-    return repaired.toString();
+    return inString ? source : repaired.toString();
   }
 
   String? _nextNonWhitespaceCharacter(String source, int start) {

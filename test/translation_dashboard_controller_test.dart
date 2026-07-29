@@ -805,6 +805,7 @@ void main() {
       await repository.restorationStarted.future;
 
       expect(controller.state.job?.completedBlocks, 6);
+      expect(controller.state.job?.id, controller.state.jobHistory.first.id);
       expect(
         controller.state.jobHistory.first.phase,
         TranslationJobPhase.cacheRestoration,

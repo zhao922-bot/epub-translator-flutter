@@ -2721,6 +2721,12 @@ class EpubChapterTranslator {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
   }) async {
+    final Set<String> requestedIds = requests
+        .map((_ProtectedSlotRequest request) => request.id)
+        .toSet();
+    if (requestedIds.length != requests.length) {
+      throw const FormatException('Protected slot request ids must be unique.');
+    }
     try {
       return await _translateProtectedSlotBatchOnce(
         dio: dio,
@@ -2779,9 +2785,6 @@ class EpubChapterTranslator {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
         .toSet();
-    if (requestedIds.length != requests.length) {
-      throw const FormatException('Protected slot request ids must be unique.');
-    }
     final Map<String, _ProtectedSlotRequest> requestById =
         <String, _ProtectedSlotRequest>{
           for (final _ProtectedSlotRequest request in requests)

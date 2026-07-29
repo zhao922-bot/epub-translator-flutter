@@ -858,8 +858,9 @@ class TranslationDashboardController
           if (_cancelRequested) {
             return;
           }
-          final TranslationJob progressJob = job.copyWith(errorMessage: null);
-          final TranslationJob historyJob = _translationHistoryJob(progressJob);
+          final TranslationJob progressJob = _translationHistoryJob(
+            job.copyWith(errorMessage: null),
+          );
           final List<String> nextLogs = <String>[
             ...state.logs,
             _safeLogText(logLine),
@@ -879,7 +880,7 @@ class TranslationDashboardController
           }
           state = state.copyWith(
             job: progressJob,
-            jobHistory: _jobHistoryWith(historyJob, persist: false),
+            jobHistory: _jobHistoryWith(progressJob, persist: false),
             runEstimate: _buildEstimate(job: progressJob),
             logs: nextLogs,
           );

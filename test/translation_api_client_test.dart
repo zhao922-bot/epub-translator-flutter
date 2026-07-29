@@ -31,4 +31,22 @@ void main() {
       throwsA(isA<FormatException>()),
     );
   });
+
+  test('rejects a repair that would create duplicate object keys', () {
+    expect(
+      () => client.decodeJsonObject(
+        r'''{"slot":{"id":"s1","text":"first "text", "text":"second"}}''',
+      ),
+      throwsA(isA<FormatException>()),
+    );
+  });
+
+  test('does not absorb trailing explanation into a JSON string', () {
+    expect(
+      () => client.decodeJsonObject(
+        r'''{"slot":{"id":"s1","text":"译文" trailing explanation"}}''',
+      ),
+      throwsA(isA<FormatException>()),
+    );
+  });
 }

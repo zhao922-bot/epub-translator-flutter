@@ -1030,6 +1030,44 @@ void main() {
     );
   });
 
+  test(
+    'rejects duplicate protected slot request ids before fallback',
+    () async {
+      final _ProtectedSlotSplitAdapter adapter = _ProtectedSlotSplitAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      await expectLater(
+        EpubChapterTranslator().translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 1,
+          ),
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'protected-a',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
+              sourceText: 'First [1] tail.',
+            ),
+            ExtractedBlock(
+              id: 'protected-a',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>Second <a href="#n2"><span>[2]</span></a> ending.</p>',
+              sourceText: 'Second [2] ending.',
+            ),
+          ],
+        ),
+        throwsA(isA<FormatException>()),
+      );
+      expect(adapter.requestIds, isEmpty);
+    },
+  );
+
   group('cross-file footnote response ids', () {
     test('same-file short marker uses slots in the footnote batch', () async {
       final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
