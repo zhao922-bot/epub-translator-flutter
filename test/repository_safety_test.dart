@@ -209,9 +209,27 @@ class _FootnoteResponseAdapter implements HttpClientAdapter {
         jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
     lastRequestBody = request;
     final List<dynamic> messages = request['messages'] as List<dynamic>;
-    lastPayload =
-        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
-            as Map<String, dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+    try {
+      lastPayload = jsonDecode(userContent) as Map<String, dynamic>;
+    } on FormatException {
+      return ResponseBody.fromString(
+        jsonEncode(<String, Object?>{
+          'choices': <Object?>[
+            <String, Object?>{
+              'message': <String, Object?>{
+                'content': '```text\nunsafe fallback wrapper\n```',
+              },
+            },
+          ],
+        }),
+        200,
+        headers: <String, List<String>>{
+          Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+        },
+      );
+    }
 
     return ResponseBody.fromString(
       jsonEncode(<String, Object?>{
@@ -303,9 +321,6 @@ class _MixedProtocolAdapter implements HttpClientAdapter {
 }
 
 class _ProtectedSlotSplitAdapter implements HttpClientAdapter {
-  _ProtectedSlotSplitAdapter({this.alwaysDropLast = false});
-
-  final bool alwaysDropLast;
   final List<List<String>> requestIds = <List<String>>[];
 
   @override
@@ -337,7 +352,7 @@ class _ProtectedSlotSplitAdapter implements HttpClientAdapter {
           .toList(growable: false),
     );
 
-    final bool dropLast = blocks.length > 1 || alwaysDropLast;
+    final bool dropLast = blocks.length > 1;
     final Iterable<Map<String, dynamic>> returned = dropLast
         ? blocks.take(blocks.length - 1)
         : blocks;
@@ -369,6 +384,77 @@ class _ProtectedSlotSplitAdapter implements HttpClientAdapter {
                 'blocks': responseBlocks,
               }),
             },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _ProtectedSlotPlainFallbackAdapter implements HttpClientAdapter {
+  _ProtectedSlotPlainFallbackAdapter({
+    this.plainResponses = const <String>['第一段译文', '结尾译文'],
+  });
+
+  final List<String> plainResponses;
+  final List<String> plainInputs = <String>[];
+  final List<String> plainSystemPrompts = <String>[];
+  int strictRequestCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String systemPrompt =
+        (messages.first as Map<String, dynamic>)['content'] as String;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    Object? responseContent;
+    try {
+      final Object? decoded = jsonDecode(userContent);
+      if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+        strictRequestCount += 1;
+        responseContent = jsonEncode(<String, Object?>{
+          'blocks': const <Object?>[],
+        });
+      }
+    } on FormatException {
+      // Individual-slot fallback intentionally sends plain source text.
+    }
+
+    if (responseContent == null) {
+      plainInputs.add(userContent);
+      plainSystemPrompts.add(systemPrompt);
+      final int responseIndex = plainInputs.length - 1;
+      responseContent = responseIndex < plainResponses.length
+          ? plainResponses[responseIndex]
+          : plainResponses.last;
+    }
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': responseContent},
           },
         ],
       }),
@@ -1002,33 +1088,152 @@ void main() {
     },
   );
 
-  test('still fails when a single protected slot response is incomplete', () {
-    final _ProtectedSlotSplitAdapter adapter = _ProtectedSlotSplitAdapter(
-      alwaysDropLast: true,
-    );
+  test(
+    'falls back to individual plain-text slots for one malformed protected block',
+    () async {
+      final _ProtectedSlotPlainFallbackAdapter adapter =
+          _ProtectedSlotPlainFallbackAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String> translated = await EpubChapterTranslator()
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'protected-a',
+                tagName: 'p',
+                sourceHtml:
+                    '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
+                sourceText: 'First [1] tail.',
+              ),
+            ],
+          );
+
+      expect(adapter.strictRequestCount, 1);
+      expect(adapter.plainInputs, <String>['First', 'tail.']);
+      expect(
+        adapter.plainSystemPrompts,
+        everyElement(contains('Return only the translated text')),
+      );
+      expect(translated.single, contains('第一段译文'));
+      expect(translated.single, contains('结尾译文'));
+      expect(translated.single, contains('href="#n1"'));
+      expect(translated.single, contains('[1]'));
+    },
+  );
+
+  test('rejects unsafe individual-slot fallback output', () async {
+    final _ProtectedSlotPlainFallbackAdapter adapter =
+        _ProtectedSlotPlainFallbackAdapter(
+          plainResponses: const <String>['```text\n不安全译文\n```'],
+        );
     final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
       ..httpClientAdapter = adapter;
 
-    expect(
-      () => EpubChapterTranslator().translateBlockBatchForTest(
+    await expectLater(
+      EpubChapterTranslator().translateBlockBatchForTest(
         dio: dio,
         config: TranslationConfig.defaults().copyWith(
           apiKey: 'sk-test',
           targetLanguage: 'Chinese',
-          maxRetries: 2,
+          maxRetries: 1,
         ),
         blocks: const <ExtractedBlock>[
           ExtractedBlock(
             id: 'protected-a',
             tagName: 'p',
-            sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a> tail.</p>',
-            sourceText: 'First [1] tail.',
+            sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
+            sourceText: 'First [1]',
           ),
         ],
       ),
       throwsA(isA<FormatException>()),
     );
   });
+
+  for (final MapEntry<String, String> wrapper in <String, String>{
+    'JSON scalar': '"第一段译文"',
+    'Markdown emphasis': '**第一段译文**',
+    'Markdown inline code': '`第一段译文`',
+    'Markdown strikethrough': '~~第一段译文~~',
+    'Markdown link': '[第一段译文](https://example.com)',
+    'Markdown list': '- 第一段译文',
+    'Chinese explanation label': '以下是译文：第一段译文',
+    'Chinese courtesy explanation': '好的，以下是译文：第一段译文',
+    'English explanation label':
+        'Here is the translation: first translated sentence.',
+    'English courtesy explanation':
+        'Sure, here is the translation: first translated sentence.',
+    'HTML comment': '<!-- explanation -->第一段译文',
+  }.entries) {
+    test('rejects ${wrapper.key} in individual-slot fallback output', () async {
+      final _ProtectedSlotPlainFallbackAdapter adapter =
+          _ProtectedSlotPlainFallbackAdapter(
+            plainResponses: <String>[wrapper.value],
+          );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      await expectLater(
+        EpubChapterTranslator().translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 1,
+          ),
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'protected-a',
+              tagName: 'p',
+              sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
+              sourceText: 'First [1]',
+            ),
+          ],
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
+  }
+
+  test(
+    'allows legitimate bracketed prose in individual-slot fallback',
+    () async {
+      final _ProtectedSlotPlainFallbackAdapter adapter =
+          _ProtectedSlotPlainFallbackAdapter(
+            plainResponses: const <String>['[第一段译文]'],
+          );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String> translated = await EpubChapterTranslator()
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'protected-a',
+                tagName: 'p',
+                sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
+                sourceText: 'First [1]',
+              ),
+            ],
+          );
+
+      expect(translated.single, contains('[第一段译文]'));
+      expect(translated.single, contains('href="#n1"'));
+    },
+  );
 
   test(
     'rejects duplicate protected slot request ids before fallback',

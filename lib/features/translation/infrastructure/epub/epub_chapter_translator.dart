@@ -2739,7 +2739,15 @@ class EpubChapterTranslator {
       );
     } on FormatException {
       if (requests.length == 1) {
-        rethrow;
+        return _translateProtectedSlotsIndividually(
+          dio: dio,
+          config: config,
+          request: requests.single,
+          context: context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        );
       }
     } on DioException catch (error) {
       if (_isCancelError(error)) {
@@ -2914,6 +2922,178 @@ class EpubChapterTranslator {
         };
       },
     );
+  }
+
+  Future<Map<String, String>> _translateProtectedSlotsIndividually({
+    required Dio dio,
+    required TranslationConfig config,
+    required _ProtectedSlotRequest request,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) async {
+    final List<String> translatedSlots = <String>[];
+    for (final String sourceText in request.template.slotTexts) {
+      translatedSlots.add(
+        await _translateProtectedSlotText(
+          dio: dio,
+          config: config,
+          sourceText: sourceText,
+          context: context,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    return <String, String>{
+      request.id: _renderAndValidateProtectedSlots(
+        config: config,
+        request: request,
+        translatedSlots: translatedSlots,
+      ),
+    };
+  }
+
+  Future<String> _translateProtectedSlotText({
+    required Dio dio,
+    required TranslationConfig config,
+    required String sourceText,
+    required TranslationBatchContext context,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+  }) {
+    final String trimmedSource = sourceText.trim();
+    return _apiClient.runRetried<String>(
+      config: config,
+      retryDelayOverride: retryDelayOverride,
+      cancelToken: cancelToken,
+      operation: () async {
+        if (cancelToken?.isCancelled ?? false) {
+          throw const TranslationCancelledException();
+        }
+        final TranslationStyleProfile batchStyleProfile =
+            _styleProfileFromBookMemoryJson(context.bookMemory);
+        final bool batchStyleConfirmed =
+            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
+        final Map<String, dynamic> requestData = <String, dynamic>{
+          'model': config.model,
+          'temperature': 0.2,
+          'messages': <Map<String, String>>[
+            <String, String>{
+              'role': 'system',
+              'content':
+                  'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+            },
+            <String, String>{'role': 'user', 'content': trimmedSource},
+          ],
+        };
+        onRequestAttempt?.call();
+        final Response<dynamic> response = await _apiClient.postChatCompletions(
+          dio: dio,
+          data: requestData,
+          cancelToken: cancelToken,
+        );
+        final String translated = _apiClient.extractMessageContent(
+          response.data,
+        );
+        _validateIndividualSlotTranslation(
+          config: config,
+          sourceText: trimmedSource,
+          translatedText: translated,
+        );
+        return translated.trim();
+      },
+    );
+  }
+
+  static void _validateIndividualSlotTranslation({
+    required TranslationConfig config,
+    required String sourceText,
+    required String translatedText,
+  }) {
+    final String trimmed = translatedText.trim();
+    if (trimmed.isEmpty) {
+      throw const FormatException(
+        'Individual protected slot translation is empty.',
+      );
+    }
+    if (trimmed.contains('```') ||
+        _hasUnexpectedJsonWrapper(
+          sourceText: sourceText,
+          translatedText: trimmed,
+        ) ||
+        _hasMarkdownWrapper(trimmed) ||
+        RegExp(r'<!--[\s\S]*?-->').hasMatch(trimmed) ||
+        RegExp(r'<\s*/?\s*[A-Za-z][^>]*>').hasMatch(trimmed) ||
+        _hasTranslationExplanationPrefix(trimmed)) {
+      throw const FormatException(
+        'Individual protected slot translation contains wrapper content.',
+      );
+    }
+    if (config.residualQualityCheck &&
+        TranslationQuality.hasSuspiciousSourceResidual(
+          sourceText: sourceText,
+          translatedText: trimmed,
+          targetLanguage: config.targetLanguage,
+        )) {
+      throw const FormatException(
+        'Possible untranslated source-language text remains in an individual protected slot.',
+      );
+    }
+  }
+
+  static bool _hasMarkdownWrapper(String value) {
+    if (RegExp(r'^`{1,2}[\s\S]+`{1,2}$').hasMatch(value) ||
+        RegExp(r'^~~[\s\S]+~~$').hasMatch(value) ||
+        RegExp(r'^\*\*[\s\S]+\*\*$').hasMatch(value) ||
+        RegExp(r'^__[\s\S]+__$').hasMatch(value) ||
+        RegExp(r'^\*[\s\S]+\*$').hasMatch(value) ||
+        RegExp(r'^_[\s\S]+_$').hasMatch(value) ||
+        RegExp(r'!?\[[^\]\r\n]+\]\([^\)\r\n]+\)').hasMatch(value)) {
+      return true;
+    }
+    return value
+        .split(RegExp(r'\r?\n'))
+        .any(
+          (String line) =>
+              RegExp(r'^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s+').hasMatch(line) ||
+              RegExp(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$').hasMatch(line) ||
+              RegExp(r'^\s*\|.*\|\s*$').hasMatch(line),
+        );
+  }
+
+  static bool _hasTranslationExplanationPrefix(String value) {
+    return RegExp(
+          r'^(?:(?:好的|当然|可以|没问题)[，,。.!！\s]*)?(?:(?:以下|下面)是)?(?:译文|翻译(?:结果|内容)?)(?:如下)?\s*[:：]',
+        ).hasMatch(value) ||
+        RegExp(
+          r"^(?:(?:sure|certainly|of course|okay|ok)[,!.]?\s*)?(?:here(?:'s| is)\s+)?(?:the\s+)?(?:translation|translated text)(?:\s+is)?\s*[:：]",
+          caseSensitive: false,
+        ).hasMatch(value);
+  }
+
+  static bool _hasUnexpectedJsonWrapper({
+    required String sourceText,
+    required String translatedText,
+  }) {
+    if (!RegExp(
+      r'^[\[{"\d\-]|^(?:true|false|null)$',
+    ).hasMatch(translatedText)) {
+      return false;
+    }
+    try {
+      final Object? decoded = jsonDecode(translatedText);
+      if (decoded is String) {
+        final String source = sourceText.trim();
+        return !(source.startsWith('"') && source.endsWith('"'));
+      }
+      return true;
+    } on FormatException {
+      return false;
+    }
   }
 
   static String _renderAndValidateProtectedSlots({
