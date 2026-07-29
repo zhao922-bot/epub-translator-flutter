@@ -466,7 +466,7 @@ void main() {
   );
 
   test(
-    'rejects malformed multi-footnote ids without single-request fallback',
+    'isolates malformed multi-footnote ids with verified split requests',
     () async {
       final Directory temp = await Directory.systemTemp.createTemp(
         'epub_repository_footnote_bad_ids_test_',
@@ -505,32 +505,39 @@ void main() {
         config: config,
       );
 
-      Future<void> expectMalformedBatchFailure() async {
-        await expectLater(
-          repository.translateChapters(
-            inputPath: epubFile.path,
-            outputDirectory: temp.path,
-            config: config,
-            chapters: inspection.chapters,
-          ),
-          throwsA(isA<FormatException>()),
-        );
-      }
+      final result = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
 
-      await expectMalformedBatchFailure();
+      expect(result.job.status, TranslationJobStatus.completed);
       expect(server.blockRequestIds, <List<String>>[
         <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+        <String>['f0:p-1'],
+        <String>['f1:p-1', 'f2:p-1'],
+        <String>['f1:p-1'],
+        <String>['f2:p-1'],
       ]);
-
-      server.resetRequests();
-      await expectMalformedBatchFailure();
       expect(
         server.blockRequestIds,
-        <List<String>>[
-          <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
-        ],
-        reason: 'The failed response must not create reusable block caches.',
+        everyElement(
+          predicate<List<String>>(
+            (List<String> ids) => ids.toSet().length == ids.length,
+            'contains only unique request ids',
+          ),
+        ),
       );
+
+      server.resetRequests();
+      await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+      expect(server.blockRequestIds, isEmpty);
     },
   );
 
@@ -652,12 +659,24 @@ void main() {
     expect(server.blockRequestIds.map((List<String> ids) => ids.length), <int>[
       3,
       1,
+      2,
       1,
       1,
     ]);
     expect(
-      server.blockRequestIds.skip(1).expand((List<String> ids) => ids),
+      server.blockRequestIds
+          .where((List<String> ids) => ids.length == 1)
+          .expand((List<String> ids) => ids),
       <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+    );
+    expect(
+      server.blockRequestIds,
+      everyElement(
+        predicate<List<String>>(
+          (List<String> ids) => ids.toSet().length == ids.length,
+          'contains only unique request ids',
+        ),
+      ),
     );
     expect(
       cacheStore.savedStates.where(
