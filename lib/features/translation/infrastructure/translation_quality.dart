@@ -192,6 +192,17 @@ class TranslationQuality {
 
     _clearRetainedProperNames(sourceDocument, translatedDocument);
 
+    final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
+      translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      targetLanguage: targetLanguage,
+    );
+    if (adjacentLowercaseWord != null) {
+      return TranslationResidualFinding(
+        kind: TranslationResidualKind.cjkAdjacentLowercaseWord,
+        token: adjacentLowercaseWord,
+      );
+    }
+
     if (_hasRemainingTranslatedInlineResidual(translatedDocument)) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
@@ -219,6 +230,72 @@ class TranslationQuality {
       );
     }
     return null;
+  }
+
+  static String? _findCjkAdjacentLowercaseWord(
+    String text, {
+    required String targetLanguage,
+  }) {
+    if (!_isCjkTargetLanguage(targetLanguage)) {
+      return null;
+    }
+    final String strippedText = _stripNonLinguisticTokens(text);
+    for (final RegExpMatch match in RegExp(
+      r'[a-z]{5,}',
+    ).allMatches(strippedText)) {
+      final int? precedingRune = _runeBefore(strippedText, match.start);
+      final int? followingRune = _runeAt(strippedText, match.end);
+      if ((precedingRune != null && _isLatinLetterRune(precedingRune)) ||
+          (followingRune != null && _isLatinLetterRune(followingRune))) {
+        continue;
+      }
+      if ((precedingRune != null && _isCjkRune(precedingRune)) ||
+          (followingRune != null && _isCjkRune(followingRune))) {
+        return match.group(0);
+      }
+    }
+    return null;
+  }
+
+  static bool _isCjkTargetLanguage(String targetLanguage) {
+    final String lower = targetLanguage.trim().toLowerCase();
+    return lower == 'zh' ||
+        lower.startsWith('zh-') ||
+        lower.contains('chinese') ||
+        lower == 'ja' ||
+        lower.startsWith('ja-') ||
+        lower.contains('japanese') ||
+        lower == 'ko' ||
+        lower.startsWith('ko-') ||
+        lower.contains('korean');
+  }
+
+  static int? _runeBefore(String text, int offset) {
+    if (offset <= 0) {
+      return null;
+    }
+    final int lastCodeUnit = text.codeUnitAt(offset - 1);
+    if (lastCodeUnit >= 0xDC00 && lastCodeUnit <= 0xDFFF && offset >= 2) {
+      return String.fromCharCodes(<int>[
+        text.codeUnitAt(offset - 2),
+        lastCodeUnit,
+      ]).runes.first;
+    }
+    return lastCodeUnit;
+  }
+
+  static int? _runeAt(String text, int offset) {
+    if (offset >= text.length) {
+      return null;
+    }
+    return text.substring(offset).runes.first;
+  }
+
+  static bool _isCjkRune(int rune) {
+    return (rune >= 0x3040 && rune <= 0x30FF) ||
+        (rune >= 0x3400 && rune <= 0x9FFF) ||
+        (rune >= 0xAC00 && rune <= 0xD7AF) ||
+        (rune >= 0x20000 && rune <= 0x2FA1F);
   }
 
   static int _englishWordCount(String text) {

@@ -617,5 +617,91 @@ void main() {
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
+
+    group('CJK-adjacent lowercase English leaks', () {
+      test('flags entitlement directly before Chinese text', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>As boundaries disappear, the concept of entitlement collapses.</p>',
+          translatedHtml: '<p>随着边界消失，entitlement概念随之瓦解。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'entitlement');
+      });
+
+      test('flags associated directly after Chinese text', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>People are entitled to the associated economic advantages.</p>',
+          translatedHtml: '<p>有权享有associated的经济优势。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'associated');
+      });
+
+      for (final ({String name, String translatedHtml}) example
+          in <({String name, String translatedHtml})>[
+            (name: 'PayPal', translatedHtml: '<p>使用PayPal支付。</p>'),
+            (name: 'Microsoft', translatedHtml: '<p>由Microsoft提供。</p>'),
+            (name: 'UN', translatedHtml: '<p>由UN发布。</p>'),
+            (
+              name: 'URL',
+              translatedHtml: '<p>访问https://example.com/path获取详情。</p>',
+            ),
+            (
+              name: 'email address',
+              translatedHtml: '<p>联系support@example.com获取帮助。</p>',
+            ),
+            (
+              name: 'spaced lowercase word',
+              translatedHtml: '<p>讨论 cyberspace 概念。</p>',
+            ),
+          ]) {
+        test('allows ${example.name}', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: '<p>Source text for ${example.name}.</p>',
+                translatedHtml: example.translatedHtml,
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
+      test('does not apply the adjacency rule to non-CJK targets', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>As boundaries disappear, the concept of entitlement collapses.</p>',
+          translatedHtml:
+              '<p>Cuando desaparecen los límites, entitlement概念 cambia.</p>',
+          targetLanguage: 'Spanish',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test('ignores lowercase words inside an exempt source-owned title', () {
+        const String sourceHtml =
+            '<p>Read <cite>The Future and Global Digital Rights of entitlement</cite>.</p>';
+
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml: sourceHtml,
+          translatedHtml:
+              '<p>阅读<cite>The Future and Global Digital Rights of entitlement</cite>。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+    });
   });
 }
