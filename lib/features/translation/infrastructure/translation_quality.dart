@@ -164,7 +164,8 @@ class TranslationQuality {
                 _elementStructurePath(translatedCandidate) &&
             sourceText == translatedText &&
             _looksLikeEnglishWorkTitle(sourceText) &&
-            !_looksLikeInstructionOrNotice(sourceText);
+            !_looksLikeSentenceOrInstruction(sourceText) &&
+            _hasWorkTitleSemantics(sourceDocument, sourceCandidate, sourceText);
         if (canExempt) {
           exemptedCandidateIndexes.add(index);
           continue;
@@ -381,7 +382,7 @@ class TranslationQuality {
         _looksLikeEnglishTitleOrName(words);
   }
 
-  static bool _looksLikeInstructionOrNotice(String text) {
+  static bool _looksLikeSentenceOrInstruction(String text) {
     final List<String> words = _englishWorkTitleWords(
       text,
     ).map((String word) => word.toLowerCase()).toList(growable: false);
@@ -413,6 +414,47 @@ class TranslationQuality {
     if (commandOpeners.contains(words.first)) {
       return true;
     }
+    const Set<String> sentenceSubjects = <String>{
+      'he',
+      'i',
+      'it',
+      'she',
+      'that',
+      'these',
+      'they',
+      'this',
+      'those',
+      'we',
+      'you',
+    };
+    if (sentenceSubjects.contains(words.first)) {
+      return true;
+    }
+    const Set<String> auxiliariesAndModals = <String>{
+      'am',
+      'are',
+      'can',
+      'could',
+      'did',
+      'do',
+      'does',
+      'had',
+      'has',
+      'have',
+      'is',
+      'may',
+      'might',
+      'must',
+      'shall',
+      'should',
+      'was',
+      'were',
+      'will',
+      'would',
+    };
+    if (words.any(auxiliariesAndModals.contains)) {
+      return true;
+    }
     return words.length >= 2 &&
         words[0] == 'important' &&
         const <String>{
@@ -421,6 +463,30 @@ class TranslationQuality {
           'safety',
           'warning',
         }.contains(words[1]);
+  }
+
+  static String _sourceTextAfterNode(Document document, Node target) {
+    final StringBuffer followingText = StringBuffer();
+    bool foundTarget = false;
+
+    void collectAfterTarget(Node node) {
+      if (identical(node, target)) {
+        foundTarget = true;
+        return;
+      }
+      if (foundTarget && node.nodeType == Node.TEXT_NODE) {
+        followingText.write(' ${node.text ?? ''}');
+        return;
+      }
+      for (final Node child in node.nodes) {
+        collectAfterTarget(child);
+      }
+    }
+
+    collectAfterTarget(
+      _nearestSemanticBlock(target) ?? document.body ?? document,
+    );
+    return _normalizeText(followingText.toString());
   }
 
   static String _sourceTextBeforeNode(
@@ -483,6 +549,95 @@ class TranslationQuality {
       ancestor = ancestor.parentNode;
     }
     return null;
+  }
+
+  static bool _hasWorkTitleSemantics(
+    Document document,
+    Element element,
+    String title,
+  ) {
+    if (element.localName == 'cite' || element.querySelector('cite') != null) {
+      return true;
+    }
+    return _hasExplicitWorkReferenceContext(document, element) ||
+        _hasAttributedWorkContext(document, element) ||
+        _hasDescriptiveWorkContext(document, element) ||
+        _hasBibliographicContext(document, element, title) ||
+        _isOnlyTitleInSemanticBlock(element, title);
+  }
+
+  static bool _hasExplicitWorkReferenceContext(
+    Document document,
+    Element element,
+  ) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
+    return RegExp(
+      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading))\s*(?:[:\-–—]\s*)?$',
+    ).hasMatch(precedingText);
+  }
+
+  static bool _hasAttributedWorkContext(Document document, Element element) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
+    if (!RegExp(r'(?:^|\s)(?:in|within)\s*$').hasMatch(precedingText)) {
+      return false;
+    }
+    final String followingText = _sourceTextAfterNode(document, element);
+    return RegExp(
+      r"^[,;:]?\s*[A-Z][A-Za-z'’\-]*(?:\s+[A-Z][A-Za-z'’\-]*){0,3}\s+(?:argues?|contends?|describes?|explains?|maintains?|notes?|observes?|proposes?|writes?)\b",
+    ).hasMatch(followingText);
+  }
+
+  static bool _hasDescriptiveWorkContext(Document document, Element element) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
+    return RegExp(
+      r"(?:\b(?:his|her|their|the)\s+)?(?:acclaimed|award-winning|best-selling|celebrated|classic|famous|influential|landmark|seminal)(?:\s+(?:book|essay|memoir|novel|report|study|work))?\s*$",
+    ).hasMatch(precedingText);
+  }
+
+  static bool _hasBibliographicContext(
+    Document document,
+    Element element,
+    String title,
+  ) {
+    final Element? block = _nearestSemanticBlock(element);
+    if (block == null) {
+      return false;
+    }
+    final String blockText = _normalizeText(block.text);
+    if (blockText == title) {
+      return false;
+    }
+    final String before = _sourceTextBeforeNode(
+      document,
+      element,
+      maxLength: null,
+    );
+    final String after = _sourceTextAfterNode(document, element);
+    final bool hasYearOrIdentifier = RegExp(
+      r'\b(?:18|19|20)\d{2}\b|\bISBN\b|(?:(?:https?|ftp)://|www\.)',
+      caseSensitive: false,
+    ).hasMatch('$before $after');
+    final bool hasAuthorLikePrefix = RegExp(
+      r"(?:^|[.;])\s*[A-Z][A-Za-z'’\-]+,\s*(?:[A-Z][A-Za-z'’\-]*\s*){1,4}[.:]?\s*$",
+    ).hasMatch(before);
+    return hasYearOrIdentifier && hasAuthorLikePrefix;
+  }
+
+  static bool _isOnlyTitleInSemanticBlock(Element element, String title) {
+    final Element? block = _nearestSemanticBlock(element);
+    if (block == null || _normalizeText(block.text) != title) {
+      return false;
+    }
+    return !_looksLikeSentenceOrInstruction(title);
   }
 
   static void _clearRetainedProperNames(
@@ -676,35 +831,41 @@ class TranslationQuality {
 
   static bool _looksLikeResidualProse(List<String> words) {
     if (_looksLikeEnglishTitleOrName(words) &&
-        !_looksLikeInstructionOrNotice(words.join(' '))) {
+        !_looksLikeSentenceOrInstruction(words.join(' '))) {
       return false;
     }
-    if (words.length >= 4) {
+    if (_looksLikeSentenceOrInstruction(words.join(' '))) {
       return true;
     }
-    const Set<String> proseCues = <String>{
-      'again',
-      'are',
-      'be',
-      'do',
-      'does',
-      'is',
-      'must',
-      'now',
-      'please',
-      'read',
-      'right',
-      'should',
-      'this',
-      'that',
-      'try',
-      'was',
-      'were',
-      'will',
+    const Set<String> finiteVerbCues = <String>{
+      'affect',
+      'affects',
+      'argue',
+      'argues',
+      'become',
+      'becomes',
+      'begin',
+      'begins',
+      'change',
+      'changes',
+      'explain',
+      'explains',
+      'make',
+      'makes',
+      'mean',
+      'means',
+      'need',
+      'needs',
+      'remain',
+      'remains',
+      'say',
+      'says',
+      'write',
+      'writes',
     };
     return words
         .map((String word) => word.toLowerCase())
-        .any(proseCues.contains);
+        .any(finiteVerbCues.contains);
   }
 
   static List<String> _englishWorkTitleWords(String text) {

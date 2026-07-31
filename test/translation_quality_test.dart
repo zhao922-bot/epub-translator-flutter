@@ -237,6 +237,24 @@ void main() {
       expect(finding, isNull);
     });
 
+    for (final String emphasizedProse in <String>[
+      'System Maintenance Will Begin Shortly',
+      'This Change Will Affect Everyone',
+    ]) {
+      test('rejects title-cased emphasized prose: $emphasizedProse', () {
+        final String html = '<p><em>$emphasizedProse</em></p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+    }
+
     test('allows a matching i work title after a neutral preposition', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
@@ -548,11 +566,36 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    test('rejects a lowercase short clause with a finite verb', () {
+      const String html = '<p>users need more time.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('allows a short retained lowercase technical phrase', () {
       final TranslationResidualFinding? finding =
           TranslationQuality.findSuspiciousHtmlResidual(
             sourceHtml: '<p>Use the machine learning model in production.</p>',
             translatedHtml: '<p>在生产中采用 machine learning model。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a four-word lowercase technical noun phrase', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>The system improves large language model inference.</p>',
+            translatedHtml: '<p>系统改进了 large language model inference。</p>',
             targetLanguage: 'Chinese',
           );
 

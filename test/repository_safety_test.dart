@@ -529,6 +529,68 @@ class _ProtectedSlotQualityRetryAdapter implements HttpClientAdapter {
   }
 }
 
+class _ProtectedSlotPayloadTooLargeAdapter implements HttpClientAdapter {
+  int strictRequestCount = 0;
+  int plainRequestCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    try {
+      final Object? decoded = jsonDecode(userContent);
+      if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+        strictRequestCount += 1;
+        return ResponseBody.fromString(
+          jsonEncode(<String, Object?>{
+            'choices': <Object?>[
+              <String, Object?>{
+                'message': <String, Object?>{
+                  'content': jsonEncode(<String, Object?>{
+                    'blocks': const <Object?>[],
+                  }),
+                },
+              },
+            ],
+          }),
+          200,
+          headers: <String, List<String>>{
+            Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+          },
+        );
+      }
+    } on FormatException {
+      // Individual-slot fallback uses plain text rather than JSON.
+    }
+
+    plainRequestCount += 1;
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{'error': 'payload too large'}),
+      413,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _ResidualThenTranslatedBatchAdapter implements HttpClientAdapter {
   int fetchCount = 0;
 
@@ -1350,6 +1412,43 @@ void main() {
       expect(translated.single, contains('id="ref-1" href="#note-1"'));
     },
   );
+
+  test('does not retry HTTP 413 during individual-slot fallback', () async {
+    final _ProtectedSlotPayloadTooLargeAdapter adapter =
+        _ProtectedSlotPayloadTooLargeAdapter();
+    final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+      ..httpClientAdapter = adapter;
+
+    await expectLater(
+      EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 3,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'protected-413',
+            tagName: 'p',
+            sourceHtml:
+                '<p>Translate this sentence.<a href="#note-1"><sup>1</sup></a></p>',
+            sourceText: 'Translate this sentence. 1',
+          ),
+        ],
+      ),
+      throwsA(
+        isA<DioException>().having(
+          (DioException error) => error.response?.statusCode,
+          'status code',
+          413,
+        ),
+      ),
+    );
+
+    expect(adapter.strictRequestCount, 3);
+    expect(adapter.plainRequestCount, 1);
+  });
 
   test('rejects unsafe individual-slot fallback output', () async {
     final _ProtectedSlotPlainFallbackAdapter adapter =
