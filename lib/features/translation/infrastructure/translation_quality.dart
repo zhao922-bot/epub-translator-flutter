@@ -147,27 +147,37 @@ class TranslationQuality {
       'i, em, cite',
     );
 
-    if (sourceTitles.length == translatedTitles.length) {
-      for (int index = 0; index < sourceTitles.length; index += 1) {
-        final Element sourceTitle = sourceTitles[index];
-        final Element translatedTitle = translatedTitles[index];
-        final String sourceText = _normalizeText(sourceTitle.text);
-        final String translatedText = _normalizeText(translatedTitle.text);
-        if (sourceTitle.localName != translatedTitle.localName ||
-            sourceText != translatedText) {
-          continue;
-        }
-        final bool hasWorkTitleSemantics =
-            sourceTitle.localName == 'cite' ||
-            _hasWorkReferenceContext(sourceTitle);
-        if (hasWorkTitleSemantics && _looksLikeEnglishWorkTitle(sourceText)) {
-          sourceTitle.text = '';
-          translatedTitle.text = '';
-        } else if (_englishWorkTitleWords(sourceText).length >= 3) {
+    for (int index = 0; index < translatedTitles.length; index += 1) {
+      final Element translatedTitle = translatedTitles[index];
+      final String translatedText = _normalizeText(translatedTitle.text);
+      final Element? sourceTitle = index < sourceTitles.length
+          ? sourceTitles[index]
+          : null;
+      final String? sourceText = sourceTitle == null
+          ? null
+          : _normalizeText(sourceTitle.text);
+      final bool hasMatchingSourceNode =
+          sourceTitle != null &&
+          sourceTitle.localName == translatedTitle.localName &&
+          sourceText == translatedText;
+      if (!hasMatchingSourceNode) {
+        if (_englishWorkTitleWords(translatedText).length >= 3) {
           return const TranslationResidualFinding(
             kind: TranslationResidualKind.longSourceText,
           );
         }
+        continue;
+      }
+      final bool hasWorkTitleSemantics =
+          sourceTitle.localName == 'cite' ||
+          _hasWorkReferenceContext(sourceDocument, sourceTitle);
+      if (hasWorkTitleSemantics && _looksLikeEnglishWorkTitle(sourceText!)) {
+        sourceTitle.text = '';
+        translatedTitle.text = '';
+      } else if (_englishWorkTitleWords(sourceText!).length >= 3) {
+        return const TranslationResidualFinding(
+          kind: TranslationResidualKind.longSourceText,
+        );
       }
     }
 
@@ -209,27 +219,40 @@ class TranslationQuality {
         _looksLikeEnglishTitleOrName(words);
   }
 
-  static bool _hasWorkReferenceContext(Element element) {
-    final Node? parent = element.parentNode;
-    if (parent == null) {
+  static String _sourceTextBeforeNode(Document document, Node target) {
+    final StringBuffer precedingText = StringBuffer();
+
+    bool collectUntilTarget(Node node) {
+      if (identical(node, target)) {
+        return true;
+      }
+      if (node.nodeType == Node.TEXT_NODE) {
+        precedingText.write(' ${node.text ?? ''}');
+        return false;
+      }
+      for (final Node child in node.nodes) {
+        if (collectUntilTarget(child)) {
+          return true;
+        }
+      }
       return false;
     }
-    final StringBuffer precedingText = StringBuffer();
-    for (final Node sibling in parent.nodes) {
-      if (identical(sibling, element)) {
-        break;
-      }
-      precedingText.write(' ${sibling.text ?? ''}');
-    }
-    final String normalized = _normalizeText(
-      precedingText.toString(),
-    ).toLowerCase();
-    final String tail = normalized.length <= 120
+
+    collectUntilTarget(document.body ?? document);
+    final String normalized = _normalizeText(precedingText.toString());
+    return normalized.length <= 120
         ? normalized
         : normalized.substring(normalized.length - 120);
+  }
+
+  static bool _hasWorkReferenceContext(Document document, Element element) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
     return RegExp(
       r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading|from|in))\s*(?:[:\-–—]\s*)?$',
-    ).hasMatch(tail);
+    ).hasMatch(precedingText);
   }
 
   static List<String> _englishWorkTitleWords(String text) {

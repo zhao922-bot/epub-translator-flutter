@@ -250,6 +250,32 @@ void main() {
       expect(finding, isNull);
     });
 
+    test('finds source citation context through an anchor wrapper', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Authors of <a href="#"><i>The 500-Year Delta: What Happens After What Comes Next</i></a> agree.</p>',
+        translatedHtml:
+            '<p>《五百年跃迁》的作者<a href="#"><i>The 500-Year Delta: What Happens After What Comes Next</i></a>表示赞同。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('finds source citation context through a span wrapper', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Read <span><em>The Shape of Things Yet to Come</em></span>.</p>',
+        translatedHtml:
+            '<p>阅读<span><em>The Shape of Things Yet to Come</em></span>。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
     test('does not exempt a title added only by the model', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
@@ -349,6 +375,50 @@ void main() {
       );
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('flags a short changed English cite title', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><cite>A Brief History</cite></p>',
+            translatedHtml: '<p><cite>A Short History</cite></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('flags a short English cite added only to the translation', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>一本书</p>',
+            translatedHtml: '<p><cite>A Brief History</cite></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('flags a short English inline with a changed tag', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><i>A Brief History</i></p>',
+            translatedHtml: '<p><em>A Brief History</em></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows an inline work title translated fully into Chinese', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><cite>A Brief History</cite></p>',
+            translatedHtml: '<p><cite>简史</cite></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
     });
   });
 }
