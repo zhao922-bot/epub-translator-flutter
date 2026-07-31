@@ -702,6 +702,76 @@ void main() {
 
         expect(finding, isNull);
       });
+
+      for (final String targetLanguage in <String>[
+        '中文',
+        '日本語',
+        '한국어',
+        'zh_Hans',
+        'ja_JP',
+        'ko_KR',
+      ]) {
+        test('supports the CJK target name $targetLanguage', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>As boundaries disappear, entitlement changes.</p>',
+                translatedHtml: '<p>边界消失后，entitlement概念改变。</p>',
+                targetLanguage: targetLanguage,
+              );
+
+          expect(
+            finding?.kind,
+            TranslationResidualKind.cjkAdjacentLowercaseWord,
+          );
+          expect(finding?.token, 'entitlement');
+        });
+      }
+
+      for (final String token in <String>["don't", 'don’t', 'co-op']) {
+        test('flags the complete lowercase token $token beside CJK', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>The source contains a missed English token.</p>',
+                translatedHtml: '<p>译文$token这样保留。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(
+            finding?.kind,
+            TranslationResidualKind.cjkAdjacentLowercaseWord,
+          );
+          expect(finding?.token, token);
+        });
+      }
+
+      test(
+        'does not match a lowercase substring inside an alphanumeric token',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: '<p>The device uses an MP3 player.</p>',
+                translatedHtml: '<p>连接mp3player设备。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test('continues checking after a URL followed by Chinese punctuation', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Visit the site, where the entitlement concept is explained.</p>',
+          translatedHtml: '<p>访问https://example.com，entitlement概念。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'entitlement');
+      });
     });
   });
 }

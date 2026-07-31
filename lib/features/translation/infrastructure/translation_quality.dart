@@ -29,6 +29,9 @@ class TranslationQuality {
     if (lower.isEmpty) {
       return false;
     }
+    if (_isCjkTargetLanguage(lower)) {
+      return true;
+    }
     // Languages where long source-script residuals are usually wrong.
     const Set<String> residualTargets = <String>{
       'zh',
@@ -241,17 +244,21 @@ class TranslationQuality {
     }
     final String strippedText = _stripNonLinguisticTokens(text);
     for (final RegExpMatch match in RegExp(
-      r'[a-z]{5,}',
+      r"[A-Za-z0-9'’\-]+",
     ).allMatches(strippedText)) {
-      final int? precedingRune = _runeBefore(strippedText, match.start);
-      final int? followingRune = _runeAt(strippedText, match.end);
-      if ((precedingRune != null && _isLatinLetterRune(precedingRune)) ||
-          (followingRune != null && _isLatinLetterRune(followingRune))) {
+      final String token = match.group(0) ?? '';
+      final bool hasLatinLetter = RegExp(r'[A-Za-z]').hasMatch(token);
+      if (token.length < 5 ||
+          !hasLatinLetter ||
+          RegExp(r'[0-9]').hasMatch(token) ||
+          token != token.toLowerCase()) {
         continue;
       }
+      final int? precedingRune = _runeBefore(strippedText, match.start);
+      final int? followingRune = _runeAt(strippedText, match.end);
       if ((precedingRune != null && _isCjkRune(precedingRune)) ||
           (followingRune != null && _isCjkRune(followingRune))) {
-        return match.group(0);
+        return token;
       }
     }
     return null;
@@ -259,15 +266,19 @@ class TranslationQuality {
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
     final String lower = targetLanguage.trim().toLowerCase();
-    return lower == 'zh' ||
-        lower.startsWith('zh-') ||
+    return RegExp(r'^(?:zh|ja|ko)(?:[-_]|$)').hasMatch(lower) ||
         lower.contains('chinese') ||
-        lower == 'ja' ||
-        lower.startsWith('ja-') ||
         lower.contains('japanese') ||
-        lower == 'ko' ||
-        lower.startsWith('ko-') ||
-        lower.contains('korean');
+        lower.contains('korean') ||
+        lower.contains('中文') ||
+        lower.contains('汉语') ||
+        lower.contains('漢語') ||
+        lower.contains('日本語') ||
+        lower.contains('日语') ||
+        lower.contains('日語') ||
+        lower.contains('한국어') ||
+        lower.contains('韩语') ||
+        lower.contains('韓語');
   }
 
   static int? _runeBefore(String text, int offset) {
@@ -624,7 +635,7 @@ class TranslationQuality {
     return text
         .replaceAll(
           RegExp(
-            r'''(?:(?:https?|ftp)://|www\.)[^\s<>"']+''',
+            r'''(?:(?:https?|ftp)://|www\.)[A-Z0-9._~:/?#\[\]@!$&()*+=;%-]+''',
             caseSensitive: false,
           ),
           ' ',
