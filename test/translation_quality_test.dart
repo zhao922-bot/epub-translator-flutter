@@ -469,5 +469,57 @@ void main() {
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
+
+    test('only exempts the nested cite subtree inside emphasized prose', () {
+      const String sourceHtml =
+          '<p><em><cite>A Brief History</cite> Please Read All Instructions</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: sourceHtml,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not treat the preposition in as a title citation cue', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Sign in <em>Please Read All Instructions Before Continuing</em></p>',
+        translatedHtml:
+            '<p>登录<em>Please Read All Instructions Before Continuing</em></p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('flags changed English text when a source cite is removed', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><cite>A Brief History</cite></p>',
+            translatedHtml: '<p>A Short History</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not inherit a read cue from the previous paragraph', () {
+      const String html =
+          '<p>This paragraph ends with Read</p><p><em>Please Read All Instructions Before Continuing</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
   });
 }

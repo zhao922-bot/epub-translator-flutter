@@ -180,18 +180,28 @@ class TranslationQuality {
           unexemptedSourceTexts.add(sourceText);
         }
       }
-      for (final Element translatedCandidate in translatedCandidates) {
-        if (_englishWorkTitleWords(translatedCandidate.text).length >= 3) {
-          return const TranslationResidualFinding(
-            kind: TranslationResidualKind.longSourceText,
-          );
-        }
+      final String translatedVisibleText = _normalizeText(
+        translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      );
+      if (_englishWorkTitleWords(translatedVisibleText).length >= 3) {
+        return const TranslationResidualFinding(
+          kind: TranslationResidualKind.longSourceText,
+        );
       }
     }
 
     for (final int index in exemptedCandidateIndexes) {
       sourceCandidates[index].text = '';
       translatedCandidates[index].text = '';
+    }
+
+    if (_hasMatchingRemainingInlineResidual(
+      sourceDocument,
+      translatedDocument,
+    )) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
     }
 
     final String translatedVisibleText = _normalizeText(
@@ -227,18 +237,27 @@ class TranslationQuality {
 
   static List<Element> _outermostWorkTitleCandidates(Document document) {
     return document.querySelectorAll('i, em, cite').where((Element candidate) {
-      Node? ancestor = candidate.parentNode;
-      while (ancestor != null) {
-        if (ancestor is Element &&
-            (ancestor.localName == 'i' ||
-                ancestor.localName == 'em' ||
-                ancestor.localName == 'cite')) {
-          return false;
-        }
-        ancestor = ancestor.parentNode;
+      if (candidate.localName == 'cite') {
+        return !_hasAncestorWithTag(candidate, const <String>{'cite'});
       }
-      return true;
+      return !_hasAncestorWithTag(candidate, const <String>{
+            'i',
+            'em',
+            'cite',
+          }) &&
+          candidate.querySelector('cite') == null;
     }).toList();
+  }
+
+  static bool _hasAncestorWithTag(Element element, Set<String> tags) {
+    Node? ancestor = element.parentNode;
+    while (ancestor != null) {
+      if (ancestor is Element && tags.contains(ancestor.localName)) {
+        return true;
+      }
+      ancestor = ancestor.parentNode;
+    }
+    return false;
   }
 
   static bool _looksLikeEnglishWorkTitle(String text) {
@@ -276,11 +295,43 @@ class TranslationQuality {
       return false;
     }
 
-    collectUntilTarget(document.body ?? document);
+    collectUntilTarget(
+      _nearestSemanticBlock(target) ?? document.body ?? document,
+    );
     final String normalized = _normalizeText(precedingText.toString());
     return normalized.length <= 120
         ? normalized
         : normalized.substring(normalized.length - 120);
+  }
+
+  static Element? _nearestSemanticBlock(Node target) {
+    const Set<String> semanticBlockTags = <String>{
+      'p',
+      'li',
+      'blockquote',
+      'dd',
+      'dt',
+      'figcaption',
+      'caption',
+      'summary',
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'td',
+      'th',
+    };
+    Node? ancestor = target.parentNode;
+    while (ancestor != null) {
+      if (ancestor is Element &&
+          semanticBlockTags.contains(ancestor.localName)) {
+        return ancestor;
+      }
+      ancestor = ancestor.parentNode;
+    }
+    return null;
   }
 
   static bool _hasWorkReferenceContext(Document document, Element element) {
@@ -289,7 +340,7 @@ class TranslationQuality {
       element,
     ).toLowerCase();
     return RegExp(
-      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading|from|in))\s*(?:[:\-–—]\s*)?$',
+      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading))\s*(?:[:\-–—]\s*)?$',
     ).hasMatch(precedingText);
   }
 
@@ -297,6 +348,32 @@ class TranslationQuality {
     return root.localName == 'cite' ||
         root.querySelector('cite') != null ||
         _hasWorkReferenceContext(document, root);
+  }
+
+  static bool _hasMatchingRemainingInlineResidual(
+    Document sourceDocument,
+    Document translatedDocument,
+  ) {
+    final List<Element> sourceInline = sourceDocument.querySelectorAll(
+      'i, em, cite',
+    );
+    final List<Element> translatedInline = translatedDocument.querySelectorAll(
+      'i, em, cite',
+    );
+    if (sourceInline.length != translatedInline.length) {
+      return false;
+    }
+    for (int index = 0; index < sourceInline.length; index += 1) {
+      final Element sourceElement = sourceInline[index];
+      final Element translatedElement = translatedInline[index];
+      final String sourceText = _normalizeText(sourceElement.text);
+      if (sourceElement.localName == translatedElement.localName &&
+          sourceText == _normalizeText(translatedElement.text) &&
+          _englishWorkTitleWords(sourceText).length >= 3) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static List<String> _englishWorkTitleWords(String text) {
