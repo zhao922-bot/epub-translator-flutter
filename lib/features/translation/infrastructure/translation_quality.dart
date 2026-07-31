@@ -247,9 +247,9 @@ class TranslationQuality {
       r"[A-Za-z0-9'’\-]+",
     ).allMatches(strippedText)) {
       final String token = match.group(0) ?? '';
-      final bool hasLatinLetter = RegExp(r'[A-Za-z]').hasMatch(token);
-      if (token.length < 5 ||
-          !hasLatinLetter ||
+      final int latinLetterCount = RegExp(r'[A-Za-z]').allMatches(token).length;
+      if (latinLetterCount < 4 ||
+          !RegExp(r'^[A-Za-z].*[A-Za-z]$').hasMatch(token) ||
           RegExp(r'[0-9]').hasMatch(token) ||
           token != token.toLowerCase()) {
         continue;
@@ -635,7 +635,7 @@ class TranslationQuality {
     return text
         .replaceAll(
           RegExp(
-            r'''(?:(?:https?|ftp)://|www\.)[A-Z0-9._~:/?#\[\]@!$&()*+=;%-]+''',
+            r'''(?:(?:https?|ftp)://|www\.)[A-Z0-9._~:/?#\[\]@!$&'()*+,;=%-]+''',
             caseSensitive: false,
           ),
           ' ',

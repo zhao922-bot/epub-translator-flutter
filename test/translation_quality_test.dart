@@ -760,6 +760,40 @@ void main() {
         },
       );
 
+      for (final String token in <String>[
+        '--beta',
+        "'open",
+        'beta--',
+        'a-b-c',
+      ]) {
+        test('allows malformed or too-short token $token beside CJK', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: '<p>The source contains an inline marker.</p>',
+                translatedHtml: '<p>中文$token内容。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
+      for (final String url in <String>[
+        'https://example.com/archive,part/entitlement',
+        "https://example.com/archive'part/entitlement",
+      ]) {
+        test('allows RFC3986 punctuation inside URL $url', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: '<p>Visit the linked resource.</p>',
+                translatedHtml: '<p>访问$url内容。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
       test('continues checking after a URL followed by Chinese punctuation', () {
         final TranslationResidualFinding?
         finding = TranslationQuality.findSuspiciousHtmlResidual(
