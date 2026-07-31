@@ -157,10 +157,13 @@ class TranslationQuality {
             sourceText != translatedText) {
           continue;
         }
-        if (_looksLikeEnglishWorkTitle(sourceText)) {
+        final bool hasWorkTitleSemantics =
+            sourceTitle.localName == 'cite' ||
+            _hasWorkReferenceContext(sourceTitle);
+        if (hasWorkTitleSemantics && _looksLikeEnglishWorkTitle(sourceText)) {
           sourceTitle.text = '';
           translatedTitle.text = '';
-        } else if (_englishWorkTitleWords(sourceText).length >= 6) {
+        } else if (_englishWorkTitleWords(sourceText).length >= 3) {
           return const TranslationResidualFinding(
             kind: TranslationResidualKind.longSourceText,
           );
@@ -201,32 +204,93 @@ class TranslationQuality {
       return false;
     }
     final List<String> words = _englishWorkTitleWords(normalized);
-    const Set<String> instructionLikeStarts = <String>{
-      'please',
-      'read',
-      'click',
-      'tap',
-      'select',
-      'choose',
-      'enter',
-      'press',
-      'follow',
-      'continue',
-      'warning',
-      'important',
-    };
     return words.length >= 3 &&
         words.length <= 16 &&
-        !instructionLikeStarts.contains(words.first.toLowerCase()) &&
         _looksLikeEnglishTitleOrName(words);
   }
 
+  static bool _hasWorkReferenceContext(Element element) {
+    final Node? parent = element.parentNode;
+    if (parent == null) {
+      return false;
+    }
+    final StringBuffer precedingText = StringBuffer();
+    for (final Node sibling in parent.nodes) {
+      if (identical(sibling, element)) {
+        break;
+      }
+      precedingText.write(' ${sibling.text ?? ''}');
+    }
+    final String normalized = _normalizeText(
+      precedingText.toString(),
+    ).toLowerCase();
+    final String tail = normalized.length <= 120
+        ? normalized
+        : normalized.substring(normalized.length - 120);
+    return RegExp(
+      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading|from|in))\s*(?:[:\-–—]\s*)?$',
+    ).hasMatch(tail);
+  }
+
   static List<String> _englishWorkTitleWords(String text) {
-    final String normalizedApostrophes = text.replaceAll(RegExp('[‘’]'), "'");
-    return RegExp(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ſ][A-Za-zÀ-ÖØ-öø-ÿĀ-ſ'-]*")
-        .allMatches(normalizedApostrophes)
-        .map((RegExpMatch match) => match.group(0)!)
-        .toList();
+    final List<String> words = <String>[];
+    final List<int> current = <int>[];
+
+    void finishWord() {
+      while (current.isNotEmpty &&
+          (current.last == 0x27 || current.last == 0x2D)) {
+        current.removeLast();
+      }
+      if (current.isNotEmpty) {
+        words.add(String.fromCharCodes(current));
+        current.clear();
+      }
+    }
+
+    for (final int rune in text.runes) {
+      if (_isLatinLetterRune(rune)) {
+        current.add(rune);
+        continue;
+      }
+      final bool followsLetterOrMark =
+          current.isNotEmpty &&
+          (_isLatinLetterRune(current.last) ||
+              _isCombiningDiacriticalMark(current.last));
+      if (_isCombiningDiacriticalMark(rune) && followsLetterOrMark) {
+        current.add(rune);
+        continue;
+      }
+      if ((rune == 0x27 || rune == 0x2018 || rune == 0x2019) &&
+          followsLetterOrMark) {
+        current.add(0x27);
+        continue;
+      }
+      if (rune == 0x2D && followsLetterOrMark) {
+        current.add(rune);
+        continue;
+      }
+      finishWord();
+    }
+    finishWord();
+    return words;
+  }
+
+  static bool _isLatinLetterRune(int rune) {
+    return (rune >= 0x0041 && rune <= 0x005A) ||
+        (rune >= 0x0061 && rune <= 0x007A) ||
+        (rune >= 0x00C0 && rune <= 0x00D6) ||
+        (rune >= 0x00D8 && rune <= 0x00F6) ||
+        (rune >= 0x00F8 && rune <= 0x02AF) ||
+        (rune >= 0x1E00 && rune <= 0x1EFF) ||
+        (rune >= 0x2C60 && rune <= 0x2C7F) ||
+        (rune >= 0xA720 && rune <= 0xA7FF) ||
+        (rune >= 0xAB30 && rune <= 0xAB6F) ||
+        (rune >= 0x10780 && rune <= 0x107BF) ||
+        (rune >= 0x1DF00 && rune <= 0x1DFFF);
+  }
+
+  static bool _isCombiningDiacriticalMark(int rune) {
+    return rune >= 0x0300 && rune <= 0x036F;
   }
 
   static String _stripNonLinguisticTokens(String text) {
@@ -314,7 +378,7 @@ class TranslationQuality {
         continue;
       }
       significantWords += 1;
-      final String first = word.substring(0, 1);
+      final String first = String.fromCharCode(word.runes.first);
       if (first == first.toUpperCase() && first != first.toLowerCase()) {
         titleCaseWords += 1;
       }

@@ -198,6 +198,58 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    test('does not exempt an unlisted title-cased imperative', () {
+      const String html = '<p><em>Open Settings And Restart The App</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not exempt short emphasized inline prose', () {
+      const String html = '<p><em>Please Read This First</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not exempt an i title without source citation context', () {
+      const String html = '<p><i>A Brief History of Time</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows an i title after a source citation cue', () {
+      const String sourceHtml = '<p>Read <i>A Brief History of Time</i>.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: '<p>阅读<i>A Brief History of Time</i>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
     test('does not exempt a title added only by the model', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
@@ -231,7 +283,20 @@ void main() {
     }
 
     test('allows a matching Latin title with a curly apostrophe in i', () {
-      const String html = '<p><i>The Fiancée’s Guide to Everything</i></p>';
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Read <i>The Fiancée’s Guide to Everything</i>.</p>',
+            translatedHtml:
+                '<p>阅读<i>The Fiancée’s Guide to Everything</i>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a matching accented Latin title in cite', () {
+      const String html =
+          '<p><cite>Émile’s Journey Through Time and Memory</cite></p>';
 
       final TranslationResidualFinding? finding =
           TranslationQuality.findSuspiciousHtmlResidual(
@@ -243,9 +308,25 @@ void main() {
       expect(finding, isNull);
     });
 
-    test('allows a matching accented Latin title in cite', () {
+    test(
+      'allows a referenced title with Latin Extended Additional letters',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>Read <i>The Ứng Đặng Guide to Time and Memory</i>.</p>',
+              translatedHtml:
+                  '<p>阅读<i>The Ứng Đặng Guide to Time and Memory</i>。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      },
+    );
+
+    test('allows a cite title with a combining Latin accent', () {
       const String html =
-          '<p><cite>Émile’s Journey Through Time and Memory</cite></p>';
+          '<p><cite>The Cafe\u0301 Guide to Every City</cite></p>';
 
       final TranslationResidualFinding? finding =
           TranslationQuality.findSuspiciousHtmlResidual(
