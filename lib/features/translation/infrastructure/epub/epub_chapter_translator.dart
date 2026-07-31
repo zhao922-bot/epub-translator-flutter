@@ -3000,7 +3000,6 @@ class EpubChapterTranslator {
           response.data,
         );
         _validateIndividualSlotTranslation(
-          config: config,
           sourceText: trimmedSource,
           translatedText: translated,
         );
@@ -3010,7 +3009,6 @@ class EpubChapterTranslator {
   }
 
   static void _validateIndividualSlotTranslation({
-    required TranslationConfig config,
     required String sourceText,
     required String translatedText,
   }) {
@@ -3031,16 +3029,6 @@ class EpubChapterTranslator {
         _hasTranslationExplanationPrefix(trimmed)) {
       throw const FormatException(
         'Individual protected slot translation contains wrapper content.',
-      );
-    }
-    if (config.residualQualityCheck &&
-        TranslationQuality.hasSuspiciousSourceResidual(
-          sourceText: sourceText,
-          translatedText: trimmed,
-          targetLanguage: config.targetLanguage,
-        )) {
-      throw const FormatException(
-        'Possible untranslated source-language text remains in an individual protected slot.',
       );
     }
   }

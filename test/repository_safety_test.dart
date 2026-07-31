@@ -1188,6 +1188,64 @@ void main() {
     },
   );
 
+  test(
+    'preserves a work title when a malformed protected batch falls back to slots',
+    () async {
+      final _ProtectedSlotPlainFallbackAdapter adapter =
+          _ProtectedSlotPlainFallbackAdapter(
+            plainResponses: const <String>[
+              '《五百年跃迁》的作者',
+              'The 500-Year Delta: What Happens After What Comes Next',
+              '描述了一场深刻转型。',
+              '其他作家也赞同。',
+            ],
+          );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String>
+      translated = await EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 1,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'p-2',
+            tagName: 'p',
+            sourceHtml:
+                '<p id="p-2">Authors of <i>The 500-Year Delta: What Happens After What Comes Next</i> describe a profound transition.<a id="footnote_ref_37" href="part0023_split_006.html#ch06-en37" role="doc-noteref"><sup>37</sup></a> Other writers agree.<a id="footnote_ref_38" href="part0023_split_006.html#ch06-en38" role="doc-noteref"><sup>38</sup></a></p>',
+            sourceText:
+                'Authors of The 500-Year Delta: What Happens After What Comes Next describe a profound transition. 37 Other writers agree. 38',
+          ),
+        ],
+      );
+
+      expect(adapter.strictRequestCount, 1);
+      expect(adapter.plainInputs, <String>[
+        'Authors of',
+        'The 500-Year Delta: What Happens After What Comes Next',
+        'describe a profound transition.',
+        'Other writers agree.',
+      ]);
+      expect(translated.single, contains('The 500-Year Delta'));
+      expect(
+        translated.single,
+        contains(
+          'id="footnote_ref_37" href="part0023_split_006.html#ch06-en37"',
+        ),
+      );
+      expect(
+        translated.single,
+        contains(
+          'id="footnote_ref_38" href="part0023_split_006.html#ch06-en38"',
+        ),
+      );
+    },
+  );
+
   test('rejects unsafe individual-slot fallback output', () async {
     final _ProtectedSlotPlainFallbackAdapter adapter =
         _ProtectedSlotPlainFallbackAdapter(
