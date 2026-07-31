@@ -591,6 +591,29 @@ class _ProtectedSlotPayloadTooLargeAdapter implements HttpClientAdapter {
   }
 }
 
+class _HtmlFootnotePayloadTooLargeAdapter implements HttpClientAdapter {
+  int requestCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requestCount += 1;
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{'error': 'payload too large'}),
+      413,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _ResidualThenTranslatedBatchAdapter implements HttpClientAdapter {
   int fetchCount = 0;
 
@@ -1596,6 +1619,36 @@ void main() {
   );
 
   group('cross-file footnote response ids', () {
+    test('does not retry HTTP 413 for an HTML footnote batch', () async {
+      final _HtmlFootnotePayloadTooLargeAdapter adapter =
+          _HtmlFootnotePayloadTooLargeAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      await expectLater(
+        EpubChapterTranslator().translateFootnoteBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 3,
+          ),
+          references: <FootnoteBlockReference>[
+            _footnoteReference(0, 'A normal HTML footnote.'),
+          ],
+        ),
+        throwsA(
+          isA<DioException>().having(
+            (DioException error) => error.response?.statusCode,
+            'status code',
+            413,
+          ),
+        ),
+      );
+
+      expect(adapter.requestCount, 1);
+    });
+
     test('same-file short marker uses slots in the footnote batch', () async {
       final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
         <Map<String, Object?>>[

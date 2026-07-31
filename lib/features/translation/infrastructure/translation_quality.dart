@@ -164,7 +164,6 @@ class TranslationQuality {
                 _elementStructurePath(translatedCandidate) &&
             sourceText == translatedText &&
             _looksLikeEnglishWorkTitle(sourceText) &&
-            !_looksLikeSentenceOrInstruction(sourceText) &&
             _hasWorkTitleSemantics(sourceDocument, sourceCandidate, sourceText);
         if (canExempt) {
           exemptedCandidateIndexes.add(index);
@@ -465,6 +464,46 @@ class TranslationQuality {
         }.contains(words[1]);
   }
 
+  static bool _looksLikeImperativeOrNotice(String text) {
+    final List<String> words = _englishWorkTitleWords(
+      text,
+    ).map((String word) => word.toLowerCase()).toList(growable: false);
+    if (words.isEmpty) {
+      return false;
+    }
+    const Set<String> imperativeOpeners = <String>{
+      'click',
+      'close',
+      'continue',
+      'do',
+      "don't",
+      'enter',
+      'follow',
+      'never',
+      'open',
+      'please',
+      'press',
+      'read',
+      'restart',
+      'select',
+      'sign',
+      'start',
+      'stop',
+      'tap',
+      'turn',
+      'wait',
+    };
+    return imperativeOpeners.contains(words.first) ||
+        (words.length >= 2 &&
+            words.first == 'important' &&
+            const <String>{
+              'information',
+              'notice',
+              'safety',
+              'warning',
+            }.contains(words[1]));
+  }
+
   static String _sourceTextAfterNode(Document document, Node target) {
     final StringBuffer followingText = StringBuffer();
     bool foundTarget = false;
@@ -559,6 +598,9 @@ class TranslationQuality {
     if (element.localName == 'cite' || element.querySelector('cite') != null) {
       return true;
     }
+    if (_looksLikeImperativeOrNotice(title)) {
+      return false;
+    }
     return _hasExplicitWorkReferenceContext(document, element) ||
         _hasAttributedWorkContext(document, element) ||
         _hasDescriptiveWorkContext(document, element) ||
@@ -637,7 +679,8 @@ class TranslationQuality {
     if (block == null || _normalizeText(block.text) != title) {
       return false;
     }
-    return !_looksLikeSentenceOrInstruction(title);
+    final int wordCount = _englishWorkTitleWords(title).length;
+    return wordCount <= 4 || !_looksLikeSentenceOrInstruction(title);
   }
 
   static void _clearRetainedProperNames(

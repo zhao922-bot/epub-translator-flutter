@@ -237,6 +237,34 @@ void main() {
       expect(finding, isNull);
     });
 
+    for (final String title in <String>['This Is Water', 'We Were Liars']) {
+      test('allows the explicit cite work title $title', () {
+        final String html = '<p><cite>$title</cite></p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+    }
+
+    test('allows a short standalone i title with sentence-like words', () {
+      const String html = '<p><i>This Is Water</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
     for (final String emphasizedProse in <String>[
       'System Maintenance Will Begin Shortly',
       'This Change Will Affect Everyone',

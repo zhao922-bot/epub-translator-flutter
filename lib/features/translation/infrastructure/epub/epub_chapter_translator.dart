@@ -2616,6 +2616,7 @@ class EpubChapterTranslator {
     return _apiClient.runRetried<Map<String, String>>(
       config: config,
       retryDelayOverride: retryDelayOverride,
+      shouldRetry: TranslationApiClient.shouldRetryBatchError,
       cancelToken: cancelToken,
       operation: () async {
         if (cancelToken?.isCancelled ?? false) {
