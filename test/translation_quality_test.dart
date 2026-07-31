@@ -778,6 +778,20 @@ void main() {
         });
       }
 
+      for (final String token in <String>['beta', 'open', 'mode', 'data']) {
+        test('allows four-letter lowercase token $token beside CJK', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>The source contains a short technical term.</p>',
+                translatedHtml: '<p>使用$token接口。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
       for (final String url in <String>[
         'https://example.com/archive,part/entitlement',
         "https://example.com/archive'part/entitlement",

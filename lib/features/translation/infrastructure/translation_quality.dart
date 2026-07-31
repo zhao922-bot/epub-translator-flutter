@@ -248,7 +248,8 @@ class TranslationQuality {
     ).allMatches(strippedText)) {
       final String token = match.group(0) ?? '';
       final int latinLetterCount = RegExp(r'[A-Za-z]').allMatches(token).length;
-      if (latinLetterCount < 4 ||
+      if (token.length < 5 ||
+          latinLetterCount < 4 ||
           !RegExp(r'^[A-Za-z].*[A-Za-z]$').hasMatch(token) ||
           RegExp(r'[0-9]').hasMatch(token) ||
           token != token.toLowerCase()) {
