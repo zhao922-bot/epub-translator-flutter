@@ -167,11 +167,6 @@ class TranslationQuality {
         if (_englishWorkTitleWords(sourceText).length >= 3) {
           unexemptedSourceTexts.add(sourceText);
         }
-        if (_englishWorkTitleWords(translatedText).length >= 3) {
-          return const TranslationResidualFinding(
-            kind: TranslationResidualKind.longSourceText,
-          );
-        }
       }
     } else {
       for (final Element sourceCandidate in sourceCandidates) {
@@ -195,10 +190,9 @@ class TranslationQuality {
       translatedCandidates[index].text = '';
     }
 
-    if (_hasMatchingRemainingInlineResidual(
-      sourceDocument,
-      translatedDocument,
-    )) {
+    _clearRetainedProperNames(sourceDocument, translatedDocument);
+
+    if (_hasRemainingTranslatedInlineResidual(translatedDocument)) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
       );
@@ -350,7 +344,7 @@ class TranslationQuality {
         _hasWorkReferenceContext(document, root);
   }
 
-  static bool _hasMatchingRemainingInlineResidual(
+  static void _clearRetainedProperNames(
     Document sourceDocument,
     Document translatedDocument,
   ) {
@@ -361,19 +355,79 @@ class TranslationQuality {
       'i, em, cite',
     );
     if (sourceInline.length != translatedInline.length) {
-      return false;
+      return;
     }
+    final List<int> retainedNameIndexes = <int>[];
     for (int index = 0; index < sourceInline.length; index += 1) {
       final Element sourceElement = sourceInline[index];
       final Element translatedElement = translatedInline[index];
       final String sourceText = _normalizeText(sourceElement.text);
       if (sourceElement.localName == translatedElement.localName &&
           sourceText == _normalizeText(translatedElement.text) &&
-          _englishWorkTitleWords(sourceText).length >= 3) {
-        return true;
+          sourceElement.querySelector('i, em, cite') == null &&
+          translatedElement.querySelector('i, em, cite') == null &&
+          _looksLikeRetainedProperName(sourceText) &&
+          _hasRetainedProperNameContext(sourceDocument, sourceElement)) {
+        retainedNameIndexes.add(index);
       }
     }
-    return false;
+    for (final int index in retainedNameIndexes) {
+      sourceInline[index].text = '';
+      translatedInline[index].text = '';
+    }
+  }
+
+  static bool _looksLikeRetainedProperName(String text) {
+    final List<String> words = _englishWorkTitleWords(text);
+    if (words.length < 2 || words.length > 6) {
+      return false;
+    }
+    const Set<String> nameParticles = <String>{
+      'and',
+      'da',
+      'de',
+      'del',
+      'der',
+      'di',
+      'dos',
+      'du',
+      'la',
+      'le',
+      'of',
+      'the',
+      'van',
+      'von',
+    };
+    final List<String> significantWords = words
+        .where((String word) => !nameParticles.contains(word.toLowerCase()))
+        .toList();
+    if (significantWords.isEmpty) {
+      return false;
+    }
+    final int titleCaseOrInitialWords = significantWords.where((String word) {
+      final String first = String.fromCharCode(word.runes.first);
+      return first == first.toUpperCase() && first != first.toLowerCase();
+    }).length;
+    return titleCaseOrInitialWords / significantWords.length > 0.5;
+  }
+
+  static bool _hasRetainedProperNameContext(
+    Document sourceDocument,
+    Element sourceElement,
+  ) {
+    final String precedingText = _sourceTextBeforeNode(
+      sourceDocument,
+      sourceElement,
+    ).toLowerCase();
+    return RegExp(r'\bby\s*(?:[:\-–—]\s*)?$').hasMatch(precedingText);
+  }
+
+  static bool _hasRemainingTranslatedInlineResidual(Document document) {
+    return document
+        .querySelectorAll('i, em, cite')
+        .any(
+          (Element element) => _englishWorkTitleWords(element.text).length >= 3,
+        );
   }
 
   static List<String> _englishWorkTitleWords(String text) {

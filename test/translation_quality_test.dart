@@ -521,5 +521,64 @@ void main() {
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
+
+    test('rejects lightly rewritten prose beside a nested cite', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p><i><cite>A Brief History</cite><em>Please Read This</em></i></p>',
+        translatedHtml:
+            '<p><i><cite>A Brief History</cite><em>Please Open This</em></i></p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows a retained three-word design credit after by', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Book design by <em>Rodrigo Corral Design</em>.</p>',
+            translatedHtml: '<p>书籍设计：<em>Rodrigo Corral Design</em>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a retained two-word credit after by', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Cover design by <em>Ralph Fowler</em>.</p>',
+            translatedHtml: '<p>封面设计：<em>Ralph Fowler</em>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a retained credit containing an initial after by', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Edited by <em>Maarten W. Bos</em>.</p>',
+            translatedHtml: '<p>编辑：<em>Maarten W. Bos</em>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('does not allow title-cased prose without a by credit cue', () {
+      const String html = '<p><em>Please Read This</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
   });
 }
