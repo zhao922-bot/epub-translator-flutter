@@ -580,5 +580,42 @@ void main() {
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
+
+    test('does not treat start by as a credit role', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Start by <em>Please Read This</em>.</p>',
+            translatedHtml: '<p>先从<em>Please Read This</em>开始。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows multiple retained names in one credit list', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Written by <em>John Smith</em> and <em>Mary Jane Watson</em>.</p>',
+        translatedHtml:
+            '<p>作者：<em>John Smith</em>、<em>Mary Jane Watson</em>。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('does not treat destroyed by as a credit role', () {
+      const String html = '<p>Destroyed by <em>Please Read This</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
   });
 }

@@ -270,7 +270,11 @@ class TranslationQuality {
         _looksLikeEnglishTitleOrName(words);
   }
 
-  static String _sourceTextBeforeNode(Document document, Node target) {
+  static String _sourceTextBeforeNode(
+    Document document,
+    Node target, {
+    int? maxLength = 120,
+  }) {
     final StringBuffer precedingText = StringBuffer();
 
     bool collectUntilTarget(Node node) {
@@ -293,9 +297,9 @@ class TranslationQuality {
       _nearestSemanticBlock(target) ?? document.body ?? document,
     );
     final String normalized = _normalizeText(precedingText.toString());
-    return normalized.length <= 120
+    return maxLength == null || normalized.length <= maxLength
         ? normalized
-        : normalized.substring(normalized.length - 120);
+        : normalized.substring(normalized.length - maxLength);
   }
 
   static Element? _nearestSemanticBlock(Node target) {
@@ -358,17 +362,29 @@ class TranslationQuality {
       return;
     }
     final List<int> retainedNameIndexes = <int>[];
+    final Map<Node, List<String>> retainedNamesByBlock = <Node, List<String>>{};
     for (int index = 0; index < sourceInline.length; index += 1) {
       final Element sourceElement = sourceInline[index];
       final Element translatedElement = translatedInline[index];
       final String sourceText = _normalizeText(sourceElement.text);
+      final Node contextRoot =
+          _nearestSemanticBlock(sourceElement) ??
+          sourceDocument.body ??
+          sourceDocument;
+      final List<String> precedingRetainedNames = retainedNamesByBlock
+          .putIfAbsent(contextRoot, () => <String>[]);
       if (sourceElement.localName == translatedElement.localName &&
           sourceText == _normalizeText(translatedElement.text) &&
           sourceElement.querySelector('i, em, cite') == null &&
           translatedElement.querySelector('i, em, cite') == null &&
           _looksLikeRetainedProperName(sourceText) &&
-          _hasRetainedProperNameContext(sourceDocument, sourceElement)) {
+          _hasRetainedProperNameContext(
+            sourceDocument,
+            sourceElement,
+            precedingRetainedNames,
+          )) {
         retainedNameIndexes.add(index);
+        precedingRetainedNames.add(sourceText);
       }
     }
     for (final int index in retainedNameIndexes) {
@@ -414,12 +430,48 @@ class TranslationQuality {
   static bool _hasRetainedProperNameContext(
     Document sourceDocument,
     Element sourceElement,
+    List<String> precedingRetainedNames,
   ) {
     final String precedingText = _sourceTextBeforeNode(
       sourceDocument,
       sourceElement,
+      maxLength: null,
     ).toLowerCase();
-    return RegExp(r'\bby\s*(?:[:\-–—]\s*)?$').hasMatch(precedingText);
+    final List<RegExpMatch> creditCues = RegExp(
+      r'\b(?:(?:written|edited|designed|illustrated|translated|photographed|compiled|created)\s+by|(?:book|cover|jacket)\s+design\s+by|(?:graphics|illustrations|art)\s+by)\s*(?:[:\-–—]\s*)?',
+    ).allMatches(precedingText).toList();
+    if (creditCues.isEmpty) {
+      return false;
+    }
+    String remaining = precedingText.substring(creditCues.last.end).trim();
+    if (remaining.isEmpty) {
+      return true;
+    }
+    bool consumedRetainedName = false;
+    for (final String retainedName in precedingRetainedNames) {
+      final String normalizedName = retainedName.toLowerCase();
+      if (!_startsWithWholeCreditName(remaining, normalizedName)) {
+        continue;
+      }
+      remaining = remaining.substring(normalizedName.length).trimLeft();
+      remaining = remaining.replaceFirst(
+        RegExp(r'^(?:(?:and\b|&|[,;])\s*)+'),
+        '',
+      );
+      consumedRetainedName = true;
+    }
+    return consumedRetainedName && remaining.trim().isEmpty;
+  }
+
+  static bool _startsWithWholeCreditName(String text, String name) {
+    if (!text.startsWith(name)) {
+      return false;
+    }
+    if (text.length == name.length) {
+      return true;
+    }
+    final String next = text.substring(name.length, name.length + 1);
+    return RegExp(r'[\s,&;]').hasMatch(next);
   }
 
   static bool _hasRemainingTranslatedInlineResidual(Document document) {
