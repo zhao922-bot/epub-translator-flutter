@@ -3391,20 +3391,17 @@ class EpubChapterTranslator {
     if (!config.residualQualityCheck) {
       return;
     }
-    final String translatedText = _plainTextFromHtmlFragment(
-      translatedHtml,
-    ).replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (!TranslationQuality.hasSuspiciousSourceResidual(
-      sourceText: block.sourceText,
-      translatedText: translatedText,
-      targetLanguage: config.targetLanguage,
-    )) {
+    final TranslationResidualFinding? finding =
+        TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml: block.sourceHtml,
+          translatedHtml: translatedHtml,
+          targetLanguage: config.targetLanguage,
+        );
+    if (finding == null) {
       return;
     }
 
-    throw FormatException(
-      'Possible untranslated source-language text remains in block ${block.id}.',
-    );
+    throw FormatException(finding.messageForBlock(block.id));
   }
 
   String _outputFilePath({

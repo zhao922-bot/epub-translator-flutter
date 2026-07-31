@@ -545,6 +545,66 @@ class _ProperNounBatchAdapter implements HttpClientAdapter {
   }
 }
 
+class _SequencedHtmlBatchAdapter implements HttpClientAdapter {
+  _SequencedHtmlBatchAdapter(this.responses);
+
+  final List<String> responses;
+  int fetchCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final Map<String, dynamic> payload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+    final List<dynamic> blocks = payload['blocks'] as List<dynamic>;
+    final String blockId =
+        (blocks.single as Map<String, dynamic>)['id'] as String;
+
+    fetchCount += 1;
+    final int responseIndex = fetchCount <= responses.length
+        ? fetchCount - 1
+        : responses.length - 1;
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{
+              'content': jsonEncode(<String, Object?>{
+                'blocks': <Object?>[
+                  <String, Object?>{
+                    'id': blockId,
+                    'html': responses[responseIndex],
+                  },
+                ],
+              }),
+            },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _RecordingMemoryAdapter implements HttpClientAdapter {
   final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
 
@@ -1397,6 +1457,7 @@ void main() {
             apiKey: 'sk-test',
             targetLanguage: 'Chinese',
             maxRetries: 1,
+            residualQualityCheck: false,
           ),
           references: <FootnoteBlockReference>[
             _footnoteReference(
@@ -1587,6 +1648,90 @@ void main() {
   });
 
   group('translation residual detection', () {
+    test('accepts a source-owned English work title in the real p-2 shape', () async {
+      const String sourceHtml =
+          '<p id="p-2">George Gilder, author of <i>The 500-Year Delta: What Happens After What Comes Next</i>, predicts a profound transition.<a id="ch06-en37-ref" href="part0023_split_006.html#ch06-en37"><sup>37</sup></a> Other writers reach a similar conclusion.<a id="ch06-en38-ref" href="part0023_split_006.html#ch06-en38"><sup>38</sup></a></p>';
+      const String translatedHtml =
+          '<p id="p-2">《五百年跃迁》的作者乔治·吉尔德在<i>The 500-Year Delta: What Happens After What Comes Next</i>中预言了一场深刻转型。<a id="ch06-en37-ref" href="part0023_split_006.html#ch06-en37"><sup>37</sup></a>其他作家也得出了相似结论。<a id="ch06-en38-ref" href="part0023_split_006.html#ch06-en38"><sup>38</sup></a></p>';
+      final _SequencedHtmlBatchAdapter adapter = _SequencedHtmlBatchAdapter(
+        const <String>[translatedHtml],
+      );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String>
+      translated = await EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+          retryDelaySeconds: 1,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'p-2',
+            tagName: 'p',
+            sourceHtml: sourceHtml,
+            sourceText:
+                'George Gilder, author of The 500-Year Delta: What Happens After What Comes Next, predicts a profound transition. 37 Other writers reach a similar conclusion. 38',
+          ),
+        ],
+      );
+
+      expect(adapter.fetchCount, 1);
+      expect(translated.single, contains('The 500-Year Delta'));
+      expect(
+        translated.single,
+        contains('href="part0023_split_006.html#ch06-en37"'),
+      );
+      expect(translated.single, contains('id="ch06-en37-ref"'));
+      expect(
+        translated.single,
+        contains('href="part0023_split_006.html#ch06-en38"'),
+      );
+      expect(translated.single, contains('id="ch06-en38-ref"'));
+    });
+
+    test(
+      'retries a CJK-adjacent lowercase English leak before accepting Chinese',
+      () async {
+        final _SequencedHtmlBatchAdapter adapter = _SequencedHtmlBatchAdapter(
+          const <String>[
+            '<p>随着边界消失，entitlement概念随之瓦解。</p>',
+            '<p>随着边界消失，权利概念也随之瓦解。</p>',
+          ],
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        final List<String>
+        translated = await EpubChapterTranslator().translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 2,
+            retryDelaySeconds: 1,
+          ),
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'block-1',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>As borders disappear, the concept of entitlement falls apart.</p>',
+              sourceText:
+                  'As borders disappear, the concept of entitlement falls apart.',
+            ),
+          ],
+        );
+
+        expect(adapter.fetchCount, 2);
+        expect(translated.single, '<p>随着边界消失，权利概念也随之瓦解。</p>');
+        expect(translated.single, isNot(contains('entitlement')));
+      },
+    );
+
     test(
       'retries Chinese-target batches that come back mostly untranslated',
       () async {
