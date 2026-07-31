@@ -140,45 +140,67 @@ class TranslationQuality {
     }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
-    final List<Element> sourceTitles = sourceDocument.querySelectorAll(
-      'i, em, cite',
+    final List<Element> sourceCandidates = _outermostWorkTitleCandidates(
+      sourceDocument,
     );
-    final List<Element> translatedTitles = translatedDocument.querySelectorAll(
-      'i, em, cite',
+    final List<Element> translatedCandidates = _outermostWorkTitleCandidates(
+      translatedDocument,
     );
+    final List<int> exemptedCandidateIndexes = <int>[];
+    final List<String> unexemptedSourceTexts = <String>[];
 
-    for (int index = 0; index < translatedTitles.length; index += 1) {
-      final Element translatedTitle = translatedTitles[index];
-      final String translatedText = _normalizeText(translatedTitle.text);
-      final Element? sourceTitle = index < sourceTitles.length
-          ? sourceTitles[index]
-          : null;
-      final String? sourceText = sourceTitle == null
-          ? null
-          : _normalizeText(sourceTitle.text);
-      final bool hasMatchingSourceNode =
-          sourceTitle != null &&
-          sourceTitle.localName == translatedTitle.localName &&
-          sourceText == translatedText;
-      if (!hasMatchingSourceNode) {
+    if (sourceCandidates.length == translatedCandidates.length) {
+      for (int index = 0; index < sourceCandidates.length; index += 1) {
+        final Element sourceCandidate = sourceCandidates[index];
+        final Element translatedCandidate = translatedCandidates[index];
+        final String sourceText = _normalizeText(sourceCandidate.text);
+        final String translatedText = _normalizeText(translatedCandidate.text);
+        final bool canExempt =
+            sourceCandidate.localName == translatedCandidate.localName &&
+            sourceText == translatedText &&
+            _looksLikeEnglishWorkTitle(sourceText) &&
+            _hasWorkTitleSemantics(sourceDocument, sourceCandidate);
+        if (canExempt) {
+          exemptedCandidateIndexes.add(index);
+          continue;
+        }
+        if (_englishWorkTitleWords(sourceText).length >= 3) {
+          unexemptedSourceTexts.add(sourceText);
+        }
         if (_englishWorkTitleWords(translatedText).length >= 3) {
           return const TranslationResidualFinding(
             kind: TranslationResidualKind.longSourceText,
           );
         }
-        continue;
       }
-      final bool hasWorkTitleSemantics =
-          sourceTitle.localName == 'cite' ||
-          _hasWorkReferenceContext(sourceDocument, sourceTitle);
-      if (hasWorkTitleSemantics && _looksLikeEnglishWorkTitle(sourceText!)) {
-        sourceTitle.text = '';
-        translatedTitle.text = '';
-      } else if (_englishWorkTitleWords(sourceText!).length >= 3) {
-        return const TranslationResidualFinding(
-          kind: TranslationResidualKind.longSourceText,
-        );
+    } else {
+      for (final Element sourceCandidate in sourceCandidates) {
+        final String sourceText = _normalizeText(sourceCandidate.text);
+        if (_englishWorkTitleWords(sourceText).length >= 3) {
+          unexemptedSourceTexts.add(sourceText);
+        }
       }
+      for (final Element translatedCandidate in translatedCandidates) {
+        if (_englishWorkTitleWords(translatedCandidate.text).length >= 3) {
+          return const TranslationResidualFinding(
+            kind: TranslationResidualKind.longSourceText,
+          );
+        }
+      }
+    }
+
+    for (final int index in exemptedCandidateIndexes) {
+      sourceCandidates[index].text = '';
+      translatedCandidates[index].text = '';
+    }
+
+    final String translatedVisibleText = _normalizeText(
+      translatedDocument.body?.text ?? translatedDocument.text ?? '',
+    );
+    if (unexemptedSourceTexts.any(translatedVisibleText.contains)) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
     }
 
     final bool hasLongSourceText = hasSuspiciousSourceResidual(
@@ -201,6 +223,22 @@ class TranslationQuality {
 
   static String _normalizeText(String text) {
     return text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  static List<Element> _outermostWorkTitleCandidates(Document document) {
+    return document.querySelectorAll('i, em, cite').where((Element candidate) {
+      Node? ancestor = candidate.parentNode;
+      while (ancestor != null) {
+        if (ancestor is Element &&
+            (ancestor.localName == 'i' ||
+                ancestor.localName == 'em' ||
+                ancestor.localName == 'cite')) {
+          return false;
+        }
+        ancestor = ancestor.parentNode;
+      }
+      return true;
+    }).toList();
   }
 
   static bool _looksLikeEnglishWorkTitle(String text) {
@@ -253,6 +291,12 @@ class TranslationQuality {
     return RegExp(
       r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading|from|in))\s*(?:[:\-–—]\s*)?$',
     ).hasMatch(precedingText);
+  }
+
+  static bool _hasWorkTitleSemantics(Document document, Element root) {
+    return root.localName == 'cite' ||
+        root.querySelector('cite') != null ||
+        _hasWorkReferenceContext(document, root);
   }
 
   static List<String> _englishWorkTitleWords(String text) {

@@ -420,5 +420,54 @@ void main() {
 
       expect(finding, isNull);
     });
+
+    test('flags a source cite whose tag was dropped around preserved text', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><cite>A Brief History</cite></p>',
+            translatedHtml: '<p>A Brief History</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows a matching nested cite and em title as one candidate', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>Read <cite><em>A Brief History of Time</em></cite>.</p>',
+            translatedHtml:
+                '<p>阅读<cite><em>A Brief History of Time</em></cite>。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a matching title whose text is wrapped below i', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Authors of <i><span>The 500-Year Delta: What Happens After What Comes Next</span></i> agree.</p>',
+        translatedHtml:
+            '<p>《五百年跃迁》的作者<i><span>The 500-Year Delta: What Happens After What Comes Next</span></i>表示赞同。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('does not partially exempt candidates when counts differ', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Read <i>A Brief History of Time</i> and <cite>The Shape of Things Yet to Come</cite>.</p>',
+        translatedHtml: '<p>阅读<i>A Brief History of Time</i>。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
   });
 }
