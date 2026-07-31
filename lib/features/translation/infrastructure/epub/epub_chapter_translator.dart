@@ -2616,7 +2616,6 @@ class EpubChapterTranslator {
     return _apiClient.runRetried<Map<String, String>>(
       config: config,
       retryDelayOverride: retryDelayOverride,
-      shouldRetry: TranslationApiClient.shouldRetryBatchError,
       cancelToken: cancelToken,
       operation: () async {
         if (cancelToken?.isCancelled ?? false) {
@@ -2932,16 +2931,39 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+  }) {
+    return _apiClient.runRetried<Map<String, String>>(
+      config: config,
+      retryDelayOverride: retryDelayOverride,
+      shouldRetry: TranslationApiClient.shouldRetryBatchError,
+      cancelToken: cancelToken,
+      operation: () => _translateProtectedSlotsIndividuallyOnce(
+        dio: dio,
+        config: config,
+        request: request,
+        context: context,
+        cancelToken: cancelToken,
+        onRequestAttempt: onRequestAttempt,
+      ),
+    );
+  }
+
+  Future<Map<String, String>> _translateProtectedSlotsIndividuallyOnce({
+    required Dio dio,
+    required TranslationConfig config,
+    required _ProtectedSlotRequest request,
+    required TranslationBatchContext context,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
   }) async {
     final List<String> translatedSlots = <String>[];
     for (final String sourceText in request.template.slotTexts) {
       translatedSlots.add(
-        await _translateProtectedSlotText(
+        await _translateProtectedSlotTextOnce(
           dio: dio,
           config: config,
           sourceText: sourceText,
           context: context,
-          retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           onRequestAttempt: onRequestAttempt,
         ),
@@ -2956,56 +2978,47 @@ class EpubChapterTranslator {
     };
   }
 
-  Future<String> _translateProtectedSlotText({
+  Future<String> _translateProtectedSlotTextOnce({
     required Dio dio,
     required TranslationConfig config,
     required String sourceText,
     required TranslationBatchContext context,
-    Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
-  }) {
+  }) async {
     final String trimmedSource = sourceText.trim();
-    return _apiClient.runRetried<String>(
-      config: config,
-      retryDelayOverride: retryDelayOverride,
-      cancelToken: cancelToken,
-      operation: () async {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        final TranslationStyleProfile batchStyleProfile =
-            _styleProfileFromBookMemoryJson(context.bookMemory);
-        final bool batchStyleConfirmed =
-            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
-        final Map<String, dynamic> requestData = <String, dynamic>{
-          'model': config.model,
-          'temperature': 0.2,
-          'messages': <Map<String, String>>[
-            <String, String>{
-              'role': 'system',
-              'content':
-                  'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
-            },
-            <String, String>{'role': 'user', 'content': trimmedSource},
-          ],
-        };
-        onRequestAttempt?.call();
-        final Response<dynamic> response = await _apiClient.postChatCompletions(
-          dio: dio,
-          data: requestData,
-          cancelToken: cancelToken,
-        );
-        final String translated = _apiClient.extractMessageContent(
-          response.data,
-        );
-        _validateIndividualSlotTranslation(
-          sourceText: trimmedSource,
-          translatedText: translated,
-        );
-        return translated.trim();
-      },
+    if (cancelToken?.isCancelled ?? false) {
+      throw const TranslationCancelledException();
+    }
+    final TranslationStyleProfile batchStyleProfile =
+        _styleProfileFromBookMemoryJson(context.bookMemory);
+    final bool batchStyleConfirmed = _styleProfileConfirmedFromBookMemoryJson(
+      context.bookMemory,
     );
+    final Map<String, dynamic> requestData = <String, dynamic>{
+      'model': config.model,
+      'temperature': 0.2,
+      'messages': <Map<String, String>>[
+        <String, String>{
+          'role': 'system',
+          'content':
+              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+        },
+        <String, String>{'role': 'user', 'content': trimmedSource},
+      ],
+    };
+    onRequestAttempt?.call();
+    final Response<dynamic> response = await _apiClient.postChatCompletions(
+      dio: dio,
+      data: requestData,
+      cancelToken: cancelToken,
+    );
+    final String translated = _apiClient.extractMessageContent(response.data);
+    _validateIndividualSlotTranslation(
+      sourceText: trimmedSource,
+      translatedText: translated,
+    );
+    return translated.trim();
   }
 
   static void _validateIndividualSlotTranslation({

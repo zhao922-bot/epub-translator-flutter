@@ -224,7 +224,7 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
-    test('does not exempt an i title without source citation context', () {
+    test('allows a standalone matching i work title', () {
       const String html = '<p><i>A Brief History of Time</i></p>';
 
       final TranslationResidualFinding? finding =
@@ -234,7 +234,44 @@ void main() {
             targetLanguage: 'Chinese',
           );
 
-      expect(finding?.kind, TranslationResidualKind.longSourceText);
+      expect(finding, isNull);
+    });
+
+    test('allows a matching i work title after a neutral preposition', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>In <i>The Sovereign Individual</i>, Davidson argues for change.</p>',
+        translatedHtml: '<p>在<i>The Sovereign Individual</i>中，戴维森主张变革。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a matching i work title after descriptive prose', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>His celebrated <i>The Sovereign Individual</i> changed the debate.</p>',
+        translatedHtml: '<p>他广受赞誉的<i>The Sovereign Individual</i>改变了这场讨论。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a matching work title in a bibliography entry', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<li>Davidson, James Dale. <em>The Sovereign Individual</em>. 1997.</li>',
+        translatedHtml:
+            '<li>詹姆斯·戴尔·戴维森：<em>The Sovereign Individual</em>，1997 年。</li>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
     });
 
     test('allows an i title after a source citation cue', () {
@@ -482,6 +519,70 @@ void main() {
           );
 
       expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('rejects short untranslated prose outside an exempt cite title', () {
+      const String html =
+          '<p>Read <cite>A Brief History of Time</cite> right now.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('rejects a short source-owned English instruction in prose', () {
+      const String html = '<p>Please try again now.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('allows a short retained lowercase technical phrase', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>Use the machine learning model in production.</p>',
+            translatedHtml: '<p>在生产中采用 machine learning model。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows retained brands and four-letter technical terms', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>OpenAI API sends data to https://example.com or support@example.com.</p>',
+        translatedHtml:
+            '<p>OpenAI API 将 data 发送到 https://example.com，或联系 support@example.com。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a retained multi-word brand outside inline markup', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>International Business Machines Corporation announced the product.</p>',
+        translatedHtml:
+            '<p>International Business Machines Corporation 发布了该产品。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
     });
 
     test('does not treat the preposition in as a title citation cue', () {

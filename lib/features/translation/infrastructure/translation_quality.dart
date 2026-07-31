@@ -160,9 +160,11 @@ class TranslationQuality {
         final String translatedText = _normalizeText(translatedCandidate.text);
         final bool canExempt =
             sourceCandidate.localName == translatedCandidate.localName &&
+            _elementStructurePath(sourceCandidate) ==
+                _elementStructurePath(translatedCandidate) &&
             sourceText == translatedText &&
             _looksLikeEnglishWorkTitle(sourceText) &&
-            _hasWorkTitleSemantics(sourceDocument, sourceCandidate);
+            !_looksLikeInstructionOrNotice(sourceText);
         if (canExempt) {
           exemptedCandidateIndexes.add(index);
           continue;
@@ -207,6 +209,12 @@ class TranslationQuality {
     }
 
     if (_hasRemainingTranslatedInlineResidual(translatedDocument)) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
+
+    if (_hasSourceOwnedShortEnglishProse(sourceDocument, translatedDocument)) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
       );
@@ -343,6 +351,20 @@ class TranslationQuality {
     return false;
   }
 
+  static String _elementStructurePath(Element element) {
+    final List<int> indexes = <int>[];
+    Node? current = element;
+    while (current is Element && current.localName != 'body') {
+      final Node? parent = current.parentNode;
+      if (parent == null) {
+        break;
+      }
+      indexes.add(parent.children.indexOf(current));
+      current = parent;
+    }
+    return indexes.reversed.join('/');
+  }
+
   static bool _looksLikeEnglishWorkTitle(String text) {
     final String normalized = _normalizeText(text);
     if (normalized.isEmpty ||
@@ -357,6 +379,48 @@ class TranslationQuality {
     return words.length >= 3 &&
         words.length <= 16 &&
         _looksLikeEnglishTitleOrName(words);
+  }
+
+  static bool _looksLikeInstructionOrNotice(String text) {
+    final List<String> words = _englishWorkTitleWords(
+      text,
+    ).map((String word) => word.toLowerCase()).toList(growable: false);
+    if (words.isEmpty) {
+      return false;
+    }
+    const Set<String> commandOpeners = <String>{
+      'click',
+      'close',
+      'continue',
+      'do',
+      "don't",
+      'enter',
+      'follow',
+      'never',
+      'open',
+      'please',
+      'press',
+      'read',
+      'restart',
+      'select',
+      'sign',
+      'start',
+      'stop',
+      'tap',
+      'turn',
+      'wait',
+    };
+    if (commandOpeners.contains(words.first)) {
+      return true;
+    }
+    return words.length >= 2 &&
+        words[0] == 'important' &&
+        const <String>{
+          'information',
+          'notice',
+          'safety',
+          'warning',
+        }.contains(words[1]);
   }
 
   static String _sourceTextBeforeNode(
@@ -419,22 +483,6 @@ class TranslationQuality {
       ancestor = ancestor.parentNode;
     }
     return null;
-  }
-
-  static bool _hasWorkReferenceContext(Document document, Element element) {
-    final String precedingText = _sourceTextBeforeNode(
-      document,
-      element,
-    ).toLowerCase();
-    return RegExp(
-      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading))\s*(?:[:\-–—]\s*)?$',
-    ).hasMatch(precedingText);
-  }
-
-  static bool _hasWorkTitleSemantics(Document document, Element root) {
-    return root.localName == 'cite' ||
-        root.querySelector('cite') != null ||
-        _hasWorkReferenceContext(document, root);
   }
 
   static void _clearRetainedProperNames(
@@ -569,6 +617,94 @@ class TranslationQuality {
         .any(
           (Element element) => _englishWorkTitleWords(element.text).length >= 3,
         );
+  }
+
+  static bool _hasSourceOwnedShortEnglishProse(
+    Document sourceDocument,
+    Document translatedDocument,
+  ) {
+    final List<String> sourceWords = _englishWorkTitleWords(
+      _stripNonLinguisticTokens(
+        sourceDocument.body?.text ?? sourceDocument.text ?? '',
+      ),
+    );
+    final List<String> translatedWords = _englishWorkTitleWords(
+      _stripNonLinguisticTokens(
+        translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      ),
+    );
+    if (sourceWords.length < 3 || translatedWords.length < 3) {
+      return false;
+    }
+
+    for (int start = 0; start <= translatedWords.length - 3; start += 1) {
+      for (int end = translatedWords.length; end >= start + 3; end -= 1) {
+        final List<String> candidate = translatedWords.sublist(start, end);
+        if (!_containsWordSequenceIgnoreCase(sourceWords, candidate)) {
+          continue;
+        }
+        if (_looksLikeResidualProse(candidate)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  static bool _containsWordSequenceIgnoreCase(
+    List<String> words,
+    List<String> candidate,
+  ) {
+    if (candidate.length > words.length) {
+      return false;
+    }
+    for (int start = 0; start <= words.length - candidate.length; start += 1) {
+      bool matches = true;
+      for (int index = 0; index < candidate.length; index += 1) {
+        if (words[start + index].toLowerCase() !=
+            candidate[index].toLowerCase()) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _looksLikeResidualProse(List<String> words) {
+    if (_looksLikeEnglishTitleOrName(words) &&
+        !_looksLikeInstructionOrNotice(words.join(' '))) {
+      return false;
+    }
+    if (words.length >= 4) {
+      return true;
+    }
+    const Set<String> proseCues = <String>{
+      'again',
+      'are',
+      'be',
+      'do',
+      'does',
+      'is',
+      'must',
+      'now',
+      'please',
+      'read',
+      'right',
+      'should',
+      'this',
+      'that',
+      'try',
+      'was',
+      'were',
+      'will',
+    };
+    return words
+        .map((String word) => word.toLowerCase())
+        .any(proseCues.contains);
   }
 
   static List<String> _englishWorkTitleWords(String text) {
@@ -722,6 +858,6 @@ class TranslationQuality {
         titleCaseWords += 1;
       }
     }
-    return significantWords >= 3 && titleCaseWords / significantWords >= 0.8;
+    return significantWords >= 2 && titleCaseWords / significantWords >= 0.8;
   }
 }

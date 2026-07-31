@@ -466,6 +466,69 @@ class _ProtectedSlotPlainFallbackAdapter implements HttpClientAdapter {
   }
 }
 
+class _ProtectedSlotQualityRetryAdapter implements HttpClientAdapter {
+  int strictRequestCount = 0;
+  final List<String> plainInputs = <String>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    Object responseContent;
+    try {
+      final Object? decoded = jsonDecode(userContent);
+      if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+        strictRequestCount += 1;
+        responseContent = jsonEncode(<String, Object?>{
+          'blocks': const <Object?>[],
+        });
+      } else {
+        throw const FormatException();
+      }
+    } on FormatException {
+      plainInputs.add(userContent);
+      final int index = plainInputs.length - 1;
+      responseContent = switch (index) {
+        0 => 'Read this sentence right now.',
+        1 => '第二段已经翻译。',
+        2 => '第一段已经翻译。',
+        _ => '第二段已经翻译。',
+      };
+    }
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': responseContent},
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
 class _ResidualThenTranslatedBatchAdapter implements HttpClientAdapter {
   int fetchCount = 0;
 
@@ -1243,6 +1306,48 @@ void main() {
           'id="footnote_ref_38" href="part0023_split_006.html#ch06-en38"',
         ),
       );
+    },
+  );
+
+  test(
+    'retries a complete individual-slot round after rebuilt HTML fails quality',
+    () async {
+      final _ProtectedSlotQualityRetryAdapter adapter =
+          _ProtectedSlotQualityRetryAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String>
+      translated = await EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'protected-retry',
+            tagName: 'p',
+            sourceHtml:
+                '<p id="body">Read this sentence right now.<a id="ref-1" href="#note-1"><sup>1</sup></a>Translate this tail too.</p>',
+            sourceText:
+                'Read this sentence right now. 1 Translate this tail too.',
+          ),
+        ],
+      );
+
+      expect(adapter.strictRequestCount, 2);
+      expect(adapter.plainInputs, <String>[
+        'Read this sentence right now.',
+        'Translate this tail too.',
+        'Read this sentence right now.',
+        'Translate this tail too.',
+      ]);
+      expect(translated.single, contains('第一段已经翻译。'));
+      expect(translated.single, contains('第二段已经翻译。'));
+      expect(translated.single, contains('id="body"'));
+      expect(translated.single, contains('id="ref-1" href="#note-1"'));
     },
   );
 
