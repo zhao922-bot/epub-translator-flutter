@@ -137,4 +137,82 @@ void main() {
       isTrue,
     );
   });
+
+  group('HTML-aware residual checks', () {
+    test('allows a source-owned English work title in matching i elements', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Authors of <i>The 500-Year Delta: What Happens After What Comes Next</i> see a change.</p>',
+        translatedHtml:
+            '<p>《五百年跃迁》的作者<i>The 500-Year Delta: What Happens After What Comes Next</i>看到了变化。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('still flags an entire untranslated sentence wrapped in i', () {
+      const String html =
+          '<p><i>This entire sentence should still be translated into Chinese for the reader.</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+      expect(
+        finding?.messageForBlock('block-7'),
+        'Possible untranslated source-language text remains in block block-7.',
+      );
+    });
+
+    test('does not exempt a title added only by the model', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Authors of The 500-Year Delta: What Happens After What Comes Next see a change.</p>',
+        translatedHtml:
+            '<p>作者发现了变化：<i>The 500-Year Delta: What Happens After What Comes Next</i></p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    for (final ({String tag, String title}) example
+        in <({String tag, String title})>[
+          (tag: 'em', title: 'The Shape of Things Yet to Come'),
+          (tag: 'cite', title: 'A Brief History of Time and Space'),
+        ]) {
+      test('allows a matching source-owned title in ${example.tag}', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Read <${example.tag}>${example.title}</${example.tag}> today.</p>',
+          translatedHtml:
+              '<p>今日阅读<${example.tag}>${example.title}</${example.tag}>。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+    }
+
+    test('does not exempt corresponding title elements with different text', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>Read <i>The 500-Year Delta: What Happens After What Comes Next</i>.</p>',
+        translatedHtml:
+            '<p>阅读<i>The 500-Year Delta: What Happens Long After What Comes Next</i>。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+  });
 }

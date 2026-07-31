@@ -1,3 +1,25 @@
+import 'package:html/dom.dart';
+import 'package:html/parser.dart' as html_parser;
+
+enum TranslationResidualKind { longSourceText, cjkAdjacentLowercaseWord }
+
+class TranslationResidualFinding {
+  const TranslationResidualFinding({required this.kind, this.token});
+
+  final TranslationResidualKind kind;
+  final String? token;
+
+  String messageForBlock(String blockId) {
+    return switch (kind) {
+      TranslationResidualKind.longSourceText =>
+        'Possible untranslated source-language text remains in block $blockId.',
+      TranslationResidualKind.cjkAdjacentLowercaseWord =>
+        'Possible untranslated source-language token "${token ?? ''}" '
+            'remains adjacent to CJK text in block $blockId.',
+    };
+  }
+}
+
 /// Residual / quality checks for translated blocks (multi-language targets).
 class TranslationQuality {
   const TranslationQuality._();
@@ -108,8 +130,74 @@ class TranslationQuality {
     return englishWords >= 10 && englishLetters / languageChars >= 0.65;
   }
 
+  static TranslationResidualFinding? findSuspiciousHtmlResidual({
+    required String sourceHtml,
+    required String translatedHtml,
+    required String targetLanguage,
+  }) {
+    final Document sourceDocument = html_parser.parse(sourceHtml);
+    final Document translatedDocument = html_parser.parse(translatedHtml);
+    final List<Element> sourceTitles = sourceDocument.querySelectorAll(
+      'i, em, cite',
+    );
+    final List<Element> translatedTitles = translatedDocument.querySelectorAll(
+      'i, em, cite',
+    );
+
+    if (sourceTitles.length == translatedTitles.length) {
+      for (int index = 0; index < sourceTitles.length; index += 1) {
+        final Element sourceTitle = sourceTitles[index];
+        final Element translatedTitle = translatedTitles[index];
+        final String sourceText = _normalizeText(sourceTitle.text);
+        final String translatedText = _normalizeText(translatedTitle.text);
+        if (sourceTitle.localName == translatedTitle.localName &&
+            sourceText == translatedText &&
+            _looksLikeEnglishWorkTitle(sourceText)) {
+          sourceTitle.text = '';
+          translatedTitle.text = '';
+        }
+      }
+    }
+
+    final bool hasLongSourceText = hasSuspiciousSourceResidual(
+      sourceText: sourceDocument.body?.text ?? sourceDocument.text ?? '',
+      translatedText:
+          translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      targetLanguage: targetLanguage,
+    );
+    if (hasLongSourceText) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
+    return null;
+  }
+
   static int _englishWordCount(String text) {
     return RegExp(r"[A-Za-z][A-Za-z'-]*").allMatches(text).length;
+  }
+
+  static String _normalizeText(String text) {
+    return text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+
+  static bool _looksLikeEnglishWorkTitle(String text) {
+    final String normalized = _normalizeText(text);
+    if (normalized.isEmpty ||
+        normalized.length > 140 ||
+        RegExp(r'[.!?。！？]$').hasMatch(normalized) ||
+        RegExp(
+          r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+        ).hasMatch(normalized)) {
+      return false;
+    }
+    final List<String> words = RegExp(r"[A-Za-z][A-Za-z'-]*")
+        .allMatches(normalized)
+        .map((RegExpMatch match) => match.group(0)!)
+        .toList();
+    return words.length >= 3 &&
+        words.length <= 16 &&
+        _looksLikeEnglishTitleOrName(words);
   }
 
   static String _stripNonLinguisticTokens(String text) {
