@@ -135,6 +135,9 @@ class TranslationQuality {
     required String translatedHtml,
     required String targetLanguage,
   }) {
+    if (!shouldCheckResidual(targetLanguage)) {
+      return null;
+    }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
     final List<Element> sourceTitles = sourceDocument.querySelectorAll(
@@ -150,11 +153,17 @@ class TranslationQuality {
         final Element translatedTitle = translatedTitles[index];
         final String sourceText = _normalizeText(sourceTitle.text);
         final String translatedText = _normalizeText(translatedTitle.text);
-        if (sourceTitle.localName == translatedTitle.localName &&
-            sourceText == translatedText &&
-            _looksLikeEnglishWorkTitle(sourceText)) {
+        if (sourceTitle.localName != translatedTitle.localName ||
+            sourceText != translatedText) {
+          continue;
+        }
+        if (_looksLikeEnglishWorkTitle(sourceText)) {
           sourceTitle.text = '';
           translatedTitle.text = '';
+        } else if (_englishWorkTitleWords(sourceText).length >= 6) {
+          return const TranslationResidualFinding(
+            kind: TranslationResidualKind.longSourceText,
+          );
         }
       }
     }
@@ -191,13 +200,33 @@ class TranslationQuality {
         ).hasMatch(normalized)) {
       return false;
     }
-    final List<String> words = RegExp(r"[A-Za-z][A-Za-z'-]*")
-        .allMatches(normalized)
-        .map((RegExpMatch match) => match.group(0)!)
-        .toList();
+    final List<String> words = _englishWorkTitleWords(normalized);
+    const Set<String> instructionLikeStarts = <String>{
+      'please',
+      'read',
+      'click',
+      'tap',
+      'select',
+      'choose',
+      'enter',
+      'press',
+      'follow',
+      'continue',
+      'warning',
+      'important',
+    };
     return words.length >= 3 &&
         words.length <= 16 &&
+        !instructionLikeStarts.contains(words.first.toLowerCase()) &&
         _looksLikeEnglishTitleOrName(words);
+  }
+
+  static List<String> _englishWorkTitleWords(String text) {
+    final String normalizedApostrophes = text.replaceAll(RegExp('[‘’]'), "'");
+    return RegExp(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-ſ][A-Za-zÀ-ÖØ-öø-ÿĀ-ſ'-]*")
+        .allMatches(normalizedApostrophes)
+        .map((RegExpMatch match) => match.group(0)!)
+        .toList();
   }
 
   static String _stripNonLinguisticTokens(String text) {
@@ -285,8 +314,8 @@ class TranslationQuality {
         continue;
       }
       significantWords += 1;
-      final int first = word.codeUnitAt(0);
-      if (first >= 0x41 && first <= 0x5A) {
+      final String first = word.substring(0, 1);
+      if (first == first.toUpperCase() && first != first.toLowerCase()) {
         titleCaseWords += 1;
       }
     }

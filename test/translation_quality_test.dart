@@ -170,6 +170,34 @@ void main() {
       );
     });
 
+    test('does not exempt a title-cased imperative in em', () {
+      const String html =
+          '<p><em>Please Read All Instructions Before Continuing</em></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not exempt a longer title-cased user notice', () {
+      const String html =
+          '<p><i>Important Safety Information For All New Device Owners Today</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('does not exempt a title added only by the model', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
@@ -201,6 +229,33 @@ void main() {
         expect(finding, isNull);
       });
     }
+
+    test('allows a matching Latin title with a curly apostrophe in i', () {
+      const String html = '<p><i>The Fiancée’s Guide to Everything</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a matching accented Latin title in cite', () {
+      const String html =
+          '<p><cite>Émile’s Journey Through Time and Memory</cite></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
 
     test('does not exempt corresponding title elements with different text', () {
       final TranslationResidualFinding?
