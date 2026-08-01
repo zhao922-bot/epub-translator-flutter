@@ -642,6 +642,15 @@ void main() {
             sourceHtml: '<p>Please Read This</p>',
             translatedHtml: '<p>Please Read This 请阅读此内容</p>',
           ),
+          (
+            sourceHtml: '<p>Markets Shape Society.</p>',
+            translatedHtml: '<p>Markets Shape Society. 市场塑造社会。</p>',
+          ),
+          (
+            sourceHtml: '<p>Technology Changes Everything.</p>',
+            translatedHtml:
+                '<p>Technology Changes Everything. 技术改变一切。</p>',
+          ),
         ]) {
       test('rejects retained title-case prose despite a Chinese gloss', () {
         final TranslationResidualFinding? finding =

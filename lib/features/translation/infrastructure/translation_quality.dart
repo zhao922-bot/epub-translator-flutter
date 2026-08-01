@@ -885,6 +885,12 @@ class TranslationQuality {
       if (!hasTargetLanguageContext) {
         return true;
       }
+      final bool hasSentenceEnding = RegExp(
+        r'''[.!?]["'\u2019\u201D)\]]*\s*$''',
+      ).hasMatch(strippedSource.trim());
+      if (translatedWords.length >= 3 && hasSentenceEnding) {
+        return true;
+      }
       if (_looksLikeSentenceOrInstruction(strippedSource)) {
         return true;
       }
