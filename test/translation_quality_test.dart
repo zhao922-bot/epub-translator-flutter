@@ -581,6 +581,20 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    test('rejects unchanged short prose around an exempt cite title', () {
+      const String html =
+          '<p>Markets shape <cite>A Brief History of Time</cite> society.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('rejects a short source-owned English instruction in prose', () {
       const String html = '<p>Please try again now.</p>';
 
@@ -629,6 +643,34 @@ void main() {
 
       expect(finding, isNull);
     });
+
+    for (final ({String phrase, String sourceHtml, String translatedHtml})
+        example
+        in <({String phrase, String sourceHtml, String translatedHtml})>[
+          (
+            phrase: 'change management process',
+            sourceHtml:
+                '<p>A reliable change management process reduces risk.</p>',
+            translatedHtml: '<p>可靠的 change management process 可以降低风险。</p>',
+          ),
+          (
+            phrase: 'mean time between failures',
+            sourceHtml:
+                '<p>The mean time between failures remains important.</p>',
+            translatedHtml: '<p>mean time between failures 这一指标依然重要。</p>',
+          ),
+        ]) {
+      test('allows the embedded technical term ${example.phrase}', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: example.sourceHtml,
+              translatedHtml: example.translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+    }
 
     test('allows retained brands and four-letter technical terms', () {
       final TranslationResidualFinding?

@@ -821,32 +821,127 @@ class TranslationQuality {
     Document sourceDocument,
     Document translatedDocument,
   ) {
-    final List<String> sourceWords = _englishWorkTitleWords(
-      _stripNonLinguisticTokens(
-        sourceDocument.body?.text ?? sourceDocument.text ?? '',
-      ),
-    );
-    final List<String> translatedWords = _englishWorkTitleWords(
-      _stripNonLinguisticTokens(
-        translatedDocument.body?.text ?? translatedDocument.text ?? '',
-      ),
-    );
-    if (sourceWords.length < 3 || translatedWords.length < 3) {
-      return false;
-    }
-
-    for (int start = 0; start <= translatedWords.length - 3; start += 1) {
-      for (int end = translatedWords.length; end >= start + 3; end -= 1) {
-        final List<String> candidate = translatedWords.sublist(start, end);
-        if (!_containsWordSequenceIgnoreCase(sourceWords, candidate)) {
-          continue;
-        }
-        if (_looksLikeResidualProse(candidate)) {
+    final List<Text> sourceTextNodes = _textNodes(sourceDocument);
+    final List<Text> translatedTextNodes = _textNodes(translatedDocument);
+    if (sourceTextNodes.length == translatedTextNodes.length) {
+      for (int index = 0; index < sourceTextNodes.length; index += 1) {
+        if (_hasSuspiciousSourceOwnedEnglishText(
+          sourceTextNodes[index].data,
+          translatedTextNodes[index].data,
+        )) {
           return true;
         }
       }
+      return false;
+    }
+    return _hasSuspiciousSourceOwnedEnglishText(
+      sourceDocument.body?.text ?? sourceDocument.text ?? '',
+      translatedDocument.body?.text ?? translatedDocument.text ?? '',
+    );
+  }
+
+  static List<Text> _textNodes(Document document) {
+    final List<Text> result = <Text>[];
+
+    void collect(Node node) {
+      if (node is Text) {
+        result.add(node);
+        return;
+      }
+      if (node is Element &&
+          const <String>{'script', 'style'}.contains(node.localName)) {
+        return;
+      }
+      for (final Node child in node.nodes) {
+        collect(child);
+      }
+    }
+
+    collect(document.body ?? document);
+    return result;
+  }
+
+  static bool _hasSuspiciousSourceOwnedEnglishText(
+    String sourceText,
+    String translatedText,
+  ) {
+    final String strippedSource = _stripNonLinguisticTokens(sourceText);
+    final String strippedTranslated = _stripNonLinguisticTokens(translatedText);
+    final List<String> sourceWords = _englishWorkTitleWords(strippedSource);
+    final List<String> translatedWords = _englishWorkTitleWords(
+      strippedTranslated,
+    );
+    if (sourceWords.length < 2 || translatedWords.length < 2) {
+      return false;
+    }
+
+    final bool allSourceEnglishRetained =
+        sourceWords.length == translatedWords.length &&
+        _sameWordsIgnoreCase(sourceWords, translatedWords);
+    if (allSourceEnglishRetained) {
+      return !_looksLikeEnglishTitleOrName(translatedWords);
+    }
+
+    final bool hasTargetLanguageContext = RegExp(
+      r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+    ).hasMatch(strippedTranslated);
+    for (final List<String> run in _englishRunsSeparatedByTargetScript(
+      strippedTranslated,
+    )) {
+      if (run.length < 2 ||
+          !_containsWordSequenceIgnoreCase(sourceWords, run)) {
+        continue;
+      }
+      if (_looksLikeEnglishTitleOrName(run)) {
+        continue;
+      }
+      final bool allLowercase = run.every(
+        (String word) => word == word.toLowerCase(),
+      );
+      final double sourceCoverage = run.length / sourceWords.length;
+      if (hasTargetLanguageContext && allLowercase && sourceCoverage < 0.75) {
+        continue;
+      }
+      return true;
     }
     return false;
+  }
+
+  static bool _sameWordsIgnoreCase(List<String> left, List<String> right) {
+    if (left.length != right.length) {
+      return false;
+    }
+    for (int index = 0; index < left.length; index += 1) {
+      if (left[index].toLowerCase() != right[index].toLowerCase()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static List<List<String>> _englishRunsSeparatedByTargetScript(String text) {
+    final List<List<String>> runs = <List<String>>[];
+    List<String> current = <String>[];
+
+    void finishRun() {
+      if (current.isNotEmpty) {
+        runs.add(current);
+        current = <String>[];
+      }
+    }
+
+    for (final RegExpMatch match in RegExp(
+      r"[A-Za-z][A-Za-z'’\-]*|[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]",
+    ).allMatches(text)) {
+      final String token = match.group(0) ?? '';
+      if (RegExp(r'^[A-Za-z]').hasMatch(token)) {
+        current.add(token.replaceAll('’', "'"));
+      } else {
+        finishRun();
+      }
+    }
+    finishRun();
+    return runs;
   }
 
   static bool _containsWordSequenceIgnoreCase(
@@ -870,45 +965,6 @@ class TranslationQuality {
       }
     }
     return false;
-  }
-
-  static bool _looksLikeResidualProse(List<String> words) {
-    if (_looksLikeEnglishTitleOrName(words) &&
-        !_looksLikeSentenceOrInstruction(words.join(' '))) {
-      return false;
-    }
-    if (_looksLikeSentenceOrInstruction(words.join(' '))) {
-      return true;
-    }
-    const Set<String> finiteVerbCues = <String>{
-      'affect',
-      'affects',
-      'argue',
-      'argues',
-      'become',
-      'becomes',
-      'begin',
-      'begins',
-      'change',
-      'changes',
-      'explain',
-      'explains',
-      'make',
-      'makes',
-      'mean',
-      'means',
-      'need',
-      'needs',
-      'remain',
-      'remains',
-      'say',
-      'says',
-      'write',
-      'writes',
-    };
-    return words
-        .map((String word) => word.toLowerCase())
-        .any(finiteVerbCues.contains);
   }
 
   static List<String> _englishWorkTitleWords(String text) {
