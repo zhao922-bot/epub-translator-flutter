@@ -885,6 +885,9 @@ class TranslationQuality {
       if (!hasTargetLanguageContext) {
         return true;
       }
+      if (_looksLikeSentenceOrInstruction(strippedSource)) {
+        return true;
+      }
       if (_looksLikeEnglishTitleOrName(translatedWords)) {
         return false;
       }

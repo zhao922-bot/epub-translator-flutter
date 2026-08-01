@@ -631,6 +631,30 @@ void main() {
       });
     }
 
+    for (final ({String sourceHtml, String translatedHtml}) example
+        in <({String sourceHtml, String translatedHtml})>[
+          (
+            sourceHtml: '<p>This Change Will Affect Everyone</p>',
+            translatedHtml:
+                '<p>This Change Will Affect Everyone 这项变化会影响所有人</p>',
+          ),
+          (
+            sourceHtml: '<p>Please Read This</p>',
+            translatedHtml: '<p>Please Read This 请阅读此内容</p>',
+          ),
+        ]) {
+      test('rejects retained title-case prose despite a Chinese gloss', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: example.sourceHtml,
+              translatedHtml: example.translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+    }
+
     test('rejects a short source-owned English instruction in prose', () {
       const String html = '<p>Please try again now.</p>';
 
