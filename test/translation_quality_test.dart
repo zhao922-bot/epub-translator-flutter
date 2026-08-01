@@ -595,6 +595,19 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    test('rejects an unchanged title-like phrase in ordinary prose', () {
+      const String html = '<p>A Brief History of Time</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('rejects a short source-owned English instruction in prose', () {
       const String html = '<p>Please try again now.</p>';
 

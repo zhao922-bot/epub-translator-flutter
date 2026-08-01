@@ -879,7 +879,7 @@ class TranslationQuality {
         sourceWords.length == translatedWords.length &&
         _sameWordsIgnoreCase(sourceWords, translatedWords);
     if (allSourceEnglishRetained) {
-      return !_looksLikeEnglishTitleOrName(translatedWords);
+      return true;
     }
 
     final bool hasTargetLanguageContext = RegExp(
