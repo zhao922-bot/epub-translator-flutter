@@ -608,6 +608,29 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    for (final ({String sourceHtml, String translatedHtml}) example
+        in <({String sourceHtml, String translatedHtml})>[
+          (
+            sourceHtml: '<p>machine learning model</p>',
+            translatedHtml: '<p>machine learning model（机器学习模型）</p>',
+          ),
+          (
+            sourceHtml: '<p>OpenAI API</p>',
+            translatedHtml: '<p>OpenAI API 接口</p>',
+          ),
+        ]) {
+      test('allows a retained source term with a Chinese explanation', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: example.sourceHtml,
+              translatedHtml: example.translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+    }
+
     test('rejects a short source-owned English instruction in prose', () {
       const String html = '<p>Please try again now.</p>';
 

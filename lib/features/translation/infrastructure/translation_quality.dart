@@ -875,16 +875,27 @@ class TranslationQuality {
       return false;
     }
 
+    final bool hasTargetLanguageContext = RegExp(
+      r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+    ).hasMatch(strippedTranslated);
     final bool allSourceEnglishRetained =
         sourceWords.length == translatedWords.length &&
         _sameWordsIgnoreCase(sourceWords, translatedWords);
     if (allSourceEnglishRetained) {
-      return true;
+      if (!hasTargetLanguageContext) {
+        return true;
+      }
+      if (_looksLikeEnglishTitleOrName(translatedWords)) {
+        return false;
+      }
+      final bool isStandaloneLowercaseTerm =
+          translatedWords.every(
+            (String word) => word == word.toLowerCase(),
+          ) &&
+          !RegExp(r'[.!?]').hasMatch(strippedSource);
+      return !isStandaloneLowercaseTerm;
     }
 
-    final bool hasTargetLanguageContext = RegExp(
-      r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
-    ).hasMatch(strippedTranslated);
     for (final List<String> run in _englishRunsSeparatedByTargetScript(
       strippedTranslated,
     )) {
