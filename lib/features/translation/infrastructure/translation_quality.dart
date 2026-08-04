@@ -169,14 +169,14 @@ class TranslationQuality {
           exemptedCandidateIndexes.add(index);
           continue;
         }
-        if (_englishWorkTitleWords(sourceText).length >= 3) {
+        if (_looksLikeEnglishWorkTitle(sourceText)) {
           unexemptedSourceTexts.add(sourceText);
         }
       }
     } else {
       for (final Element sourceCandidate in sourceCandidates) {
         final String sourceText = _normalizeText(sourceCandidate.text);
-        if (_englishWorkTitleWords(sourceText).length >= 3) {
+        if (_looksLikeEnglishWorkTitle(sourceText)) {
           unexemptedSourceTexts.add(sourceText);
         }
       }
@@ -367,16 +367,27 @@ class TranslationQuality {
 
   static bool _looksLikeEnglishWorkTitle(String text) {
     final String normalized = _normalizeText(text);
-    if (normalized.isEmpty ||
-        normalized.length > 140 ||
-        RegExp(r'[.!?。！？]$').hasMatch(normalized) ||
-        RegExp(
-          r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
-        ).hasMatch(normalized)) {
+    if (normalized.isEmpty || normalized.length > 140) {
       return false;
     }
-    final List<String> words = _englishWorkTitleWords(normalized);
-    return words.length >= 3 &&
+    // Source HTML often keeps a trailing period inside italicized titles
+    // ("The Great Reckoning.") without making them ordinary sentences.
+    final String titleCore = normalized.replaceFirst(
+      RegExp(r'[.!?。！？]+$'),
+      '',
+    );
+    if (titleCore.isEmpty ||
+        titleCore.length > 140 ||
+        RegExp(r'[.!?。！？]').hasMatch(titleCore) ||
+        RegExp(
+          r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+        ).hasMatch(titleCore)) {
+      return false;
+    }
+    final List<String> words = _englishWorkTitleWords(titleCore);
+    // Two-word title-case names are common for books and newsletters
+    // ("Strategic Investment", "Blade Runner").
+    return words.length >= 2 &&
         words.length <= 16 &&
         _looksLikeEnglishTitleOrName(words);
   }
@@ -605,6 +616,9 @@ class TranslationQuality {
         _hasAttributedWorkContext(document, element) ||
         _hasDescriptiveWorkContext(document, element) ||
         _hasBibliographicContext(document, element, title) ||
+        _hasSubjectWorkContext(document, element) ||
+        _hasNamedPublicationContext(document, element) ||
+        _hasSerialWorkTitleContext(document, element, title) ||
         _isOnlyTitleInSemanticBlock(element, title);
   }
 
@@ -617,7 +631,7 @@ class TranslationQuality {
       element,
     ).toLowerCase();
     return RegExp(
-      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper)(?:\s+(?:called|named|titled))?|\b(?:read|reading))\s*(?:[:\-–—]\s*)?$',
+      r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper|newsletter|magazine|journal)(?:\s+(?:called|named|titled))?|\b(?:read|reading)|\bwent\s+into)\s*(?:[:\-–—]\s*)?$',
     ).hasMatch(precedingText);
   }
 
@@ -643,6 +657,61 @@ class TranslationQuality {
     return RegExp(
       r"(?:\b(?:his|her|their|the)\s+)?(?:acclaimed|award-winning|best-selling|celebrated|classic|famous|influential|landmark|seminal)(?:\s+(?:book|essay|memoir|novel|report|study|work))?\s*$",
     ).hasMatch(precedingText);
+  }
+
+  static bool _hasSubjectWorkContext(Document document, Element element) {
+    final String followingText = _sourceTextAfterNode(document, element);
+    return RegExp(
+      r'^(?:[,;:]?\s*)?(?:'
+      r'builds?\s+upon|draws?\s+(?:on|from)|is\s+based\s+on|'
+      r'explores?|examines?|argues?|contends?|describes?|chronicles?|'
+      r'recounts?|presents?|offers?|provides?|remains?|became|becomes|'
+      r'changed|continues?|develops?|extends?|follows?|'
+      r'is\s+a|was\s+a|were|are\s+a'
+      r')\b',
+      caseSensitive: false,
+    ).hasMatch(followingText);
+  }
+
+  static bool _hasNamedPublicationContext(
+    Document document,
+    Element element,
+  ) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
+    return RegExp(
+      r'(?:\b(?:our|the|his|her|their)\s+)?(?:newsletter|magazine|journal|newspaper|column|periodical|publication|bulletin|digest)\b[,:\s]*$',
+    ).hasMatch(precedingText);
+  }
+
+  static bool _hasSerialWorkTitleContext(
+    Document document,
+    Element element,
+    String title,
+  ) {
+    final String precedingText = _sourceTextBeforeNode(
+      document,
+      element,
+    ).toLowerCase();
+    if (!RegExp(r'\b(?:and|or)\s*$').hasMatch(precedingText)) {
+      return false;
+    }
+    final Element? block = _nearestSemanticBlock(element);
+    if (block == null) {
+      return false;
+    }
+    for (final Element candidate in block.querySelectorAll('i, em, cite')) {
+      if (identical(candidate, element)) {
+        continue;
+      }
+      final String other = _normalizeText(candidate.text);
+      if (other != title && _looksLikeEnglishWorkTitle(other)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool _hasBibliographicContext(
@@ -813,7 +882,8 @@ class TranslationQuality {
     return document
         .querySelectorAll('i, em, cite')
         .any(
-          (Element element) => _englishWorkTitleWords(element.text).length >= 3,
+          (Element element) =>
+              _looksLikeEnglishWorkTitle(_normalizeText(element.text)),
         );
   }
 

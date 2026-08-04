@@ -307,6 +307,58 @@ void main() {
       expect(finding, isNull);
     });
 
+    test('allows acknowledgments titles used as subjects and newsletter names', () {
+      const String sourceHtml =
+          '<p>It is the third we have done together. '
+          '<i class="calibre3">The Sovereign Individual</i> builds upon research '
+          'that went into <i class="calibre3">Blood in the Streets</i> and '
+          '<i class="calibre3">The Great Reckoning.</i> Our special thanks go to '
+          'Bill Bonner for our newsletter, <i class="calibre3">Strategic Investment.</i></p>';
+      const String translatedHtml =
+          '<p>这是我们合作完成的第三本书。'
+          '<i class="calibre3">The Sovereign Individual</i> 建立在此前写入 '
+          '<i class="calibre3">Blood in the Streets</i> 与 '
+          '<i class="calibre3">The Great Reckoning.</i> 的研究之上。我们特别感谢 '
+          'Bill Bonner，以及我们的通讯 <i class="calibre3">Strategic Investment.</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: translatedHtml,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a retained two-word italic title with trailing period', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>He edits the newsletter, <i>Strategic Investment.</i></p>',
+            translatedHtml:
+                '<p>他主编这份通讯，<i>Strategic Investment.</i></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('still rejects untranslated acknowledgments prose that keeps titles', () {
+      const String sourceHtml =
+          '<p><i>The Sovereign Individual</i> builds upon research that went into '
+          '<i>Blood in the Streets</i> and <i>The Great Reckoning.</i></p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: sourceHtml,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('allows a matching work title in a bibliography entry', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
