@@ -274,6 +274,7 @@ class EpubChapterTranslator {
           'Write notes for translators into ${config.targetLanguage}. '
           'confidence must be one of: high, medium, low. '
           'Prefer executable style rules over marketing labels. '
+          'Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language. '
           'If evidence is thin, still provide a best-effort primaryGenre with confidence low. '
           'Do not wrap the JSON in markdown fences.',
       cancelToken: cancelToken,
@@ -1647,7 +1648,7 @@ class EpubChapterTranslator {
       'chapters': sourceChapters,
     };
     final String styleProfilePrompt = config.styleProfileEnabled
-        ? ' Also return styleProfile as an object with keys: primaryGenre, secondaryGenres, tone, sentenceStyle, translationConstraints, avoid, confidence. primaryGenre should be a practical book type such as business nonfiction, science fiction, romance, historical fiction, literary fiction, mystery, fantasy, memoir, or self-help. secondaryGenres is a short string array. tone and sentenceStyle are short phrases. translationConstraints and avoid are short actionable string arrays for translators. confidence must be one of: high, medium, low. If evidence is weak, set confidence to low and keep constraints conservative. Prefer executable style rules over marketing labels.'
+        ? ' Also return styleProfile as an object with keys: primaryGenre, secondaryGenres, tone, sentenceStyle, translationConstraints, avoid, confidence. primaryGenre should be a practical book type such as business nonfiction, science fiction, romance, historical fiction, literary fiction, mystery, fantasy, memoir, or self-help. secondaryGenres is a short string array. tone and sentenceStyle are short phrases. translationConstraints and avoid are short actionable string arrays for translators. confidence must be one of: high, medium, low. If evidence is weak, set confidence to low and keep constraints conservative. Prefer executable style rules over marketing labels. Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language.'
         : ' Do not invent a styleProfile.';
     final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
       dio: dio,

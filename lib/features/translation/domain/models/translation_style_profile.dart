@@ -92,7 +92,10 @@ class TranslationStyleProfile {
     if (!shouldInject) {
       return '';
     }
-    return _buildInstruction(targetLanguage: targetLanguage, confirmed: false);
+    return forTargetLanguage(targetLanguage)._buildInstruction(
+      targetLanguage: targetLanguage,
+      confirmed: false,
+    );
   }
 
   /// Prompt fragment for a user-confirmed/edited profile.
@@ -100,22 +103,69 @@ class TranslationStyleProfile {
     if (!shouldInjectWhenConfirmed) {
       return '';
     }
-    return _buildInstruction(targetLanguage: targetLanguage, confirmed: true);
+    return forTargetLanguage(targetLanguage)._buildInstruction(
+      targetLanguage: targetLanguage,
+      confirmed: true,
+    );
+  }
+
+  /// Returns a profile safe to inject for [targetLanguage].
+  ///
+  /// For non-English targets, rules that tell the model to keep whole English
+  /// quotations/dialogue intact are removed and replaced with an explicit
+  /// "translate quoted prose" constraint. Proper names, work titles, URLs and
+  /// short technical terms remain allowed.
+  TranslationStyleProfile forTargetLanguage(String targetLanguage) {
+    if (!_requiresTranslatedQuotedProse(targetLanguage)) {
+      return this;
+    }
+
+    final List<String> safeConstraints = translationConstraints
+        .where((String rule) => !_retainsSourceLanguageQuotedProse(rule))
+        .toList(growable: true);
+    final List<String> safeAvoid = avoid
+        .where((String rule) => !_retainsSourceLanguageQuotedProse(rule))
+        .toList(growable: false);
+
+    final bool needsQuoteTranslationRule = translationConstraints.any(
+          _retainsSourceLanguageQuotedProse,
+        ) ||
+        avoid.any(_retainsSourceLanguageQuotedProse);
+    if (needsQuoteTranslationRule) {
+      final String quoteRule =
+          'Quoted prose, dialogue, and epigraphs must be translated into '
+          '${targetLanguage.trim()}; keep only proper names, work titles, '
+          'URLs, and short technical terms in the source language';
+      if (!safeConstraints.any(
+        (String rule) => rule.toLowerCase().contains('quoted prose, dialogue'),
+      )) {
+        safeConstraints.insert(0, quoteRule);
+      }
+    }
+
+    return copyWith(
+      translationConstraints: safeConstraints.take(8).toList(growable: false),
+      avoid: safeAvoid.take(6).toList(growable: false),
+    );
   }
 
   String _buildInstruction({
     required String targetLanguage,
     required bool confirmed,
   }) {
+    final TranslationStyleProfile safeProfile = forTargetLanguage(
+      targetLanguage,
+    );
     final List<String> parts = <String>[
       if (primaryGenre.isNotEmpty) 'Genre: $primaryGenre',
       if (secondaryGenres.isNotEmpty)
         'Secondary: ${secondaryGenres.join(', ')}',
       if (tone.isNotEmpty) 'Tone: $tone',
       if (sentenceStyle.isNotEmpty) 'Sentence style: $sentenceStyle',
-      if (translationConstraints.isNotEmpty)
-        'Do: ${translationConstraints.join('; ')}',
-      if (avoid.isNotEmpty) 'Avoid: ${avoid.join('; ')}',
+      if (safeProfile.translationConstraints.isNotEmpty)
+        'Do: ${safeProfile.translationConstraints.join('; ')}',
+      if (safeProfile.avoid.isNotEmpty)
+        'Avoid: ${safeProfile.avoid.join('; ')}',
     ];
     if (parts.isEmpty) {
       return '';
@@ -196,6 +246,55 @@ class TranslationStyleProfile {
         .where((String item) => item.isNotEmpty)
         .take(limit)
         .toList(growable: false);
+  }
+
+  static bool _requiresTranslatedQuotedProse(String targetLanguage) {
+    final String lower = targetLanguage.trim().toLowerCase();
+    if (lower.isEmpty) {
+      return false;
+    }
+    if (RegExp(r'^(en|eng|english)([-_\s].*)?$').hasMatch(lower)) {
+      return false;
+    }
+    if (lower.contains('english') &&
+        !lower.contains('chinese') &&
+        !lower.contains('中文') &&
+        !lower.contains('japanese') &&
+        !lower.contains('korean')) {
+      return false;
+    }
+    return true;
+  }
+
+  static bool _retainsSourceLanguageQuotedProse(String rule) {
+    final String lower = rule.trim().toLowerCase();
+    if (lower.isEmpty) {
+      return false;
+    }
+
+    final bool mentionsQuotedMaterial = RegExp(
+      r'\b(quote|quotes|quoted|quotation|quotations|epigraph|epigraphs|dialogue|dialog)\b',
+    ).hasMatch(lower);
+    final bool mentionsEnglish = RegExp(r'\benglish\b').hasMatch(lower);
+    final bool retainsSourceLanguage = RegExp(
+      r'\b(keep|preserve|retain|leave)\b',
+    ).hasMatch(lower);
+
+    if (mentionsQuotedMaterial && mentionsEnglish && retainsSourceLanguage) {
+      return true;
+    }
+    if (mentionsQuotedMaterial &&
+        RegExp(
+          r'(in english|original english|english with .+ attribution|keep .+ english|preserve .+ english)',
+        ).hasMatch(lower)) {
+      return true;
+    }
+    if (RegExp(
+      r'(keep|preserve|retain).{0,40}(dialogue|dialog|quotation|quote|epigraph).{0,20}(english|source language)',
+    ).hasMatch(lower)) {
+      return true;
+    }
+    return false;
   }
 }
 
