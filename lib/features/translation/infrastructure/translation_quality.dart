@@ -98,12 +98,6 @@ class TranslationQuality {
     if (englishWords < 7) {
       return false;
     }
-    if (_hasSuspiciousEnglishRun(
-      text,
-      allowTitleLikeRun: _looksLikeBibliographicCitation(sourceText),
-    )) {
-      return true;
-    }
 
     final List<String> englishWordValues = RegExp(
       r"[A-Za-z][A-Za-z'-]*",
@@ -112,9 +106,6 @@ class TranslationQuality {
     final int nonLatinChars = RegExp(
       r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
     ).allMatches(text).length;
-    if (englishLetters >= 40 && nonLatinChars == 0) {
-      return true;
-    }
     final int languageChars = englishLetters + nonLatinChars;
     if (languageChars == 0) {
       return false;
@@ -123,12 +114,26 @@ class TranslationQuality {
       final int first = word.codeUnitAt(0);
       return first >= 0x41 && first <= 0x5A;
     }).length;
+    // Acknowledgments-style name lists keep long English proper-name runs
+    // inside otherwise-translated CJK prose. Evaluate this before the raw
+    // English-run detector so retained names are not treated as untranslated
+    // sentences.
     final bool mostlyProperNames =
         nonLatinChars >= 4 &&
         englishWords >= 4 &&
         properNameLikeWords / englishWords >= 0.65;
     if (mostlyProperNames) {
       return false;
+    }
+    if (_hasSuspiciousEnglishRun(
+      text,
+      allowTitleLikeRun: _looksLikeBibliographicCitation(sourceText),
+    )) {
+      return true;
+    }
+
+    if (englishLetters >= 40 && nonLatinChars == 0) {
+      return true;
     }
     return englishWords >= 10 && englishLetters / languageChars >= 0.65;
   }

@@ -359,6 +359,74 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    test('allows a translated acknowledgments name list with retained English names', () {
+      const String sourceHtml =
+          '<p class="indent">We also acknowledge the special friendship of '
+          'Alan Lindsay; Brian, Donald, and Scott Lines; Robert Lloyd George; '
+          'Jane Collis; Carter Beese; Andy Miller; Scott Hill; Nils Taube; '
+          'Gilbert de Botton; Michael Geltner; Mark Ford; David Keating; '
+          'Pete Sepp; Curtin Winsor, III; V. Harwood Bocker, III; '
+          'Guillermo Cervino; Eduardo Maschwitz; Michael Reynal; Jorge Gamarci; '
+          'Jackie Locke; Douglas Reid; Jose Pascar; Luis Kenny; '
+          'Robert Lawrence, III; Ken Klein; Kim Saull; Jim Moloney; '
+          'Mike Geltner; Lee Euler; Tom Crema; Nancy Lazar; Greg Barnhill; '
+          'Becky Mangus; Nancy Oppenlander; Wayne Livingstone; Hans Kuppers; '
+          'Michael Baybak; Allan Zschlag; David Hale; Lisa Eden; Mel Lieberman; '
+          'Glenn Blaugh; Sir Roger Douglas; Michael Smorch; Jimmie Rogers; '
+          'Ambrose Evans-Pritchard; Chris Wood; Marc Faber; Ronnie Chan; '
+          'William F. Nicklin; Lenny Smith; Jack Wheeler; Jim Bennett; '
+          'Gordon Tullock; Jay Bernstein; Gary Vernier; Jenny Mitchel; '
+          'Julia Guth; Lisa Young; Mia; Mark Frasier; Lisa Bernard; '
+          'Rita Smith; Ruth Lyons; Yarah Chiekh; Fabian Dilaimy; Tim Hoese; '
+          'and our families.</p>';
+      const String translatedHtml =
+          '<p class="indent">我们也感谢这些特别的朋友：'
+          'Alan Lindsay；Brian、Donald 和 Scott Lines；Robert Lloyd George；'
+          'Jane Collis；Carter Beese；Andy Miller；Scott Hill；Nils Taube；'
+          'Gilbert de Botton；Michael Geltner；Mark Ford；David Keating；'
+          'Pete Sepp；Curtin Winsor, III；V. Harwood Bocker, III；'
+          'Guillermo Cervino；Eduardo Maschwitz；Michael Reynal；Jorge Gamarci；'
+          'Jackie Locke；Douglas Reid；Jose Pascar；Luis Kenny；'
+          'Robert Lawrence, III；Ken Klein；Kim Saull；Jim Moloney；'
+          'Mike Geltner；Lee Euler；Tom Crema；Nancy Lazar；Greg Barnhill；'
+          'Becky Mangus；Nancy Oppenlander；Wayne Livingstone；Hans Kuppers；'
+          'Michael Baybak；Allan Zschlag；David Hale；Lisa Eden；Mel Lieberman；'
+          'Glenn Blaugh；Sir Roger Douglas；Michael Smorch；Jimmie Rogers；'
+          'Ambrose Evans-Pritchard；Chris Wood；Marc Faber；Ronnie Chan；'
+          'William F. Nicklin；Lenny Smith；Jack Wheeler；Jim Bennett；'
+          'Gordon Tullock；Jay Bernstein；Gary Vernier；Jenny Mitchel；'
+          'Julia Guth；Lisa Young；Mia；Mark Frasier；Lisa Bernard；'
+          'Rita Smith；Ruth Lyons；Yarah Chiekh；Fabian Dilaimy；Tim Hoese；'
+          '以及我们的家人。</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: translatedHtml,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('still rejects an untranslated acknowledgments name list', () {
+      const String sourceHtml =
+          '<p class="indent">We also acknowledge the special friendship of '
+          'Alan Lindsay; Brian, Donald, and Scott Lines; Robert Lloyd George; '
+          'Jane Collis; Carter Beese; Andy Miller; Scott Hill; Nils Taube; '
+          'Gilbert de Botton; Michael Geltner; Mark Ford; David Keating; '
+          'Pete Sepp; Curtin Winsor, III; and our families.</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: sourceHtml,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('allows a matching work title in a bibliography entry', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
