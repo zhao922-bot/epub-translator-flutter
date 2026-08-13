@@ -211,6 +211,7 @@ class TranslationQuality {
       translatedCandidates[index].text = '';
     }
 
+    _clearMatchingAuditedForeignTerms(sourceDocument, translatedDocument);
     _clearRetainedProperNames(sourceDocument, translatedDocument);
 
     final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
@@ -768,6 +769,54 @@ class TranslationQuality {
     return RegExp(
       r'(?:\b(?:our|the|his|her|their)\s+)?(?:newsletter|magazine|journal|newspaper|column|periodical|publication|bulletin|digest)\b[,:\s]*$',
     ).hasMatch(precedingText);
+  }
+
+  static void _clearMatchingAuditedForeignTerms(
+    Document sourceDocument,
+    Document translatedDocument,
+  ) {
+    const Set<String> auditedTerms = <String>{'patricius'};
+    final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
+    final List<Element> translatedInline = translatedDocument.querySelectorAll(
+      'i, em',
+    );
+    if (sourceInline.length != translatedInline.length) {
+      return;
+    }
+
+    for (int index = 0; index < sourceInline.length; index += 1) {
+      final Element sourceElement = sourceInline[index];
+      final Element translatedElement = translatedInline[index];
+      final String sourceText = _normalizeText(sourceElement.text);
+      final String translatedText = _normalizeText(translatedElement.text);
+      if (sourceElement.localName != translatedElement.localName ||
+          _taggedElementStructurePath(sourceElement) !=
+              _taggedElementStructurePath(translatedElement) ||
+          sourceElement.children.isNotEmpty ||
+          translatedElement.children.isNotEmpty ||
+          sourceElement.text != translatedElement.text ||
+          sourceText != translatedText ||
+          !RegExp(r"^[A-Za-z][A-Za-z'-]*$").hasMatch(sourceText) ||
+          !auditedTerms.contains(sourceText.toLowerCase())) {
+        continue;
+      }
+      sourceElement.text = '';
+      translatedElement.text = '';
+    }
+  }
+
+  static String _taggedElementStructurePath(Element element) {
+    final List<String> segments = <String>[];
+    Node? current = element;
+    while (current is Element && current.localName != 'body') {
+      final Node? parent = current.parentNode;
+      if (parent == null) {
+        break;
+      }
+      segments.add('${current.localName}:${parent.children.indexOf(current)}');
+      current = parent;
+    }
+    return segments.reversed.join('/');
   }
 
   static bool _hasSerialWorkTitleContext(

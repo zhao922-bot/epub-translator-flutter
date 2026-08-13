@@ -1179,6 +1179,145 @@ void main() {
       expect(finding?.kind, TranslationResidualKind.longSourceText);
     });
 
+    group('audited retained foreign terms', () {
+      test('allows matching italic Latin patricius in translated prose', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Odoacer governed Italy as Zeno\'s <i class="calibre3">patricius</i>.</p>',
+          translatedHtml:
+              '<p>奥多亚塞以芝诺的<i class="calibre3">patricius</i>身份治理意大利。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test(
+        'allows matching emphasized Latin patricius in translated prose',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: '<p>Odoacer served as <em>patricius</em>.</p>',
+                translatedHtml: '<p>奥多亚塞担任<em>patricius</em>官职。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test('still rejects an ordinary emphasized English word', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>This point is <i>important</i>.</p>',
+              translatedHtml: '<p>这一点<i>important</i>很关键。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'important');
+      });
+
+      test('still rejects patricius outside an italic semantic node', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Odoacer held the title patricius.</p>',
+              translatedHtml: '<p>奥多亚塞担任patricius这一官职。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'patricius');
+      });
+
+      test('still rejects a multiword italic residual', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Odoacer was <i>patricius remains</i>.</p>',
+              translatedHtml: '<p>奥多亚塞是<i>patricius remains</i>官员。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+      });
+
+      test('still rejects a nested retained foreign term', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Odoacer was <i><span>patricius</span></i>.</p>',
+              translatedHtml: '<p>奥多亚塞是<i><span>patricius</span></i>官员。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'patricius');
+      });
+
+      test('still rejects the term when the inline tag changes', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Odoacer was <i>patricius</i>.</p>',
+              translatedHtml: '<p>奥多亚塞是<em>patricius</em>官员。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'patricius');
+      });
+
+      test('still rejects the term when an ancestor tag changes', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<section><p>Odoacer was <i>patricius</i>.</p></section>',
+              translatedHtml: '<aside><p>奥多亚塞是<i>patricius</i>官员。</p></aside>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'patricius');
+      });
+
+      test('still rejects the term when its raw inline text changes', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Odoacer was <i>patricius</i>.</p>',
+              translatedHtml: '<p>奥多亚塞是<i> patricius</i>官员。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'patricius');
+      });
+
+      test('continues checking after clearing a retained foreign term', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The <i>patricius</i> retained an entitlement privilege.</p>',
+          translatedHtml: '<p><i>patricius</i>官职保留了entitlement特权。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'entitlement');
+      });
+
+      test('still rejects long English prose after a retained foreign term', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The <i>patricius</i> retained this entire English sentence without translation.</p>',
+          translatedHtml:
+              '<p><i>patricius</i>官职之后仍有 this entire English sentence without translation.</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+    });
+
     test('does not treat the preposition in as a title citation cue', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
