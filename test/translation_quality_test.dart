@@ -1153,6 +1153,32 @@ void main() {
       expect(finding, isNull);
     });
 
+    test('allows a retained person name with a lowercase name particle', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>In the words of the Y2K expert Peter de Jager, “If we lose the ability to make a phone call, then we lose everything. We lose electronic fund transfers, we lose trading, we lose branch banking.” And the follow-on consequences of Y2K failures could come to more than that.</p>',
+        translatedHtml:
+            '<p>用 Y2K 专家 Peter de Jager 的话说：“如果我们失去拨打电话的能力，那么我们将失去一切。我们将失去电子资金转账，失去交易，失去分行银行业务。”而 Y2K 故障的连锁后果恐怕远不止于此。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
+
+    test('still rejects an untranslated quote after a retained person name', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>In the words of the Y2K expert Peter de Jager, “If we lose the ability to make a phone call, then we lose everything. We lose electronic fund transfers, we lose trading, we lose branch banking.” And the follow-on consequences of Y2K failures could come to more than that.</p>',
+        translatedHtml:
+            '<p>用 Y2K 专家 Peter de Jager 的话说：“If we lose the ability to make a phone call, then we lose everything. We lose electronic fund transfers, we lose trading, we lose branch banking.”而 Y2K 故障的连锁后果恐怕远不止于此。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('does not treat the preposition in as a title citation cue', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(

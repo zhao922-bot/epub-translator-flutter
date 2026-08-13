@@ -1231,6 +1231,9 @@ class TranslationQuality {
           !_containsWordSequenceIgnoreCase(sourceWords, run)) {
         continue;
       }
+      if (_canonicalRetainedPersonName(run.join(' ')) != null) {
+        continue;
+      }
       if (_looksLikeEnglishTitleOrName(run)) {
         continue;
       }
