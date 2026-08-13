@@ -377,10 +377,7 @@ class TranslationQuality {
     }
     // Source HTML often keeps a trailing period inside italicized titles
     // ("The Great Reckoning.") without making them ordinary sentences.
-    final String titleCore = normalized.replaceFirst(
-      RegExp(r'[.!?。！？]+$'),
-      '',
-    );
+    final String titleCore = normalized.replaceFirst(RegExp(r'[.!?。！？]+$'), '');
     if (titleCore.isEmpty ||
         titleCore.length > 140 ||
         RegExp(r'[.!?。！？]').hasMatch(titleCore) ||
@@ -678,10 +675,7 @@ class TranslationQuality {
     ).hasMatch(followingText);
   }
 
-  static bool _hasNamedPublicationContext(
-    Document document,
-    Element element,
-  ) {
+  static bool _hasNamedPublicationContext(Document document, Element element) {
     final String precedingText = _sourceTextBeforeNode(
       document,
       element,
@@ -782,16 +776,24 @@ class TranslationQuality {
           sourceDocument;
       final List<String> precedingRetainedNames = retainedNamesByBlock
           .putIfAbsent(contextRoot, () => <String>[]);
-      if (sourceElement.localName == translatedElement.localName &&
+      final bool matchingCreditName =
           sourceText == _normalizeText(translatedElement.text) &&
-          sourceElement.querySelector('i, em, cite') == null &&
-          translatedElement.querySelector('i, em, cite') == null &&
-          _looksLikeRetainedProperName(sourceText) &&
           _hasRetainedProperNameContext(
             sourceDocument,
             sourceElement,
             precedingRetainedNames,
-          )) {
+          );
+      final bool matchingEpigraphAttribution = _isMatchingEpigraphAttribution(
+        sourceElement,
+        translatedElement,
+      );
+      if (sourceElement.localName == translatedElement.localName &&
+          _elementStructurePath(sourceElement) ==
+              _elementStructurePath(translatedElement) &&
+          sourceElement.children.isEmpty &&
+          translatedElement.children.isEmpty &&
+          _looksLikeRetainedProperName(sourceText) &&
+          (matchingCreditName || matchingEpigraphAttribution)) {
         retainedNameIndexes.add(index);
         precedingRetainedNames.add(sourceText);
       }
@@ -800,6 +802,161 @@ class TranslationQuality {
       sourceInline[index].text = '';
       translatedInline[index].text = '';
     }
+  }
+
+  static bool _isMatchingEpigraphAttribution(
+    Element sourceElement,
+    Element translatedElement,
+  ) {
+    if (!_isEpigraphAttributionLocation(sourceElement) ||
+        !_isEpigraphAttributionLocation(translatedElement)) {
+      return false;
+    }
+    final String? sourceName = _epigraphAttributionName(sourceElement.text);
+    final String? translatedName = _epigraphAttributionName(
+      translatedElement.text,
+    );
+    return sourceName != null &&
+        translatedName != null &&
+        sourceName == translatedName;
+  }
+
+  static bool _isEpigraphAttributionLocation(Element element) {
+    final Node? paragraphNode = element.parentNode;
+    if (paragraphNode is! Element || paragraphNode.localName != 'p') {
+      return false;
+    }
+    if (!_hasEpigraphAttributionSemantics(paragraphNode)) {
+      return false;
+    }
+    final Node? blockquoteNode = paragraphNode.parentNode;
+    if (blockquoteNode is! Element ||
+        blockquoteNode.localName != 'blockquote') {
+      return false;
+    }
+    final List<Element> inlineCandidates = paragraphNode.querySelectorAll(
+      'i, em, cite',
+    );
+    if (inlineCandidates.length != 1 ||
+        !identical(inlineCandidates.single, element) ||
+        _hasVisibleTextBeforeChild(paragraphNode, element) ||
+        !_hasVisibleTextAfterChild(paragraphNode, element)) {
+      return false;
+    }
+    final List<Element> visibleParagraphs = blockquoteNode.children
+        .where(
+          (Element child) =>
+              child.localName == 'p' && _normalizeText(child.text).isNotEmpty,
+        )
+        .toList(growable: false);
+    return visibleParagraphs.length >= 2 &&
+        identical(visibleParagraphs.last, paragraphNode);
+  }
+
+  static bool _hasEpigraphAttributionSemantics(Element paragraph) {
+    final Set<String> classTokens = paragraph.classes
+        .map((String token) => token.toLowerCase())
+        .toSet();
+    const Set<String> recognizedClasses = <String>{
+      'attribution',
+      'epi-att',
+      'epigraph-attribution',
+      'epigraph-author',
+      'quote-attribution',
+      'quote-author',
+    };
+    return classTokens.any(recognizedClasses.contains);
+  }
+
+  static bool _hasVisibleTextBeforeChild(Element parent, Node target) {
+    for (final Node child in parent.nodes) {
+      if (identical(child, target)) {
+        return false;
+      }
+      if (_normalizeText(child.text ?? '').isNotEmpty) {
+        return true;
+      }
+    }
+    return true;
+  }
+
+  static bool _hasVisibleTextAfterChild(Element parent, Node target) {
+    bool foundTarget = false;
+    for (final Node child in parent.nodes) {
+      if (identical(child, target)) {
+        foundTarget = true;
+        continue;
+      }
+      if (foundTarget && _normalizeText(child.text ?? '').isNotEmpty) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static String? _epigraphAttributionName(String text) {
+    final String normalized = _normalizeText(text);
+    final RegExpMatch? match = RegExp(
+      r'^(?:[-\u2012\u2013\u2014\u2015]\s*)+(.+?)[,，;；:：]\s*$',
+    ).firstMatch(normalized);
+    if (match == null) {
+      return null;
+    }
+    final String name = _normalizeText(match.group(1) ?? '');
+    if (name.isEmpty || _looksLikeSentenceOrInstruction(name)) {
+      return null;
+    }
+    for (final int rune in name.runes) {
+      final bool allowedSeparator =
+          rune == 0x20 ||
+          rune == 0x27 ||
+          rune == 0x2D ||
+          rune == 0x2E ||
+          rune == 0x2018 ||
+          rune == 0x2019;
+      if (!_isLatinLetterRune(rune) &&
+          !_isCombiningDiacriticalMark(rune) &&
+          !allowedSeparator) {
+        return null;
+      }
+    }
+    final List<String> words = _englishWorkTitleWords(name);
+    if (words.length < 2 || words.length > 6) {
+      return null;
+    }
+    if (const <String>{
+      'a',
+      'an',
+      'the',
+      'this',
+      'these',
+      'those',
+    }.contains(words.first.toLowerCase())) {
+      return null;
+    }
+    const Set<String> nameParticles = <String>{
+      'da',
+      'de',
+      'del',
+      'der',
+      'di',
+      'dos',
+      'du',
+      'la',
+      'le',
+      'van',
+      'von',
+    };
+    for (final String word in words) {
+      if (nameParticles.contains(word.toLowerCase())) {
+        continue;
+      }
+      final String first = String.fromCharCode(word.runes.first);
+      if (first != first.toUpperCase() || first == first.toLowerCase()) {
+        return null;
+      }
+    }
+    return words.join(' ');
   }
 
   static bool _looksLikeRetainedProperName(String text) {
@@ -973,9 +1130,7 @@ class TranslationQuality {
         return false;
       }
       final bool isStandaloneLowercaseTerm =
-          translatedWords.every(
-            (String word) => word == word.toLowerCase(),
-          ) &&
+          translatedWords.every((String word) => word == word.toLowerCase()) &&
           !RegExp(r'[.!?]').hasMatch(strippedSource);
       return !isStandaloneLowercaseTerm;
     }

@@ -139,6 +139,183 @@ void main() {
   });
 
   group('HTML-aware residual checks', () {
+    test(
+      'allows a retained epigraph attribution name after punctuation localization',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '''
+<blockquote class="epigraph">
+  <p class="noindent"><i>“The future is disorder. A door like this has cracked open five or six times since we got up on our hind legs. It is the best possible time to be alive, when almost everything you thought you knew is wrong.”</i></p>
+  <p class="epi-att"><i>—Tom Stoppard,</i> Arcadia</p>
+</blockquote>
+''',
+              translatedHtml: '''
+<blockquote class="epigraph">
+  <p class="noindent"><i>“未来就是混乱。自我们直立行走以来，这样的门已经裂开过五六次了。这是一个活着再好不过的时代，因为你所知的一切几乎都是错的。”</i></p>
+  <p class="epi-att"><i>——Tom Stoppard，</i>《阿卡迪亚》</p>
+</blockquote>
+''',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      },
+    );
+
+    test(
+      'still rejects an untranslated epigraph with a retained attribution',
+      () {
+        const String html = '''
+<blockquote class="epigraph">
+  <p><i>“The future is disorder. A door like this has cracked open five or six times since we got up on our hind legs.”</i></p>
+  <p class="epi-att"><i>—Tom Stoppard,</i> Arcadia</p>
+</blockquote>
+''';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
+
+    test('still rejects a partly untranslated epigraph quotation', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '''
+<blockquote class="epigraph">
+  <p><i>“The future is disorder. A door like this has cracked open five or six times since we got up on our hind legs.”</i></p>
+  <p class="epi-att"><i>—Tom Stoppard,</i> Arcadia</p>
+</blockquote>
+''',
+            translatedHtml: '''
+<blockquote class="epigraph">
+  <p><i>“未来就是混乱。A door like this has cracked open five or six times since we got up on our hind legs.”</i></p>
+  <p class="epi-att"><i>——Tom Stoppard，</i>《阿卡迪亚》</p>
+</blockquote>
+''',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not exempt a changed epigraph attribution name', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '''
+<blockquote class="epigraph">
+  <p><i>“The future is disorder.”</i></p>
+  <p class="epi-att"><i>—Tom Stoppard,</i> Arcadia</p>
+</blockquote>
+''',
+            translatedHtml: '''
+<blockquote class="epigraph">
+  <p><i>“未来就是混乱。”</i></p>
+  <p class="epi-att"><i>——Thomas Stoppard，</i>《阿卡迪亚》</p>
+</blockquote>
+''',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not treat a normal paragraph as an epigraph attribution', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p><i>—Tom Stoppard,</i> wrote the play.</p>',
+            translatedHtml: '<p><i>——Tom Stoppard，</i>创作了这部戏剧。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test(
+      'does not exempt an epigraph inline that also contains a work title',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '''
+<blockquote><p><i>“The future is disorder.”</i></p><p><i>—Tom Stoppard, Arcadia</i></p></blockquote>
+''',
+              translatedHtml: '''
+<blockquote><p><i>“未来就是混乱。”</i></p><p><i>——Tom Stoppard, Arcadia</i></p></blockquote>
+''',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
+
+    test('does not mistake a dashed work title for an attribution name', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '''
+<blockquote><p><i>“The future is disorder.”</i></p><p><i>—The Sovereign Individual,</i> Arcadia</p></blockquote>
+''',
+            translatedHtml: '''
+<blockquote><p><i>“未来就是混乱。”</i></p><p><i>——The Sovereign Individual，</i>《阿卡迪亚》</p></blockquote>
+''',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test(
+      'does not infer an attribution name without an explicit attribution class',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '''
+<blockquote><p><i>“The future is disorder.”</i></p><p><i>—Strategic Investment,</i> Arcadia</p></blockquote>
+''',
+              translatedHtml: '''
+<blockquote><p><i>“未来就是混乱。”</i></p><p><i>——Strategic Investment，</i>《阿卡迪亚》</p></blockquote>
+''',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
+
+    test('does not exempt an attribution without a preceding quotation', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<blockquote><p><i>—Tom Stoppard,</i> Arcadia</p></blockquote>',
+            translatedHtml:
+                '<blockquote><p><i>——Tom Stoppard，</i>《阿卡迪亚》</p></blockquote>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not exempt an attribution name wrapped in a nested span', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '''
+<blockquote><p><i>“The future is disorder.”</i></p><p><i>—<span>Tom Stoppard</span>,</i> Arcadia</p></blockquote>
+''',
+            translatedHtml: '''
+<blockquote><p><i>“未来就是混乱。”</i></p><p><i>——<span>Tom Stoppard</span>，</i>《阿卡迪亚》</p></blockquote>
+''',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('allows a source-owned English work title in matching i elements', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(
@@ -336,78 +513,83 @@ void main() {
           TranslationQuality.findSuspiciousHtmlResidual(
             sourceHtml:
                 '<p>He edits the newsletter, <i>Strategic Investment.</i></p>',
-            translatedHtml:
-                '<p>他主编这份通讯，<i>Strategic Investment.</i></p>',
+            translatedHtml: '<p>他主编这份通讯，<i>Strategic Investment.</i></p>',
             targetLanguage: 'Chinese',
           );
 
       expect(finding, isNull);
     });
 
-    test('still rejects untranslated acknowledgments prose that keeps titles', () {
-      const String sourceHtml =
-          '<p><i>The Sovereign Individual</i> builds upon research that went into '
-          '<i>Blood in the Streets</i> and <i>The Great Reckoning.</i></p>';
+    test(
+      'still rejects untranslated acknowledgments prose that keeps titles',
+      () {
+        const String sourceHtml =
+            '<p><i>The Sovereign Individual</i> builds upon research that went into '
+            '<i>Blood in the Streets</i> and <i>The Great Reckoning.</i></p>';
 
-      final TranslationResidualFinding? finding =
-          TranslationQuality.findSuspiciousHtmlResidual(
-            sourceHtml: sourceHtml,
-            translatedHtml: sourceHtml,
-            targetLanguage: 'Chinese',
-          );
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: sourceHtml,
+              targetLanguage: 'Chinese',
+            );
 
-      expect(finding?.kind, TranslationResidualKind.longSourceText);
-    });
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
 
-    test('allows a translated acknowledgments name list with retained English names', () {
-      const String sourceHtml =
-          '<p class="indent">We also acknowledge the special friendship of '
-          'Alan Lindsay; Brian, Donald, and Scott Lines; Robert Lloyd George; '
-          'Jane Collis; Carter Beese; Andy Miller; Scott Hill; Nils Taube; '
-          'Gilbert de Botton; Michael Geltner; Mark Ford; David Keating; '
-          'Pete Sepp; Curtin Winsor, III; V. Harwood Bocker, III; '
-          'Guillermo Cervino; Eduardo Maschwitz; Michael Reynal; Jorge Gamarci; '
-          'Jackie Locke; Douglas Reid; Jose Pascar; Luis Kenny; '
-          'Robert Lawrence, III; Ken Klein; Kim Saull; Jim Moloney; '
-          'Mike Geltner; Lee Euler; Tom Crema; Nancy Lazar; Greg Barnhill; '
-          'Becky Mangus; Nancy Oppenlander; Wayne Livingstone; Hans Kuppers; '
-          'Michael Baybak; Allan Zschlag; David Hale; Lisa Eden; Mel Lieberman; '
-          'Glenn Blaugh; Sir Roger Douglas; Michael Smorch; Jimmie Rogers; '
-          'Ambrose Evans-Pritchard; Chris Wood; Marc Faber; Ronnie Chan; '
-          'William F. Nicklin; Lenny Smith; Jack Wheeler; Jim Bennett; '
-          'Gordon Tullock; Jay Bernstein; Gary Vernier; Jenny Mitchel; '
-          'Julia Guth; Lisa Young; Mia; Mark Frasier; Lisa Bernard; '
-          'Rita Smith; Ruth Lyons; Yarah Chiekh; Fabian Dilaimy; Tim Hoese; '
-          'and our families.</p>';
-      const String translatedHtml =
-          '<p class="indent">我们也感谢这些特别的朋友：'
-          'Alan Lindsay；Brian、Donald 和 Scott Lines；Robert Lloyd George；'
-          'Jane Collis；Carter Beese；Andy Miller；Scott Hill；Nils Taube；'
-          'Gilbert de Botton；Michael Geltner；Mark Ford；David Keating；'
-          'Pete Sepp；Curtin Winsor, III；V. Harwood Bocker, III；'
-          'Guillermo Cervino；Eduardo Maschwitz；Michael Reynal；Jorge Gamarci；'
-          'Jackie Locke；Douglas Reid；Jose Pascar；Luis Kenny；'
-          'Robert Lawrence, III；Ken Klein；Kim Saull；Jim Moloney；'
-          'Mike Geltner；Lee Euler；Tom Crema；Nancy Lazar；Greg Barnhill；'
-          'Becky Mangus；Nancy Oppenlander；Wayne Livingstone；Hans Kuppers；'
-          'Michael Baybak；Allan Zschlag；David Hale；Lisa Eden；Mel Lieberman；'
-          'Glenn Blaugh；Sir Roger Douglas；Michael Smorch；Jimmie Rogers；'
-          'Ambrose Evans-Pritchard；Chris Wood；Marc Faber；Ronnie Chan；'
-          'William F. Nicklin；Lenny Smith；Jack Wheeler；Jim Bennett；'
-          'Gordon Tullock；Jay Bernstein；Gary Vernier；Jenny Mitchel；'
-          'Julia Guth；Lisa Young；Mia；Mark Frasier；Lisa Bernard；'
-          'Rita Smith；Ruth Lyons；Yarah Chiekh；Fabian Dilaimy；Tim Hoese；'
-          '以及我们的家人。</p>';
+    test(
+      'allows a translated acknowledgments name list with retained English names',
+      () {
+        const String sourceHtml =
+            '<p class="indent">We also acknowledge the special friendship of '
+            'Alan Lindsay; Brian, Donald, and Scott Lines; Robert Lloyd George; '
+            'Jane Collis; Carter Beese; Andy Miller; Scott Hill; Nils Taube; '
+            'Gilbert de Botton; Michael Geltner; Mark Ford; David Keating; '
+            'Pete Sepp; Curtin Winsor, III; V. Harwood Bocker, III; '
+            'Guillermo Cervino; Eduardo Maschwitz; Michael Reynal; Jorge Gamarci; '
+            'Jackie Locke; Douglas Reid; Jose Pascar; Luis Kenny; '
+            'Robert Lawrence, III; Ken Klein; Kim Saull; Jim Moloney; '
+            'Mike Geltner; Lee Euler; Tom Crema; Nancy Lazar; Greg Barnhill; '
+            'Becky Mangus; Nancy Oppenlander; Wayne Livingstone; Hans Kuppers; '
+            'Michael Baybak; Allan Zschlag; David Hale; Lisa Eden; Mel Lieberman; '
+            'Glenn Blaugh; Sir Roger Douglas; Michael Smorch; Jimmie Rogers; '
+            'Ambrose Evans-Pritchard; Chris Wood; Marc Faber; Ronnie Chan; '
+            'William F. Nicklin; Lenny Smith; Jack Wheeler; Jim Bennett; '
+            'Gordon Tullock; Jay Bernstein; Gary Vernier; Jenny Mitchel; '
+            'Julia Guth; Lisa Young; Mia; Mark Frasier; Lisa Bernard; '
+            'Rita Smith; Ruth Lyons; Yarah Chiekh; Fabian Dilaimy; Tim Hoese; '
+            'and our families.</p>';
+        const String translatedHtml =
+            '<p class="indent">我们也感谢这些特别的朋友：'
+            'Alan Lindsay；Brian、Donald 和 Scott Lines；Robert Lloyd George；'
+            'Jane Collis；Carter Beese；Andy Miller；Scott Hill；Nils Taube；'
+            'Gilbert de Botton；Michael Geltner；Mark Ford；David Keating；'
+            'Pete Sepp；Curtin Winsor, III；V. Harwood Bocker, III；'
+            'Guillermo Cervino；Eduardo Maschwitz；Michael Reynal；Jorge Gamarci；'
+            'Jackie Locke；Douglas Reid；Jose Pascar；Luis Kenny；'
+            'Robert Lawrence, III；Ken Klein；Kim Saull；Jim Moloney；'
+            'Mike Geltner；Lee Euler；Tom Crema；Nancy Lazar；Greg Barnhill；'
+            'Becky Mangus；Nancy Oppenlander；Wayne Livingstone；Hans Kuppers；'
+            'Michael Baybak；Allan Zschlag；David Hale；Lisa Eden；Mel Lieberman；'
+            'Glenn Blaugh；Sir Roger Douglas；Michael Smorch；Jimmie Rogers；'
+            'Ambrose Evans-Pritchard；Chris Wood；Marc Faber；Ronnie Chan；'
+            'William F. Nicklin；Lenny Smith；Jack Wheeler；Jim Bennett；'
+            'Gordon Tullock；Jay Bernstein；Gary Vernier；Jenny Mitchel；'
+            'Julia Guth；Lisa Young；Mia；Mark Frasier；Lisa Bernard；'
+            'Rita Smith；Ruth Lyons；Yarah Chiekh；Fabian Dilaimy；Tim Hoese；'
+            '以及我们的家人。</p>';
 
-      final TranslationResidualFinding? finding =
-          TranslationQuality.findSuspiciousHtmlResidual(
-            sourceHtml: sourceHtml,
-            translatedHtml: translatedHtml,
-            targetLanguage: 'Chinese',
-          );
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translatedHtml,
+              targetLanguage: 'Chinese',
+            );
 
-      expect(finding, isNull);
-    });
+        expect(finding, isNull);
+      },
+    );
 
     test('still rejects an untranslated acknowledgments name list', () {
       const String sourceHtml =
@@ -768,8 +950,7 @@ void main() {
           ),
           (
             sourceHtml: '<p>Technology Changes Everything.</p>',
-            translatedHtml:
-                '<p>Technology Changes Everything. 技术改变一切。</p>',
+            translatedHtml: '<p>Technology Changes Everything. 技术改变一切。</p>',
           ),
         ]) {
       test('rejects retained title-case prose despite a Chinese gloss', () {
