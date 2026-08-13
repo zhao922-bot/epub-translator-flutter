@@ -1253,7 +1253,7 @@ void main() {
         expect(finding?.token, 'important');
       });
 
-      test('does not exempt politique when the inline comma changes', () {
+      test('allows politique when its comma moves outside the inline node', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
               sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
@@ -1261,8 +1261,18 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
-        expect(finding?.token, 'politique');
+        expect(finding, isNull);
+      });
+
+      test('allows politique with a localized inline comma', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是<i>politique，</i>用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
       });
 
       test('does not exempt politique outside italic markup', () {
@@ -1298,7 +1308,7 @@ void main() {
         });
       }
 
-      test('does not exempt a near-match audited Latin phrase', () {
+      test('allows an audited phrase when its inline comma moves outside', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
               sourceHtml: '<p>The expression is <i>ultimum refugium,</i>.</p>',
@@ -1306,8 +1316,121 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
+        expect(finding, isNull);
+      });
+
+      test('does not exempt a changed audited Latin phrase', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The expression is <i>ultimum refugium,</i>.</p>',
+              translatedHtml: '<p>这一表达是<i>ultimum refuge</i>（最后避难所）。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt an unreviewed source punctuation form', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique;</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是<i>politique</i>，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
         expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
-        expect(finding?.token, 'ultimum');
+        expect(finding?.token, 'politique');
+      });
+
+      test('does not exempt extra prose appended to an audited term', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是<i>politique remains</i>，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('rejects extra prose even when spaces break CJK adjacency', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是 <i>politique remains</i> ，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt an unreviewed translated punctuation form', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是<i>politique;</i>，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('rejects unreviewed punctuation even without CJK adjacency', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是 <i>politique;</i> ，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('rejects non-ASCII Latin lookalikes outside the allowlist', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是 <i>ｐｏｌｉｔｉｑｕｅ；</i> ，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      for (final String invalidTranslation in <String>['', '；', '123']) {
+        test('rejects non-translations such as "$invalidTranslation"', () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+            translatedHtml: '<p>古法语术语是 <i>$invalidTranslation</i> ，用于此处。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+          expect(finding?.kind, TranslationResidualKind.longSourceText);
+        });
+      }
+
+      test('allows an audited term translated fully into Chinese', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>这个古法语词是<i>权宜政客，</i>用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+
+      test('does not exempt an audited term when attributes change', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>The term is <i class="calibre3">politique,</i>.</p>',
+              translatedHtml: '<p>该术语是<i class="changed">politique</i>。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
 
       test('does not normalize whitespace when matching an audited node', () {
@@ -1417,8 +1540,7 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
-        expect(finding?.token, 'patricius');
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
 
       test('still rejects the term when an ancestor tag changes', () {
@@ -1430,8 +1552,7 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
-        expect(finding?.token, 'patricius');
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
 
       test('still rejects the term when its raw inline text changes', () {
@@ -1442,8 +1563,7 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
-        expect(finding?.token, 'patricius');
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
 
       test('continues checking after clearing a retained foreign term', () {

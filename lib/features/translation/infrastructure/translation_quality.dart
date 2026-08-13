@@ -211,7 +211,15 @@ class TranslationQuality {
       translatedCandidates[index].text = '';
     }
 
-    _clearMatchingAuditedForeignTerms(sourceDocument, translatedDocument);
+    if (!_clearMatchingAuditedForeignTerms(
+      sourceDocument,
+      translatedDocument,
+      targetLanguage: targetLanguage,
+    )) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
     _clearMatchingInvertedIndexPersonNames(sourceDocument, translatedDocument);
     _clearRetainedProperNames(sourceDocument, translatedDocument);
 
@@ -772,49 +780,87 @@ class TranslationQuality {
     ).hasMatch(precedingText);
   }
 
-  static void _clearMatchingAuditedForeignTerms(
+  static bool _clearMatchingAuditedForeignTerms(
     Document sourceDocument,
-    Document translatedDocument,
-  ) {
-    const Set<String> auditedNodeTexts = <String>{
-      'Homo economicus',
-      'civitas,',
-      'cullagium,"',
-      'militum perpetuum,',
-      'pagus',
-      'patria',
-      'patricius',
-      'politique,',
-      'prophetae',
-      'ultimum refugium,',
-      '—de facto',
+    Document translatedDocument, {
+    required String targetLanguage,
+  }) {
+    const Map<String, Set<String>> auditedNodeTexts = <String, Set<String>>{
+      'Homo economicus': <String>{'Homo economicus'},
+      'civitas,': <String>{'civitas,', 'civitas', 'civitas，'},
+      'cullagium,"': <String>{
+        'cullagium,"',
+        'cullagium',
+        'cullagium,',
+        'cullagium，',
+        'cullagium,”',
+        'cullagium，”',
+      },
+      'militum perpetuum,': <String>{
+        'militum perpetuum,',
+        'militum perpetuum',
+        'militum perpetuum，',
+      },
+      'pagus': <String>{'pagus'},
+      'patria': <String>{'patria'},
+      'patricius': <String>{'patricius'},
+      'politique,': <String>{'politique,', 'politique', 'politique，'},
+      'prophetae': <String>{'prophetae'},
+      'ultimum refugium,': <String>{
+        'ultimum refugium,',
+        'ultimum refugium',
+        'ultimum refugium，',
+      },
+      '—de facto': <String>{
+        '—de facto',
+        '——de facto',
+        '–de facto',
+        '-de facto',
+        '--de facto',
+        'de facto',
+      },
     };
     final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
     final List<Element> translatedInline = translatedDocument.querySelectorAll(
       'i, em',
     );
     if (sourceInline.length != translatedInline.length) {
-      return;
+      return !sourceInline.any(
+        (Element element) =>
+            element.children.isEmpty &&
+            auditedNodeTexts.containsKey(element.text),
+      );
     }
 
     for (int index = 0; index < sourceInline.length; index += 1) {
       final Element sourceElement = sourceInline[index];
       final Element translatedElement = translatedInline[index];
-      final String sourceText = _normalizeText(sourceElement.text);
-      final String translatedText = _normalizeText(translatedElement.text);
+      final Set<String>? allowedTranslations =
+          auditedNodeTexts[sourceElement.text];
+      if (sourceElement.children.isNotEmpty || allowedTranslations == null) {
+        continue;
+      }
       if (sourceElement.localName != translatedElement.localName ||
           _taggedElementStructurePath(sourceElement) !=
               _taggedElementStructurePath(translatedElement) ||
-          sourceElement.children.isNotEmpty ||
-          translatedElement.children.isNotEmpty ||
-          sourceElement.text != translatedElement.text ||
-          sourceText != translatedText ||
-          !auditedNodeTexts.contains(sourceElement.text)) {
+          !_sameElementAttributes(sourceElement, translatedElement) ||
+          translatedElement.children.isNotEmpty) {
+        return false;
+      }
+      if (!allowedTranslations.contains(translatedElement.text)) {
+        if (translatedElement.text.runes.any(_isLatinLetterRune) ||
+            !_hasTargetScript(
+              translatedElement.text,
+              targetLanguage: targetLanguage,
+            )) {
+          return false;
+        }
         continue;
       }
       sourceElement.text = '';
       translatedElement.text = '';
     }
+    return true;
   }
 
   static String _taggedElementStructurePath(Element element) {
@@ -1538,7 +1584,10 @@ class TranslationQuality {
         (rune >= 0x2C60 && rune <= 0x2C7F) ||
         (rune >= 0xA720 && rune <= 0xA7FF) ||
         (rune >= 0xAB30 && rune <= 0xAB6F) ||
+        (rune >= 0xFF21 && rune <= 0xFF3A) ||
+        (rune >= 0xFF41 && rune <= 0xFF5A) ||
         (rune >= 0x10780 && rune <= 0x107BF) ||
+        (rune >= 0x1D400 && rune <= 0x1D6A5) ||
         (rune >= 0x1DF00 && rune <= 0x1DFFF);
   }
 
