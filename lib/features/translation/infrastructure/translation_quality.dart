@@ -787,6 +787,11 @@ class TranslationQuality {
   }) {
     const Map<String, Set<String>> auditedNodeTexts = <String, Set<String>>{
       'Homo economicus': <String>{'Homo economicus'},
+      'agri deserti,': <String>{
+        'agri deserti,',
+        'agri deserti',
+        'agri deserti，',
+      },
       'civitas,': <String>{'civitas,', 'civitas', 'civitas，'},
       'cullagium,"': <String>{
         'cullagium,"',

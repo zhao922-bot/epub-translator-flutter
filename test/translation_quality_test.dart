@@ -1240,6 +1240,32 @@ void main() {
         expect(finding, isNull);
       });
 
+      test('allows retained Latin agri deserti with its translated gloss', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>There were many <i class="calibre3">agri deserti,</i> or abandoned farms.</p>',
+          translatedHtml:
+              '<p>当时有许多<i class="calibre3">agri deserti</i>（即被弃耕的农场）。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test('does not exempt an unreviewed agri deserti source form', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>There were many <i>agri deserti</i> in the region.</p>',
+              translatedHtml: '<p>当地有许多<i>agri deserti</i>农场。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'deserti');
+      });
+
       test('does not exempt an ordinary italic word with a trailing comma', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
