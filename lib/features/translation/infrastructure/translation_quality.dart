@@ -776,7 +776,12 @@ class TranslationQuality {
     Document sourceDocument,
     Document translatedDocument,
   ) {
-    const Set<String> auditedTerms = <String>{'patricius'};
+    const Set<String> auditedTerms = <String>{
+      'pagus',
+      'patria',
+      'patricius',
+      'prophetae',
+    };
     final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
     final List<Element> translatedInline = translatedDocument.querySelectorAll(
       'i, em',

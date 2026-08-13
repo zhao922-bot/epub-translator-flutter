@@ -1207,6 +1207,51 @@ void main() {
         },
       );
 
+      for (final ({String token, String gloss}) example
+          in <({String token, String gloss})>[
+            (token: 'pagus', gloss: '城镇'),
+            (token: 'patria', gloss: '祖国'),
+            (token: 'prophetae', gloss: '先知群体'),
+          ]) {
+        test('allows audited Latin term ${example.token}', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>The historical term is <i>${example.token}</i>.</p>',
+                translatedHtml:
+                    '<p>这一历史术语是<i>${example.token}</i>（${example.gloss}）。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
+      test('allows two matching patria term nodes in one block', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The narrow <i>patria</i> differed from a broader <i>patria</i>.</p>',
+          translatedHtml:
+              '<p>狭义的<i>patria</i>（祖国）不同于更广义的<i>patria</i>（祖国）。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test('does not exempt the translatable historical word scriptoria', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Monasteries maintained <i>scriptoria</i>.</p>',
+              translatedHtml: '<p>修道院设有<i>scriptoria</i>场所。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'scriptoria');
+      });
+
       test('still rejects an ordinary emphasized English word', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
