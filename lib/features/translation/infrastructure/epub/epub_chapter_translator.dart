@@ -3399,6 +3399,7 @@ class EpubChapterTranslator {
           sourceHtml: block.sourceHtml,
           translatedHtml: translatedHtml,
           targetLanguage: config.targetLanguage,
+          allowRetainedAuthorSignature: block.isAuthorSignature,
         );
     if (finding == null) {
       return;
@@ -3515,6 +3516,7 @@ class EpubChapterTranslator {
               _styleProfileCacheValue(confirmedStyleProfile),
               chapterPath,
               block.sourceHtml,
+              if (block.isAuthorSignature) 'author-signature-v1',
             ].join('|'),
           ),
         )

@@ -42,3 +42,19 @@
 - [ ] 开启生产残留检查运行真实题词单章测试，确认 API 返回可通过质量门。
 - [ ] 运行整书长跑，复用兼容缓存并记录完成结果或下一个精确故障块。
 - [ ] 所有证据确认后提交生产代码和回归测试。
+
+### 任务 4：处理长跑发现的前言末尾署名
+
+**文件：**
+- 修改：`lib/features/translation/domain/models/inspected_chapter.dart`
+- 修改：`lib/features/translation/infrastructure/epub/epub_html_extractor.dart`
+- 修改：`lib/features/translation/infrastructure/translation_quality.dart`
+- 修改：`lib/features/translation/infrastructure/epub/epub_chapter_translator.dart`
+- 测试：`test/epub_html_extractor_selection_test.dart`
+- 测试：`test/translation_quality_test.dart`
+- 测试：`test/repository_safety_test.dart`
+
+- [x] 用整章终止三行签名组标记作者，日期和地点保持普通块。
+- [x] 允许作者原名保留或译为目标文字，拒绝另一英文名、嵌套结构和夹带英文。
+- [x] 普通块保持 v12 缓存键完全兼容，仅隔离署名块。
+- [ ] 完成全量相关测试、独立审查与真实整书断点续跑。

@@ -921,6 +921,59 @@ void main() {
       expect(withGlossary, hasLength(64));
     });
 
+    test('ordinary block cache key remains compatible with v12', () {
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test',
+        model: 'example-model',
+        targetLanguage: 'Chinese',
+      );
+      final String currentKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block,
+        chapterPath: 'chapter-1.xhtml',
+      );
+      final String legacyV12Key = sha256
+          .convert(
+            utf8.encode(
+              <Object>[
+                'v12-protected-anchor-text-slots',
+                'https://api.example.test/v1',
+                config.model.trim(),
+                config.targetLanguage.trim(),
+                config.lockedGlossary.trim(),
+                config.residualQualityCheck,
+                config.styleProfileEnabled,
+                'none',
+                'chapter-1.xhtml',
+                block.sourceHtml,
+              ].join('|'),
+            ),
+          )
+          .toString();
+
+      expect(currentKey, legacyV12Key);
+    });
+
+    test('author signature block uses an isolated cache key', () {
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test',
+        model: 'example-model',
+        targetLanguage: 'Chinese',
+      );
+      final String ordinaryKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block,
+        chapterPath: 'chapter-1.xhtml',
+      );
+      final String signatureKey = EpubChapterTranslator.blockCacheKeyForTest(
+        config: config,
+        block: block.copyWith(isAuthorSignature: true),
+        chapterPath: 'chapter-1.xhtml',
+      );
+
+      expect(signatureKey, isNot(ordinaryKey));
+    });
+
     test(
       'block cache key invalidates v9 through v11 footnote structure results',
       () {
@@ -1963,6 +2016,39 @@ void main() {
   });
 
   group('translation residual detection', () {
+    test(
+      'accepts a retained author signature through the batch path',
+      () async {
+        final _SequencedHtmlBatchAdapter adapter = _SequencedHtmlBatchAdapter(
+          const <String>['<p class="sig">Peter Thiel</p>'],
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        final List<String> translated = await EpubChapterTranslator()
+            .translateBlockBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 1,
+              ),
+              blocks: const <ExtractedBlock>[
+                ExtractedBlock(
+                  id: 'p-11',
+                  tagName: 'p',
+                  sourceHtml: '<p class="sig">Peter Thiel</p>',
+                  sourceText: 'Peter Thiel',
+                  isAuthorSignature: true,
+                ),
+              ],
+            );
+
+        expect(adapter.fetchCount, 1);
+        expect(translated, const <String>['<p class="sig">Peter Thiel</p>']);
+      },
+    );
+
     test('accepts a source-owned English work title in the real p-2 shape', () async {
       const String sourceHtml =
           '<p id="p-2">George Gilder, author of <i>The 500-Year Delta: What Happens After What Comes Next</i>, predicts a profound transition.<a id="ch06-en37-ref" href="part0023_split_006.html#ch06-en37"><sup>37</sup></a> Other writers reach a similar conclusion.<a id="ch06-en38-ref" href="part0023_split_006.html#ch06-en38"><sup>38</sup></a></p>';

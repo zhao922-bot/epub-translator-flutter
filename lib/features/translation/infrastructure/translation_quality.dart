@@ -142,12 +142,23 @@ class TranslationQuality {
     required String sourceHtml,
     required String translatedHtml,
     required String targetLanguage,
+    bool allowRetainedAuthorSignature = false,
   }) {
     if (!shouldCheckResidual(targetLanguage)) {
       return null;
     }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
+    if (allowRetainedAuthorSignature &&
+        !_prepareAuthorSignatureForResidualCheck(
+          sourceDocument,
+          translatedDocument,
+          targetLanguage: targetLanguage,
+        )) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
     final List<Element> sourceCandidates = _outermostWorkTitleCandidates(
       sourceDocument,
     );
@@ -246,6 +257,76 @@ class TranslationQuality {
       );
     }
     return null;
+  }
+
+  static bool _prepareAuthorSignatureForResidualCheck(
+    Document sourceDocument,
+    Document translatedDocument, {
+    required String targetLanguage,
+  }) {
+    final List<Element> sourceElements =
+        sourceDocument.body?.children ?? const <Element>[];
+    final List<Element> translatedElements =
+        translatedDocument.body?.children ?? const <Element>[];
+    if (sourceElements.length != 1 || translatedElements.length != 1) {
+      return false;
+    }
+    final Element sourceElement = sourceElements.single;
+    final Element translatedElement = translatedElements.single;
+    final String sourceText = _normalizeText(sourceElement.text);
+    final String translatedText = _normalizeText(translatedElement.text);
+    if (sourceElement.localName != 'p' ||
+        translatedElement.localName != 'p' ||
+        !_hasSignatureSemantics(sourceElement) ||
+        !_hasSignatureSemantics(translatedElement) ||
+        sourceElement.children.isNotEmpty ||
+        translatedElement.children.isNotEmpty ||
+        _canonicalRetainedPersonName(sourceText) == null) {
+      return false;
+    }
+
+    if (sourceText == translatedText) {
+      sourceElement.text = '';
+      translatedElement.text = '';
+      return true;
+    }
+
+    // A translated or transliterated signature is already safe. Keep it in
+    // the normal residual pipeline so any unrelated English text is still
+    // checked. A different all-Latin name, however, is not an acceptable
+    // retained signature and must be retried.
+    if (!_hasTargetScript(translatedText, targetLanguage: targetLanguage) ||
+        RegExp(r'[A-Za-z]').hasMatch(translatedText)) {
+      return false;
+    }
+    return true;
+  }
+
+  static bool _hasTargetScript(String text, {required String targetLanguage}) {
+    final String lower = targetLanguage.trim().toLowerCase();
+    if (_isCjkTargetLanguage(lower)) {
+      return RegExp(
+        r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+      ).hasMatch(text);
+    }
+    if (lower.startsWith('ru') || lower.contains('russian')) {
+      return RegExp(r'[\u0400-\u04FF]').hasMatch(text);
+    }
+    if (lower.startsWith('ar') || lower.contains('arabic')) {
+      return RegExp(r'[\u0600-\u06FF]').hasMatch(text);
+    }
+    return false;
+  }
+
+  static bool _hasSignatureSemantics(Element paragraph) {
+    const Set<String> recognizedClasses = <String>{
+      'author-signature',
+      'sig',
+      'signature',
+    };
+    return paragraph.classes
+        .map((String token) => token.toLowerCase())
+        .any(recognizedClasses.contains);
   }
 
   static String? _findCjkAdjacentLowercaseWord(
@@ -608,6 +689,10 @@ class TranslationQuality {
     Element element,
     String title,
   ) {
+    final Element? semanticBlock = _nearestSemanticBlock(element);
+    if (semanticBlock != null && _hasSignatureSemantics(semanticBlock)) {
+      return false;
+    }
     if (element.localName == 'cite' || element.querySelector('cite') != null) {
       return true;
     }
@@ -903,6 +988,10 @@ class TranslationQuality {
       return null;
     }
     final String name = _normalizeText(match.group(1) ?? '');
+    return _canonicalRetainedPersonName(name);
+  }
+
+  static String? _canonicalRetainedPersonName(String name) {
     if (name.isEmpty || _looksLikeSentenceOrInstruction(name)) {
       return null;
     }

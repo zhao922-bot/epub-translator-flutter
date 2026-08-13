@@ -66,6 +66,7 @@ class ExtractedBlock {
     required this.sourceHtml,
     required this.sourceText,
     this.translatedHtml,
+    this.isAuthorSignature = false,
   });
 
   final String id;
@@ -73,6 +74,7 @@ class ExtractedBlock {
   final String sourceHtml;
   final String sourceText;
   final String? translatedHtml;
+  final bool isAuthorSignature;
 
   ExtractedBlock copyWith({
     String? id,
@@ -81,6 +83,7 @@ class ExtractedBlock {
     String? sourceText,
     String? translatedHtml,
     bool clearTranslatedHtml = false,
+    bool? isAuthorSignature,
   }) {
     return ExtractedBlock(
       id: id ?? this.id,
@@ -90,6 +93,7 @@ class ExtractedBlock {
       translatedHtml: clearTranslatedHtml
           ? null
           : translatedHtml ?? this.translatedHtml,
+      isAuthorSignature: isAuthorSignature ?? this.isAuthorSignature,
     );
   }
 }

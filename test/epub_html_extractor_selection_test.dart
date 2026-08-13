@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_quality.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -50,6 +51,217 @@ void main() {
     expect(chapter.category, ChapterCategory.content);
     expect(chapter.recommendedForTranslation, isTrue);
     expect(chapter.includeInTranslation, isTrue);
+  });
+
+  test('marks only the author row in a preface signature metadata group', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The translated preface prose ends here with a complete final sentence.</p>
+  <p class="sig">Peter Thiel</p>
+  <p class="sig">January 6, 2020</p>
+  <p class="sig">Los Angeles</p>
+</section>
+</body></html>
+'''),
+    );
+
+    final Map<String, ExtractedBlock> byText = <String, ExtractedBlock>{
+      for (final ExtractedBlock block in chapter.blocks)
+        block.sourceText: block,
+    };
+    expect(byText['Peter Thiel']?.isAuthorSignature, isTrue);
+    expect(byText['January 6, 2020']?.isAuthorSignature, isFalse);
+    expect(byText['Los Angeles']?.isAuthorSignature, isFalse);
+
+    expect(
+      TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml: byText['Peter Thiel']!.sourceHtml,
+        translatedHtml: byText['Peter Thiel']!.sourceHtml,
+        targetLanguage: 'Chinese',
+        allowRetainedAuthorSignature: byText['Peter Thiel']!.isAuthorSignature,
+      ),
+      isNull,
+    );
+    expect(
+      TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml: byText['Los Angeles']!.sourceHtml,
+        translatedHtml: byText['Los Angeles']!.sourceHtml,
+        targetLanguage: 'Chinese',
+        allowRetainedAuthorSignature: byText['Los Angeles']!.isAuthorSignature,
+      )?.kind,
+      TranslationResidualKind.longSourceText,
+    );
+  });
+
+  test('does not mark a work title in a terminal preface metadata group', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Strategic Investment</p>
+  <p class="sig">January 6, 2020</p>
+  <p class="sig">Los Angeles</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('does not mark a place in the author position', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Los Angeles</p>
+  <p class="sig">January 6, 2020</p>
+  <p class="sig">California</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('requires the signature date to consume the complete row', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Peter Thiel</p>
+  <p class="sig">Drafted January 6, 2020 for publication</p>
+  <p class="sig">Los Angeles</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('requires the location row to consume the complete value', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Peter Thiel</p>
+  <p class="sig">January 6, 2020</p>
+  <p class="sig">Los Angeles and further explanatory prose</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('requires the signature group to end the semantic preface', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Peter Thiel</p>
+  <p class="sig">January 6, 2020</p>
+  <p class="sig">Los Angeles</p>
+  <p>Additional prose follows the supposed signature group.</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('does not mark a signature group inside a nonterminal wrapper', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <div>
+    <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+    <p class="sig">Peter Thiel</p>
+    <p class="sig">January 6, 2020</p>
+    <p class="sig">Los Angeles</p>
+  </div>
+  <p>Additional prose follows outside the wrapper.</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('requires one shared signature class across the complete group', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/preface.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Preface</title></head><body>
+<section epub:type="preface" role="doc-preface">
+  <p>The preface closes with enough ordinary prose to establish the boundary.</p>
+  <p class="sig">Peter Thiel</p>
+  <p class="signature">January 6, 2020</p>
+  <p class="author-signature">Los Angeles</p>
+</section>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
+  });
+
+  test('does not infer author signatures in an ordinary content chapter', () {
+    final InspectedChapter chapter = extractor.inspectChapterBytes(
+      chapterPath: 'OEBPS/chapter01.xhtml',
+      bytes: utf8.encode('''
+<html><head><title>Chapter One</title></head><body>
+  <p class="sig">Strategic Investment</p>
+  <p class="sig">January 6, 2020</p>
+</body></html>
+'''),
+    );
+
+    expect(
+      chapter.blocks.any((ExtractedBlock block) => block.isAuthorSignature),
+      isFalse,
+    );
   });
 
   test('direct TOC links are extracted as translatable link blocks', () {

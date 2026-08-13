@@ -163,6 +163,91 @@ void main() {
       },
     );
 
+    test('allows an explicitly classified author signature name', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p class="sig">Peter Thiel</p>',
+            translatedHtml: '<p class="sig">Peter Thiel</p>',
+            targetLanguage: 'Chinese',
+            allowRetainedAuthorSignature: true,
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows a classified author signature translated into Chinese', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p class="sig">Peter Thiel</p>',
+            translatedHtml: '<p class="sig">彼得·蒂尔</p>',
+            targetLanguage: 'Chinese',
+            allowRetainedAuthorSignature: true,
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('continues checking residual prose after a translated signature', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml: '<p class="sig">Peter Thiel</p>',
+        translatedHtml:
+            '<p class="sig">彼得·蒂尔 This sentence remains untranslated in the final output.</p>',
+        targetLanguage: 'Chinese',
+        allowRetainedAuthorSignature: true,
+      );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('rejects a classified signature changed to another English name', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p class="sig">Peter Thiel</p>',
+            translatedHtml: '<p class="sig">Thomas Thiel</p>',
+            targetLanguage: 'Chinese',
+            allowRetainedAuthorSignature: true,
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test('does not retain the same name without signature classification', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p class="sig">Peter Thiel</p>',
+            translatedHtml: '<p class="sig">Peter Thiel</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
+    test(
+      'does not classify a standalone signature-class place as an author',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p class="sig">Los Angeles</p>',
+              translatedHtml: '<p class="sig">Los Angeles</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
+
+    test('does not exempt nested markup in a classified author signature', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: '<p class="sig"><em>Peter Thiel</em></p>',
+            translatedHtml: '<p class="sig"><em>Peter Thiel</em></p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test(
       'still rejects an untranslated epigraph with a retained attribution',
       () {
