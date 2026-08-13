@@ -1318,6 +1318,130 @@ void main() {
       });
     });
 
+    group('inverted index person names', () {
+      for (final ({String inverted, String natural}) example
+          in <({String inverted, String natural})>[
+            (inverted: 'de Balsac, Robert,', natural: 'Robert de Balsac'),
+            (inverted: 'de Fiore, Joachim,', natural: 'Joachim de Fiore'),
+            (inverted: 'de Jager, Peter,', natural: 'Peter de Jager'),
+            (inverted: 'de Soto, Hernando,', natural: 'Hernando de Soto'),
+            (inverted: 'van Creveld, Martin,', natural: 'Martin van Creveld'),
+            (
+              inverted: 'Van Den Berghe, Pierre,',
+              natural: 'Pierre van den Berghe',
+            ),
+            (inverted: 'Dos Passos, John,', natural: 'John dos Passos'),
+          ]) {
+        test('allows retained ${example.inverted}', () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<li class="indexmain"><span epub:type="index-term">${example.inverted}</span> <a epub:type="index-locator" href="chapter.xhtml#page">44</a></li>',
+            translatedHtml:
+                '<li class="indexmain"><span epub:type="index-term">${example.inverted}</span> <a epub:type="index-locator" href="chapter.xhtml#page">44</a></li>',
+            targetLanguage: 'Chinese',
+          );
+
+          expect(finding, isNull);
+        });
+
+        test('allows natural-order ${example.natural}', () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<li class="indexmain"><span epub:type="index-term">${example.inverted}</span> <a epub:type="index-locator" href="chapter.xhtml#page">44</a></li>',
+            translatedHtml:
+                '<li class="indexmain"><span epub:type="index-term">${example.natural}</span> <a epub:type="index-locator" href="chapter.xhtml#page">44</a></li>',
+            targetLanguage: 'Chinese',
+          );
+
+          expect(finding, isNull);
+        });
+      }
+
+      test('does not exempt an inverted name outside an index term', () {
+        const String html =
+            '<li><span>de Jager, Peter,</span> <a href="#page">44</a></li>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt a non-person index phrase', () {
+        const String html =
+            '<li><span epub:type="index-term">de facto, rule of law,</span> <a epub:type="index-locator" href="#page">44</a></li>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt a nested index term', () {
+        const String html =
+            '<li><span epub:type="index-term"><em>de Jager, Peter,</em></span> <a epub:type="index-locator" href="#page">44</a></li>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: html,
+              translatedHtml: html,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt an index term when another attribute changes', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<li><span class="source" epub:type="index-term">de Jager, Peter,</span> <a epub:type="index-locator" href="#page">44</a></li>',
+          translatedHtml:
+              '<li><span class="translated" epub:type="index-term">de Jager, Peter,</span> <a epub:type="index-locator" href="#page">44</a></li>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt an index term when its path changes', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<li><span epub:type="index-term">de Jager, Peter,</span> <a epub:type="index-locator" href="#page">44</a></li>',
+          translatedHtml:
+              '<li><div><span epub:type="index-term">de Jager, Peter,</span></div> <a epub:type="index-locator" href="#page">44</a></li>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('continues checking prose outside a retained index name', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<li><span epub:type="index-term">de Jager, Peter,</span> includes an entitlement discussion.</li>',
+          translatedHtml:
+              '<li><span epub:type="index-term">Peter de Jager</span>包含entitlement讨论。</li>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'entitlement');
+      });
+    });
+
     test('does not treat the preposition in as a title citation cue', () {
       final TranslationResidualFinding?
       finding = TranslationQuality.findSuspiciousHtmlResidual(

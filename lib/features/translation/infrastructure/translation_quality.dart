@@ -212,6 +212,7 @@ class TranslationQuality {
     }
 
     _clearMatchingAuditedForeignTerms(sourceDocument, translatedDocument);
+    _clearMatchingInvertedIndexPersonNames(sourceDocument, translatedDocument);
     _clearRetainedProperNames(sourceDocument, translatedDocument);
 
     final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
@@ -817,6 +818,121 @@ class TranslationQuality {
       current = parent;
     }
     return segments.reversed.join('/');
+  }
+
+  static void _clearMatchingInvertedIndexPersonNames(
+    Document sourceDocument,
+    Document translatedDocument,
+  ) {
+    final List<Element> sourceTerms = sourceDocument
+        .querySelectorAll('span')
+        .where(_isLeafIndexTerm)
+        .toList(growable: false);
+    final List<Element> translatedTerms = translatedDocument
+        .querySelectorAll('span')
+        .where(_isLeafIndexTerm)
+        .toList(growable: false);
+    if (sourceTerms.length != translatedTerms.length) {
+      return;
+    }
+
+    for (int index = 0; index < sourceTerms.length; index += 1) {
+      final Element sourceElement = sourceTerms[index];
+      final Element translatedElement = translatedTerms[index];
+      final String? sourceName = _canonicalInvertedIndexPersonName(
+        sourceElement.text,
+      );
+      final String? translatedName =
+          _canonicalInvertedIndexPersonName(translatedElement.text) ??
+          _canonicalRetainedPersonName(_normalizeText(translatedElement.text));
+      if (sourceName == null ||
+          translatedName == null ||
+          sourceName != translatedName ||
+          !_sameElementAttributes(sourceElement, translatedElement) ||
+          _taggedElementStructurePath(sourceElement) !=
+              _taggedElementStructurePath(translatedElement)) {
+        continue;
+      }
+      sourceElement.text = '';
+      translatedElement.text = '';
+    }
+  }
+
+  static bool _sameElementAttributes(Element source, Element translated) {
+    if (source.attributes.length != translated.attributes.length) {
+      return false;
+    }
+    for (final MapEntry<Object, String> attribute
+        in source.attributes.entries) {
+      if (translated.attributes[attribute.key] != attribute.value) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool _isLeafIndexTerm(Element element) {
+    if (element.children.isNotEmpty || element.parent?.localName != 'li') {
+      return false;
+    }
+    return (element.attributes['epub:type'] ?? '')
+        .split(RegExp(r'\s+'))
+        .map((String token) => token.toLowerCase())
+        .contains('index-term');
+  }
+
+  static String? _canonicalInvertedIndexPersonName(String text) {
+    final String normalized = _normalizeText(text);
+    final List<String> commaParts = normalized
+        .split(',')
+        .map((String part) => part.trim())
+        .toList(growable: true);
+    if (commaParts.length == 3 && commaParts.last.isEmpty) {
+      commaParts.removeLast();
+    }
+    if (commaParts.length != 2 ||
+        commaParts.first.isEmpty ||
+        commaParts.last.isEmpty) {
+      return null;
+    }
+
+    final String surname = commaParts.first;
+    final String givenNames = commaParts.last;
+    final List<String> surnameWords = _englishWorkTitleWords(surname);
+    const Set<String> lowercaseSurnameParticles = <String>{
+      'da',
+      'de',
+      'del',
+      'der',
+      'di',
+      'dos',
+      'du',
+      'la',
+      'le',
+      'van',
+      'von',
+    };
+    if (surnameWords.length < 2 ||
+        !lowercaseSurnameParticles.contains(surnameWords.first.toLowerCase())) {
+      return null;
+    }
+
+    final List<String> normalizedSurnameWords = surnameWords
+        .map(
+          (String word) =>
+              lowercaseSurnameParticles.contains(word.toLowerCase())
+              ? word.toLowerCase()
+              : word,
+        )
+        .toList(growable: false);
+
+    final String naturalOrder =
+        '$givenNames ${normalizedSurnameWords.join(' ')}';
+    final List<String> naturalWords = _englishWorkTitleWords(naturalOrder);
+    if (naturalWords.length < 3 || naturalWords.length > 6) {
+      return null;
+    }
+    return _canonicalRetainedPersonName(naturalOrder);
   }
 
   static bool _hasSerialWorkTitleContext(
