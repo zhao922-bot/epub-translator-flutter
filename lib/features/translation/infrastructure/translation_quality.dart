@@ -776,12 +776,18 @@ class TranslationQuality {
     Document sourceDocument,
     Document translatedDocument,
   ) {
-    const Set<String> auditedTerms = <String>{
+    const Set<String> auditedNodeTexts = <String>{
+      'Homo economicus',
+      'civitas,',
+      'cullagium,"',
+      'militum perpetuum,',
       'pagus',
       'patria',
       'patricius',
-      'politique',
+      'politique,',
       'prophetae',
+      'ultimum refugium,',
+      '—de facto',
     };
     final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
     final List<Element> translatedInline = translatedDocument.querySelectorAll(
@@ -796,9 +802,6 @@ class TranslationQuality {
       final Element translatedElement = translatedInline[index];
       final String sourceText = _normalizeText(sourceElement.text);
       final String translatedText = _normalizeText(translatedElement.text);
-      final RegExpMatch? auditedTermMatch = RegExp(
-        r"^([A-Za-z][A-Za-z'-]*),?$",
-      ).firstMatch(sourceText);
       if (sourceElement.localName != translatedElement.localName ||
           _taggedElementStructurePath(sourceElement) !=
               _taggedElementStructurePath(translatedElement) ||
@@ -806,10 +809,7 @@ class TranslationQuality {
           translatedElement.children.isNotEmpty ||
           sourceElement.text != translatedElement.text ||
           sourceText != translatedText ||
-          auditedTermMatch == null ||
-          !auditedTerms.contains(
-            (auditedTermMatch.group(1) ?? '').toLowerCase(),
-          )) {
+          !auditedNodeTexts.contains(sourceElement.text)) {
         continue;
       }
       sourceElement.text = '';

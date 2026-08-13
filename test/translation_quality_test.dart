@@ -1277,6 +1277,66 @@ void main() {
         expect(finding?.token, 'politique');
       });
 
+      for (final String auditedNodeText in <String>[
+        '—de facto',
+        'civitas,',
+        'Homo economicus',
+        'militum perpetuum,',
+        'cullagium,"',
+        'ultimum refugium,',
+      ]) {
+        test('allows exact audited node text $auditedNodeText', () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>The historical expression is <i>$auditedNodeText</i>.</p>',
+            translatedHtml: '<p>这一历史表达是<i>$auditedNodeText</i>（术语）。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+          expect(finding, isNull);
+        });
+      }
+
+      test('does not exempt a near-match audited Latin phrase', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The expression is <i>ultimum refugium,</i>.</p>',
+              translatedHtml: '<p>这一表达是<i>ultimum refugium</i>（最后避难所）。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'ultimum');
+      });
+
+      test('does not normalize whitespace when matching an audited node', () {
+        const String sourceHtml =
+            '<p>The expression is <i> Homo economicus</i>.</p>';
+        const String translatedHtml =
+            '<p>这一表达是<i> Homo economicus</i>（经济人）。</p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
+      test('does not exempt an unaudited Latin-looking phrase', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The expression is <i>Homo sapiens</i>.</p>',
+              translatedHtml: '<p>这一表达是<i>Homo sapiens</i>（智人）。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      });
+
       test('allows two matching patria term nodes in one block', () {
         final TranslationResidualFinding?
         finding = TranslationQuality.findSuspiciousHtmlResidual(
