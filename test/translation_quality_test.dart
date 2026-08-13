@@ -1227,6 +1227,56 @@ void main() {
         });
       }
 
+      test('allows matching Old French politique with a trailing comma', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The expression derives from an Old French word, <i class="calibre3">politique,</i> used for opportunists.</p>',
+          translatedHtml:
+              '<p>这个说法源自古法语词<i class="calibre3">politique,</i>用来形容机会主义者。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test('does not exempt an ordinary italic word with a trailing comma', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>This point is <i>important,</i> not optional.</p>',
+              translatedHtml: '<p>这一点<i>important,</i>并非可选。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'important');
+      });
+
+      test('does not exempt politique when the inline comma changes', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The term is <i>politique,</i> in Old French.</p>',
+              translatedHtml: '<p>古法语术语是<i>politique</i>，用于此处。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'politique');
+      });
+
+      test('does not exempt politique outside italic markup', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>The Old French word was politique.</p>',
+              translatedHtml: '<p>古法语词是politique。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'politique');
+      });
+
       test('allows two matching patria term nodes in one block', () {
         final TranslationResidualFinding?
         finding = TranslationQuality.findSuspiciousHtmlResidual(

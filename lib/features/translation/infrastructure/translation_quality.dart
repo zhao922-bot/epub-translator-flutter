@@ -780,6 +780,7 @@ class TranslationQuality {
       'pagus',
       'patria',
       'patricius',
+      'politique',
       'prophetae',
     };
     final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
@@ -795,6 +796,9 @@ class TranslationQuality {
       final Element translatedElement = translatedInline[index];
       final String sourceText = _normalizeText(sourceElement.text);
       final String translatedText = _normalizeText(translatedElement.text);
+      final RegExpMatch? auditedTermMatch = RegExp(
+        r"^([A-Za-z][A-Za-z'-]*),?$",
+      ).firstMatch(sourceText);
       if (sourceElement.localName != translatedElement.localName ||
           _taggedElementStructurePath(sourceElement) !=
               _taggedElementStructurePath(translatedElement) ||
@@ -802,8 +806,10 @@ class TranslationQuality {
           translatedElement.children.isNotEmpty ||
           sourceElement.text != translatedElement.text ||
           sourceText != translatedText ||
-          !RegExp(r"^[A-Za-z][A-Za-z'-]*$").hasMatch(sourceText) ||
-          !auditedTerms.contains(sourceText.toLowerCase())) {
+          auditedTermMatch == null ||
+          !auditedTerms.contains(
+            (auditedTermMatch.group(1) ?? '').toLowerCase(),
+          )) {
         continue;
       }
       sourceElement.text = '';
