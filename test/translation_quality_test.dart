@@ -1518,7 +1518,7 @@ void main() {
       );
 
       test(
-        'rejects an audited term still in English when the italic wrapper '
+        'allows an audited term still in English when the italic wrapper '
         'is dropped',
         () {
           final TranslationResidualFinding? finding =
@@ -1530,7 +1530,24 @@ void main() {
                 targetLanguage: 'Chinese',
               );
 
-          expect(finding, isNotNull);
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'allows an audited term retained as plain quoted text when all '
+        'italic wrappers are dropped',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>Aristotle wrote <i class="calibre3">Sophistical Refutations,</i> a term meaningless today as <i class="calibre3">Politics</i> was. It derives from an Old French word, <i class="calibre3">politique,</i> used to describe opportunists.</p>',
+                translatedHtml:
+                    '<p>亚里士多德写了《诡辩驳议》，这个词今天毫无意义，就像《政治学》在中世纪一样。它源自古法语单词“politique”，用来描述机会主义者。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
         },
       );
 

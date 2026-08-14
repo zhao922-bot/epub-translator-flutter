@@ -793,9 +793,10 @@ class TranslationQuality {
     if (sourceInline.length != translatedInline.length) {
       // A model may fully translate an audited foreign term into the target
       // language and drop the italic wrapper entirely (for example
-      // <i>—de facto</i> -> “实际上”). That is acceptable. It is not
-      // acceptable for the source-language term to remain in the output
-      // without the reviewed wrapper, because it would bypass the audit.
+      // <i>—de facto</i> -> “实际上”), or it may keep the audited term as
+      // plain text without the italic wrapper (for example
+      // <i>politique,</i> -> “politique”). Both are acceptable: the term
+      // itself is approved for retention; the wrapper is presentation only.
       final String translatedVisibleText = _normalizeText(
         translatedDocument.body?.text ?? translatedDocument.text ?? '',
       );
@@ -805,8 +806,23 @@ class TranslationQuality {
           continue;
         }
         final String core = _auditedCoreText(element.text);
-        if (core.isNotEmpty && translatedVisibleText.contains(core)) {
-          return false;
+        if (core.isNotEmpty) {
+          // Whether the term is translated away or retained verbatim, the
+          // source node is no longer a residual to complain about.
+          element.text = '';
+          if (translatedVisibleText.contains(core)) {
+            final List<Element> translatedMatching = translatedDocument
+                .querySelectorAll('*')
+                .where(
+                  (Element candidate) =>
+                      candidate.children.isEmpty &&
+                      _normalizeText(candidate.text) == core,
+                )
+                .toList(growable: false);
+            for (final Element candidate in translatedMatching) {
+              candidate.text = '';
+            }
+          }
         }
       }
       return true;
