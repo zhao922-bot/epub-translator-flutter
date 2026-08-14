@@ -176,7 +176,7 @@ class TranslationApiClient {
     final dynamic rawContent =
         (responseData
             as Map<String, dynamic>)['choices']?[0]?['message']?['content'];
-    return switch (rawContent) {
+    final String content = switch (rawContent) {
       String value => value.trim(),
       List<dynamic> value =>
         value
@@ -189,6 +189,24 @@ class TranslationApiClient {
             .trim(),
       _ => '',
     };
+    return _stripReasoningBlocks(content);
+  }
+
+  /// Removes `<think>...</think>` reasoning blocks that reasoning models
+  /// (for example DeepSeek-R1 variants) may prepend to the visible content.
+  ///
+  /// These blocks are model-internal reasoning, not translation output; they
+  /// would otherwise break strict JSON parsing in batch mode and be mistaken
+  /// for untranslated source text in single-block mode.
+  String _stripReasoningBlocks(String content) {
+    final String stripped = content.replaceAllMapped(
+      RegExp(
+        r'<think(?:\s[^>]*)?>[\s\S]*?</think>',
+        caseSensitive: false,
+      ),
+      (Match match) => '',
+    );
+    return stripped.trim();
   }
 
   Map<String, dynamic> decodeJsonObject(String content) {
