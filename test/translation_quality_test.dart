@@ -1551,6 +1551,74 @@ void main() {
         },
       );
 
+      test(
+        'allows repeated audited terms mixed with translated work titles '
+        'when wrappers change',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
+                translatedHtml:
+                    '<p>对patria的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的patria。patria本身更可能是一个家乡。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'allows repeated audited terms in italics mixed with translated '
+        'work titles when source wrapper count changes',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
+                translatedHtml:
+                    '<p>对<i class="calibre3">patria</i>的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的<i class="calibre3">patria</i>。<i class="calibre3">patria</i>本身更可能是一个家乡。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'allows retained English work title with Chinese marker when '
+        'wrapper counts match',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing that ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
+                translatedHtml:
+                    '<p>在《十七世纪的普遍危机》(<i class="calibre3">The General Crisis of the Seventeenth Century</i>)中... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'allows translated work title inside italics without Chinese '
+        'book markers when it was fully translated',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
+                translatedHtml:
+                    '<p>... 在<i class="calibre3">17世纪的一般危机</i>中进一步阐明 ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
       test('does not exempt an audited term when attributes change', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(

@@ -174,13 +174,18 @@ class TranslationQuality {
         final Element translatedCandidate = translatedCandidates[index];
         final String sourceText = _normalizeText(sourceCandidate.text);
         final String translatedText = _normalizeText(translatedCandidate.text);
+        final bool hasChineseTitleMarker = RegExp(
+          r'[《「『〈》」』〉]',
+        ).hasMatch(translatedDocument.body?.text ?? '');
         final bool canExempt =
             sourceCandidate.localName == translatedCandidate.localName &&
             _elementStructurePath(sourceCandidate) ==
                 _elementStructurePath(translatedCandidate) &&
-            sourceText == translatedText &&
+            _normalizedWorkTitleText(sourceText) ==
+                _normalizedWorkTitleText(translatedText) &&
             _looksLikeEnglishWorkTitle(sourceText) &&
-            _hasWorkTitleSemantics(sourceDocument, sourceCandidate, sourceText);
+            (_hasWorkTitleSemantics(sourceDocument, sourceCandidate, sourceText) ||
+                hasChineseTitleMarker);
         if (canExempt) {
           exemptedCandidateIndexes.add(index);
           continue;
@@ -192,17 +197,55 @@ class TranslationQuality {
     } else {
       for (final Element sourceCandidate in sourceCandidates) {
         final String sourceText = _normalizeText(sourceCandidate.text);
-        if (_looksLikeEnglishWorkTitle(sourceText)) {
-          unexemptedSourceTexts.add(sourceText);
+        if (!_looksLikeEnglishWorkTitle(sourceText) ||
+            isAuditedForeignTermNodeText(sourceText)) {
+          continue;
         }
+        final Element? matchingTranslated = translatedCandidates
+            .where(
+              (Element candidate) =>
+                  _normalizedWorkTitleText(candidate.text) ==
+                      _normalizedWorkTitleText(sourceText) &&
+                  _looksLikeEnglishWorkTitle(
+                    _normalizedWorkTitleText(candidate.text),
+                  ),
+            )
+            .firstOrNull;
+        if (matchingTranslated != null) {
+          // The model kept the original English work title and supplied a
+          // translated gloss elsewhere in the block; this is the same
+          // retention accepted when wrapper counts match.
+          sourceCandidate.text = '';
+          matchingTranslated.text = '';
+          continue;
+        }
+        unexemptedSourceTexts.add(_normalizedWorkTitleText(sourceText));
       }
       final String translatedVisibleText = _normalizeText(
-        translatedDocument.body?.text ?? translatedDocument.text ?? '',
+        _stripSourceAuditedForeignTermsFromText(
+          sourceHtml,
+          translatedDocument.body?.text ?? translatedDocument.text ?? '',
+        ),
       );
-      if (_englishWorkTitleWords(translatedVisibleText).length >= 3) {
-        return const TranslationResidualFinding(
-          kind: TranslationResidualKind.longSourceText,
-        );
+      final bool hasChineseTitleMarker = RegExp(
+        r'[《「『〈]',
+      ).hasMatch(translatedVisibleText) ||
+          RegExp(r'[》」』〉]').hasMatch(translatedVisibleText) ||
+          translatedCandidates.any(
+            (Element candidate) => RegExp(
+              r'[\u3400-\u9FFF\u20000-\u2FA1F]',
+            ).hasMatch(candidate.text),
+          );
+      for (final String unexempted in unexemptedSourceTexts) {
+        // An unretained source work title that is neither kept verbatim nor
+        // translated into a Chinese title (marked with 《》 etc.) means the
+        // model dropped it entirely instead of translating the block.
+        if (!translatedVisibleText.contains(unexempted) &&
+            !hasChineseTitleMarker) {
+          return const TranslationResidualFinding(
+            kind: TranslationResidualKind.longSourceText,
+          );
+        }
       }
     }
 
@@ -224,7 +267,10 @@ class TranslationQuality {
     _clearRetainedProperNames(sourceDocument, translatedDocument);
 
     final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
-      translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      _stripSourceAuditedForeignTermsFromText(
+        sourceHtml,
+        translatedDocument.body?.text ?? translatedDocument.text ?? '',
+      ),
       targetLanguage: targetLanguage,
     );
     if (adjacentLowercaseWord != null) {
@@ -859,6 +905,17 @@ class TranslationQuality {
     return true;
   }
 
+  /// Normalizes a work-title candidate so trailing punctuation (for example
+  /// `The General Crisis of the Seventeenth Century,`) does not prevent
+  /// matching the same title retained without that punctuation in the
+  /// translation.
+  static String _normalizedWorkTitleText(String text) {
+    return _normalizeText(text).replaceFirst(
+      RegExp(r'[,;:。，；：.!?！？]+$'),
+      '',
+    );
+  }
+
   /// Audited source-language foreign terms that may legitimately stay in the
   /// translated text (typically historical Latin/Italian expressions).
   static const Map<String, Set<String>> auditedForeignTermNodes =
@@ -884,6 +941,7 @@ class TranslationQuality {
           'militum perpetuum，',
         },
         'pagus': <String>{'pagus'},
+        'patria,': <String>{'patria,', 'patria', 'patria，'},
         'patria': <String>{'patria'},
         'patricius': <String>{'patricius'},
         'politique,': <String>{'politique,', 'politique', 'politique，'},
@@ -915,6 +973,38 @@ class TranslationQuality {
   /// Whether [nodeText] is an exact audited foreign term source node.
   static bool isAuditedForeignTermNodeText(String nodeText) {
     return auditedForeignTermNodes.containsKey(nodeText);
+  }
+
+  /// Removes audited foreign terms that the *source* actually contains from
+  /// [text] before heuristic counts (for example work-title word counting and
+  /// CJK-adjacent checks) so retained terms such as `patria` or `de facto`
+  /// are not mistaken for untranslated English prose. Unreviewed source forms
+  /// (for example `agri deserti` without its audited comma form) stay intact
+  /// and continue to be flagged.
+  static String _stripSourceAuditedForeignTermsFromText(
+    String sourceHtml,
+    String text,
+  ) {
+    String stripped = text;
+    final Set<String> sourceCores = <String>{};
+    final Document sourceDocument = html_parser.parse(sourceHtml);
+    for (final Element element in sourceDocument.querySelectorAll('i, em')) {
+      if (element.children.isNotEmpty ||
+          !auditedForeignTermNodes.containsKey(element.text)) {
+        continue;
+      }
+      final String core = _auditedCoreText(element.text);
+      if (core.isNotEmpty) {
+        sourceCores.add(core);
+      }
+    }
+    for (final String core in sourceCores) {
+      stripped = stripped.replaceAll(
+        RegExp(RegExp.escape(core), caseSensitive: false),
+        ' ',
+      );
+    }
+    return stripped;
   }
 
   /// Strips surrounding punctuation/quotes/whitespace from an audited source
