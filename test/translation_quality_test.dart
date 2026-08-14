@@ -1500,6 +1500,40 @@ void main() {
         expect(finding, isNull);
       });
 
+      test(
+        'allows an audited term translated fully into Chinese when the '
+        'italic wrapper is dropped',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> or even overt hostage-taking.</p>',
+                translatedHtml:
+                    '<p>征税的最终形式——实际上就是劫持人质，甚至公开绑架。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'rejects an audited term still in English when the italic wrapper '
+        'is dropped',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> hostage-taking.</p>',
+                translatedHtml:
+                    '<p>征税的最终形式 —de facto 劫持人质。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNotNull);
+        },
+      );
+
       test('does not exempt an audited term when attributes change', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(

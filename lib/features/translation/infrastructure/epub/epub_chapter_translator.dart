@@ -1901,6 +1901,8 @@ class EpubChapterTranslator {
       trimmedTranslation,
     );
     bool wroteMainText = false;
+    final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
+        <({_HtmlTextSlot slot, String sourceText})>[];
     for (final _HtmlTextSlot slot in sourceSlots) {
       if (slot.protected) {
         continue;
@@ -1909,10 +1911,45 @@ class EpubChapterTranslator {
         slot.text = translatedPlainText;
         wroteMainText = true;
       } else {
+        final String sourceText = slot.text;
         slot.text = '';
+        emptiedSlots.add((slot: slot, sourceText: sourceText));
       }
     }
+    _removeEmptiedInlineEmphasis(emptiedSlots);
     return rebuiltRoot.outerHtml;
+  }
+
+  /// After rebuilding the source skeleton, inline emphasis wrappers whose
+  /// source text is an audited foreign term and that were emptied (for example
+  /// `<i class="calibre3">agri deserti,</i>` when the model folded the whole
+  /// translation into the first text slot) are removed. Keeping them would
+  /// make the residual checker treat the emptied node as an untranslated
+  /// audited term and reject a perfectly valid translation. Ordinary empty
+  /// emphasis wrappers are preserved so source skeletons stay stable.
+  static void _removeEmptiedInlineEmphasis(
+    List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots,
+  ) {
+    final Set<dom.Element> candidates = <dom.Element>{};
+    for (final ({_HtmlTextSlot slot, String sourceText}) entry
+        in emptiedSlots) {
+      if (!TranslationQuality.isAuditedForeignTermNodeText(
+        entry.sourceText.trim(),
+      )) {
+        continue;
+      }
+      final dom.Node? parent = entry.slot.node.parentNode;
+      if (parent is dom.Element &&
+          (parent.localName == 'i' || parent.localName == 'em')) {
+        candidates.add(parent);
+      }
+    }
+    for (final dom.Element element in candidates) {
+      if (element.children.isNotEmpty || element.text.trim().isNotEmpty) {
+        continue;
+      }
+      element.remove();
+    }
   }
 
   static bool _overflowTextFitsSourceSlots({

@@ -9,6 +9,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_quality.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:html/parser.dart' as html_parser;
 
@@ -2510,6 +2511,44 @@ void main() {
 
       expect(locked, '<p class="lead" id="p1">你好 <em>世界</em>。</p>');
     });
+
+    test(
+      'removes emptied inline emphasis after rebuilding a folded translation',
+      () {
+        final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+          sourceHtml:
+              '<p>Some of the <i class="calibre3">agri deserti,</i> or deserted farms were brought back.</p>',
+          translatedHtml: '<p>部分荒废农地重新开垦利用。</p>',
+        );
+
+        expect(locked, '<p>部分荒废农地重新开垦利用。</p>');
+        expect(locked, isNot(contains('<i')));
+      },
+    );
+
+    test(
+      'folded audited term translation passes residual check after lock',
+      () {
+        const String sourceHtml =
+            '<p class="noindent">Some of the <i class="calibre3">agri deserti,</i> or deserted farms were brought back into production.</p>';
+        const String modelHtml =
+            '<p class="noindent">部分荒废农地被重新开垦利用。</p>';
+        final String locked =
+            EpubTranslationRepository.lockHtmlStructureForTest(
+              sourceHtml: sourceHtml,
+              translatedHtml: modelHtml,
+            );
+        expect(locked, isNot(contains('<i')));
+        expect(
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: locked,
+            targetLanguage: 'Chinese',
+          ),
+          isNull,
+        );
+      },
+    );
 
     test('keeps original links when the model removes footnote anchors', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(

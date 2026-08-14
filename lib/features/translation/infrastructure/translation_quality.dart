@@ -785,65 +785,31 @@ class TranslationQuality {
     Document translatedDocument, {
     required String targetLanguage,
   }) {
-    const Map<String, Set<String>> auditedNodeTexts = <String, Set<String>>{
-      'Homo economicus': <String>{'Homo economicus'},
-      'agri deserti,': <String>{
-        'agri deserti,',
-        'agri deserti',
-        'agri deserti，',
-      },
-      'civitas,': <String>{'civitas,', 'civitas', 'civitas，'},
-      'cullagium,"': <String>{
-        'cullagium,"',
-        'cullagium',
-        'cullagium,',
-        'cullagium，',
-        'cullagium,”',
-        'cullagium，”',
-      },
-      'militum perpetuum,': <String>{
-        'militum perpetuum,',
-        'militum perpetuum',
-        'militum perpetuum，',
-      },
-      'pagus': <String>{'pagus'},
-      'patria': <String>{'patria'},
-      'patricius': <String>{'patricius'},
-      'politique,': <String>{'politique,', 'politique', 'politique，'},
-      'plentitude potestatis': <String>{'plentitude potestatis'},
-      '“sistema del potere,”': <String>{
-        '“sistema del potere,”',
-        'sistema del potere',
-        'sistema del potere,',
-        '“sistema del potere”',
-        'sistema del potere，',
-        '“sistema del potere，”',
-      },
-      'prophetae': <String>{'prophetae'},
-      'ultimum refugium,': <String>{
-        'ultimum refugium,',
-        'ultimum refugium',
-        'ultimum refugium，',
-      },
-      '—de facto': <String>{
-        '—de facto',
-        '——de facto',
-        '–de facto',
-        '-de facto',
-        '--de facto',
-        'de facto',
-      },
-    };
+    const Map<String, Set<String>> auditedNodeTexts = auditedForeignTermNodes;
     final List<Element> sourceInline = sourceDocument.querySelectorAll('i, em');
     final List<Element> translatedInline = translatedDocument.querySelectorAll(
       'i, em',
     );
     if (sourceInline.length != translatedInline.length) {
-      return !sourceInline.any(
-        (Element element) =>
-            element.children.isEmpty &&
-            auditedNodeTexts.containsKey(element.text),
+      // A model may fully translate an audited foreign term into the target
+      // language and drop the italic wrapper entirely (for example
+      // <i>—de facto</i> -> “实际上”). That is acceptable. It is not
+      // acceptable for the source-language term to remain in the output
+      // without the reviewed wrapper, because it would bypass the audit.
+      final String translatedVisibleText = _normalizeText(
+        translatedDocument.body?.text ?? translatedDocument.text ?? '',
       );
+      for (final Element element in sourceInline) {
+        if (element.children.isNotEmpty ||
+            !auditedNodeTexts.containsKey(element.text)) {
+          continue;
+        }
+        final String core = _auditedCoreText(element.text);
+        if (core.isNotEmpty && translatedVisibleText.contains(core)) {
+          return false;
+        }
+      }
+      return true;
     }
 
     for (int index = 0; index < sourceInline.length; index += 1) {
@@ -875,6 +841,77 @@ class TranslationQuality {
       translatedElement.text = '';
     }
     return true;
+  }
+
+  /// Audited source-language foreign terms that may legitimately stay in the
+  /// translated text (typically historical Latin/Italian expressions).
+  static const Map<String, Set<String>> auditedForeignTermNodes =
+      <String, Set<String>>{
+        'Homo economicus': <String>{'Homo economicus'},
+        'agri deserti,': <String>{
+          'agri deserti,',
+          'agri deserti',
+          'agri deserti，',
+        },
+        'civitas,': <String>{'civitas,', 'civitas', 'civitas，'},
+        'cullagium,"': <String>{
+          'cullagium,"',
+          'cullagium',
+          'cullagium,',
+          'cullagium，',
+          'cullagium,”',
+          'cullagium，”',
+        },
+        'militum perpetuum,': <String>{
+          'militum perpetuum,',
+          'militum perpetuum',
+          'militum perpetuum，',
+        },
+        'pagus': <String>{'pagus'},
+        'patria': <String>{'patria'},
+        'patricius': <String>{'patricius'},
+        'politique,': <String>{'politique,', 'politique', 'politique，'},
+        'plentitude potestatis': <String>{'plentitude potestatis'},
+        '“sistema del potere,”': <String>{
+          '“sistema del potere,”',
+          'sistema del potere',
+          'sistema del potere,',
+          '“sistema del potere”',
+          'sistema del potere，',
+          '“sistema del potere，”',
+        },
+        'prophetae': <String>{'prophetae'},
+        'ultimum refugium,': <String>{
+          'ultimum refugium,',
+          'ultimum refugium',
+          'ultimum refugium，',
+        },
+        '—de facto': <String>{
+          '—de facto',
+          '——de facto',
+          '–de facto',
+          '-de facto',
+          '--de facto',
+          'de facto',
+        },
+      };
+
+  /// Whether [nodeText] is an exact audited foreign term source node.
+  static bool isAuditedForeignTermNodeText(String nodeText) {
+    return auditedForeignTermNodes.containsKey(nodeText);
+  }
+
+  /// Strips surrounding punctuation/quotes/whitespace from an audited source
+  /// node so we can detect whether the source-language term still appears in
+  /// the translated text (for example `—de facto` -> `de facto`).
+  static String _auditedCoreText(String value) {
+    return value.replaceAll(
+      RegExp(
+        r'^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$',
+        unicode: true,
+      ),
+      '',
+    );
   }
 
   static String _taggedElementStructurePath(Element element) {

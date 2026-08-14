@@ -49,4 +49,63 @@ void main() {
       throwsA(isA<FormatException>()),
     );
   });
+
+  test('strips reasoning think blocks from message content', () {
+    final String content = client.extractMessageContent(
+      <String, dynamic>{
+        'choices': <dynamic>[
+          <String, dynamic>{
+            'message': <String, dynamic>{
+              'content':
+                  '<think>I should translate this heading into Chinese.</think>\n'
+                      '{"blocks":[{"id":"h3-4","html":"<h3 class=\\"h2\\"><i class=\\"calibre5\\">想法成为财富</i></h3>"}]}',
+            },
+          },
+        ],
+      },
+    );
+    expect(content, isNot(contains('think')));
+    expect(content, startsWith('{'));
+    expect(
+      (client.decodeJsonObject(content)['blocks'] as List<dynamic>).single,
+      containsPair('id', 'h3-4'),
+    );
+  });
+
+  test('strips think blocks even when they contain JSON-looking text', () {
+    final String content = client.extractMessageContent(
+      <String, dynamic>{
+        'choices': <dynamic>[
+          <String, dynamic>{
+            'message': <String, dynamic>{
+              'content':
+                  '<think>{"blocks":[]} should not be parsed</think>'
+                      '{"blocks":[{"id":"p1","html":"<p>译文</p>"}]}',
+            },
+          },
+        ],
+      },
+    );
+    expect(content, isNot(contains('should not be parsed')));
+    expect(
+      client.decodeJsonObject(content)['blocks'] as List<dynamic>,
+      hasLength(1),
+    );
+  });
+
+  test('keeps content without think blocks unchanged', () {
+    const String raw = '{"blocks":[{"id":"p1","html":"<p>译文</p>"}]}';
+    expect(
+      client.extractMessageContent(
+        <String, dynamic>{
+          'choices': <dynamic>[
+            <String, dynamic>{
+              'message': <String, dynamic>{'content': raw},
+            },
+          ],
+        },
+      ),
+      raw,
+    );
+  });
 }
