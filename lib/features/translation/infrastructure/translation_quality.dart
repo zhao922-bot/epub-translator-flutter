@@ -810,6 +810,7 @@ class TranslationQuality {
       'patria': <String>{'patria'},
       'patricius': <String>{'patricius'},
       'politique,': <String>{'politique,', 'politique', 'politique，'},
+      'plentitude potestatis': <String>{'plentitude potestatis'},
       'prophetae': <String>{'prophetae'},
       'ultimum refugium,': <String>{
         'ultimum refugium,',

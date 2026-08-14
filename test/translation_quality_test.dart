@@ -1266,6 +1266,34 @@ void main() {
         expect(finding?.token, 'deserti');
       });
 
+      test(
+        'allows retained Latin plentitude potestatis with its translated gloss',
+        () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>Especially the <i class="calibre3">plentitude potestatis</i> (fullness of power) of the pope.</p>',
+            translatedHtml:
+                '<p>尤其是教皇的<i class="calibre3">plentitude potestatis</i>（充分权力）。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test('does not exempt an unreviewed plentitude residual form', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>Especially the <i>plentitude</i> of power.</p>',
+              translatedHtml: '<p>尤其是<i>plentitude</i>权力。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'plentitude');
+      });
+
       test('does not exempt an ordinary italic word with a trailing comma', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
