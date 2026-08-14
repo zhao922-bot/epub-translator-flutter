@@ -1294,6 +1294,31 @@ void main() {
         expect(finding?.token, 'plentitude');
       });
 
+      test('allows retained Italian sistema del potere with its translated gloss', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>What the Sicilians call the <i class="calibre3">“sistema del potere,”</i> the “system of power,” of organized crime.</p>',
+          translatedHtml:
+              '<p>西西里人所谓的<i class="calibre3">“sistema del potere,”</i>（权力体系），在有组织犯罪中作用日益重要。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      });
+
+      test('does not exempt an unreviewed sistema residual form', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p>They call it the <i>sistema</i> of power.</p>',
+              translatedHtml: '<p>他们称之为权力的<i>sistema</i>。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'sistema');
+      });
+
       test('does not exempt an ordinary italic word with a trailing comma', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(

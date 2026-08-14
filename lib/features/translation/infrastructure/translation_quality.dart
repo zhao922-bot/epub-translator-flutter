@@ -811,6 +811,14 @@ class TranslationQuality {
       'patricius': <String>{'patricius'},
       'politique,': <String>{'politique,', 'politique', 'politique，'},
       'plentitude potestatis': <String>{'plentitude potestatis'},
+      '“sistema del potere,”': <String>{
+        '“sistema del potere,”',
+        'sistema del potere',
+        'sistema del potere,',
+        '“sistema del potere”',
+        'sistema del potere，',
+        '“sistema del potere，”',
+      },
       'prophetae': <String>{'prophetae'},
       'ultimum refugium,': <String>{
         'ultimum refugium,',
