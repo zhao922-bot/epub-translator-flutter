@@ -1619,6 +1619,38 @@ void main() {
         },
       );
 
+      test(
+        'allows Latin endnote abbreviation op. cit. retained in italics',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<li>Durant, <i class="calibre3">op. cit.,</i> p. 43.</li>',
+                translatedHtml:
+                    '<li>杜兰特, <i class="calibre3">op. cit.,</i> 第43页.</li>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test(
+        'allows op. cit. translated to Chinese endnote gloss',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<li>Durant, <i class="calibre3">op. cit.,</i> p. 43.</li>',
+                translatedHtml:
+                    '<li>杜兰特, <i class="calibre3">同上引文</i> 第43页.</li>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
       test('does not exempt an audited term when attributes change', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
