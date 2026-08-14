@@ -2082,6 +2082,15 @@ void main() {
             (name: 'Microsoft', translatedHtml: '<p>由Microsoft提供。</p>'),
             (name: 'UN', translatedHtml: '<p>由UN发布。</p>'),
             (
+              name: 'domain company name',
+              translatedHtml: '<p>例如Amazon.com，都能提供手册。</p>',
+            ),
+            (
+              name: 'domain company name as anchor',
+              translatedHtml:
+                  '<p>例如 <a href="https://www.amazon.com/">Amazon.com</a>，都能提供手册。</p>',
+            ),
+            (
               name: 'URL',
               translatedHtml: '<p>访问https://example.com/path获取详情。</p>',
             ),
