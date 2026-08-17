@@ -56,6 +56,45 @@ void main() {
       );
     });
 
+    test('half-width forward gloss folds to full-width on first occurrence', () {
+      final ProperNameBookState state = ProperNameNormalizer.bookState();
+      final String out = ProperNameNormalizer.normalizeHtml(
+        '<p>亚当·斯密 (Adam Smith) 的核心思想。</p>'
+        '<p>Adam Smith也这样认为。</p>',
+        mappings,
+        targetLanguage: 'Chinese',
+        state: state,
+      );
+      expect(out, contains('亚当·斯密（Adam Smith）的核心思想'));
+      expect(out, contains('亚当·斯密也这样认为'));
+      // The half-width pair must not survive anywhere in the block.
+      expect(RegExp(r'\bAdam Smith\)').hasMatch(out), isFalse);
+      expect(RegExp(r'Adam Smith\s*（').hasMatch(out), isFalse);
+      // The Chinese name must not be double-wrapped with its own gloss.
+      expect(RegExp(r'亚当·斯密（亚当·斯密').hasMatch(out), isFalse);
+    });
+
+    test('name split by a pagebreak anchor still matches and stays clean', () {
+      final ProperNameBookState state = ProperNameNormalizer.bookState();
+      final String out = ProperNameNormalizer.normalizeHtml(
+        '<p>即Pierre Van Den <span id="page_281" epub:type="pagebreak" '
+        'role="doc-pagebreak" aria-label="281"></span>Berghe所称的。</p>'
+        '<p>Van Den Berghe也作此论断。</p>',
+        mappings,
+        targetLanguage: 'Chinese',
+        state: state,
+      );
+      expect(
+        out,
+        contains('即Pierre 范登·伯格（Van Den Berghe）所称的'),
+      );
+      expect(out, contains('范登·伯格也作此论断'));
+      // The pagebreak anchor must not survive inside the gloss.
+      expect(RegExp(r'<span').hasMatch(out), isFalse);
+      // The gloss must not be duplicated on the already-annotated name.
+      expect(RegExp(r'范登·伯格（范登·伯格').hasMatch(out), isFalse);
+    });
+
     test('leaves endnotes / bibliography untouched', () {
       final String out = ProperNameNormalizer.normalizeHtml(
         '<li class="endnotes1">Adam Smith，《国富论》（The Wealth of Nations），第8页。</li>',

@@ -83,6 +83,7 @@ class ProperNameNormalizer {
     final String prefixed = _prefixAndSuffixLatinIdentifiers(html);
     String working = prefixed;
     for (final ProperNameMap mapping in mappings) {
+      working = _canonicalizeForwardHalfWidthGloss(working, mapping);
       working = _canonicalizeReverseGlosses(working, mapping);
       working = _normalizeNameInHtml(
         working,
@@ -95,6 +96,35 @@ class ProperNameNormalizer {
     // Remove the placeholder sentinels left around latin identifiers so they
     // stay untouched (URLs, footnotes anchors, work-title glosses, ...).
     return _stripIdentifierSentinels(working);
+  }
+
+  /// Folds a half-width forward gloss `中文 (English)` to the canonical
+  /// `中文（English）` shape BEFORE the bare-name state machine runs, so a
+  /// model that emitted `亚当·斯密 (Adam Smith)` converges to the same
+  /// full-width shape as everything else instead of being double-glossed.
+  static String _canonicalizeForwardHalfWidthGloss(
+    String html,
+    ProperNameMap mapping,
+  ) {
+    final String source = RegExp.escape(mapping.source);
+    final RegExp pattern = RegExp(
+      r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' +
+          source +
+          r'\s*\)\s*',
+    );
+    if (!pattern.hasMatch(html)) {
+      return html;
+    }
+    final StringBuffer output = StringBuffer();
+    int cursor = 0;
+    for (final Match match in pattern.allMatches(html)) {
+      output
+        ..write(html.substring(cursor, match.start))
+        ..write('${match.group(1)?.trim()}（${mapping.source}）');
+      cursor = match.end;
+    }
+    output.write(html.substring(cursor));
+    return output.toString();
   }
 
   static bool _isBibliographicOrIndexEntry(String html) {
@@ -113,7 +143,7 @@ class ProperNameNormalizer {
     ProperNameBookState? state,
   }) {
     final String source = RegExp.escape(mapping.source);
-    final RegExp english = RegExp(source, caseSensitive: false);
+    final RegExp english = _tolerantNamePattern(mapping.source);
     if (!english.hasMatch(html)) {
       return html;
     }
@@ -140,7 +170,7 @@ class ProperNameNormalizer {
       }
       output
         ..write(html.substring(cursor, match.start))
-        ..write('${mapping.target}（${mapping.source}）');
+        ..write('${mapping.target}（${_cleanLooseHtmlTokens(raw)}）');
       state?.countedNames.add(mapping.source);
       cursor = match.end;
     }
@@ -151,15 +181,46 @@ class ProperNameNormalizer {
     return output.toString();
   }
 
+  /// Builds a matching regex for a possibly multi-token proper name. Tokens
+  /// may be separated by whitespace and by an empty inline tag pair (for
+  /// example an EPUB `pagebreak` anchor embedded in the middle of a model
+  /// returned translation), so `Pierre Van Den <span…></span>Berghe` still
+  /// matches the locked `Van Den Berghe`.
+  static RegExp _tolerantNamePattern(String source) {
+    final String escaped = RegExp.escape(source);
+    if (!RegExp(r'\s').hasMatch(source)) {
+      return RegExp(escaped, caseSensitive: false);
+    }
+    final String emptyTagPair = r'<[^>]+>\s*</[^>]+>';
+    final String gap = r'[\s\u00A0]*(?:' + emptyTagPair + r')?[\s\u00A0]*';
+    final String pattern = source
+        .split(RegExp(r'\s+'))
+        .map(RegExp.escape)
+        .join(gap);
+    return RegExp(pattern, caseSensitive: false);
+  }
+
+  /// Strips any empty inline tag pairs / bare tags that the tolerant matcher
+  /// may have travelled through so the parenthetical keeps a clean Latin
+  /// name (a pagebreak anchor is meaningless inside a gloss).
+  static String _cleanLooseHtmlTokens(String value) {
+    return value
+        .replaceAll(RegExp(r'<[^>]+>\s*</[^>]+>'), '')
+        .replaceAll(RegExp(r'<[^>]+>'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
   /// Whether [match] spans an English name that is embedded inside an
-  /// already-canonical `中文（English）` gloss: preceded by an opening paren
-  /// or followed by a closing paren (ignoring whitespace).
+  /// already-canonical `中文（English）` gloss — a full-width paren pair that
+  /// is the shape we emit. A half-width `(English)` pair is NOT canonical: it
+  /// must be folded to full-width so the whole book converges on one shape.
   static bool _isCanonicalGlossInnerName(String html, Match match) {
     final bool precededByOpen = RegExp(
-      r'[（(]\s*$',
+      r'[（]\s*$',
     ).hasMatch(html.substring(0, match.start));
     final bool followedByClose = RegExp(
-      r'^\s*[)）]',
+      r'^\s*[）]',
     ).hasMatch(html.substring(match.end));
     return precededByOpen || followedByClose;
   }
