@@ -2941,15 +2941,25 @@ class EpubChapterTranslator {
       );
     } on FormatException {
       if (requests.length == 1) {
-        return _translateProtectedSlotsIndividually(
-          dio: dio,
-          config: config,
-          request: requests.single,
-          context: context,
-          retryDelayOverride: retryDelayOverride,
-          cancelToken: cancelToken,
-          onRequestAttempt: onRequestAttempt,
-        );
+        try {
+          return await _translateProtectedSlotsIndividually(
+            dio: dio,
+            config: config,
+            request: requests.single,
+            context: context,
+            retryDelayOverride: retryDelayOverride,
+            cancelToken: cancelToken,
+            onRequestAttempt: onRequestAttempt,
+          );
+        } on FormatException catch (error) {
+          if (_isQualityRejection(error)) {
+            degradedBlockIds.add(requests.single.block.id);
+            return <String, String>{
+              requests.single.id: requests.single.block.sourceHtml,
+            };
+          }
+          rethrow;
+        }
       }
     } on DioException catch (error) {
       if (_isCancelError(error)) {

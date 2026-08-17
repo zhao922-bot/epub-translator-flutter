@@ -595,6 +595,90 @@ class _ProtectedSlotQualityRetryAdapter implements HttpClientAdapter {
   }
 }
 
+class _ProtectedSlotAlwaysResidualAdapter implements HttpClientAdapter {
+  int strictRequestCount = 0;
+  int plainRequestCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    try {
+      final Object? decoded = jsonDecode(userContent);
+      if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+        strictRequestCount += 1;
+        final List<dynamic> blocks = decoded['blocks'] as List<dynamic>;
+        return ResponseBody.fromString(
+          jsonEncode(<String, Object?>{
+            'choices': <Object?>[
+              <String, Object?>{
+                'message': <String, Object?>{
+                  'content': jsonEncode(<String, Object?>{
+                    'blocks': <Object?>[
+                      for (final dynamic block in blocks)
+                        <String, Object?>{
+                          'id': block['id'],
+                          'slots': <Object?>[
+                            for (final dynamic slot in block['slots'] as List<dynamic>)
+                              <String, Object?>{
+                                'id': slot['id'],
+                                'text': 'This English sentence never gets translated.',
+                              },
+                          ],
+                        },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          200,
+          headers: <String, List<String>>{
+            Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+          },
+        );
+      }
+      throw const FormatException();
+    } on FormatException {
+      plainRequestCount += 1;
+      // Individual-slot fallback: keep the source English so the rendered
+      // block still fails the residual-quality gate on every attempt.
+      return ResponseBody.fromString(
+        jsonEncode(<String, Object?>{
+          'choices': <Object?>[
+            <String, Object?>{
+              'message': <String, Object?>{
+                'content': 'This English sentence never gets translated.',
+              },
+            },
+          ],
+        }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+      );
+    }
+  }
+}
+
 class _ProtectedSlotPayloadTooLargeAdapter implements HttpClientAdapter {
   int strictRequestCount = 0;
   int plainRequestCount = 0;
@@ -1558,8 +1642,52 @@ void main() {
     },
   );
 
- test(
-   'retries a complete individual-slot round after rebuilt HTML fails quality',
+  test(
+    'degrades a protected-slot block instead of aborting when residuals persist',
+    () async {
+      final _ProtectedSlotAlwaysResidualAdapter adapter =
+          _ProtectedSlotAlwaysResidualAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+      final EpubChapterTranslator translator = EpubChapterTranslator();
+      final List<String> translated = await translator.translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'protected-slot-degrade',
+            tagName: 'p',
+            sourceHtml:
+                '<p>The church had a unique position to preserve peace and '
+                'establish rules for an order that transcended fragmented '
+                'local sovereignty.<a href="#n1"><span>[1]</span></a> '
+                'This was a task that no secular power could have '
+                'undertaken on its own.</p>',
+            sourceText:
+                'The church had a unique position to preserve peace and '
+                'establish rules for an order that transcended fragmented '
+                'local sovereignty. [1] This was a task that no secular power '
+                'could have undertaken on its own.',
+          ),
+        ],
+      );
+
+      expect(translated, hasLength(1));
+      expect(
+        translator.getDegradedBlockIdsForTest(),
+        contains('protected-slot-degrade'),
+      );
+      expect(adapter.strictRequestCount, greaterThan(0));
+      expect(adapter.plainRequestCount, greaterThan(0));
+    },
+  );
+
+  test(
+    'retries a complete individual-slot round after rebuilt HTML fails quality',
     () async {
       final _ProtectedSlotQualityRetryAdapter adapter =
           _ProtectedSlotQualityRetryAdapter();
