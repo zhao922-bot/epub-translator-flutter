@@ -2,10 +2,10 @@
 
 一款面向整本书翻译的 Flutter EPUB 工具。它不只是把文本发送给模型，而是围绕 EPUB 结构解析、风格确认、上下文翻译、质量校验、断点续传和兼容性输出，提供完整的书籍翻译工作流。
 
-当前版本：**v1.2.0**
+当前版本：**v1.3.0**
 
 - Windows x64：已验证并发布完整便携包。
-- Android：保留源码与构建支持；v1.2.0 暂不发布 APK，待完成真机全链路验证后再提供。
+- Android：保留源码与构建支持；v1.3.0 暂不发布 APK，待完成真机全链路验证后再提供。
 
 ## 核心能力
 
@@ -67,13 +67,13 @@
 
 从 [GitHub Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) 下载：
 
-`epub-translator-flutter-v1.2.0-windows-x64-portable.zip`
+`epub-translator-flutter-v1.3.0-windows-x64-portable.zip`
 
 完整解压 ZIP 后运行 `epub_translator_flutter_clean.exe`。请不要只单独复制 EXE；Flutter Windows 程序还需要同目录中的 DLL 和 `data` 文件夹。
 
 当前发布包面向 64 位 Windows。由于应用暂未进行商业代码签名，Windows SmartScreen 首次运行时可能显示安全提醒。
 
-## v1.2.0 重点更新
+## v1.3.0 重点更新
 
 - 新增翻译前风格档案生成、置信度展示和用户编辑确认。
 - 优化风格采样，避免目录、索引等页面干扰书籍类型判断。
@@ -102,7 +102,7 @@ Windows 构建输出位于：
 build\windows\x64\runner\Release\
 ```
 
-Android 构建命令仍可使用，但 v1.2.0 未将 APK 列为正式验证和发布产物：
+Android 构建命令仍可使用，但 v1.3.0 未将 APK 列为正式验证和发布产物：
 
 ```powershell
 flutter build apk --release
