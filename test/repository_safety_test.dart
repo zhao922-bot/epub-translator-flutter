@@ -379,7 +379,8 @@ class _ResidualDegradeAdapter implements HttpClientAdapter {
     final String source = '$sourceHtml'.toLowerCase();
     if (source.contains('sovereign individual') ||
         source.contains('untranslated')) {
-      return '<p>The Sovereign Individual remains untranslated here.</p>';
+      return '<p>This sentence still has many English words remaining '
+          'untranslated in the result.</p>';
     }
     return '<p>已翻译。</p>';
   }
