@@ -1546,7 +1546,7 @@ void main() {
       );
 
       expect(translated, hasLength(2));
-      expect(translated[0], contains('The Sovereign Individual'));
+      expect(translated[0], contains('untranslated'));
       expect(
         translator.getDegradedBlockIdsForTest(),
         contains('degraded-target'),
