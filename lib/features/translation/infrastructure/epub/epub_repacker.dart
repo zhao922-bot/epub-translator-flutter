@@ -12,6 +12,7 @@ import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'proper_name_normalizer.dart';
 import 'protected_anchor_text_slots.dart';
 import 'xhtml_html_compatibility.dart';
 
@@ -103,6 +104,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
 
     throwIfCancelled();
+    final ProperNameBookState properNameState = ProperNameNormalizer.bookState();
     final Map<String, String> translatedHtmlByPath = <String, String>{
       for (final InspectedChapter chapter in chapters)
         if (chapter.includeInTranslation)
@@ -110,6 +112,8 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
             chapter: chapter,
             bilingual: config.bilingual,
             targetLanguage: config.targetLanguage,
+            lockedGlossary: config.lockedGlossary,
+            properNameState: properNameState,
           ),
     };
     _synchronizeHtmlTocLabels(translatedHtmlByPath, chapters);
@@ -142,7 +146,12 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     required InspectedChapter chapter,
     required bool bilingual,
     String targetLanguage = 'Chinese',
+    String lockedGlossary = '',
+    ProperNameBookState? properNameState,
   }) {
+    final List<ProperNameMap> nameMappings = ProperNameNormalizer.parseGlossary(
+      lockedGlossary,
+    );
     final dom.Document document = html_parser.parse(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(chapter.originalHtml),
     );
@@ -162,9 +171,17 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       );
       containsCjkTranslation =
           containsCjkTranslation || _containsCjk(normalizedTranslation);
-      final String replacement = bilingual
+      var replacement = bilingual
           ? '${target.outerHtml}\n${_sanitizeForBilingual(normalizedTranslation)}'
           : _safelyUnwrapReplacementForStructuralTag(target, normalizedTranslation);
+      if (nameMappings.isNotEmpty) {
+        replacement = ProperNameNormalizer.normalizeHtml(
+          replacement,
+          nameMappings,
+          targetLanguage: targetLanguage,
+          state: properNameState,
+        );
+      }
       _replaceNodeWithHtml(target, replacement);
     }
     if (containsCjkTranslation) {

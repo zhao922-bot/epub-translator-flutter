@@ -230,8 +230,9 @@ class AppStrings {
       : 'Generate a style profile after inspection, or fill it in manually.';
   String get textScaleLabel => isChinese ? '字号' : 'Text size';
   String get lockedGlossary => isChinese ? '锁定术语表' : 'Locked glossary';
-  String get lockedGlossaryHint =>
-      isChinese ? '每行：原文 => 译文' : 'One per line: source => target';
+  String get lockedGlossaryHint => isChinese
+      ? '每行：原文 => 译文。首个出现会给中文（原文），之后只给中文。'
+      : 'One per line: source => target. First occurrence keeps 中文（原文）, later occurrences are Chinese only.';
   String get supportedPlatformsNote =>
       isChinese ? '支持 Windows、Android' : 'Windows, Android';
   String get accessibilitySection => isChinese ? '无障碍' : 'Accessibility';
