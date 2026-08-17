@@ -164,7 +164,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
           containsCjkTranslation || _containsCjk(normalizedTranslation);
       final String replacement = bilingual
           ? '${target.outerHtml}\n${_sanitizeForBilingual(normalizedTranslation)}'
-          : normalizedTranslation;
+          : _safelyUnwrapReplacementForStructuralTag(target, normalizedTranslation);
       _replaceNodeWithHtml(target, replacement);
     }
     if (containsCjkTranslation) {
@@ -174,6 +174,42 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       );
     }
     return XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
+  }
+
+  /// Table cells (`td` / `th`) must keep their wrapper element or the table
+  /// layout collapses. The model is allowed to return the inner content
+  /// without the cell wrapper (`<p>…</p>` instead of `<td>…</td>`), so if the
+  /// first node of the replacement is not the same structural tag, we wrap it
+  /// back with the original tag and its attributes.
+  String _safelyUnwrapReplacementForStructuralTag(
+    dom.Element target,
+    String replacementHtml,
+  ) {
+    final String tag = target.localName ?? '';
+    if (tag != 'td' && tag != 'th') {
+      return replacementHtml;
+    }
+    final dom.DocumentFragment fragment = html_parser.parseFragment(
+      XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
+      container: target.parent?.localName ?? 'body',
+    );
+    final dom.Node? first = fragment.nodes.isEmpty ? null : fragment.nodes.first;
+    if (first is dom.Element && first.localName == tag) {
+      return replacementHtml;
+    }
+    final StringBuffer attrs = StringBuffer();
+    for (final MapEntry<Object, String> entry in target.attributes.entries) {
+      attrs.write(' ${entry.key}="${_escapeAttr(entry.value)}"');
+    }
+    return '<$tag$attrs>$replacementHtml</$tag>';
+  }
+
+  static String _escapeAttr(String value) {
+    return value
+        .replaceAll('&', '&amp;')
+        .replaceAll('"', '&quot;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
   }
 
   void _replaceNodeWithHtml(dom.Element target, String replacementHtml) {

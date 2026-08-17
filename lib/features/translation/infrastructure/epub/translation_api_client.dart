@@ -399,7 +399,14 @@ class TranslationApiClient {
   }
 
   static bool shouldFallbackBatchDioException(DioException error) {
-    return error.response?.statusCode == 413;
+    if (error.response?.statusCode == 413) {
+      return true;
+    }
+    // A receive timeout on a large batch often means the endpoint is too slow
+    // for the whole batch rather than that translation failed. Fall back to
+    // smaller single-block requests, which are far less likely to time out,
+    // instead of failing the entire translation run.
+    return error.type == DioExceptionType.receiveTimeout;
   }
 
   static bool shouldRetryBatchError(Object error) {

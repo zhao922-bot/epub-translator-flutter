@@ -269,6 +269,37 @@ void main() {
       },
     );
 
+    test(
+      'allows a translated epigraph whose dash attribution stays in English',
+      () {
+        const String sourceHtml = '''
+<blockquote class="blockquote2a">
+  <p class="block"><i class="calibre3">&ldquo;[C]onsider the definition of a
+    racketeer as someone who creates a threat and then charges for its
+    reduction. Governments&rsquo; provision of protection, by this standard,
+    often qualifies as racketeering.&rdquo;</i></p>
+  <p class="att">—CHARLES TILLY</p>
+</blockquote>
+''';
+        const String translatedHtml = '''
+<blockquote class="blockquote2a">
+  <p class="block"><i class="calibre3">&ldquo;[考]虑敲诈勒索者的定义：制造威胁，
+    然后收取降低威胁的费用。按照这个标准，政府提供的保护往往也符合敲诈勒索的
+    特征。&rdquo;</i></p>
+  <p class="att">—CHARLES TILLY</p>
+</blockquote>
+''';
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      },
+    );
+
     test('still rejects a partly untranslated epigraph quotation', () {
       final TranslationResidualFinding? finding =
           TranslationQuality.findSuspiciousHtmlResidual(
@@ -604,6 +635,32 @@ void main() {
 
       expect(finding, isNull);
     });
+
+    test(
+      'allows a repeated retained two-word italic newsletter name inside '
+      'translated prose',
+      () {
+        const String sourceHtml =
+            '<p>Time after time, <i>Strategic Investment</i> has scooped the '
+            'world. In its first issue, <i>Strategic Investment</i> pinpointed '
+            'a member of the Soviet Politburo, Mikhail Gorbachev. Before he '
+            'took power, <i>Strategic Investment</i> obtained an interview.</p>';
+        const String translatedHtml =
+            '<p>一次又一次，<i>Strategic Investment</i>在新闻发生之前就抢先预测。'
+            '在创刊号中，<i>Strategic Investment</i>精准锁定了一位苏联政治局'
+            '（Politburo）成员——米哈伊尔·戈尔巴乔夫（Mikhail Gorbachev）。'
+            '在他尚未掌权之前，<i>Strategic Investment</i>就获得了采访。</p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translatedHtml,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      },
+    );
 
     test(
       'still rejects untranslated acknowledgments prose that keeps titles',
@@ -1093,6 +1150,32 @@ void main() {
             sourceHtml:
                 '<p>The system improves large language model inference.</p>',
             translatedHtml: '<p>系统改进了 large language model inference。</p>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('allows an English book title glossed in Chinese brackets', () {
+      const String sourceHtml =
+          '<p class="indent">In fact, the word <i class="calibre3">international'
+          '</i> was invented by Jeremy Bentham in 1789. It was first used in '
+          'his book <i class="calibre3">An Introduction to the Principles of '
+          'Morals and Legislation.</i> Bentham wrote, &ldquo;The word <i '
+          'class="calibre3">international</i> it must be acknowledged, is a new '
+          'one.&rdquo;</p>';
+      const String translatedHtml =
+          '<p class="indent">事实上，"国际的"（<i class="calibre3">international'
+          '</i>）这个词是杰里米·边沁于1789年创造的。它首次出现在他的著作'
+          '<i class="calibre3">《道德与立法原理导论》（An Introduction to the '
+          'Principles of Morals and Legislation）</i>中。边沁写道："\'国际的\''
+          '（<i class="calibre3">international</i>）这个词，必须承认，是一个'
+          '新词。"</p>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: translatedHtml,
             targetLanguage: 'Chinese',
           );
 
@@ -1703,6 +1786,60 @@ void main() {
         expect(finding, isNull);
       });
 
+      test(
+        'allows an audited term with normalized straight quotes and dropped '
+        'comma',
+        () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>What the Sicilians call the <i>&ldquo;sistema del '
+                    'potere,&rdquo;</i> the &ldquo;system of power,&rdquo; of '
+                    'organized crime has an increasingly important role.</p>',
+                translatedHtml:
+                    '<p>西西里人所说的<i>"sistema del potere"</i>，即"权力体系"，'
+                    '这一有组织犯罪的权力体系发挥着日益重要的作用。</p>',
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test('allows a proper-name original gloss with a lowercase word', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>Clinton&rsquo;s step-uncle, Raymond Clinton, to whom '
+                  'Bill Clinton referred as a &ldquo;father figure,&rdquo; '
+                  'was reputedly a leading &ldquo;Godfather&rdquo; figure in '
+                  'the Dixie mafia.</p>',
+              translatedHtml:
+                  '<p>克林顿的继叔雷蒙德·克林顿（Raymond Clinton），被比尔·'
+                  '克林顿称为"父亲般的人物"，据传是南方黑手党（Dixie mafia）中'
+                  '一位举足轻重的"教父"级人物。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+
+      test('allows a retained legal case name like Roe v. Wade', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>The language of the Declaration of Independence was not '
+                  'applied to embryos by the justices in <i>Roe</i> v. '
+                  '<i>Wade.</i></p>',
+              translatedHtml:
+                  '<p>《独立宣言》的语言也未被<i>Roe</i> v. <i>Wade</i>案的'
+                  '大法官们适用于胚胎。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+
       test('does not exempt the translatable historical word scriptoria', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
@@ -2110,6 +2247,52 @@ void main() {
 
       for (final ({String name, String translatedHtml}) example
           in <({String name, String translatedHtml})>[
+            (
+              name: 'full-width parenthesized gloss',
+              translatedHtml: '<p>这种过程称为伐林开垦（assarting）。</p>',
+            ),
+            (
+              name: 'half-width parenthesized gloss',
+              translatedHtml: '<p>这种过程称为伐林开垦(assarting)。</p>',
+            ),
+            (
+              name: 'full-width parenthesized gloss in emphasis',
+              translatedHtml:
+                  '<p>这种过程称为<i>伐林开垦（assarting）</i>。</p>',
+            ),
+            (
+              name: 'parenthesized gloss with comma in source',
+              translatedHtml: '<p>这种过程称为伐林开垦（assarting），后来。</p>',
+            ),
+          ]) {
+        test('allows ${example.name} beside CJK', () {
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml:
+                    '<p>This process, known as <i>assarting,</i> gave an outlet.</p>',
+                translatedHtml: example.translatedHtml,
+                targetLanguage: 'Chinese',
+              );
+
+          expect(finding, isNull);
+        });
+      }
+
+      test('flags an unparenthesized gloss still beside CJK', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>This process, known as assarting, gave an outlet.</p>',
+              translatedHtml: '<p>这种过程称为伐林开垦assarting。</p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
+        expect(finding?.token, 'assarting');
+      });
+
+      for (final ({String name, String translatedHtml}) example
+          in <({String name, String translatedHtml})>[
             (name: 'PayPal', translatedHtml: '<p>使用PayPal支付。</p>'),
             (name: 'Microsoft', translatedHtml: '<p>由Microsoft提供。</p>'),
             (name: 'UN', translatedHtml: '<p>由UN发布。</p>'),
@@ -2292,6 +2475,294 @@ void main() {
         expect(finding?.kind, TranslationResidualKind.cjkAdjacentLowercaseWord);
         expect(finding?.token, 'entitlement');
       });
+    });
+
+    group('retained short lowercase transliteration', () {
+      test('allows a pinyin gloss retained inside its own inline node', () {
+        const String sourceHtml =
+            '<p class="indent"><span id="page_391" epub:type="pagebreak" '
+            'role="doc-pagebreak" aria-label="391"></span>Confucius taught '
+            'that we should always behave with moderation (he called the '
+            'Golden Mean <i class="calibre3">chum yum,</i> at least as it was '
+            'translated by seventeenth-century scholars). He also taught that '
+            'we should respect authority and treat others as we would wish to '
+            'be treated ourselves. That teaching is twenty-five hundred years '
+            'old. As a tradition it influenced China for all recorded history, '
+            'but Confucianism seems an outmoded tradition to many modern '
+            'Chinese, who do not value moderation, who respect force rather '
+            'than authority, and certainly do not treat others as they would '
+            'wish to be treated themselves. With the loss of tradition, '
+            'societies can lose the whole vocabulary of their moral consensus. '
+            'China, with all its advancing power, is now a morally backward '
+            'country compared to Tibet, impoverished and oppressed as the '
+            'Tibetans are.</p>';
+        const String translated =
+            '<p class="indent"><span id="page_391" epub:type="pagebreak" '
+            'role="doc-pagebreak" aria-label="391"></span>孔子教导我们应当始终'
+            '举止有度（他将中庸之道称为"中庸"（<i class="calibre3">chum yum'
+            '</i>），至少在十七世纪学者的译法中如此）。他还教导我们应当尊重权威，'
+            '并以己所欲施于人。这一教诲已有两千五百年的历史。作为一种传统，它影响了'
+            '整个有史记载以来的中国，但对许多现代中国人而言，儒家学说似乎是一种过时'
+            '的传统——他们不重视中庸之道，崇尚武力而非权威，当然也不会以己所欲施于'
+            '人。随着传统的丧失，社会可能会失去其道德共识的整套语汇。尽管中国国力'
+            '日益强盛，但与西藏相比，如今它在道德上却是一个落后的国度，尽管西藏人民'
+            '贫困且遭受压迫。</p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translated,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+
+      test('allows a two-word lowercase transliteration alone', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: '<p><i>chum yum,</i></p>',
+              translatedHtml: '<p><i>chum yum</i></p>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+    });
+
+    group('retained anchor text shaped like a domain path', () {
+      test('allows an author URL anchor without www prefix', () {
+        const String sourceHtml =
+            '<p class="authorm1">FOR MORE ON THESE AUTHORS:<br '
+            'class="calibre9"/><a href="http://www.simonandschuster.com/'
+            'authors/James-Dale-Davidson" class="calibre4">'
+            'SimonandSchuster.com/authors/James-Dale-Davidson</a><br '
+            'class="calibre9"/><a href="http://www.simonandschuster.com/'
+            'authors/Lord-William-Rees-Mogg/" class="calibre4">'
+            'SimonandSchuster.com/authors/Lord-William-Rees-Mogg/</a></p>';
+        const String translated =
+            '<p class="authorm1">了解更多关于这些作者的信息：<br '
+            'class="calibre9"/><a href="http://www.simonandschuster.com/'
+            'authors/James-Dale-Davidson" class="calibre4">'
+            'SimonandSchuster.com/authors/James-Dale-Davidson</a><br '
+            'class="calibre9"/><a href="http://www.simonandschuster.com/'
+            'authors/Lord-William-Rees-Mogg/" class="calibre4">'
+            'SimonandSchuster.com/authors/Lord-William-Rees-Mogg/</a></p>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: sourceHtml,
+              translatedHtml: translated,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      });
+    });
+
+    group('bibliographic entry retention', () {
+      const String liSource =
+          '<li class="endnotes1" value="13"><a id="ch01-en13" '
+          'href="part0007_split_007.html#ch01en13" class="calibre4">13</a>.'
+          '&#160;Frederic C. Lane, "Economic Consequences of Organized '
+          'Violence," <i class="calibre3">The Journal of Economic History,'
+          '</i> vol. 18, no. 4 (December 1958), p. 402.</li>';
+
+      test('allows retained author/title fields once the entry is translated',
+          () {
+        const String translated =
+            '<li class="endnotes1" value="13"><a id="ch01-en13" '
+            'href="part0007_split_007.html#ch01en13" class="calibre4">13</a>.'
+            '&#160;Frederic C. Lane, "有组织暴力的经济后果，" <i class='
+            '"calibre3">经济史杂志</i>, vol. 18, no. 4 (December 1958), '
+            'p. 402.</li>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: liSource,
+              translatedHtml: translated,
+              targetLanguage: 'Chinese',
+              allowBibliographicRetention: true,
+            );
+
+        expect(finding, isNull);
+      });
+
+      test(
+          'still rejects a completely untranslated bibliography entry',
+          () {
+            final TranslationResidualFinding? finding =
+                TranslationQuality.findSuspiciousHtmlResidual(
+                  sourceHtml: liSource,
+                  translatedHtml: liSource,
+                  targetLanguage: 'Chinese',
+                  allowBibliographicRetention: true,
+                );
+
+            expect(finding?.kind, TranslationResidualKind.longSourceText);
+          },
+      );
+
+      test('a bibliography entry without the opt-in is still checked', () {
+        const String translated =
+            '<li class="endnotes1" value="13"><a id="ch01-en13" '
+            'href="part0007_split_007.html#ch01en13" class="calibre4">13</a>.'
+            '&#160;Frederic C. Lane, "有组织暴力的经济后果，" <i class='
+            '"calibre3">经济史杂志</i>, vol. 18, no. 4 (December 1958), '
+            'p. 402.</li>';
+
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: liSource,
+              translatedHtml: translated,
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNotNull,
+            reason:
+                'Without the bibliographic opt-in, original-language fields '
+                'in a reference entry are still treated as residuals.');
+      });
+
+      test(
+          'allows a translated endnote that retains the journal name in i',
+          () {
+            const String source =
+                '<li class="endnotes1" value="14"><a id="ch01-en14" '
+                'href="part0007_split_008.html#ch01en14" class="calibre4">14'
+                '</a>.&#160;Nicholas Colchester, “Goodbye Nation-State, Hello… '
+                'What?,” <i class="calibre3">New York Times,</i> July 17, 1994,'
+                ' p. E17.</li>';
+            const String translated =
+                '<li class="endnotes1" value="14"><a id="ch01-en14" '
+                'href="part0007_split_008.html#ch01en14" class="calibre4">14'
+                '</a>.&#160;Nicholas Colchester, “再见民族国家，你好……什么？, ” '
+                '<i class="calibre3">New York Times,</i> 1994年7月17日, '
+                'E17页。</li>';
+
+            final TranslationResidualFinding? finding =
+                TranslationQuality.findSuspiciousHtmlResidual(
+                  sourceHtml: source,
+                  translatedHtml: translated,
+                  targetLanguage: 'Chinese',
+                  allowBibliographicRetention: true,
+                );
+
+            expect(finding, isNull);
+          },
+      );
+
+      test('detects pure citation-metadata endnotes', () {
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            '17. Fiorentini and Peltzman, op. cit., p. 15.',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata('21. Ibid.'),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata('32. Hirshleifer, '
+              'op. cit., p. 173.'),
+          isTrue,
+        );
+      });
+
+      test('does not treat prose-bearing endnotes as pure metadata', () {
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'The details about bridges and infrastructure are mainly from '
+            'Ibid.',
+          ),
+          isFalse,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'Frederic C. Lane, "Economic Consequences of Organized Violence," '
+            'The Journal of Economic History, vol. 18, no. 4 (December 1958), '
+            'p. 402.',
+          ),
+          isFalse,
+        );
+      });
+
+      test('treats index-term entries with page numbers as pure metadata', () {
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'Abu-Lughod, Janet, 213, 215',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata('Agricola, Rodolph, 118'),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata('Bawer, Bruce, 264n'),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'bin Laden, Osama, 21–22, 37, 193',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'de Soto, Hernando, 149, 150',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'Leonardo da Vinci, 318',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'Hayek, Friedrich A. von, 40, 216, 218',
+          ),
+          isTrue,
+        );
+        expect(
+          TranslationQuality.isPureCitationMetadata(
+            'van Creveld, Martin, 96, 100–101, 107',
+          ),
+          isTrue,
+        );
+      });
+
+      test(
+        'exempts pure index-metadata li from residual check only when '
+        'bibliographic retention is allowed',
+        () {
+          const String source =
+              '<li class="indexmain" id="idx1_1"><span epub:type="index-term">'
+              'Abu-Lughod, Janet,</span> <a epub:type="index-locator" '
+              'href="part0013_split_007.html#page_213" class="calibre4">213</a>, '
+              '<a epub:type="index-locator" '
+              'href="part0013_split_008.html#page_215" '
+              'class="calibre4">215</a></li>';
+          final TranslationResidualFinding? allowed =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: source,
+                translatedHtml: source,
+                targetLanguage: 'Chinese',
+                allowBibliographicRetention: true,
+              );
+          expect(allowed, isNull);
+          final TranslationResidualFinding? rejected =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: source,
+                translatedHtml: source,
+                targetLanguage: 'Chinese',
+              );
+          expect(rejected, isNotNull);
+        },
+      );
     });
   });
 }

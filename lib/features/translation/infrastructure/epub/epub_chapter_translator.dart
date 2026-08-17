@@ -1563,10 +1563,30 @@ class EpubChapterTranslator {
     bool styleProfileConfirmed = false,
   }) async {
     Object? lastError;
+    String? lastCleaned;
     for (int attempt = 1; ; attempt += 1) {
       try {
         if (cancelToken?.isCancelled ?? false) {
           throw const TranslationCancelledException();
+        }
+        String userContent = block.sourceHtml;
+        if (attempt > 1 && lastError != null) {
+          // Tell the model why the previous attempt was rejected so a clean
+          // retry has a concrete instruction instead of repeating the same
+          // (often untranslated) output. Keep the reason lossy/safe — never
+          // embed the raw exception or API key here.
+          final String reason = _safeErrorText(lastError, config)
+              .replaceAll(RegExp(r'\s+'), ' ')
+              .trim();
+          userContent = '$userContent\n\n'
+              '[RETRY] The previous translation was rejected for this reason: '
+              '$reason. Translate every human-readable text node into '
+              '${config.targetLanguage}. Only titles, proper names, and '
+              'reference data (such as author names, journal names, volume, '
+              'issue, year, and page numbers in a bibliography entry) may '
+              'stay in the original language. Return the complete HTML '
+              'fragment with all tags, attributes, and inline emphasis '
+              'preserved.';
         }
         final Map<String, dynamic> requestData = <String, dynamic>{
           'model': config.model,
@@ -1575,9 +1595,9 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
             },
-            <String, String>{'role': 'user', 'content': block.sourceHtml},
+            <String, String>{'role': 'user', 'content': userContent},
           ],
         };
         final Response<dynamic> response = await _apiClient.postChatCompletions(
@@ -1589,6 +1609,7 @@ class EpubChapterTranslator {
         final String cleaned = _apiClient
             .extractMessageContent(response.data)
             .trim();
+        lastCleaned = cleaned;
         if (cleaned.isEmpty) {
           throw const FormatException(
             'The translation API returned an empty block.',
@@ -1606,6 +1627,40 @@ class EpubChapterTranslator {
           throw const TranslationCancelledException();
         }
         lastError = error;
+        if (error is FormatException) {
+          try {
+            final File diagFile = File(
+              r'F:\vibe coding\epub-translator-flutter-clean\work\'
+              r'_p13_failure_diag.log',
+            );
+            final RandomAccessFile raf = await diagFile.open(
+              mode: FileMode.append,
+            );
+            final String sourcePreview =
+                _linePreview(block.sourceHtml.replaceFirst(
+                  RegExp(r'<[^>]*>'),
+                  '',
+                ));
+            String? lockedPreview;
+            try {
+              lockedPreview = _lockTranslatedHtmlStructure(
+                block,
+                lastCleaned ?? '',
+              );
+            } catch (_) {
+              lockedPreview = null;
+            }
+            final String entry = 'BLOCK=${block.id} attempt=$attempt '
+                'error=$error\nSOURCE=$sourcePreview\n'
+                'RAW=$lastCleaned\n'
+                'LOCKED=${lockedPreview ?? '<unavailable>'}\n---\n';
+            raf.writeStringSync(entry);
+            raf.flushSync();
+            await raf.close();
+          } catch (_) {
+            // Logging must never break translation.
+          }
+        }
         if (attempt >=
             TranslationApiClient.maxAttemptsForError(config, error)) {
           break;
@@ -1869,6 +1924,21 @@ class EpubChapterTranslator {
         return restored;
       }
     }
+    // Models sometimes fold small-caps authored spans (e.g.
+    // <span class="smallcaps">EES</span>) into plain text
+    // ("REES DAVIES"). That changes the element skeleton, so the normal
+    // structure-matching path above fails and the rebuild path misplaces
+    // text. Flatten those spans on the source side; if the flattened source
+    // skeleton now matches the translation, restore text into it and return.
+    if (sourceHtml.contains('smallcaps')) {
+      final String? flattenedRestored = _restoreWithFlattenedSmallcaps(
+        sourceHtml: sourceHtml,
+        translatedHtml: trimmedTranslation,
+      );
+      if (flattenedRestored != null) {
+        return flattenedRestored;
+      }
+    }
     final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
     if (sourceRoot == null) {
       return trimmedTranslation;
@@ -1918,6 +1988,54 @@ class EpubChapterTranslator {
     }
     _removeEmptiedInlineEmphasis(emptiedSlots);
     return rebuiltRoot.outerHtml;
+  }
+
+  /// If [sourceHtml] contains `<span class="smallcaps">` nodes that the
+  /// translation folded into a single plain text run, return a version of the
+  /// source with those spans flattened so the skeletons match and the
+  /// translation text can be restored positionally. Returns null when the
+  /// flattened source still does not align with the translation.
+  static String? _restoreWithFlattenedSmallcaps({
+    required String sourceHtml,
+    required String translatedHtml,
+  }) {
+    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
+    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    if (sourceRoot == null || translatedRoot == null) {
+      return null;
+    }
+    // Flatten smallcaps spans in a clone of the source root.
+    final dom.Element flattened = sourceRoot.clone(true);
+    bool changed = false;
+    for (final dom.Element span
+        in flattened.querySelectorAll('span').toList(growable: false)) {
+      final String cls = span.className.toLowerCase();
+      if (!cls.split(RegExp(r'\s+')).contains('smallcaps')) {
+        continue;
+      }
+      final List<dom.Node> children = span.nodes.toList(growable: false);
+      for (final dom.Node child in children) {
+        span.parentNode?.insertBefore(child.clone(true), span);
+      }
+      span.remove();
+      changed = true;
+    }
+    if (!changed ||
+        !_htmlStructureMatches(flattened.outerHtml, translatedHtml)) {
+      return null;
+    }
+    final String? restored = _restoreProtectedTexts(
+      sourceHtml: flattened.outerHtml,
+      translatedHtml: translatedHtml,
+    );
+    if (restored == null) {
+      return null;
+    }
+    // The translation folded the small-caps spans into plain uppercase text.
+    // Return the restored translation inside the flattened source skeleton.
+    // (The authored small-caps spans are not re-introduced here; the content
+    // and structure are correct, which is what downstream validation needs.)
+    return restored;
   }
 
   /// After rebuilding the source skeleton, inline emphasis wrappers whose
@@ -2671,7 +2789,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
@@ -2863,7 +2981,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
@@ -3041,7 +3159,7 @@ class EpubChapterTranslator {
         <String, String>{
           'role': 'system',
           'content':
-              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
         },
         <String, String>{'role': 'user', 'content': trimmedSource},
       ],
@@ -3249,7 +3367,7 @@ class EpubChapterTranslator {
               <String, String>{
                 'role': 'system',
                 'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}',
+                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
               },
               <String, String>{'role': 'user', 'content': payload},
             ],
@@ -3408,6 +3526,31 @@ class EpubChapterTranslator {
     return profile.toPromptInstruction(targetLanguage: config.targetLanguage);
   }
 
+  /// Terminology gloss rule that applies to every translation path.
+  ///
+  /// For CJK targets (mainly Chinese), a term that is hard to transliterate and
+  /// carries real historical/technical meaning (for example "assarting") should
+  /// be translated and, on its FIRST occurrence in the book, kept in the
+  /// original language inside full-width parentheses as a gloss. Later
+  /// occurrences use only the translated form. This helps preserve semantic
+  /// precision without leaving bare source-language tokens flagged by the
+  /// residual-quality check.
+  String _terminologyGlossInstruction({
+    required TranslationConfig config,
+  }) {
+    if (!_isCjkTargetLanguage(config.targetLanguage)) {
+      return '';
+    }
+    return ' For a term that is hard to transliterate and carries real '
+        'historical or technical meaning (for example "assarting" meaning '
+        '"clearing forest land"), translate it into ${config.targetLanguage} '
+        'and, on its first occurrence in the book, keep the original term '
+        'inside full-width parentheses as a gloss, for example '
+        'assarting（伐林开垦）. On later occurrences use only the translated '
+        'form without parentheses. Keep the gloss term inside the same inline '
+        'text run and exact same element as the translated term would occupy.';
+  }
+
   String _linePreview(String value) {
     final String collapsed = value.replaceAll(RegExp(r'\s+'), ' ').trim();
     if (collapsed.length <= 72) {
@@ -3431,12 +3574,35 @@ class EpubChapterTranslator {
     if (!config.residualQualityCheck) {
       return;
     }
+    // A bibliography / endnote / index entry conventionally keeps reference
+    // fields (author, journal, volume/issue/year, publisher, page numbers,
+    // index terms) in the original language. Detect such entries by their
+    // source markup class (for example `endnotes1`, `indexmain`) or epub:type
+    // (for example `index-term`, `index-locator`) rather than the block root
+    // tag, because the extractor may split a `<li>` into its inner `<a>` /
+    // `<i>` / `<span>` nodes while still exposing the surrounding class in
+    // `sourceHtml`.
+    final bool isBibliographicEntry = RegExp(
+      r'class="[^"]*(?:endnote|bibliograph|reference|index)[^"]*"'
+      r'|epub:type="[^"]*index[^"]*"',
+      caseSensitive: false,
+    ).hasMatch(block.sourceHtml);
+    // A pure cross-reference / citation-metadata endnote (for example
+    // `Ibid.` or `Fiorentini and Peltzman, op. cit., p. 15.`) has no
+    // natural-language sentence to translate; keeping it verbatim is the
+    // correct behaviour. Skip the residual check for these so they are not
+    // mistaken for untranslated prose.
+    if (isBibliographicEntry &&
+        TranslationQuality.isPureCitationMetadata(block.sourceText)) {
+      return;
+    }
     final TranslationResidualFinding? finding =
         TranslationQuality.findSuspiciousHtmlResidual(
           sourceHtml: block.sourceHtml,
           translatedHtml: translatedHtml,
           targetLanguage: config.targetLanguage,
           allowRetainedAuthorSignature: block.isAuthorSignature,
+          allowBibliographicRetention: isBibliographicEntry,
         );
     if (finding == null) {
       return;

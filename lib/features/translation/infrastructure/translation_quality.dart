@@ -77,6 +77,7 @@ class TranslationQuality {
     required String sourceText,
     required String translatedText,
     required String targetLanguage,
+    Set<String> sourceWorkTitles = const <String>{},
   }) {
     if (!shouldCheckResidual(targetLanguage)) {
       return false;
@@ -127,7 +128,9 @@ class TranslationQuality {
     }
     if (_hasSuspiciousEnglishRun(
       text,
-      allowTitleLikeRun: _looksLikeBibliographicCitation(sourceText),
+      allowTitleLikeRun:
+          _looksLikeBibliographicCitation(sourceText) ||
+          sourceWorkTitles.isNotEmpty,
     )) {
       return true;
     }
@@ -143,12 +146,19 @@ class TranslationQuality {
     required String translatedHtml,
     required String targetLanguage,
     bool allowRetainedAuthorSignature = false,
+    bool allowBibliographicRetention = false,
   }) {
     if (!shouldCheckResidual(targetLanguage)) {
       return null;
     }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
+    // Capture source inline work titles BEFORE any clearing below empties the
+    // `<i>/<em>/<cite>` nodes, so retained work titles can be recognised later
+    // even when the source copy was scrubbed by term/name handling.
+    final Set<String> sourceInlineWorkTitles = _sourceInlineWorkTitles(
+      sourceDocument,
+    );
     if (allowRetainedAuthorSignature &&
         !_prepareAuthorSignatureForResidualCheck(
           sourceDocument,
@@ -165,6 +175,10 @@ class TranslationQuality {
     final List<Element> translatedCandidates = _outermostWorkTitleCandidates(
       translatedDocument,
     );
+    final Set<String> sourceWorkTitles = sourceCandidates
+        .map((Element candidate) => _normalizedWorkTitleText(candidate.text))
+        .where(_looksLikeEnglishWorkTitle)
+        .toSet();
     final List<int> exemptedCandidateIndexes = <int>[];
     final List<String> unexemptedSourceTexts = <String>[];
 
@@ -217,6 +231,20 @@ class TranslationQuality {
           // retention accepted when wrapper counts match.
           sourceCandidate.text = '';
           matchingTranslated.text = '';
+          continue;
+        }
+        // The model may instead render the book title as a bilingual gloss in
+        // a single node: 《中文书名》（English original title）. The English
+        // original is retained only as a parenthetical gloss, exactly like
+        // the separate-node form handled above, so treat it as matched too.
+        final bool translatedGlossRetained = translatedCandidates.any(
+          (Element candidate) => _isWorkTitleGlossRetention(
+            candidate.text,
+            sourceText,
+          ),
+        );
+        if (translatedGlossRetained) {
+          sourceCandidate.text = '';
           continue;
         }
         unexemptedSourceTexts.add(_normalizedWorkTitleText(sourceText));
@@ -280,13 +308,30 @@ class TranslationQuality {
       );
     }
 
-    if (_hasRemainingTranslatedInlineResidual(translatedDocument)) {
+    if (_hasRemainingTranslatedInlineResidual(
+      translatedDocument,
+      sourceInlineWorkTitles: sourceInlineWorkTitles,
+    )) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
       );
     }
 
-    if (_hasSourceOwnedShortEnglishProse(sourceDocument, translatedDocument)) {
+    if (allowBibliographicRetention &&
+        isPureCitationMetadata(
+          sourceDocument.body?.text ?? sourceDocument.text ?? '',
+        )) {
+      // Pure citation / index metadata (author names, page numbers, locators,
+      // `Ibid.` / `op. cit.` cross-references) is conventionally retained
+      // verbatim. The per-node short-English-prose check below would mistake
+      // these retained fields for untranslated sentences even when the entry
+      // is a pure metadata line with nothing to translate, so exempt it here
+      // the same way the translation-time validation does.
+    } else if (_hasSourceOwnedShortEnglishProse(
+      sourceDocument,
+      translatedDocument,
+      isBibliographicEntry: allowBibliographicRetention,
+    )) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
       );
@@ -295,7 +340,8 @@ class TranslationQuality {
     final String translatedVisibleText = _normalizeText(
       translatedDocument.body?.text ?? translatedDocument.text ?? '',
     );
-    if (unexemptedSourceTexts.any(translatedVisibleText.contains)) {
+    if (!allowBibliographicRetention &&
+        unexemptedSourceTexts.any(translatedVisibleText.contains)) {
       return const TranslationResidualFinding(
         kind: TranslationResidualKind.longSourceText,
       );
@@ -306,6 +352,7 @@ class TranslationQuality {
       translatedText:
           translatedDocument.body?.text ?? translatedDocument.text ?? '',
       targetLanguage: targetLanguage,
+      sourceWorkTitles: sourceWorkTitles,
     );
     if (hasLongSourceText) {
       return const TranslationResidualFinding(
@@ -313,6 +360,94 @@ class TranslationQuality {
       );
     }
     return null;
+  }
+
+  /// Whether [text] is a pure citation-metadata endnote with no translatable
+  /// natural-language sentence, e.g. `Ibid.` or `Yardeni, op. cit., p. 62.`
+  ///
+  /// Such entries conventionally stay verbatim in translated works, since
+  /// `op. cit.` / `ibid.` / `loc. cit.` are standard scholarly abbreviations
+  /// and any surrounding words are author/journal names or page numbers.
+  static bool isPureCitationMetadata(String text) {
+    final String normalized = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    // Remove the leading footnote number (`14.`) and the entry's number anchor
+    // text if the extractor included it (`14`) at the start.
+    var body = normalized.replaceFirst(RegExp(r'^\d+\s*\.?\s*'), '');
+    // Strip any quoted/curly-quoted article or book titles — a quoted title is
+    // translatable natural-language content, so its presence disqualifies the
+    // entry from being treated as pure metadata.
+    if (RegExp(r'[“”"«»]').hasMatch(body)) {
+      return false;
+    }
+    // Strip trailing sentence-final punctuation then split into words.
+    body = body.replaceFirst(RegExp(r'[.!?]+\s*$'), '');
+    final List<String> words = RegExp(
+      r"[A-Za-z][A-Za-z'’\-]*|\d+",
+    ).allMatches(body).map((RegExpMatch match) => match.group(0)!).toList();
+    if (words.isEmpty) {
+      return true;
+    }
+    const Set<String> citationTokens = <String>{
+      'a',
+      'al',
+      'ben',
+      'bin',
+      'and',
+      'by',
+      'cit',
+      'da',
+      'de',
+      'del',
+      'der',
+      'des',
+      'di',
+      'du',
+      'ed',
+      'eds',
+      'el',
+      'et',
+      'for',
+      'ibid',
+      'in',
+      'la',
+      'le',
+      'loc',
+      'n',
+      'no',
+      'of',
+      'op',
+      'p',
+      'pp',
+      'rev',
+      'sd',
+      'st',
+      'ten',
+      'ter',
+      'the',
+      'trans',
+      'van',
+      'vol',
+      'von',
+      'see',
+      'quoted',
+    };
+    for (final String word in words) {
+      if (RegExp(r'^\d+$').hasMatch(word)) {
+        continue;
+      }
+      final String lower = word.toLowerCase();
+      if (citationTokens.contains(lower)) {
+        continue;
+      }
+      final String first = word.substring(0, 1);
+      // Allow title-cased author/journal words (Fiorentini, Peltzman,
+      // Washington, New) but reject ordinary lowercase sentence words.
+      if (first == first.toUpperCase() && first != first.toLowerCase()) {
+        continue;
+      }
+      return false;
+    }
+    return true;
   }
 
   static bool _prepareAuthorSignatureForResidualCheck(
@@ -409,10 +544,47 @@ class TranslationQuality {
       final int? followingRune = _runeAt(strippedText, match.end);
       if ((precedingRune != null && _isCjkRune(precedingRune)) ||
           (followingRune != null && _isCjkRune(followingRune))) {
+        if (_isParenthesizedTermGloss(text, token)) {
+          continue;
+        }
         return token;
       }
     }
     return null;
+  }
+
+  /// Whether [token] appears inside parentheses/quotes that are immediately
+  /// preceded by CJK context, i.e. a translator gloss such as
+  /// `伐林开垦（assarting）` or `伐林开垦(assarting)`. Such a retained term is
+  /// a deliberate first-occurrence gloss rather than bare untranslated text,
+  /// so it should be allowed to stay next to Chinese.
+  static bool _isParenthesizedTermGloss(String text, String token) {
+    final String escaped = RegExp.escape(token);
+    // Direction 1: translated term first, original inside parentheses, e.g.
+    // 伐林开垦（assarting） or 伐林开垦(assarting).
+    final RegExp translatedFirstPattern = RegExp(
+      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u20000-\u2FA1F]\s*[（(]'
+      r'[^）)]*'
+      '$escaped'
+      r'[^）)]*'
+      r'[）)]',
+    );
+    if (translatedFirstPattern.hasMatch(text)) {
+      return true;
+    }
+    // Direction 2: retained original term first, Chinese gloss inside
+    // parentheses, e.g. job-coachman（临时马车夫）. The parenthesized content
+    // must contain CJK so this is clearly a translated gloss rather than an
+    // untranslated term followed by unrelated punctuation.
+    final RegExp retainedFirstPattern = RegExp(
+      '$escaped'
+      r'\s*[（(]'
+      r'[^）)]*'
+      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u20000-\u2FA1F]'
+      r'[^）)]*'
+      r'[）)]',
+    );
+    return retainedFirstPattern.hasMatch(text);
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -889,7 +1061,14 @@ class TranslationQuality {
           translatedElement.children.isNotEmpty) {
         return false;
       }
-      if (!allowedTranslations.contains(translatedElement.text)) {
+      final String normalizedTranslated = _normalizeAuditedTerm(
+        translatedElement.text,
+      );
+      final bool normalizedAllowed = allowedTranslations.any(
+        (String candidate) =>
+            _normalizeAuditedTerm(candidate) == normalizedTranslated,
+      );
+      if (!normalizedAllowed) {
         if (translatedElement.text.runes.any(_isLatinLetterRune) ||
             !_hasTargetScript(
               translatedElement.text,
@@ -905,6 +1084,24 @@ class TranslationQuality {
     return true;
   }
 
+  /// Normalizes only quote variants (curly to straight/absent) and a single
+  /// trailing comma or period so audited foreign terms still match when the
+  /// model normalizes quotes or drops the audited boundary comma (for example
+  /// `“sistema del potere,”` -> `"sistema del potere"`). Any other change --
+  /// leading whitespace, a semicolon, an internal edit -- must stay a
+  /// rejection, because those unreviewed forms are exactly what the strict
+  /// tests require to fail.
+  static String _normalizeAuditedTerm(String value) {
+    final String withoutQuotes = value.replaceAll(
+      RegExp(r'[“”"„‟«»]'),
+      '',
+    );
+    return withoutQuotes.replaceFirst(
+      RegExp(r'[,，。.]$'),
+      '',
+    );
+  }
+
   /// Normalizes a work-title candidate so trailing punctuation (for example
   /// `The General Crisis of the Seventeenth Century,`) does not prevent
   /// matching the same title retained without that punctuation in the
@@ -914,6 +1111,25 @@ class TranslationQuality {
       RegExp(r'[,;:。，；：.!?！？]+$'),
       '',
     );
+  }
+
+  /// Whether [translatedText] holds [sourceTitle] as an original-title gloss
+  /// inside a Chinese book-title wrapper, for example
+  /// `《道德与立法原理导论》（An Introduction to the Principles of Morals and
+  /// Legislation）`.
+  static bool _isWorkTitleGlossRetention(
+    String translatedText,
+    String sourceTitle,
+  ) {
+    final String normalizedTranslated = _normalizeText(translatedText);
+    if (!RegExp(r'[《「『〈（]').hasMatch(normalizedTranslated)) {
+      return false;
+    }
+    final String normalizedSource = _normalizedWorkTitleText(sourceTitle);
+    if (normalizedSource.isEmpty) {
+      return false;
+    }
+    return normalizedTranslated.contains(normalizedSource);
   }
 
   /// Audited source-language foreign terms that may legitimately stay in the
@@ -1516,19 +1732,132 @@ class TranslationQuality {
     return RegExp(r'[\s,&;]').hasMatch(next);
   }
 
-  static bool _hasRemainingTranslatedInlineResidual(Document document) {
+  /// Work titles appearing inside source-language `<i>/<em>/<cite>` nodes.
+  /// Computed before any clearing logic, so retained titles can be verified
+  /// even after the source copies are scrubbed from the parsed document.
+  static Set<String> _sourceInlineWorkTitles(Document document) {
     return document
+        .querySelectorAll('i, em, cite')
+        .map(
+          (Element element) =>
+              _normalizedWorkTitleText(_normalizeText(element.text)),
+        )
+        .where(
+          (String title) =>
+              title.isNotEmpty && _looksLikeEnglishWorkTitle(title),
+        )
+        .toSet();
+  }
+
+  static bool _hasRemainingTranslatedInlineResidual(
+    Document translatedDocument, {
+    required Set<String> sourceInlineWorkTitles,
+  }) {
+    return translatedDocument
         .querySelectorAll('i, em, cite')
         .any(
           (Element element) =>
-              _looksLikeEnglishWorkTitle(_normalizeText(element.text)),
+              _looksLikeEnglishWorkTitle(_normalizeText(element.text)) &&
+              !sourceInlineWorkTitles.contains(
+                _normalizedWorkTitleText(_normalizeText(element.text)),
+              ),
         );
+  }
+
+  /// Clears matching retained work-title nodes from `<i>/<em>/<cite>` in both
+  /// the source and translated documents, so a title kept verbatim in its own
+  /// emphasis node is not later misread as untranslated source prose. A
+  /// title-like node in the translation is only cleared when an equivalent
+  /// source node exists, keeping genuinely untranslated emphasis prose intact.
+  static void _clearInlineEmphasisTitleNodes(
+    Document sourceDocument,
+    Document translatedDocument,
+  ) {
+    // Only clear retained title nodes when the surrounding block was actually
+    // translated (has target-script context). A block that is still entirely
+    // English — for example an untranslated emphasized instruction like
+    // `Important Safety Information For All New Device Owners Today` — must
+    // not be exempted just because its emphasis text is title-cased.
+    final String translatedBody =
+        translatedDocument.body?.text ?? translatedDocument.text ?? '';
+    final bool hasTargetScriptContext = RegExp(
+      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+    ).hasMatch(translatedBody);
+    if (!hasTargetScriptContext) {
+      return;
+    }
+    final List<Element> sourceTitles = sourceDocument
+        .querySelectorAll('i, em, cite')
+        .where(
+          (Element element) =>
+              _looksLikeEnglishWorkTitle(_normalizeText(element.text)) &&
+              !_looksLikeSentenceOrInstruction(
+                _normalizeText(element.text),
+              ),
+        )
+        .toList(growable: false);
+    // Imperative / instruction-like emphasis (for example
+    // `Please Read All Instructions Before Continuing`) is never a work title
+    // even when it is title-cased, so leave it in place to be caught by the
+    // residual checks.
+    final List<Element> translatedTitles = translatedDocument
+        .querySelectorAll('i, em, cite')
+        .where(
+          (Element element) =>
+              _looksLikeEnglishWorkTitle(_normalizeText(element.text)) &&
+              !_looksLikeSentenceOrInstruction(
+                _normalizeText(element.text),
+              ),
+        )
+        .toList(growable: false);
+    for (final Element translatedTitle in translatedTitles) {
+      final String normalized = _normalizedWorkTitleText(
+        _normalizeText(translatedTitle.text),
+      );
+      if (normalized.isEmpty) {
+        continue;
+      }
+      for (final Element sourceTitle in sourceTitles) {
+        if (_normalizedWorkTitleText(_normalizeText(sourceTitle.text)) ==
+            normalized) {
+          translatedTitle.text = '';
+          sourceTitle.text = '';
+          break;
+        }
+      }
+    }
   }
 
   static bool _hasSourceOwnedShortEnglishProse(
     Document sourceDocument,
     Document translatedDocument,
+    {bool isBibliographicEntry = false,}
   ) {
+    if (isBibliographicEntry) {
+      // A bibliography / endnote entry conventionally keeps several fields in
+      // the original language: author names, journal names, volume/issue/year
+      // and page numbers, publisher and city. These retained fields appear as
+      // `allSourceEnglishRetained` text nodes that are exactly the same in the
+      // source and the translation, so the per-node prose check below would
+      // mistake them for untranslated sentences. When the surrounding entry was
+      // actually translated (it contains target-script text), skip the per-node
+      // check; a completely untranslated entry is still rejected because no
+      // target-script context exists to gate this exemption.
+      final String translatedBody =
+          translatedDocument.body?.text ?? translatedDocument.text ?? '';
+      final bool hasTargetScriptContext = RegExp(
+        r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
+      ).hasMatch(translatedBody);
+      if (hasTargetScriptContext) {
+        return false;
+      }
+    }
+    // Retained work titles inside their own `<i>/<em>/<cite>` nodes are
+    // deliberate (for example the newsletter title <i>Strategic Investment</i>
+    // kept verbatim inside otherwise-translated prose). Clear the matching
+    // source/translation title nodes before the pairwise text-node comparison
+    // so they are not mistaken for untranslated source prose.
+    _clearInlineEmphasisTitleNodes(sourceDocument, translatedDocument);
     final List<Text> sourceTextNodes = _textNodes(sourceDocument);
     final List<Text> translatedTextNodes = _textNodes(translatedDocument);
     if (sourceTextNodes.length == translatedTextNodes.length) {
@@ -1591,7 +1920,46 @@ class TranslationQuality {
         _sameWordsIgnoreCase(sourceWords, translatedWords);
     if (allSourceEnglishRetained) {
       if (!hasTargetLanguageContext) {
+        // A lone retained epigraph attribution (`—CHARLES TILLY`) is a
+        // deliberate retention, not an untranslated sentence. Requiring the
+        // leading dash keeps ordinary unmodified `sig` text (for example
+        // `Peter Thiel` or `Los Angeles`) out of this exemption.
+        if (RegExp(r'^[-–—]').hasMatch(strippedSource.trim())) {
+          final String name = _normalizeText(strippedSource)
+              .replaceFirst(RegExp(r'^[-–—]\s*'), '');
+          if (_canonicalRetainedPersonName(name) != null) {
+            return false;
+          }
+        }
+        // A short all-lowercase transliteration/term retained verbatim in
+        // both source and translated inline node (for example the pinyin
+        // gloss `chum yum`) is a deliberate term retention, not an
+        // untranslated sentence. Only very short lowercase runs qualify so
+        // title-case proper names such as `Peter Thiel` or `Los Angeles`
+        // and full English sentences still fail.
+        final bool isShortLowercaseTransliteration =
+            translatedWords.length >= 1 &&
+            translatedWords.length <= 4 &&
+            translatedWords.every(
+              (String word) => word == word.toLowerCase(),
+            ) &&
+            !RegExp(r'[.!?]').hasMatch(strippedTranslated);
+        if (isShortLowercaseTransliteration) {
+          return false;
+        }
         return true;
+      }
+      // A retained English work title inside an otherwise-translated inline
+      // node (for example 《道德与立法原理导论》（An Introduction to the
+      // Principles of Morals and Legislation）) is a deliberate original-title
+      // gloss marked with CJK book-title brackets. Exempt it before the
+      // sentence-ending heuristic so a book title whose source ends with a
+      // period is not mistaken for a lone untranslated sentence.
+      final bool isCjkMarkedTitle =
+          _looksLikeEnglishTitleOrName(translatedWords) &&
+          RegExp(r'[《「『〈》」』〉]').hasMatch(strippedTranslated);
+      if (isCjkMarkedTitle) {
+        return false;
       }
       final bool hasSentenceEnding = RegExp(
         r'''[.!?]["'\u2019\u201D)\]]*\s*$''',
@@ -1622,6 +1990,22 @@ class TranslationQuality {
         continue;
       }
       if (_looksLikeEnglishTitleOrName(run)) {
+        continue;
+      }
+      // Legal case names such as `Roe v. Wade` (or the embedded form
+      // `Roe v. Wade案`) are conventionally retained verbatim in translated
+      // legal/commentary prose. Recognize the `X v. Y` shape so these
+      // retentions are not treated as untranslated sentences.
+      if (_looksLikeLegalCaseName(run)) {
+        continue;
+      }
+      // An original-term gloss in parentheses after a Chinese translation
+      // (for example 南方黑手党（Dixie mafia）) is a deliberate first-use
+      // retention. The run may contain a lowercase ordinary word (`mafia`),
+      // so it is not title-like, but it still sits inside the parenthesized
+      // gloss and must not be treated as untranslated prose.
+      final String runText = run.join(' ');
+      if (_isParenthesizedTermGloss(strippedTranslated, runText)) {
         continue;
       }
       final bool allLowercase = run.every(
@@ -1778,7 +2162,7 @@ class TranslationQuality {
         )
         .replaceAll(
           RegExp(
-            r'''\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z]{2,})+\b''',
+            r'''\b[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z]{2,})+(?:/[-A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?\b''',
           ),
           ' ',
         );
@@ -1834,9 +2218,13 @@ class TranslationQuality {
       'as',
       'at',
       'by',
+      'd',
       'for',
       'from',
       'in',
+      'l',
+      'n',
+      'o',
       'of',
       'on',
       'or',
@@ -1847,15 +2235,87 @@ class TranslationQuality {
     int significantWords = 0;
     int titleCaseWords = 0;
     for (final String word in words) {
+      // Split European-style apostrophe connectives (Coeur d'Alene -> d +
+      // Alene) so the short lowercase particle (d', l', …) is treated as a
+      // connector instead of a significant lowercase word.
+      final List<String> parts = _splitApostropheConnective(word);
+      if (parts.length == 2) {
+        if (connectors.contains(parts[0].toLowerCase())) {
+          final String second = parts[1];
+          if (_isTitleCaseWord(second)) {
+            titleCaseWords += 1;
+          }
+          significantWords += 1;
+          continue;
+        }
+      }
       if (connectors.contains(word.toLowerCase())) {
         continue;
       }
       significantWords += 1;
-      final String first = String.fromCharCode(word.runes.first);
-      if (first == first.toUpperCase() && first != first.toLowerCase()) {
+      if (_isTitleCaseWord(word)) {
         titleCaseWords += 1;
       }
     }
     return significantWords >= 2 && titleCaseWords / significantWords >= 0.8;
+  }
+
+  /// Whether [words] form a legal citation shape `X v. Y` (for example
+  /// `Roe v. Wade`), optionally embedded as `X v. Y案` by the translator.
+  /// `v.` may be tokenized as `v` (the period is stripped by the word
+  /// tokenizer). Both parties must be title-case proper names of 1-3 words.
+  static bool _looksLikeLegalCaseName(List<String> words) {
+    final int vIndex = words.indexWhere((String word) {
+      final String normalized = word.replaceAll(RegExp(r'[.\s]'), '');
+      return normalized.toLowerCase() == 'v' || normalized.toLowerCase() == 'vs';
+    });
+    if (vIndex <= 0 || vIndex >= words.length - 1) {
+      return false;
+    }
+    final List<String> plaintiff = words.sublist(0, vIndex);
+    final List<String> defendant = words.sublist(vIndex + 1);
+    if (plaintiff.isEmpty ||
+        defendant.isEmpty ||
+        plaintiff.length > 3 ||
+        defendant.length > 3) {
+      return false;
+    }
+    bool allTitleCaseWords(List<String> parts) =>
+        parts.length >= 1 &&
+        parts.every((String word) {
+          final String stripped = word.replaceAll(RegExp(r'[.!.,]'), '');
+          if (stripped.isEmpty) {
+            return false;
+          }
+          final String first = String.fromCharCode(stripped.runes.first);
+          return first == first.toUpperCase() && first != first.toLowerCase();
+        });
+    return allTitleCaseWords(plaintiff) && allTitleCaseWords(defendant);
+  }
+
+  /// Debug-only probe: applies [TranslationQuality._looksLikeEnglishTitleOrName]
+  /// to the English words of a mixed-CJK inline node.
+  static bool debugLooksLikeEnglishTitleOrName(String text) {
+    return _looksLikeEnglishTitleOrName(
+      _englishWorkTitleWords(text),
+    );
+  }
+
+  /// Splits a word like `d'Alene` into `['d', 'Alene']` when the leading
+  /// apostrophe particle is a 1-2 lowercase-letter connective. Returns the
+  /// original word unchanged when it is not such a form.
+  static List<String> _splitApostropheConnective(String word) {
+    final RegExpMatch? match = RegExp(
+      r"^([a-z]{1,2})'([A-Z][A-Za-z'\-]*)$",
+    ).firstMatch(word);
+    if (match == null) {
+      return <String>[word];
+    }
+    return <String>[match.group(1)!, match.group(2)!];
+  }
+
+  static bool _isTitleCaseWord(String word) {
+    final String first = String.fromCharCode(word.runes.first);
+    return first == first.toUpperCase() && first != first.toLowerCase();
   }
 }
