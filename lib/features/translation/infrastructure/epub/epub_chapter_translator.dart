@@ -44,6 +44,12 @@ class EpubChapterTranslator {
        _footnoteBatchPlanner =
            footnoteBatchPlanner ?? const FootnoteBatchPlanner();
 
+  /// Block ids whose translation could not pass the residual-quality gate
+  /// after all retries. They degrade to their last usable translation and
+  /// the whole book continues, instead of every retry exhausting and
+  /// aborting the book. Recorded so the run report can list them honestly.
+  final Set<String> degradedBlockIds = <String>{};
+
   final TranslationCacheStore _cacheStore;
   final EpubRepacker _repacker;
   final TranslationApiClient _apiClient;
@@ -157,6 +163,9 @@ class EpubChapterTranslator {
       chapterBlocks: chapterBlocks,
     );
   }
+
+  /// Test-only view of the blocks degraded for this translator instance.
+  Set<String> getDegradedBlockIdsForTest() => degradedBlockIds;
 
   Future<List<String>> translateBlockBatchForTest({
     required Dio dio,
@@ -1043,15 +1052,17 @@ class EpubChapterTranslator {
                 'Translated footnote ${reference.requestId} is missing before cache write.',
               );
             }
-            await _cacheStore.putBlockTranslation(
-              _blockCacheKey(
-                config,
-                reference.block,
-                chapterPath: reference.chapter.path,
-                confirmedStyleProfile: userStyleProfile,
-              ),
-              translated,
-            );
+            if (!degradedBlockIds.contains(reference.block.id)) {
+              await _cacheStore.putBlockTranslation(
+                _blockCacheKey(
+                  config,
+                  reference.block,
+                  chapterPath: reference.chapter.path,
+                  confirmedStyleProfile: userStyleProfile,
+                ),
+                translated,
+              );
+            }
             translatedByChapterIndex[reference.chapterIndex]![reference
                 .block
                 .id] = reference.block.copyWith(
@@ -1334,15 +1345,16 @@ class EpubChapterTranslator {
               final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
               await Future.wait<void>(<Future<void>>[
                 for (int index = 0; index < batch.blocks.length; index += 1)
-                  _cacheStore.putBlockTranslation(
-                    _blockCacheKey(
-                      config,
-                      batch.blocks[index],
-                      chapterPath: chapter.path,
-                      confirmedStyleProfile: userStyleProfile,
+                  if (!degradedBlockIds.contains(batch.blocks[index].id))
+                    _cacheStore.putBlockTranslation(
+                      _blockCacheKey(
+                        config,
+                        batch.blocks[index],
+                        chapterPath: chapter.path,
+                        confirmedStyleProfile: userStyleProfile,
+                      ),
+                      translatedBatch[index],
                     ),
-                    translatedBatch[index],
-                  ),
               ]);
               cacheWriteStopwatch.stop();
               chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
@@ -1496,6 +1508,17 @@ class EpubChapterTranslator {
                 updatedByPath[chapter.path] ?? chapter,
           )
           .toList();
+      if (degradedBlockIds.isNotEmpty) {
+        emit(
+          currentJob.copyWith(
+            currentChapter: 'Repacking EPUB',
+            currentBlock: null,
+          ),
+          'Degraded blocks retained as their last usable translation: '
+          '${degradedBlockIds.join(',')}. The EPUB will still be produced and '
+          'the run report lists these blocks.',
+        );
+      }
       final Stopwatch repackStopwatch = Stopwatch()..start();
       throwIfCancelled();
       await _repacker.writeTranslatedEpub(
@@ -1671,6 +1694,18 @@ class EpubChapterTranslator {
         );
       }
     }
+    // A residual-quality rejection that survives every retry must NOT abort
+    // the whole book. The model is not reliably deterministic: one unstable
+    // batch reply that leaves a source-language run can fail all retries even
+    // when the same block translates correctly on another call. Degrade that
+    // one block to its last usable translation (or the source HTML when no
+    // reply ever came back), record it for the run report, and keep going.
+    if (lastError is FormatException && _isQualityRejection(lastError)) {
+      degradedBlockIds.add(block.id);
+      return lastCleaned != null && lastCleaned.trim().isNotEmpty
+          ? lastCleaned
+          : block.sourceHtml;
+    }
     if (lastError is DioException && lastError.error is HandshakeException) {
       final String host = Uri.parse(
         _apiClient.normalizedBaseUrl(config.apiBaseUrl),
@@ -1682,6 +1717,17 @@ class EpubChapterTranslator {
     throw StateError(
       'Translation failed after ${config.maxRetries} attempts: $lastError',
     );
+  }
+
+  /// Whether [error] is a residual-quality gate rejection (as opposed to a
+  /// structural / transport failure). Only these degrade across retries.
+  static bool _isQualityRejection(Object error) {
+    final String message = error.toString();
+    return RegExp(
+      r'Possible untranslated source-language text remains in block '
+      r'|Possible untranslated source-language token '
+      r'|Possible untranslated source-language text',
+    ).hasMatch(message);
   }
 
   Future<_BookMemory> _generateInitialBookMemory({

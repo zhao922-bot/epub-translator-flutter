@@ -321,6 +321,70 @@ class _MixedProtocolAdapter implements HttpClientAdapter {
   }
 }
 
+class _ResidualDegradeAdapter implements HttpClientAdapter {
+  final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
+
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final String rawRequest = utf8.decode(builder.takeBytes());
+    final Map<String, dynamic> request =
+        jsonDecode(rawRequest) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last['content'] as String?)?.trim() ?? '';
+    final bool batchMode = userContent.startsWith('{');
+    final Object? content;
+    if (batchMode) {
+      final Map<String, dynamic> payload =
+          jsonDecode(userContent) as Map<String, dynamic>;
+      final List<dynamic> blocks =
+          payload['blocks'] as List<dynamic>? ?? <dynamic>[];
+      content = jsonEncode(<String, Object?>{'blocks': <Object?>[
+        for (final dynamic block in blocks)
+          <String, Object?>{'id': block['id'], 'html': _htmlFor(block['html'])},
+      ]});
+      payloads.add(<String, dynamic>{'mode': 'batch'});
+    } else {
+      content = _htmlFor(userContent);
+      payloads.add(<String, dynamic>{'mode': 'single'});
+    }
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': content},
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+
+  String _htmlFor(Object? sourceHtml) {
+    final String source = '$sourceHtml'.toLowerCase();
+    if (source.contains('sovereign individual') ||
+        source.contains('untranslated')) {
+      return '<p>The Sovereign Individual remains untranslated here.</p>';
+    }
+    return '<p>已翻译。</p>';
+  }
+}
+
 class _ProtectedSlotSplitAdapter implements HttpClientAdapter {
   final List<List<String>> requestIds = <List<String>>[];
 
@@ -1449,7 +1513,52 @@ void main() {
   );
 
   test(
-    'retries a complete individual-slot round after rebuilt HTML fails quality',
+    'degrades a residual-quality block instead of aborting the whole run',
+    () async {
+      final _ResidualDegradeAdapter adapter = _ResidualDegradeAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+      final EpubChapterTranslator translator = EpubChapterTranslator();
+      final List<String> translated = await translator.translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'degraded-target',
+            tagName: 'p',
+            sourceHtml:
+                '<p>The Sovereign Individual remains to be translated.</p>',
+            sourceText:
+                'The Sovereign Individual remains to be translated.',
+          ),
+          ExtractedBlock(
+            id: 'good-a',
+            tagName: 'p',
+            sourceHtml: '<p>Normal paragraph.</p>',
+            sourceText: 'Normal paragraph.',
+          ),
+        ],
+      );
+
+      expect(translated, hasLength(2));
+      expect(translated[0], contains('The Sovereign Individual'));
+      expect(
+        translator.getDegradedBlockIdsForTest(),
+        contains('degraded-target'),
+      );
+      expect(
+        translator.getDegradedBlockIdsForTest().contains('good-a'),
+        isFalse,
+      );
+    },
+  );
+
+ test(
+   'retries a complete individual-slot round after rebuilt HTML fails quality',
     () async {
       final _ProtectedSlotQualityRetryAdapter adapter =
           _ProtectedSlotQualityRetryAdapter();
