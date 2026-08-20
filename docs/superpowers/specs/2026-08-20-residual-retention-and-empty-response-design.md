@@ -13,7 +13,7 @@
 
 `TranslationQuality.findSuspiciousHtmlResidual` 在 HTML 结构不完全对应、作品标题位于混合文本节点、或模型把标题放入 CJK 书名括号时，无法稳定识别 source-owned 文本。日志中的 `The Sovereign Individual`、`Strategic Investment`、`The Times`、作者姓名、网址和 `chum yum` 等合法保留内容因此触发 `FormatException`。当前翻译器会对残留质量错误重试，但重试不会改变判定规则，导致同一块连续失败。
 
-`_translateSingleBlock` 在 API 返回空消息时立即抛出 `FormatException`。空响应不是质量判定错误，当前逻辑没有针对它的短退避重试；达到尝试上限后会抛出 `StateError`，而不是像残留质量块一样降级并继续。
+`_translateSingleBlock` 在 API 返回空消息时抛出 `FormatException`。它已经经过通用重试循环，但达到尝试上限后只抛出没有 block 上下文的通用 `StateError`，用户无法判断是哪一块、是否属于 API 空响应。
 
 ## 设计方案
 
@@ -36,10 +36,10 @@
 
 ### 2. 空响应专用恢复
 
-将空消息视为可重试的暂态 API 响应：
+将空消息作为独立的暂态 API 响应类别记录，同时沿用现有的可取消重试循环：
 
-- 在同一块内按现有最大尝试次数重试；
-- 使用短的、可取消的退避，不改变正常网络错误和限流错误的策略；
+- 保持同一块内按现有最大尝试次数重试；
+- 保持现有可取消退避，不改变正常网络错误和限流错误的策略；
 - 每次重试提示模型返回完整 HTML 片段；
 - 重试耗尽时抛出包含 block id、尝试次数和“API 返回空内容”的明确错误；
 - 不把空字符串当作可用译文，也不静默降级为空 HTML。
@@ -61,4 +61,3 @@ API 响应 → 提取消息 → 空响应检查/重试 → 锁定 HTML 结构 �
 - 新增 API 空响应测试：空响应后第二次有效响应成功；连续空响应达到上限时抛出明确错误；
 - 现有 `translation_quality_test.dart`、`repository_safety_test.dart` 全部通过；
 - `flutter analyze lib test tool`、`flutter test` 和 Windows release 构建通过。
-

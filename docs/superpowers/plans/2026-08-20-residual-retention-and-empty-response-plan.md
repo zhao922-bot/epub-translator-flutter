@@ -83,13 +83,13 @@ flutter test test/translation_quality_test.dart
 
 让单块 fallback 的所有响应都为空，断言抛出的 `StateError` 包含 block id、`empty`/`空` 和尝试次数；这保证修复不会静默返回空 HTML。
 
-### 任务 4：实现空响应重试
+### 任务 4：完善空响应错误分类
 
 **文件：** `lib/features/translation/infrastructure/epub/epub_chapter_translator.dart:1632-1695`
 
-- [ ] **步骤 1：为单块循环标记空响应错误类别**
+- [ ] **步骤 1：确认并保留现有空响应重试路径**
 
-保留现有 `FormatException('The translation API returned an empty block.')`，并增加只匹配该消息的 `_isEmptyTranslationResponse` 判断，使空响应走现有 `maxAttemptsForError` 循环，而不是被误认为质量降级。
+现有 `_translateBlock` 已经对 `FormatException('The translation API returned an empty block.')` 使用通用 `maxAttemptsForError` 循环和可取消退避；新增回归测试必须保持这一行为，不另造一套重试器，也不把空响应归入质量降级。
 
 - [ ] **步骤 2：为重试提示增加明确指令**
 
@@ -144,4 +144,3 @@ git status --short
 git add lib test
 git commit -m "fix: recover retained titles and empty responses"
 ```
-
