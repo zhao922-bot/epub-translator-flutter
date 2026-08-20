@@ -136,7 +136,7 @@ flutter build windows --release
 
 预期：退出码 0，生成 `build/windows/x64/runner/Release/epub_translator_flutter_clean.exe`。
 
-- [ ] **步骤 4：检查差异并提交实现**
+- [x] **步骤 4：检查差异并提交实现**
 
 ```powershell
 git diff --check
