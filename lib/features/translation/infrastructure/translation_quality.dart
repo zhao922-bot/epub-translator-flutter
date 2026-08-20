@@ -722,9 +722,16 @@ class TranslationQuality {
     // Source HTML often keeps a trailing period inside italicized titles
     // ("The Great Reckoning.") without making them ordinary sentences.
     final String titleCore = normalized.replaceFirst(RegExp(r'[.!?。！？]+$'), '');
-    if (titleCore.isEmpty ||
-        titleCore.length > 140 ||
-        RegExp(r'[.!?。！？]').hasMatch(titleCore) ||
+    if (titleCore.isEmpty || titleCore.length > 140) {
+      return false;
+    }
+    // Short abbreviations inside a title (for example `Alt. Abracadabra`)
+    // are not sentence punctuation. Remove those abbreviation periods before
+    // checking for punctuation that should disqualify a title candidate.
+    final String withoutAbbreviationPeriods = titleCore
+        .replaceAll(RegExp(r'\b(?:[A-Za-z]\.){2,}(?=\s|$)'), '')
+        .replaceAll(RegExp(r'\b[A-Za-z]{1,3}\.(?=\s+[A-Z])'), '');
+    if (RegExp(r'[.!?。！？]').hasMatch(withoutAbbreviationPeriods) ||
         RegExp(
           r'[\u0400-\u04FF\u0600-\u06FF\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF]',
         ).hasMatch(titleCore)) {

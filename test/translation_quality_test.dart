@@ -660,6 +660,33 @@ void main() {
       },
     );
 
+    test('allows an italic heading that is only a retained short title', () {
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<h3 class="h2"><i class="calibre5">Alt. Abracadabra</i></h3>',
+            translatedHtml:
+                '<h3 class="h2"><i class="calibre5">Alt. Abracadabra</i></h3>',
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding, isNull);
+    });
+
+    test('still rejects emphasized prose with sentence punctuation', () {
+      const String html =
+          '<h3><i>This. Is not a retained title for readers.</i></h3>';
+
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: html,
+            translatedHtml: html,
+            targetLanguage: 'Chinese',
+          );
+
+      expect(finding?.kind, TranslationResidualKind.longSourceText);
+    });
+
     test('allows acknowledgments titles used as subjects and newsletter names', () {
       const String sourceHtml =
           '<p>It is the third we have done together. '
