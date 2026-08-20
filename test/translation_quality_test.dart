@@ -600,6 +600,22 @@ void main() {
       expect(finding, isNull);
     });
 
+    test(
+      'allows a retained work title moved into CJK book-title marks after HTML locking',
+      () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>The Politburo is an avid reader of <i class="calibre3">The Sovereign Individual</i>.</p>',
+              translatedHtml:
+                  '<p>中国政治局是《The Sovereign Individual》的热心读者。</p><i class="calibre3"></i>',
+              targetLanguage: 'Chinese',
+            );
+
+        expect(finding, isNull);
+      },
+    );
+
     test('allows acknowledgments titles used as subjects and newsletter names', () {
       const String sourceHtml =
           '<p>It is the third we have done together. '
