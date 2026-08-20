@@ -351,10 +351,15 @@ class _ResidualDegradeAdapter implements HttpClientAdapter {
           jsonDecode(userContent) as Map<String, dynamic>;
       final List<dynamic> blocks =
           payload['blocks'] as List<dynamic>? ?? <dynamic>[];
-      content = jsonEncode(<String, Object?>{'blocks': <Object?>[
-        for (final dynamic block in blocks)
-          <String, Object?>{'id': block['id'], 'html': _htmlFor(block['html'])},
-      ]});
+      content = jsonEncode(<String, Object?>{
+        'blocks': <Object?>[
+          for (final dynamic block in blocks)
+            <String, Object?>{
+              'id': block['id'],
+              'html': _htmlFor(block['html']),
+            },
+        ],
+      });
       payloads.add(<String, dynamic>{'mode': 'batch'});
     } else {
       content = _htmlFor(userContent);
@@ -636,10 +641,12 @@ class _ProtectedSlotAlwaysResidualAdapter implements HttpClientAdapter {
                         <String, Object?>{
                           'id': block['id'],
                           'slots': <Object?>[
-                            for (final dynamic slot in block['slots'] as List<dynamic>)
+                            for (final dynamic slot
+                                in block['slots'] as List<dynamic>)
                               <String, Object?>{
                                 'id': slot['id'],
-                                'text': 'This English sentence never gets translated.',
+                                'text':
+                                    'This English sentence never gets translated.',
                               },
                           ],
                         },
@@ -670,10 +677,10 @@ class _ProtectedSlotAlwaysResidualAdapter implements HttpClientAdapter {
             },
           ],
         }),
-      200,
-      headers: <String, List<String>>{
-        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
-      },
+        200,
+        headers: <String, List<String>>{
+          Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+        },
       );
     }
   }
@@ -892,6 +899,74 @@ class _SequencedHtmlBatchAdapter implements HttpClientAdapter {
                 ],
               }),
             },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+class _EmptyThenValidHtmlAdapter implements HttpClientAdapter {
+  _EmptyThenValidHtmlAdapter({this.alwaysEmpty = false});
+
+  final bool alwaysEmpty;
+  int fetchCount = 0;
+  int batchRequestCount = 0;
+  int singleRequestCount = 0;
+  final List<String> userContents = <String>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+    userContents.add(userContent);
+    fetchCount += 1;
+    final bool batchMode = userContent.trimLeft().startsWith('{');
+    final Object content;
+    if (batchMode) {
+      batchRequestCount += 1;
+      final Map<String, dynamic> payload =
+          jsonDecode(userContent) as Map<String, dynamic>;
+      final List<dynamic> blocks = payload['blocks'] as List<dynamic>;
+      content = jsonEncode(<String, Object?>{
+        'blocks': <Object?>[
+          <String, Object?>{
+            'id': (blocks.single as Map<String, dynamic>)['id'],
+            'html': '',
+          },
+        ],
+      });
+    } else {
+      singleRequestCount += 1;
+      content = alwaysEmpty || singleRequestCount == 1
+          ? ''
+          : '<p>这句话已经翻译完成。</p>';
+    }
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': content},
           },
         ],
       }),
@@ -1604,30 +1679,31 @@ void main() {
       final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
         ..httpClientAdapter = adapter;
       final EpubChapterTranslator translator = EpubChapterTranslator();
-      final List<String> translated = await translator.translateBlockBatchForTest(
-        dio: dio,
-        config: TranslationConfig.defaults().copyWith(
-          apiKey: 'sk-test',
-          targetLanguage: 'Chinese',
-          maxRetries: 2,
-        ),
-        blocks: const <ExtractedBlock>[
-          ExtractedBlock(
-            id: 'degraded-target',
-            tagName: 'p',
-            sourceHtml:
-                '<p>The Sovereign Individual remains to be translated.</p>',
-            sourceText:
-                'The Sovereign Individual remains to be translated.',
-          ),
-          ExtractedBlock(
-            id: 'good-a',
-            tagName: 'p',
-            sourceHtml: '<p>Normal paragraph.</p>',
-            sourceText: 'Normal paragraph.',
-          ),
-        ],
-      );
+      final List<String> translated = await translator
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 2,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'degraded-target',
+                tagName: 'p',
+                sourceHtml:
+                    '<p>The Sovereign Individual remains to be translated.</p>',
+                sourceText:
+                    'The Sovereign Individual remains to be translated.',
+              ),
+              ExtractedBlock(
+                id: 'good-a',
+                tagName: 'p',
+                sourceHtml: '<p>Normal paragraph.</p>',
+                sourceText: 'Normal paragraph.',
+              ),
+            ],
+          );
 
       expect(translated, hasLength(2));
       expect(translated[0], contains('untranslated'));
@@ -1650,7 +1726,8 @@ void main() {
       final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
         ..httpClientAdapter = adapter;
       final EpubChapterTranslator translator = EpubChapterTranslator();
-      final List<String> translated = await translator.translateBlockBatchForTest(
+      final List<String>
+      translated = await translator.translateBlockBatchForTest(
         dio: dio,
         config: TranslationConfig.defaults().copyWith(
           apiKey: 'sk-test',
@@ -2373,6 +2450,76 @@ void main() {
     );
 
     test(
+      'retries an empty single-block response before accepting valid HTML',
+      () async {
+        final _EmptyThenValidHtmlAdapter adapter = _EmptyThenValidHtmlAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        final List<String> translated = await EpubChapterTranslator()
+            .translateBlockBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 2,
+                retryDelaySeconds: 0,
+              ),
+              blocks: const <ExtractedBlock>[
+                ExtractedBlock(
+                  id: 'empty-response-block',
+                  tagName: 'p',
+                  sourceHtml: '<p>This sentence needs translation.</p>',
+                  sourceText: 'This sentence needs translation.',
+                ),
+              ],
+            );
+
+        expect(adapter.fetchCount, 4);
+        expect(adapter.userContents, anyElement(contains('[RETRY]')));
+        expect(translated, const <String>['<p>这句话已经翻译完成。</p>']);
+      },
+    );
+
+    test(
+      'reports the block id when empty single-block responses are exhausted',
+      () async {
+        final _EmptyThenValidHtmlAdapter adapter = _EmptyThenValidHtmlAdapter(
+          alwaysEmpty: true,
+        );
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+
+        await expectLater(
+          EpubChapterTranslator().translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 2,
+              retryDelaySeconds: 0,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'empty-response-block',
+                tagName: 'p',
+                sourceHtml: '<p>This sentence needs translation.</p>',
+                sourceText: 'This sentence needs translation.',
+              ),
+            ],
+          ),
+          throwsA(
+            predicate<Object>(
+              (Object error) =>
+                  error.toString().contains('empty-response-block') &&
+                  error.toString().contains('empty'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test(
       'retries Chinese-target batches that come back mostly untranslated',
       () async {
         final _ResidualThenTranslatedBatchAdapter adapter =
@@ -2753,7 +2900,8 @@ void main() {
     test(
       'removes emptied inline emphasis after rebuilding a folded translation',
       () {
-        final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        final String
+        locked = EpubTranslationRepository.lockHtmlStructureForTest(
           sourceHtml:
               '<p>Some of the <i class="calibre3">agri deserti,</i> or deserted farms were brought back.</p>',
           translatedHtml: '<p>部分荒废农地重新开垦利用。</p>',
@@ -2764,29 +2912,24 @@ void main() {
       },
     );
 
-    test(
-      'folded audited term translation passes residual check after lock',
-      () {
-        const String sourceHtml =
-            '<p class="noindent">Some of the <i class="calibre3">agri deserti,</i> or deserted farms were brought back into production.</p>';
-        const String modelHtml =
-            '<p class="noindent">部分荒废农地被重新开垦利用。</p>';
-        final String locked =
-            EpubTranslationRepository.lockHtmlStructureForTest(
-              sourceHtml: sourceHtml,
-              translatedHtml: modelHtml,
-            );
-        expect(locked, isNot(contains('<i')));
-        expect(
-          TranslationQuality.findSuspiciousHtmlResidual(
-            sourceHtml: sourceHtml,
-            translatedHtml: locked,
-            targetLanguage: 'Chinese',
-          ),
-          isNull,
-        );
-      },
-    );
+    test('folded audited term translation passes residual check after lock', () {
+      const String sourceHtml =
+          '<p class="noindent">Some of the <i class="calibre3">agri deserti,</i> or deserted farms were brought back into production.</p>';
+      const String modelHtml = '<p class="noindent">部分荒废农地被重新开垦利用。</p>';
+      final String locked = EpubTranslationRepository.lockHtmlStructureForTest(
+        sourceHtml: sourceHtml,
+        translatedHtml: modelHtml,
+      );
+      expect(locked, isNot(contains('<i')));
+      expect(
+        TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml: sourceHtml,
+          translatedHtml: locked,
+          targetLanguage: 'Chinese',
+        ),
+        isNull,
+      );
+    });
 
     test('keeps original links when the model removes footnote anchors', () {
       final String locked = EpubTranslationRepository.lockHtmlStructureForTest(

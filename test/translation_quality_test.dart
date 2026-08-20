@@ -603,18 +603,46 @@ void main() {
     test(
       'allows a retained work title moved into CJK book-title marks after HTML locking',
       () {
-        final TranslationResidualFinding? finding =
-            TranslationQuality.findSuspiciousHtmlResidual(
-              sourceHtml:
-                  '<p>The Politburo is an avid reader of <i class="calibre3">The Sovereign Individual</i>.</p>',
-              translatedHtml:
-                  '<p>中国政治局是《The Sovereign Individual》的热心读者。</p><i class="calibre3"></i>',
-              targetLanguage: 'Chinese',
-            );
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The Politburo is an avid reader of <i class="calibre3">The Sovereign Individual</i>.</p>',
+          translatedHtml:
+              '<p>中国政治局是《The Sovereign Individual》的热心读者。</p><i class="calibre3"></i>',
+          targetLanguage: 'Chinese',
+        );
 
         expect(finding, isNull);
       },
     );
+
+    test(
+      'still rejects a retained work title without CJK title context in untranslated prose',
+      () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The Politburo is an avid reader of <i class="calibre3">The Sovereign Individual</i>.</p>',
+          translatedHtml:
+              '<p>中国政治局是 an avid reader of The Sovereign Individual。</p><i class="calibre3"></i>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
+      },
+    );
+
+    test('allows a short technical term inside translated quote context', () {
+      final TranslationResidualFinding?
+      finding = TranslationQuality.findSuspiciousHtmlResidual(
+        sourceHtml:
+            '<p>New software, the so-called "agoric systems", will replace old software.</p>',
+        translatedHtml: '<p>新型软件，即所谓的“agoric开放系统”，将取代旧软件。</p>',
+        targetLanguage: 'Chinese',
+      );
+
+      expect(finding, isNull);
+    });
 
     test('allows acknowledgments titles used as subjects and newsletter names', () {
       const String sourceHtml =
@@ -652,31 +680,28 @@ void main() {
       expect(finding, isNull);
     });
 
-    test(
-      'allows a repeated retained two-word italic newsletter name inside '
-      'translated prose',
-      () {
-        const String sourceHtml =
-            '<p>Time after time, <i>Strategic Investment</i> has scooped the '
-            'world. In its first issue, <i>Strategic Investment</i> pinpointed '
-            'a member of the Soviet Politburo, Mikhail Gorbachev. Before he '
-            'took power, <i>Strategic Investment</i> obtained an interview.</p>';
-        const String translatedHtml =
-            '<p>一次又一次，<i>Strategic Investment</i>在新闻发生之前就抢先预测。'
-            '在创刊号中，<i>Strategic Investment</i>精准锁定了一位苏联政治局'
-            '（Politburo）成员——米哈伊尔·戈尔巴乔夫（Mikhail Gorbachev）。'
-            '在他尚未掌权之前，<i>Strategic Investment</i>就获得了采访。</p>';
+    test('allows a repeated retained two-word italic newsletter name inside '
+        'translated prose', () {
+      const String sourceHtml =
+          '<p>Time after time, <i>Strategic Investment</i> has scooped the '
+          'world. In its first issue, <i>Strategic Investment</i> pinpointed '
+          'a member of the Soviet Politburo, Mikhail Gorbachev. Before he '
+          'took power, <i>Strategic Investment</i> obtained an interview.</p>';
+      const String translatedHtml =
+          '<p>一次又一次，<i>Strategic Investment</i>在新闻发生之前就抢先预测。'
+          '在创刊号中，<i>Strategic Investment</i>精准锁定了一位苏联政治局'
+          '（Politburo）成员——米哈伊尔·戈尔巴乔夫（Mikhail Gorbachev）。'
+          '在他尚未掌权之前，<i>Strategic Investment</i>就获得了采访。</p>';
 
-        final TranslationResidualFinding? finding =
-            TranslationQuality.findSuspiciousHtmlResidual(
-              sourceHtml: sourceHtml,
-              translatedHtml: translatedHtml,
-              targetLanguage: 'Chinese',
-            );
+      final TranslationResidualFinding? finding =
+          TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml: sourceHtml,
+            translatedHtml: translatedHtml,
+            targetLanguage: 'Chinese',
+          );
 
-        expect(finding, isNull);
-      },
-    );
+      expect(finding, isNull);
+    });
 
     test(
       'still rejects untranslated acknowledgments prose that keeps titles',
@@ -1393,18 +1418,21 @@ void main() {
         expect(finding?.token, 'plentitude');
       });
 
-      test('allows retained Italian sistema del potere with its translated gloss', () {
-        final TranslationResidualFinding?
-        finding = TranslationQuality.findSuspiciousHtmlResidual(
-          sourceHtml:
-              '<p>What the Sicilians call the <i class="calibre3">“sistema del potere,”</i> the “system of power,” of organized crime.</p>',
-          translatedHtml:
-              '<p>西西里人所谓的<i class="calibre3">“sistema del potere,”</i>（权力体系），在有组织犯罪中作用日益重要。</p>',
-          targetLanguage: 'Chinese',
-        );
+      test(
+        'allows retained Italian sistema del potere with its translated gloss',
+        () {
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>What the Sicilians call the <i class="calibre3">“sistema del potere,”</i> the “system of power,” of organized crime.</p>',
+            translatedHtml:
+                '<p>西西里人所谓的<i class="calibre3">“sistema del potere,”</i>（权力体系），在有组织犯罪中作用日益重要。</p>',
+            targetLanguage: 'Chinese',
+          );
 
-        expect(finding, isNull);
-      });
+          expect(finding, isNull);
+        },
+      );
 
       test('does not exempt an unreviewed sistema residual form', () {
         final TranslationResidualFinding? finding =
@@ -1599,124 +1627,101 @@ void main() {
         expect(finding, isNull);
       });
 
-      test(
-        'allows an audited term translated fully into Chinese when the '
-        'italic wrapper is dropped',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> or even overt hostage-taking.</p>',
-                translatedHtml:
-                    '<p>征税的最终形式——实际上就是劫持人质，甚至公开绑架。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows an audited term translated fully into Chinese when the '
+          'italic wrapper is dropped', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> or even overt hostage-taking.</p>',
+          translatedHtml: '<p>征税的最终形式——实际上就是劫持人质，甚至公开绑架。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows an audited term still in English when the italic wrapper '
-        'is dropped',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> hostage-taking.</p>',
-                translatedHtml:
-                    '<p>征税的最终形式 —de facto 劫持人质。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows an audited term still in English when the italic wrapper '
+          'is dropped', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>The ultimate form of withholding tax<i class="calibre3">—de facto</i> hostage-taking.</p>',
+          translatedHtml: '<p>征税的最终形式 —de facto 劫持人质。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows an audited term retained as plain quoted text when all '
-        'italic wrappers are dropped',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>Aristotle wrote <i class="calibre3">Sophistical Refutations,</i> a term meaningless today as <i class="calibre3">Politics</i> was. It derives from an Old French word, <i class="calibre3">politique,</i> used to describe opportunists.</p>',
-                translatedHtml:
-                    '<p>亚里士多德写了《诡辩驳议》，这个词今天毫无意义，就像《政治学》在中世纪一样。它源自古法语单词“politique”，用来描述机会主义者。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows an audited term retained as plain quoted text when all '
+          'italic wrappers are dropped', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Aristotle wrote <i class="calibre3">Sophistical Refutations,</i> a term meaningless today as <i class="calibre3">Politics</i> was. It derives from an Old French word, <i class="calibre3">politique,</i> used to describe opportunists.</p>',
+          translatedHtml:
+              '<p>亚里士多德写了《诡辩驳议》，这个词今天毫无意义，就像《政治学》在中世纪一样。它源自古法语单词“politique”，用来描述机会主义者。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows repeated audited terms mixed with translated work titles '
-        'when wrappers change',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
-                translatedHtml:
-                    '<p>对patria的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的patria。patria本身更可能是一个家乡。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows repeated audited terms mixed with translated work titles '
+          'when wrappers change', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
+          translatedHtml:
+              '<p>对patria的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的patria。patria本身更可能是一个家乡。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows repeated audited terms in italics mixed with translated '
-        'work titles when source wrapper count changes',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
-                translatedHtml:
-                    '<p>对<i class="calibre3">patria</i>的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的<i class="calibre3">patria</i>。<i class="calibre3">patria</i>本身更可能是一个家乡。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows repeated audited terms in italics mixed with translated '
+          'work titles when source wrapper count changes', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>Loyalty to the <i class="calibre3">patria,</i> as <i class="calibre3">The General Crisis of the Seventeenth Century,</i> shows, is narrower <i class="calibre3">patria</i> against the state. The <i class="calibre3">patria</i> itself is a home town.</p>',
+          translatedHtml:
+              '<p>对<i class="calibre3">patria</i>的忠诚，正如《十七世纪的普遍危机》所示，是更狭隘的<i class="calibre3">patria</i>。<i class="calibre3">patria</i>本身更可能是一个家乡。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows retained English work title with Chinese marker when '
-        'wrapper counts match',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing that ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
-                translatedHtml:
-                    '<p>在《十七世纪的普遍危机》(<i class="calibre3">The General Crisis of the Seventeenth Century</i>)中... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows retained English work title with Chinese marker when '
+          'wrapper counts match', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing that ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
+          translatedHtml:
+              '<p>在《十七世纪的普遍危机》(<i class="calibre3">The General Crisis of the Seventeenth Century</i>)中... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
-      test(
-        'allows translated work title inside italics without Chinese '
-        'book markers when it was fully translated',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
-                translatedHtml:
-                    '<p>... 在<i class="calibre3">17世纪的一般危机</i>中进一步阐明 ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows translated work title inside italics without Chinese '
+          'book markers when it was fully translated', () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>... in <i class="calibre3">The General Crisis of the Seventeenth Century,</i> showing ... <i class="calibre3">patria,</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>.</p>',
+          translatedHtml:
+              '<p>... 在<i class="calibre3">17世纪的一般危机</i>中进一步阐明 ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i> ... <i class="calibre3">patria</i>。</p>',
+          targetLanguage: 'Chinese',
+        );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
       test(
         'allows Latin endnote abbreviation op. cit. retained in italics',
@@ -1734,21 +1739,18 @@ void main() {
         },
       );
 
-      test(
-        'allows op. cit. translated to Chinese endnote gloss',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<li>Durant, <i class="calibre3">op. cit.,</i> p. 43.</li>',
-                translatedHtml:
-                    '<li>杜兰特, <i class="calibre3">同上引文</i> 第43页.</li>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows op. cit. translated to Chinese endnote gloss', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<li>Durant, <i class="calibre3">op. cit.,</i> p. 43.</li>',
+              translatedHtml:
+                  '<li>杜兰特, <i class="calibre3">同上引文</i> 第43页.</li>',
+              targetLanguage: 'Chinese',
+            );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
       test('does not exempt an audited term when attributes change', () {
         final TranslationResidualFinding? finding =
@@ -1802,25 +1804,22 @@ void main() {
         expect(finding, isNull);
       });
 
-      test(
-        'allows an audited term with normalized straight quotes and dropped '
-        'comma',
-        () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>What the Sicilians call the <i>&ldquo;sistema del '
-                    'potere,&rdquo;</i> the &ldquo;system of power,&rdquo; of '
-                    'organized crime has an increasingly important role.</p>',
-                translatedHtml:
-                    '<p>西西里人所说的<i>"sistema del potere"</i>，即"权力体系"，'
-                    '这一有组织犯罪的权力体系发挥着日益重要的作用。</p>',
-                targetLanguage: 'Chinese',
-              );
+      test('allows an audited term with normalized straight quotes and dropped '
+          'comma', () {
+        final TranslationResidualFinding? finding =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml:
+                  '<p>What the Sicilians call the <i>&ldquo;sistema del '
+                  'potere,&rdquo;</i> the &ldquo;system of power,&rdquo; of '
+                  'organized crime has an increasingly important role.</p>',
+              translatedHtml:
+                  '<p>西西里人所说的<i>"sistema del potere"</i>，即"权力体系"，'
+                  '这一有组织犯罪的权力体系发挥着日益重要的作用。</p>',
+              targetLanguage: 'Chinese',
+            );
 
-          expect(finding, isNull);
-        },
-      );
+        expect(finding, isNull);
+      });
 
       test('allows a proper-name original gloss with a lowercase word', () {
         final TranslationResidualFinding? finding =
@@ -2273,8 +2272,7 @@ void main() {
             ),
             (
               name: 'full-width parenthesized gloss in emphasis',
-              translatedHtml:
-                  '<p>这种过程称为<i>伐林开垦（assarting）</i>。</p>',
+              translatedHtml: '<p>这种过程称为<i>伐林开垦（assarting）</i>。</p>',
             ),
             (
               name: 'parenthesized gloss with comma in source',
@@ -2282,13 +2280,13 @@ void main() {
             ),
           ]) {
         test('allows ${example.name} beside CJK', () {
-          final TranslationResidualFinding? finding =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml:
-                    '<p>This process, known as <i>assarting,</i> gave an outlet.</p>',
-                translatedHtml: example.translatedHtml,
-                targetLanguage: 'Chinese',
-              );
+          final TranslationResidualFinding?
+          finding = TranslationQuality.findSuspiciousHtmlResidual(
+            sourceHtml:
+                '<p>This process, known as <i>assarting,</i> gave an outlet.</p>',
+            translatedHtml: example.translatedHtml,
+            targetLanguage: 'Chinese',
+          );
 
           expect(finding, isNull);
         });
@@ -2584,40 +2582,39 @@ void main() {
           'Violence," <i class="calibre3">The Journal of Economic History,'
           '</i> vol. 18, no. 4 (December 1958), p. 402.</li>';
 
-      test('allows retained author/title fields once the entry is translated',
-          () {
-        const String translated =
-            '<li class="endnotes1" value="13"><a id="ch01-en13" '
-            'href="part0007_split_007.html#ch01en13" class="calibre4">13</a>.'
-            '&#160;Frederic C. Lane, "有组织暴力的经济后果，" <i class='
-            '"calibre3">经济史杂志</i>, vol. 18, no. 4 (December 1958), '
-            'p. 402.</li>';
+      test(
+        'allows retained author/title fields once the entry is translated',
+        () {
+          const String translated =
+              '<li class="endnotes1" value="13"><a id="ch01-en13" '
+              'href="part0007_split_007.html#ch01en13" class="calibre4">13</a>.'
+              '&#160;Frederic C. Lane, "有组织暴力的经济后果，" <i class='
+              '"calibre3">经济史杂志</i>, vol. 18, no. 4 (December 1958), '
+              'p. 402.</li>';
 
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: liSource,
+                translatedHtml: translated,
+                targetLanguage: 'Chinese',
+                allowBibliographicRetention: true,
+              );
+
+          expect(finding, isNull);
+        },
+      );
+
+      test('still rejects a completely untranslated bibliography entry', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
               sourceHtml: liSource,
-              translatedHtml: translated,
+              translatedHtml: liSource,
               targetLanguage: 'Chinese',
               allowBibliographicRetention: true,
             );
 
-        expect(finding, isNull);
+        expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
-
-      test(
-          'still rejects a completely untranslated bibliography entry',
-          () {
-            final TranslationResidualFinding? finding =
-                TranslationQuality.findSuspiciousHtmlResidual(
-                  sourceHtml: liSource,
-                  translatedHtml: liSource,
-                  targetLanguage: 'Chinese',
-                  allowBibliographicRetention: true,
-                );
-
-            expect(finding?.kind, TranslationResidualKind.longSourceText);
-          },
-      );
 
       test('a bibliography entry without the opt-in is still checked', () {
         const String translated =
@@ -2634,38 +2631,41 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding, isNotNull,
-            reason:
-                'Without the bibliographic opt-in, original-language fields '
-                'in a reference entry are still treated as residuals.');
+        expect(
+          finding,
+          isNotNull,
+          reason:
+              'Without the bibliographic opt-in, original-language fields '
+              'in a reference entry are still treated as residuals.',
+        );
       });
 
       test(
-          'allows a translated endnote that retains the journal name in i',
-          () {
-            const String source =
-                '<li class="endnotes1" value="14"><a id="ch01-en14" '
-                'href="part0007_split_008.html#ch01en14" class="calibre4">14'
-                '</a>.&#160;Nicholas Colchester, “Goodbye Nation-State, Hello… '
-                'What?,” <i class="calibre3">New York Times,</i> July 17, 1994,'
-                ' p. E17.</li>';
-            const String translated =
-                '<li class="endnotes1" value="14"><a id="ch01-en14" '
-                'href="part0007_split_008.html#ch01en14" class="calibre4">14'
-                '</a>.&#160;Nicholas Colchester, “再见民族国家，你好……什么？, ” '
-                '<i class="calibre3">New York Times,</i> 1994年7月17日, '
-                'E17页。</li>';
+        'allows a translated endnote that retains the journal name in i',
+        () {
+          const String source =
+              '<li class="endnotes1" value="14"><a id="ch01-en14" '
+              'href="part0007_split_008.html#ch01en14" class="calibre4">14'
+              '</a>.&#160;Nicholas Colchester, “Goodbye Nation-State, Hello… '
+              'What?,” <i class="calibre3">New York Times,</i> July 17, 1994,'
+              ' p. E17.</li>';
+          const String translated =
+              '<li class="endnotes1" value="14"><a id="ch01-en14" '
+              'href="part0007_split_008.html#ch01en14" class="calibre4">14'
+              '</a>.&#160;Nicholas Colchester, “再见民族国家，你好……什么？, ” '
+              '<i class="calibre3">New York Times,</i> 1994年7月17日, '
+              'E17页。</li>';
 
-            final TranslationResidualFinding? finding =
-                TranslationQuality.findSuspiciousHtmlResidual(
-                  sourceHtml: source,
-                  translatedHtml: translated,
-                  targetLanguage: 'Chinese',
-                  allowBibliographicRetention: true,
-                );
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: source,
+                translatedHtml: translated,
+                targetLanguage: 'Chinese',
+                allowBibliographicRetention: true,
+              );
 
-            expect(finding, isNull);
-          },
+          expect(finding, isNull);
+        },
       );
 
       test('detects pure citation-metadata endnotes', () {
@@ -2675,13 +2675,12 @@ void main() {
           ),
           isTrue,
         );
+        expect(TranslationQuality.isPureCitationMetadata('21. Ibid.'), isTrue);
         expect(
-          TranslationQuality.isPureCitationMetadata('21. Ibid.'),
-          isTrue,
-        );
-        expect(
-          TranslationQuality.isPureCitationMetadata('32. Hirshleifer, '
-              'op. cit., p. 173.'),
+          TranslationQuality.isPureCitationMetadata(
+            '32. Hirshleifer, '
+            'op. cit., p. 173.',
+          ),
           isTrue,
         );
       });
@@ -2732,9 +2731,7 @@ void main() {
           isTrue,
         );
         expect(
-          TranslationQuality.isPureCitationMetadata(
-            'Leonardo da Vinci, 318',
-          ),
+          TranslationQuality.isPureCitationMetadata('Leonardo da Vinci, 318'),
           isTrue,
         );
         expect(
@@ -2751,34 +2748,31 @@ void main() {
         );
       });
 
-      test(
-        'exempts pure index-metadata li from residual check only when '
-        'bibliographic retention is allowed',
-        () {
-          const String source =
-              '<li class="indexmain" id="idx1_1"><span epub:type="index-term">'
-              'Abu-Lughod, Janet,</span> <a epub:type="index-locator" '
-              'href="part0013_split_007.html#page_213" class="calibre4">213</a>, '
-              '<a epub:type="index-locator" '
-              'href="part0013_split_008.html#page_215" '
-              'class="calibre4">215</a></li>';
-          final TranslationResidualFinding? allowed =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml: source,
-                translatedHtml: source,
-                targetLanguage: 'Chinese',
-                allowBibliographicRetention: true,
-              );
-          expect(allowed, isNull);
-          final TranslationResidualFinding? rejected =
-              TranslationQuality.findSuspiciousHtmlResidual(
-                sourceHtml: source,
-                translatedHtml: source,
-                targetLanguage: 'Chinese',
-              );
-          expect(rejected, isNotNull);
-        },
-      );
+      test('exempts pure index-metadata li from residual check only when '
+          'bibliographic retention is allowed', () {
+        const String source =
+            '<li class="indexmain" id="idx1_1"><span epub:type="index-term">'
+            'Abu-Lughod, Janet,</span> <a epub:type="index-locator" '
+            'href="part0013_split_007.html#page_213" class="calibre4">213</a>, '
+            '<a epub:type="index-locator" '
+            'href="part0013_split_008.html#page_215" '
+            'class="calibre4">215</a></li>';
+        final TranslationResidualFinding? allowed =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: source,
+              translatedHtml: source,
+              targetLanguage: 'Chinese',
+              allowBibliographicRetention: true,
+            );
+        expect(allowed, isNull);
+        final TranslationResidualFinding? rejected =
+            TranslationQuality.findSuspiciousHtmlResidual(
+              sourceHtml: source,
+              translatedHtml: source,
+              targetLanguage: 'Chinese',
+            );
+        expect(rejected, isNotNull);
+      });
     });
   });
 }

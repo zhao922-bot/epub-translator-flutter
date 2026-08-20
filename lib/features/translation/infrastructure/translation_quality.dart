@@ -198,9 +198,27 @@ class TranslationQuality {
             _normalizedWorkTitleText(sourceText) ==
                 _normalizedWorkTitleText(translatedText) &&
             _looksLikeEnglishWorkTitle(sourceText) &&
-            (_hasWorkTitleSemantics(sourceDocument, sourceCandidate, sourceText) ||
+            (_hasWorkTitleSemantics(
+                  sourceDocument,
+                  sourceCandidate,
+                  sourceText,
+                ) ||
                 hasChineseTitleMarker);
-        if (canExempt) {
+        final bool canExemptCjkGloss =
+            !canExempt &&
+            _clearCjkMarkedWorkTitleGloss(
+              translatedDocument,
+              sourceText,
+              targetLanguage: targetLanguage,
+            );
+        if (canExempt || canExemptCjkGloss) {
+          if (canExemptCjkGloss) {
+            // The HTML lock may leave an empty emphasis wrapper at the end of
+            // the block while the model moves the original title into plain
+            // CJK book-title marks. Clear only the quality-check copy; the
+            // rendered translation remains untouched.
+            sourceCandidate.text = '';
+          }
           exemptedCandidateIndexes.add(index);
           continue;
         }
@@ -238,10 +256,8 @@ class TranslationQuality {
         // original is retained only as a parenthetical gloss, exactly like
         // the separate-node form handled above, so treat it as matched too.
         final bool translatedGlossRetained = translatedCandidates.any(
-          (Element candidate) => _isWorkTitleGlossRetention(
-            candidate.text,
-            sourceText,
-          ),
+          (Element candidate) =>
+              _isWorkTitleGlossRetention(candidate.text, sourceText),
         );
         if (translatedGlossRetained) {
           sourceCandidate.text = '';
@@ -255,9 +271,8 @@ class TranslationQuality {
           translatedDocument.body?.text ?? translatedDocument.text ?? '',
         ),
       );
-      final bool hasChineseTitleMarker = RegExp(
-        r'[《「『〈]',
-      ).hasMatch(translatedVisibleText) ||
+      final bool hasChineseTitleMarker =
+          RegExp(r'[《「『〈]').hasMatch(translatedVisibleText) ||
           RegExp(r'[》」』〉]').hasMatch(translatedVisibleText) ||
           translatedCandidates.any(
             (Element candidate) => RegExp(
@@ -547,6 +562,9 @@ class TranslationQuality {
         if (_isParenthesizedTermGloss(text, token)) {
           continue;
         }
+        if (_isQuotedTermGloss(text, token)) {
+          continue;
+        }
         return token;
       }
     }
@@ -585,6 +603,23 @@ class TranslationQuality {
       r'[）)]',
     );
     return retainedFirstPattern.hasMatch(text);
+  }
+
+  /// Whether [token] is retained inside a translated quote that also contains
+  /// target-script context, for example `“agoric开放系统”`. Quoted technical
+  /// terms are source-owned labels, not standalone untranslated prose.
+  static bool _isQuotedTermGloss(String text, String token) {
+    final String escaped = RegExp.escape(token);
+    final RegExp quotedPattern = RegExp(
+      r'[“「『"]'
+      r'(?=[^”」』"]*[぀-ヿ㐀-鿿가-힯])'
+      r'[^”」』"]*'
+      '$escaped'
+      r'[^”」』"]*'
+      r'[”」』"]',
+      caseSensitive: false,
+    );
+    return quotedPattern.hasMatch(text);
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -1092,14 +1127,8 @@ class TranslationQuality {
   /// rejection, because those unreviewed forms are exactly what the strict
   /// tests require to fail.
   static String _normalizeAuditedTerm(String value) {
-    final String withoutQuotes = value.replaceAll(
-      RegExp(r'[“”"„‟«»]'),
-      '',
-    );
-    return withoutQuotes.replaceFirst(
-      RegExp(r'[,，。.]$'),
-      '',
-    );
+    final String withoutQuotes = value.replaceAll(RegExp(r'[“”"„‟«»]'), '');
+    return withoutQuotes.replaceFirst(RegExp(r'[,，。.]$'), '');
   }
 
   /// Normalizes a work-title candidate so trailing punctuation (for example
@@ -1107,10 +1136,7 @@ class TranslationQuality {
   /// matching the same title retained without that punctuation in the
   /// translation.
   static String _normalizedWorkTitleText(String text) {
-    return _normalizeText(text).replaceFirst(
-      RegExp(r'[,;:。，；：.!?！？]+$'),
-      '',
-    );
+    return _normalizeText(text).replaceFirst(RegExp(r'[,;:。，；：.!?！？]+$'), '');
   }
 
   /// Whether [translatedText] holds [sourceTitle] as an original-title gloss
@@ -1130,6 +1156,55 @@ class TranslationQuality {
       return false;
     }
     return normalizedTranslated.contains(normalizedSource);
+  }
+
+  /// Clears one retained source work title when the model moved it out of its
+  /// original inline wrapper and placed it inside CJK book-title/parenthesis
+  /// marks (for example `《The Sovereign Individual》`). This only mutates the
+  /// parsed quality-check document, never the final HTML returned to callers.
+  static bool _clearCjkMarkedWorkTitleGloss(
+    Document translatedDocument,
+    String sourceTitle, {
+    required String targetLanguage,
+  }) {
+    final String normalizedSource = _normalizedWorkTitleText(sourceTitle);
+    if (normalizedSource.isEmpty ||
+        _looksLikeSentenceOrInstruction(normalizedSource)) {
+      return false;
+    }
+    final String translatedBody =
+        translatedDocument.body?.text ?? translatedDocument.text ?? '';
+    if (!_hasTargetScript(translatedBody, targetLanguage: targetLanguage)) {
+      return false;
+    }
+    final RegExp retainedTitle = RegExp(
+      r'[《「『〈（]\s*' +
+          RegExp.escape(normalizedSource) +
+          r'\s*[,.;:，。；：]?\s*[》」』〉）]',
+      caseSensitive: false,
+    );
+    for (final Text node in _textNodes(translatedDocument)) {
+      final String data = node.data;
+      final RegExpMatch? match = retainedTitle.firstMatch(data);
+      if (match == null) {
+        continue;
+      }
+      final String matchedTitle = match.group(0)!;
+      final int titleStart = matchedTitle.toLowerCase().indexOf(
+        normalizedSource.toLowerCase(),
+      );
+      if (titleStart < 0) {
+        continue;
+      }
+      final int absoluteStart = match.start + titleStart;
+      node.data = data.replaceRange(
+        absoluteStart,
+        absoluteStart + normalizedSource.length,
+        '',
+      );
+      return true;
+    }
+    return false;
   }
 
   /// Audited source-language foreign terms that may legitimately stay in the
@@ -1236,10 +1311,7 @@ class TranslationQuality {
   /// the translated text (for example `—de facto` -> `de facto`).
   static String _auditedCoreText(String value) {
     return value.replaceAll(
-      RegExp(
-        r'^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$',
-        unicode: true,
-      ),
+      RegExp(r'^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$', unicode: true),
       '',
     );
   }
@@ -1791,9 +1863,7 @@ class TranslationQuality {
         .where(
           (Element element) =>
               _looksLikeEnglishWorkTitle(_normalizeText(element.text)) &&
-              !_looksLikeSentenceOrInstruction(
-                _normalizeText(element.text),
-              ),
+              !_looksLikeSentenceOrInstruction(_normalizeText(element.text)),
         )
         .toList(growable: false);
     // Imperative / instruction-like emphasis (for example
@@ -1805,9 +1875,7 @@ class TranslationQuality {
         .where(
           (Element element) =>
               _looksLikeEnglishWorkTitle(_normalizeText(element.text)) &&
-              !_looksLikeSentenceOrInstruction(
-                _normalizeText(element.text),
-              ),
+              !_looksLikeSentenceOrInstruction(_normalizeText(element.text)),
         )
         .toList(growable: false);
     for (final Element translatedTitle in translatedTitles) {
@@ -1830,9 +1898,9 @@ class TranslationQuality {
 
   static bool _hasSourceOwnedShortEnglishProse(
     Document sourceDocument,
-    Document translatedDocument,
-    {bool isBibliographicEntry = false,}
-  ) {
+    Document translatedDocument, {
+    bool isBibliographicEntry = false,
+  }) {
     if (isBibliographicEntry) {
       // A bibliography / endnote entry conventionally keeps several fields in
       // the original language: author names, journal names, volume/issue/year
@@ -1925,8 +1993,9 @@ class TranslationQuality {
         // leading dash keeps ordinary unmodified `sig` text (for example
         // `Peter Thiel` or `Los Angeles`) out of this exemption.
         if (RegExp(r'^[-–—]').hasMatch(strippedSource.trim())) {
-          final String name = _normalizeText(strippedSource)
-              .replaceFirst(RegExp(r'^[-–—]\s*'), '');
+          final String name = _normalizeText(
+            strippedSource,
+          ).replaceFirst(RegExp(r'^[-–—]\s*'), '');
           if (_canonicalRetainedPersonName(name) != null) {
             return false;
           }
@@ -2267,7 +2336,8 @@ class TranslationQuality {
   static bool _looksLikeLegalCaseName(List<String> words) {
     final int vIndex = words.indexWhere((String word) {
       final String normalized = word.replaceAll(RegExp(r'[.\s]'), '');
-      return normalized.toLowerCase() == 'v' || normalized.toLowerCase() == 'vs';
+      return normalized.toLowerCase() == 'v' ||
+          normalized.toLowerCase() == 'vs';
     });
     if (vIndex <= 0 || vIndex >= words.length - 1) {
       return false;
@@ -2296,9 +2366,7 @@ class TranslationQuality {
   /// Debug-only probe: applies [TranslationQuality._looksLikeEnglishTitleOrName]
   /// to the English words of a mixed-CJK inline node.
   static bool debugLooksLikeEnglishTitleOrName(String text) {
-    return _looksLikeEnglishTitleOrName(
-      _englishWorkTitleWords(text),
-    );
+    return _looksLikeEnglishTitleOrName(_englishWorkTitleWords(text));
   }
 
   /// Splits a word like `d'Alene` into `['d', 'Alene']` when the leading

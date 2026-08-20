@@ -1598,13 +1598,20 @@ class EpubChapterTranslator {
           // retry has a concrete instruction instead of repeating the same
           // (often untranslated) output. Keep the reason lossy/safe — never
           // embed the raw exception or API key here.
-          final String reason = _safeErrorText(lastError, config)
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim();
-          userContent = '$userContent\n\n'
+          final String reason = _safeErrorText(
+            lastError,
+            config,
+          ).replaceAll(RegExp(r'\s+'), ' ').trim();
+          final String retryInstruction = _isEmptyTranslationResponse(lastError)
+              ? 'The previous response was empty. Return a complete HTML '
+                    'fragment with every human-readable text node translated '
+                    'into ${config.targetLanguage}.'
+              : 'Translate every human-readable text node into '
+                    '${config.targetLanguage}.';
+          userContent =
+              '$userContent\n\n'
               '[RETRY] The previous translation was rejected for this reason: '
-              '$reason. Translate every human-readable text node into '
-              '${config.targetLanguage}. Only titles, proper names, and '
+              '$reason. $retryInstruction Only titles, proper names, and '
               'reference data (such as author names, journal names, volume, '
               'issue, year, and page numbers in a bibliography entry) may '
               'stay in the original language. Return the complete HTML '
@@ -1659,11 +1666,9 @@ class EpubChapterTranslator {
             final RandomAccessFile raf = await diagFile.open(
               mode: FileMode.append,
             );
-            final String sourcePreview =
-                _linePreview(block.sourceHtml.replaceFirst(
-                  RegExp(r'<[^>]*>'),
-                  '',
-                ));
+            final String sourcePreview = _linePreview(
+              block.sourceHtml.replaceFirst(RegExp(r'<[^>]*>'), ''),
+            );
             String? lockedPreview;
             try {
               lockedPreview = _lockTranslatedHtmlStructure(
@@ -1673,7 +1678,8 @@ class EpubChapterTranslator {
             } catch (_) {
               lockedPreview = null;
             }
-            final String entry = 'BLOCK=${block.id} attempt=$attempt '
+            final String entry =
+                'BLOCK=${block.id} attempt=$attempt '
                 'error=$error\nSOURCE=$sourcePreview\n'
                 'RAW=$lastCleaned\n'
                 'LOCKED=${lockedPreview ?? '<unavailable>'}\n---\n';
@@ -1706,6 +1712,13 @@ class EpubChapterTranslator {
           ? lastCleaned
           : block.sourceHtml;
     }
+    if (lastError is FormatException &&
+        _isEmptyTranslationResponse(lastError)) {
+      throw StateError(
+        'Translation failed after ${config.maxRetries} attempts for block '
+        '${block.id}: the translation API returned empty content.',
+      );
+    }
     if (lastError is DioException && lastError.error is HandshakeException) {
       final String host = Uri.parse(
         _apiClient.normalizedBaseUrl(config.apiBaseUrl),
@@ -1728,6 +1741,13 @@ class EpubChapterTranslator {
       r'|Possible untranslated source-language token '
       r'|Possible untranslated source-language text',
     ).hasMatch(message);
+  }
+
+  static bool _isEmptyTranslationResponse(Object error) {
+    return error is FormatException &&
+        error.toString().contains(
+          'The translation API returned an empty block.',
+        );
   }
 
   Future<_BookMemory> _generateInitialBookMemory({
@@ -3591,9 +3611,7 @@ class EpubChapterTranslator {
   /// occurrences use only the translated form. This helps preserve semantic
   /// precision without leaving bare source-language tokens flagged by the
   /// residual-quality check.
-  String _terminologyGlossInstruction({
-    required TranslationConfig config,
-  }) {
+  String _terminologyGlossInstruction({required TranslationConfig config}) {
     if (!_isCjkTargetLanguage(config.targetLanguage)) {
       return '';
     }
