@@ -2288,6 +2288,7 @@ class TranslationQuality {
       'at',
       'by',
       'd',
+      'del',
       'for',
       'from',
       'in',

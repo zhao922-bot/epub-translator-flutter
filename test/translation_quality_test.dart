@@ -644,6 +644,22 @@ void main() {
       expect(finding, isNull);
     });
 
+    test(
+      'allows multiple retained original titles in a translated book reference',
+      () {
+        final TranslationResidualFinding?
+        finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml:
+              '<p>See <i>II Libro del Cortegiano</i>, or <i>The Book of the Courtier</i>.</p>',
+          translatedHtml:
+              '<p>参见《廷臣论》（<i>II Libro del Cortegiano</i>，即<i>The Book of the Courtier</i>）。</p>',
+          targetLanguage: 'Chinese',
+        );
+
+        expect(finding, isNull);
+      },
+    );
+
     test('allows acknowledgments titles used as subjects and newsletter names', () {
       const String sourceHtml =
           '<p>It is the third we have done together. '
