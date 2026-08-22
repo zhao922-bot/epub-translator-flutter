@@ -1002,6 +1002,30 @@ class _AlwaysReceiveTimeoutAdapter implements HttpClientAdapter {
   }
 }
 
+class _AlwaysConnectionTimeoutAdapter implements HttpClientAdapter {
+  int fetchCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    fetchCount += 1;
+    if (requestStream != null) {
+      await for (final Uint8List _ in requestStream) {}
+    }
+    throw DioException(
+      requestOptions: options,
+      type: DioExceptionType.connectionTimeout,
+      message: 'simulated connection timeout',
+    );
+  }
+}
+
 class _RecordingMemoryAdapter implements HttpClientAdapter {
   final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
 
@@ -2075,6 +2099,39 @@ void main() {
       },
     );
 
+    test(
+      'degrades connection-timed-out HTML footnote blocks after one retry',
+      () async {
+        final _AlwaysConnectionTimeoutAdapter adapter =
+            _AlwaysConnectionTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final Map<String, String> translated = await translator
+            .translateFootnoteBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 4,
+                retryDelaySeconds: 0,
+              ),
+              references: <FootnoteBlockReference>[
+                _footnoteReference(0, 'First unreachable note.'),
+                _footnoteReference(1, 'Second unreachable note.'),
+              ],
+            );
+
+        expect(translated, <String, String>{
+          'f0:p-1': '<p>First unreachable note.</p>',
+          'f1:p-1': '<p>Second unreachable note.</p>',
+        });
+        expect(translator.getDegradedBlockIdsForTest(), contains('p-1'));
+        expect(adapter.fetchCount, 2);
+      },
+    );
+
     test('same-file short marker uses slots in the footnote batch', () async {
       final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
         <Map<String, Object?>>[
@@ -2614,6 +2671,45 @@ void main() {
     );
 
     test(
+      'degrades a batch after one connection-timeout retry instead of aborting',
+      () async {
+        final _AlwaysConnectionTimeoutAdapter adapter =
+            _AlwaysConnectionTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final List<String> translated = await translator
+            .translateBlockBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 4,
+                retryDelaySeconds: 0,
+              ),
+              blocks: const <ExtractedBlock>[
+                ExtractedBlock(
+                  id: 'connection-timeout-block',
+                  tagName: 'p',
+                  sourceHtml: '<p>The endpoint was unreachable.</p>',
+                  sourceText: 'The endpoint was unreachable.',
+                ),
+              ],
+            );
+
+        expect(translated, const <String>[
+          '<p>The endpoint was unreachable.</p>',
+        ]);
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          contains('connection-timeout-block'),
+        );
+        expect(adapter.fetchCount, 2);
+      },
+    );
+
+    test(
       'degrades a protected-slot block after repeated receive timeouts',
       () async {
         final _AlwaysReceiveTimeoutAdapter adapter =
@@ -2650,6 +2746,46 @@ void main() {
           contains('timeout-protected-block'),
         );
         expect(adapter.fetchCount, 1);
+      },
+    );
+
+    test(
+      'degrades a protected-slot batch after one connection-timeout retry',
+      () async {
+        final _AlwaysConnectionTimeoutAdapter adapter =
+            _AlwaysConnectionTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final List<String>
+        translated = await translator.translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 4,
+            retryDelaySeconds: 0,
+          ),
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'connection-timeout-protected-block',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>Endpoint unavailable.<a href="#n1"><span>[1]</span></a></p>',
+              sourceText: 'Endpoint unavailable. [1]',
+            ),
+          ],
+        );
+
+        expect(translated, const <String>[
+          '<p>Endpoint unavailable.<a href="#n1"><span>[1]</span></a></p>',
+        ]);
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          contains('connection-timeout-protected-block'),
+        );
+        expect(adapter.fetchCount, 2);
       },
     );
 

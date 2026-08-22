@@ -45,9 +45,9 @@ class EpubChapterTranslator {
            footnoteBatchPlanner ?? const FootnoteBatchPlanner();
 
   /// Block ids whose translation could not pass quality checks or whose API
-  /// response timed out. They degrade to their last usable translation (or
-  /// source HTML when no response arrived) so the whole book can continue.
-  /// Recorded so the run report can list them honestly.
+  /// connection/response timed out. They degrade to their last usable
+  /// translation (or source HTML when no response arrived) so the whole book
+  /// can continue. Recorded so the run report can list them honestly.
   final Set<String> degradedBlockIds = <String>{};
 
   final TranslationCacheStore _cacheStore;
@@ -1658,7 +1658,7 @@ class EpubChapterTranslator {
         }
         lastError = error;
         if (error is FormatException ||
-            TranslationApiClient.isReceiveTimeout(error)) {
+            TranslationApiClient.isRequestTimeout(error)) {
           try {
             final File diagFile = File(
               r'F:\vibe coding\epub-translator-flutter-clean\work\'
@@ -1720,7 +1720,7 @@ class EpubChapterTranslator {
         '${block.id}: the translation API returned empty content.',
       );
     }
-    if (TranslationApiClient.isReceiveTimeout(lastError)) {
+    if (TranslationApiClient.isRequestTimeout(lastError)) {
       degradedBlockIds.add(block.id);
       return lastCleaned != null && lastCleaned.trim().isNotEmpty
           ? lastCleaned
@@ -2799,31 +2799,41 @@ class EpubChapterTranslator {
           ),
         );
       } on DioException catch (error) {
-        if (!TranslationApiClient.isReceiveTimeout(error)) {
-          rethrow;
-        }
-        // A timed-out cross-file batch must not abort every footnote in the
-        // EPUB. Retry each reference independently; a reference that still
-        // times out degrades to its source HTML and is reported with the run.
-        for (final FootnoteBlockReference reference in htmlReferences) {
-          try {
-            translatedById.addAll(
-              await _translateFootnoteHtmlBatch(
-                dio: dio,
-                config: config,
-                references: <FootnoteBlockReference>[reference],
-                context: batch.context,
-                retryDelayOverride: retryDelayOverride,
-                cancelToken: cancelToken,
-                onRequestAttempt: onRequestAttempt,
-              ),
-            );
-          } on DioException catch (singleError) {
-            if (!TranslationApiClient.isReceiveTimeout(singleError)) {
-              rethrow;
-            }
+        if (TranslationApiClient.isConnectionTimeout(error)) {
+          // A connection timeout is endpoint-wide rather than payload-size
+          // related. The batch already retried once, so retain its source
+          // blocks instead of multiplying the outage into per-block calls.
+          for (final FootnoteBlockReference reference in htmlReferences) {
             degradedBlockIds.add(reference.block.id);
             translatedById[reference.requestId] = reference.block.sourceHtml;
+          }
+        } else {
+          if (!TranslationApiClient.isReceiveTimeout(error)) {
+            rethrow;
+          }
+          // A receive timeout on a large batch can be payload related. Retry
+          // each reference independently; one that still times out degrades
+          // to its source HTML and is reported with the run.
+          for (final FootnoteBlockReference reference in htmlReferences) {
+            try {
+              translatedById.addAll(
+                await _translateFootnoteHtmlBatch(
+                  dio: dio,
+                  config: config,
+                  references: <FootnoteBlockReference>[reference],
+                  context: batch.context,
+                  retryDelayOverride: retryDelayOverride,
+                  cancelToken: cancelToken,
+                  onRequestAttempt: onRequestAttempt,
+                ),
+              );
+            } on DioException catch (singleError) {
+              if (!TranslationApiClient.isReceiveTimeout(singleError)) {
+                rethrow;
+              }
+              degradedBlockIds.add(reference.block.id);
+              translatedById[reference.requestId] = reference.block.sourceHtml;
+            }
           }
         }
       }
@@ -3021,6 +3031,15 @@ class EpubChapterTranslator {
     } on DioException catch (error) {
       if (_isCancelError(error)) {
         throw const TranslationCancelledException();
+      }
+      if (TranslationApiClient.isConnectionTimeout(error)) {
+        degradedBlockIds.addAll(
+          requests.map((_ProtectedSlotRequest request) => request.block.id),
+        );
+        return <String, String>{
+          for (final _ProtectedSlotRequest request in requests)
+            request.id: request.block.sourceHtml,
+        };
       }
       if (TranslationApiClient.isReceiveTimeout(error) &&
           requests.length == 1) {
@@ -3553,6 +3572,14 @@ class EpubChapterTranslator {
     } on DioException catch (error) {
       if (_isCancelError(error)) {
         throw const TranslationCancelledException();
+      }
+      if (TranslationApiClient.isConnectionTimeout(error)) {
+        degradedBlockIds.addAll(
+          batch.blocks.map((ExtractedBlock block) => block.id),
+        );
+        return batch.blocks
+            .map((ExtractedBlock block) => block.sourceHtml)
+            .toList(growable: false);
       }
       if (TranslationApiClient.shouldFallbackBatchDioException(error)) {
         final TranslationStyleProfile fallbackStyleProfile =
