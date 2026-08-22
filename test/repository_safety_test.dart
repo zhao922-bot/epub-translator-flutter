@@ -978,6 +978,30 @@ class _EmptyThenValidHtmlAdapter implements HttpClientAdapter {
   }
 }
 
+class _AlwaysReceiveTimeoutAdapter implements HttpClientAdapter {
+  int fetchCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    fetchCount += 1;
+    if (requestStream != null) {
+      await for (final Uint8List _ in requestStream) {}
+    }
+    throw DioException(
+      requestOptions: options,
+      type: DioExceptionType.receiveTimeout,
+      message: 'simulated receive timeout',
+    );
+  }
+}
+
 class _RecordingMemoryAdapter implements HttpClientAdapter {
   final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
 
@@ -2018,6 +2042,39 @@ void main() {
       expect(adapter.requestCount, 1);
     });
 
+    test(
+      'degrades timed-out HTML footnote blocks instead of aborting',
+      () async {
+        final _AlwaysReceiveTimeoutAdapter adapter =
+            _AlwaysReceiveTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final Map<String, String> translated = await translator
+            .translateFootnoteBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 4,
+                retryDelaySeconds: 0,
+              ),
+              references: <FootnoteBlockReference>[
+                _footnoteReference(0, 'First timed-out note.'),
+                _footnoteReference(1, 'Second timed-out note.'),
+              ],
+            );
+
+        expect(translated, <String, String>{
+          'f0:p-1': '<p>First timed-out note.</p>',
+          'f1:p-1': '<p>Second timed-out note.</p>',
+        });
+        expect(translator.getDegradedBlockIdsForTest(), contains('p-1'));
+        expect(adapter.fetchCount, 3);
+      },
+    );
+
     test('same-file short marker uses slots in the footnote batch', () async {
       final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
         <Map<String, Object?>>[
@@ -2516,6 +2573,83 @@ void main() {
             ),
           ),
         );
+      },
+    );
+
+    test(
+      'degrades a block after repeated receive timeouts instead of aborting',
+      () async {
+        final _AlwaysReceiveTimeoutAdapter adapter =
+            _AlwaysReceiveTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final List<String> translated = await translator
+            .translateBlockBatchForTest(
+              dio: dio,
+              config: TranslationConfig.defaults().copyWith(
+                apiKey: 'sk-test',
+                targetLanguage: 'Chinese',
+                maxRetries: 4,
+                retryDelaySeconds: 0,
+              ),
+              blocks: const <ExtractedBlock>[
+                ExtractedBlock(
+                  id: 'timeout-block',
+                  tagName: 'p',
+                  sourceHtml: '<p>This block timed out.</p>',
+                  sourceText: 'This block timed out.',
+                ),
+              ],
+            );
+
+        expect(translated, const <String>['<p>This block timed out.</p>']);
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          contains('timeout-block'),
+        );
+        expect(adapter.fetchCount, 3);
+      },
+    );
+
+    test(
+      'degrades a protected-slot block after repeated receive timeouts',
+      () async {
+        final _AlwaysReceiveTimeoutAdapter adapter =
+            _AlwaysReceiveTimeoutAdapter();
+        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+          ..httpClientAdapter = adapter;
+        final EpubChapterTranslator translator = EpubChapterTranslator();
+
+        final List<String>
+        translated = await translator.translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 4,
+            retryDelaySeconds: 0,
+          ),
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'timeout-protected-block',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>This block has a note.<a href="#n1"><span>[1]</span></a></p>',
+              sourceText: 'This block has a note. [1]',
+            ),
+          ],
+        );
+
+        expect(translated, const <String>[
+          '<p>This block has a note.<a href="#n1"><span>[1]</span></a></p>',
+        ]);
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          contains('timeout-protected-block'),
+        );
+        expect(adapter.fetchCount, 1);
       },
     );
 

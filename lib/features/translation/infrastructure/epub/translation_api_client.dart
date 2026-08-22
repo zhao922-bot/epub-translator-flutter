@@ -398,6 +398,11 @@ class TranslationApiClient {
     return error is DioException && CancelToken.isCancel(error);
   }
 
+  static bool isReceiveTimeout(Object error) {
+    return error is DioException &&
+        error.type == DioExceptionType.receiveTimeout;
+  }
+
   static bool shouldFallbackBatchDioException(DioException error) {
     if (error.response?.statusCode == 413) {
       return true;
@@ -424,6 +429,13 @@ class TranslationApiClient {
     final int normalMaxAttempts = max(1, config.maxRetries);
     if (isRateLimitError(error)) {
       return max(normalMaxAttempts, 8);
+    }
+    // A receive timeout means the endpoint did not produce a response within
+    // the configured window. Retrying the same large request four or more
+    // times can block the whole EPUB for many minutes; one retry is enough to
+    // distinguish a transient stall before the caller degrades that block.
+    if (isReceiveTimeout(error)) {
+      return min(normalMaxAttempts, 2);
     }
     return normalMaxAttempts;
   }
