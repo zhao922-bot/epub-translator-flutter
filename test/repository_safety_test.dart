@@ -2709,6 +2709,53 @@ void main() {
       },
     );
 
+    test('test translation runs do not retain degraded block state', () async {
+      final EpubChapterTranslator translator = EpubChapterTranslator();
+      const ExtractedBlock first = ExtractedBlock(
+        id: 'p-0',
+        tagName: 'p',
+        sourceHtml: '<p>First.</p>',
+        sourceText: 'First.',
+      );
+      const ExtractedBlock second = ExtractedBlock(
+        id: 'p-0',
+        tagName: 'p',
+        sourceHtml: '<p>Second.</p>',
+        sourceText: 'Second.',
+      );
+      final _AlwaysConnectionTimeoutAdapter timeoutAdapter =
+          _AlwaysConnectionTimeoutAdapter();
+      final Dio timeoutDio = Dio(
+        BaseOptions(baseUrl: 'https://api.example.test/v1'),
+      )..httpClientAdapter = timeoutAdapter;
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiKey: 'sk-test',
+        targetLanguage: 'Chinese',
+        maxRetries: 0,
+        retryDelaySeconds: 0,
+      );
+
+      await translator.translateBlockBatchForTest(
+        dio: timeoutDio,
+        config: config,
+        blocks: const <ExtractedBlock>[first],
+      );
+      expect(translator.getDegradedBlockIdsForTest(), <String>{'p-0'});
+
+      final _SequencedHtmlBatchAdapter successAdapter =
+          _SequencedHtmlBatchAdapter(<String>['<p>第二段。</p>']);
+      final Dio successDio = Dio(
+        BaseOptions(baseUrl: 'https://api.example.test/v1'),
+      )..httpClientAdapter = successAdapter;
+      await translator.translateBlockBatchForTest(
+        dio: successDio,
+        config: config,
+        blocks: const <ExtractedBlock>[second],
+      );
+
+      expect(translator.getDegradedBlockIdsForTest(), isEmpty);
+    });
+
     test(
       'degrades a protected-slot block after repeated receive timeouts',
       () async {

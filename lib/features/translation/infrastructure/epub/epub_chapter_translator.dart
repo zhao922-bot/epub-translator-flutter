@@ -44,11 +44,11 @@ class EpubChapterTranslator {
        _footnoteBatchPlanner =
            footnoteBatchPlanner ?? const FootnoteBatchPlanner();
 
-  /// Block ids whose translation could not pass quality checks or whose API
+  /// Blocks whose translation could not pass quality checks or whose API
   /// connection/response timed out. They degrade to their last usable
   /// translation (or source HTML when no response arrived) so the whole book
   /// can continue. Recorded so the run report can list them honestly.
-  final Set<String> degradedBlockIds = <String>{};
+  final Set<ExtractedBlock> _degradedBlocks = <ExtractedBlock>{};
 
   final TranslationCacheStore _cacheStore;
   final EpubRepacker _repacker;
@@ -165,7 +165,12 @@ class EpubChapterTranslator {
   }
 
   /// Test-only view of the blocks degraded for this translator instance.
-  Set<String> getDegradedBlockIdsForTest() => degradedBlockIds;
+  Set<String> getDegradedBlockIdsForTest() =>
+      _degradedBlocks.map((ExtractedBlock block) => block.id).toSet();
+
+  void _beginDegradedTracking() {
+    _degradedBlocks.clear();
+  }
 
   Future<List<String>> translateBlockBatchForTest({
     required Dio dio,
@@ -176,6 +181,7 @@ class EpubChapterTranslator {
     List<ExtractedBlock> contextAfter = const <ExtractedBlock>[],
     Map<String, Object?>? bookMemory,
   }) {
+    _beginDegradedTracking();
     return _translateBlockBatch(
       dio: dio,
       config: config,
@@ -198,6 +204,7 @@ class EpubChapterTranslator {
     required List<FootnoteBlockReference> references,
     Map<String, Object?>? bookMemory,
   }) {
+    _beginDegradedTracking();
     return _translateFootnoteBatch(
       dio: dio,
       config: config,
@@ -577,6 +584,7 @@ class EpubChapterTranslator {
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
+    _beginDegradedTracking();
     try {
       final List<InspectedChapter> selectedChapters = chapters
           .where(
@@ -1052,7 +1060,8 @@ class EpubChapterTranslator {
                 'Translated footnote ${reference.requestId} is missing before cache write.',
               );
             }
-            if (!degradedBlockIds.contains(reference.block.id)) {
+            final bool cacheable = !_degradedBlocks.contains(reference.block);
+            if (cacheable) {
               await _cacheStore.putBlockTranslation(
                 _blockCacheKey(
                   config,
@@ -1062,6 +1071,7 @@ class EpubChapterTranslator {
                 ),
                 translated,
               );
+              cacheWriteCount += 1;
             }
             translatedByChapterIndex[reference.chapterIndex]![reference
                 .block
@@ -1070,7 +1080,6 @@ class EpubChapterTranslator {
             );
             completedBlocks += 1;
             apiTranslatedBlocks += 1;
-            cacheWriteCount += 1;
             blocksSinceResumeSave += 1;
             currentJob = currentJob.copyWith(
               progress: completedBlocks / totalBlocks,
@@ -1343,24 +1352,27 @@ class EpubChapterTranslator {
                 'Performance: API batch ${timedBatch.batchNumber}/${batches.length} for ${chapter.title} (${batch.blocks.length} blocks) took ${_formatDuration(timedBatch.elapsed)}.',
               );
               final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
-              await Future.wait<void>(<Future<void>>[
+              final List<int> cacheableIndexes = <int>[
                 for (int index = 0; index < batch.blocks.length; index += 1)
-                  if (!degradedBlockIds.contains(batch.blocks[index].id))
-                    _cacheStore.putBlockTranslation(
-                      _blockCacheKey(
-                        config,
-                        batch.blocks[index],
-                        chapterPath: chapter.path,
-                        confirmedStyleProfile: userStyleProfile,
-                      ),
-                      translatedBatch[index],
+                  if (!_degradedBlocks.contains(batch.blocks[index])) index,
+              ];
+              await Future.wait<void>(<Future<void>>[
+                for (final int index in cacheableIndexes)
+                  _cacheStore.putBlockTranslation(
+                    _blockCacheKey(
+                      config,
+                      batch.blocks[index],
+                      chapterPath: chapter.path,
+                      confirmedStyleProfile: userStyleProfile,
                     ),
+                    translatedBatch[index],
+                  ),
               ]);
               cacheWriteStopwatch.stop();
               chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
               totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-              chapterCacheWrites += batch.blocks.length;
-              cacheWriteCount += batch.blocks.length;
+              chapterCacheWrites += cacheableIndexes.length;
+              cacheWriteCount += cacheableIndexes.length;
 
               for (int index = 0; index < batch.blocks.length; index += 1) {
                 throwIfCancelled();
@@ -1508,15 +1520,20 @@ class EpubChapterTranslator {
                 updatedByPath[chapter.path] ?? chapter,
           )
           .toList();
-      if (degradedBlockIds.isNotEmpty) {
+      final int degradedBlockCount = _degradedBlocks.length;
+      if (degradedBlockCount > 0) {
+        final String degradedBlockSample = _degradedBlocks
+            .take(20)
+            .map((ExtractedBlock block) => block.id)
+            .join(',');
         emit(
           currentJob.copyWith(
             currentChapter: 'Repacking EPUB',
             currentBlock: null,
+            degradedBlockCount: degradedBlockCount,
           ),
-          'Degraded blocks retained as their last usable translation: '
-          '${degradedBlockIds.join(',')}. The EPUB will still be produced and '
-          'the run report lists these blocks.',
+          'Translation retained fallback content for $degradedBlockCount '
+          'blocks${degradedBlockSample.isEmpty ? '' : ': $degradedBlockSample'}.',
         );
       }
       final Stopwatch repackStopwatch = Stopwatch()..start();
@@ -1532,11 +1549,22 @@ class EpubChapterTranslator {
       throwIfCancelled();
       repackStopwatch.stop();
 
-      final TranslationJob completedJob = currentJob.copyWith(
-        status: TranslationJobStatus.completed,
+      final bool allBlocksDegraded =
+          totalBlocks > 0 && degradedBlockCount >= totalBlocks;
+      final TranslationJobStatus terminalStatus = allBlocksDegraded
+          ? TranslationJobStatus.failed
+          : degradedBlockCount > 0
+          ? TranslationJobStatus.completedWithWarnings
+          : TranslationJobStatus.completed;
+      final TranslationJob terminalJob = currentJob.copyWith(
+        status: terminalStatus,
         phase: TranslationJobPhase.translation,
         progress: 1,
-        currentChapter: 'EPUB ready',
+        currentChapter: allBlocksDegraded
+            ? 'Translation failed'
+            : degradedBlockCount > 0
+            ? 'EPUB ready with warnings'
+            : 'EPUB ready',
         currentBlock: null,
         completedFiles: completedFiles,
         totalFiles: selectedChapters.length,
@@ -1544,29 +1572,37 @@ class EpubChapterTranslator {
         totalBlocks: totalBlocks,
         cachedBlocks: cachedBlocks,
         resumedBlocks: resumedBlocks,
+        degradedBlockCount: degradedBlockCount,
+        errorMessage: allBlocksDegraded
+            ? 'Every selected text block fell back after translation failures.'
+            : null,
       );
       translationStopwatch.stop();
       emit(
-        completedJob,
-        'Translation complete. Wrote translated EPUB to $outputFilePath',
+        terminalJob,
+        allBlocksDegraded
+            ? 'Translation failed because every selected text block retained fallback content.'
+            : degradedBlockCount > 0
+            ? 'Translation completed with warnings. Wrote partial EPUB to $outputFilePath'
+            : 'Translation complete. Wrote translated EPUB to $outputFilePath',
       );
       emit(
-        completedJob,
+        terminalJob,
         'Performance: Final EPUB repack took ${_formatDuration(repackStopwatch.elapsed)}.',
       );
       emit(
-        completedJob,
+        terminalJob,
         'Performance: Translation run took ${_formatDuration(translationStopwatch.elapsed)}. Translated $apiTranslatedBlocks new blocks at ${_formatBlocksPerMinute(apiTranslatedBlocks, translationStopwatch.elapsed)} blocks/min on average, excluding cache and resume hits. Total API time ${_formatDuration(totalApiElapsed)}; book memory ${_formatDuration(totalMemoryElapsed)} across $memoryRequestCount requests; block cache writes ${_formatDuration(totalCacheWriteElapsed)} across $cacheWriteCount writes.${footnoteBatchCount == 0 ? '' : ' Cross-file footnotes used $footnoteBatchCount batches across $footnoteRequestCount API requests.'}',
       );
       await _cacheStore.saveJobState(
         _resumeStateFromJob(
           jobKey: jobKey,
           inputFingerprint: inputFingerprint,
-          job: completedJob,
-          status: 'completed',
+          job: terminalJob,
+          status: terminalStatus.name,
         ),
       );
-      return TranslationRunResult(job: completedJob, chapters: updatedChapters);
+      return TranslationRunResult(job: terminalJob, chapters: updatedChapters);
     } on TranslationCancelledException {
       rethrow;
     } catch (error) {
@@ -1708,7 +1744,7 @@ class EpubChapterTranslator {
     // one block to its last usable translation (or the source HTML when no
     // reply ever came back), record it for the run report, and keep going.
     if (lastError is FormatException && _isQualityRejection(lastError)) {
-      degradedBlockIds.add(block.id);
+      _degradedBlocks.add(block);
       return lastCleaned != null && lastCleaned.trim().isNotEmpty
           ? lastCleaned
           : block.sourceHtml;
@@ -1721,7 +1757,7 @@ class EpubChapterTranslator {
       );
     }
     if (TranslationApiClient.isRequestTimeout(lastError)) {
-      degradedBlockIds.add(block.id);
+      _degradedBlocks.add(block);
       return lastCleaned != null && lastCleaned.trim().isNotEmpty
           ? lastCleaned
           : block.sourceHtml;
@@ -2804,7 +2840,7 @@ class EpubChapterTranslator {
           // related. The batch already retried once, so retain its source
           // blocks instead of multiplying the outage into per-block calls.
           for (final FootnoteBlockReference reference in htmlReferences) {
-            degradedBlockIds.add(reference.block.id);
+            _degradedBlocks.add(reference.block);
             translatedById[reference.requestId] = reference.block.sourceHtml;
           }
         } else {
@@ -2831,7 +2867,7 @@ class EpubChapterTranslator {
               if (!TranslationApiClient.isReceiveTimeout(singleError)) {
                 rethrow;
               }
-              degradedBlockIds.add(reference.block.id);
+              _degradedBlocks.add(reference.block);
               translatedById[reference.requestId] = reference.block.sourceHtml;
             }
           }
@@ -3020,7 +3056,7 @@ class EpubChapterTranslator {
           );
         } on FormatException catch (error) {
           if (_isQualityRejection(error)) {
-            degradedBlockIds.add(requests.single.block.id);
+            _degradedBlocks.add(requests.single.block);
             return <String, String>{
               requests.single.id: requests.single.block.sourceHtml,
             };
@@ -3033,8 +3069,8 @@ class EpubChapterTranslator {
         throw const TranslationCancelledException();
       }
       if (TranslationApiClient.isConnectionTimeout(error)) {
-        degradedBlockIds.addAll(
-          requests.map((_ProtectedSlotRequest request) => request.block.id),
+        _degradedBlocks.addAll(
+          requests.map((_ProtectedSlotRequest request) => request.block),
         );
         return <String, String>{
           for (final _ProtectedSlotRequest request in requests)
@@ -3043,7 +3079,7 @@ class EpubChapterTranslator {
       }
       if (TranslationApiClient.isReceiveTimeout(error) &&
           requests.length == 1) {
-        degradedBlockIds.add(requests.single.block.id);
+        _degradedBlocks.add(requests.single.block);
         return <String, String>{
           requests.single.id: requests.single.block.sourceHtml,
         };
@@ -3574,9 +3610,7 @@ class EpubChapterTranslator {
         throw const TranslationCancelledException();
       }
       if (TranslationApiClient.isConnectionTimeout(error)) {
-        degradedBlockIds.addAll(
-          batch.blocks.map((ExtractedBlock block) => block.id),
-        );
+        _degradedBlocks.addAll(batch.blocks);
         return batch.blocks
             .map((ExtractedBlock block) => block.sourceHtml)
             .toList(growable: false);

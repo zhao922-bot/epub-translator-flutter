@@ -1,11 +1,14 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -177,6 +180,151 @@ void main() {
       expect(secondRun.job.hasExportableEpub, isTrue);
     },
   );
+
+  test(
+    'partial timeout result is exportable and retries only degraded blocks',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_repository_warning_retry_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final File epubFile = File('${temp.path}/partial.epub');
+      await _writeTestEpub(
+        epubFile,
+        chapters: const <String, String>{
+          'OPS/Text/chapter.xhtml':
+              '<p>First paragraph.</p><p>Second paragraph.</p>',
+        },
+      );
+      final List<String> cacheEvents = <String>[];
+      final _EventRecordingCacheStore cacheStore = _EventRecordingCacheStore(
+        cacheEvents,
+      );
+      final _SelectiveTimeoutAdapter adapter = _SelectiveTimeoutAdapter(
+        timedOutBlockIds: <String>{'p-1'},
+      );
+      final EpubChapterTranslator translator = EpubChapterTranslator(
+        cacheStore: cacheStore,
+        apiClient: _ControlledTranslationApiClient(adapter),
+      );
+      final EpubTranslationRepository repository = EpubTranslationRepository(
+        cacheStore: cacheStore,
+        translator: translator,
+      );
+      final TranslationConfig config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://api.example.test/v1',
+        apiKey: 'sk-test',
+        model: 'warning-retry-${temp.path.hashCode}',
+        targetLanguage: 'Chinese',
+        chunkSize: 1,
+        maxConcurrent: 1,
+        maxRetries: 0,
+        retryDelaySeconds: 0,
+      );
+      final inspection = await repository.startJob(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+
+      final firstRun = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      expect(
+        firstRun.job.status,
+        TranslationJobStatus.completedWithWarnings,
+        reason:
+            'requests=${adapter.blockRequestIds}, '
+            'degraded=${firstRun.job.degradedBlockCount}, '
+            'total=${firstRun.job.totalBlocks}',
+      );
+      expect(firstRun.job.degradedBlockCount, 1);
+      expect(firstRun.job.hasExportableEpub, isTrue);
+      expect(cacheStore.translations, hasLength(1));
+
+      adapter
+        ..timedOutBlockIds.clear()
+        ..blockRequestIds.clear();
+      final secondRun = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+
+      expect(adapter.blockRequestIds, <List<String>>[
+        <String>['p-1'],
+      ]);
+      expect(secondRun.job.status, TranslationJobStatus.completed);
+      expect(secondRun.job.degradedBlockCount, 0);
+    },
+  );
+
+  test('all degraded blocks produce a non-exportable failed job', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_repository_all_degraded_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+    final File epubFile = File('${temp.path}/all_degraded.epub');
+    await _writeTestEpub(
+      epubFile,
+      chapters: const <String, String>{
+        'OPS/Text/chapter.xhtml':
+            '<p>First paragraph.</p><p>Second paragraph.</p>',
+      },
+    );
+    final _EventRecordingCacheStore cacheStore = _EventRecordingCacheStore(
+      <String>[],
+    );
+    final _SelectiveTimeoutAdapter adapter = _SelectiveTimeoutAdapter(
+      timedOutBlockIds: <String>{'p-1', 'p-2'},
+    );
+    final EpubTranslationRepository repository = EpubTranslationRepository(
+      cacheStore: cacheStore,
+      translator: EpubChapterTranslator(
+        cacheStore: cacheStore,
+        apiClient: _ControlledTranslationApiClient(adapter),
+      ),
+    );
+    final TranslationConfig config = TranslationConfig.defaults().copyWith(
+      apiBaseUrl: 'https://api.example.test/v1',
+      apiKey: 'sk-test',
+      model: 'all-degraded-${temp.path.hashCode}',
+      targetLanguage: 'Chinese',
+      chunkSize: 1,
+      maxConcurrent: 1,
+      maxRetries: 0,
+      retryDelaySeconds: 0,
+    );
+    final inspection = await repository.startJob(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+    );
+
+    final result = await repository.translateChapters(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+      chapters: inspection.chapters,
+    );
+
+    expect(
+      result.job.status,
+      TranslationJobStatus.failed,
+      reason:
+          'requests=${adapter.blockRequestIds}, '
+          'degraded=${result.job.degradedBlockCount}, '
+          'total=${result.job.totalBlocks}',
+    );
+    expect(result.job.degradedBlockCount, result.job.totalBlocks);
+    expect(result.job.hasExportableEpub, isFalse);
+    expect(cacheStore.translations, isEmpty);
+  });
 
   test(
     'skips chapter memory when no later uncached chapter can use it',
@@ -790,6 +938,105 @@ class _EventRecordingCacheStore extends TranslationCacheStore {
   @override
   Future<void> saveJobState(JobResumeState state) async {
     jobState = state;
+  }
+}
+
+class _ControlledTranslationApiClient extends TranslationApiClient {
+  const _ControlledTranslationApiClient(this.adapter);
+
+  final HttpClientAdapter adapter;
+
+  @override
+  Dio buildDio(TranslationConfig config) {
+    return Dio(BaseOptions(baseUrl: config.apiBaseUrl))
+      ..httpClientAdapter = adapter;
+  }
+}
+
+class _SelectiveTimeoutAdapter implements HttpClientAdapter {
+  _SelectiveTimeoutAdapter({required this.timedOutBlockIds});
+
+  final Set<String> timedOutBlockIds;
+  final List<List<String>> blockRequestIds = <List<String>>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder bytes = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        bytes.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(bytes.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final Map<String, dynamic> payload =
+        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
+            as Map<String, dynamic>;
+    final String kind = payload['kind'] as String? ?? 'blocks';
+    final Object responsePayload;
+    if (kind == 'initialBookMemory') {
+      responsePayload = <String, Object?>{
+        'bookSummary': 'A short test book.',
+        'styleGuide': <Object?>[],
+        'glossary': <Object?>[],
+        'recentChapters': <Object?>[],
+      };
+    } else if (kind == 'chapterMemory') {
+      responsePayload = <String, Object?>{
+        'title': 'Chapter',
+        'summary': 'A translated chapter.',
+        'continuityNotes': <Object?>[],
+        'glossary': <Object?>[],
+      };
+    } else {
+      final List<Map<String, dynamic>> blocks =
+          (payload['blocks'] as List<dynamic>).cast<Map<String, dynamic>>();
+      final List<String> ids = blocks
+          .map((Map<String, dynamic> block) => block['id'] as String)
+          .toList(growable: false);
+      blockRequestIds.add(ids);
+      if (ids.any(timedOutBlockIds.contains)) {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionTimeout,
+          message: 'simulated connection timeout',
+        );
+      }
+      responsePayload = <String, Object?>{
+        'blocks': blocks
+            .map(
+              (Map<String, dynamic> block) => <String, Object?>{
+                'id': block['id'],
+                'html': '<p>译文。</p>',
+              },
+            )
+            .toList(growable: false),
+      };
+    }
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{
+              'content': jsonEncode(responsePayload),
+            },
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
   }
 }
 
