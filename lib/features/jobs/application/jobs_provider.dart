@@ -36,7 +36,8 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
           canOpenOutput: job.hasExportableEpub,
           canRetry:
               job.status == TranslationJobStatus.failed ||
-              job.status == TranslationJobStatus.cancelled,
+              job.status == TranslationJobStatus.cancelled ||
+              job.status == TranslationJobStatus.completedWithWarnings,
           canResume: job.canResumeTranslation,
           phaseLabel: phaseLabel(job.phase),
         ),
@@ -52,6 +53,7 @@ String _statusLabel(TranslationJobStatus status) {
     TranslationJobStatus.inspected => 'Inspected',
     TranslationJobStatus.cancelled => 'Cancelled',
     TranslationJobStatus.failed => 'Failed',
+    TranslationJobStatus.completedWithWarnings => 'Completed with warnings',
     TranslationJobStatus.completed => 'Completed',
   };
 }

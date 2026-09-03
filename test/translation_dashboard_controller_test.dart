@@ -214,6 +214,75 @@ class _BlockingTranslationRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+class _WarningTranslationRepository extends _SuccessfulInspectionRepository {
+  _WarningTranslationRepository() : super(blockCount: 2);
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    translateCount += 1;
+    final TranslationJob job = TranslationJob(
+      id: 'warning-result',
+      inputPath: inputPath,
+      outputPath: '$outputDirectory\\book_translated.epub',
+      status: TranslationJobStatus.completedWithWarnings,
+      phase: TranslationJobPhase.translation,
+      progress: 1,
+      completedFiles: 1,
+      totalFiles: 1,
+      completedBlocks: 2,
+      totalBlocks: 2,
+      degradedBlockCount: 1,
+    );
+    onProgress?.call(job, 'Translation completed with warnings.');
+    return TranslationRunResult(job: job, chapters: chapters);
+  }
+}
+
+class _AllDegradedTranslationRepository
+    extends _SuccessfulInspectionRepository {
+  _AllDegradedTranslationRepository() : super(blockCount: 2);
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    translateCount += 1;
+    const String error =
+        'Every selected text block fell back after translation failures.';
+    final TranslationJob job = TranslationJob(
+      id: 'all-degraded-result',
+      inputPath: inputPath,
+      outputPath: '$outputDirectory\\book_translated.epub',
+      status: TranslationJobStatus.failed,
+      phase: TranslationJobPhase.translation,
+      progress: 1,
+      currentChapter: 'Translation failed',
+      completedFiles: 1,
+      totalFiles: 1,
+      completedBlocks: 2,
+      totalBlocks: 2,
+      degradedBlockCount: 2,
+      errorMessage: error,
+    );
+    onProgress?.call(job, error);
+    return TranslationRunResult(job: job, chapters: chapters);
+  }
+}
+
 class _CacheProgressRepository extends _SuccessfulInspectionRepository {
   @override
   Future<TranslationRunResult> translateChapters({
@@ -911,6 +980,101 @@ void main() {
 
     expect(repository.startCount, 0);
     expect(controller.state.logs.last, contains('Only failed or cancelled'));
+  });
+
+  test('preserves a warning result and records its warning log', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _WarningTranslationRepository(),
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    await controller.startInspection();
+    await controller.startTranslation();
+
+    expect(
+      controller.state.job?.status,
+      TranslationJobStatus.completedWithWarnings,
+    );
+    expect(controller.state.job?.degradedBlockCount, 1);
+    expect(controller.state.jobHistory.first.degradedBlockCount, 1);
+    expect(
+      controller.state.logs,
+      contains(
+        'Translation completed with 1 blocks retaining fallback content.',
+      ),
+    );
+  });
+
+  test('retries completed-with-warnings history items', () async {
+    final _SuccessfulInspectionRepository repository =
+        _SuccessfulInspectionRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(
+            initial: const <TranslationJob>[
+              TranslationJob(
+                id: 'warning-job',
+                inputPath: 'C:\\Books\\partial.epub',
+                outputPath: 'C:\\Translated\\partial_translated.epub',
+                status: TranslationJobStatus.completedWithWarnings,
+                phase: TranslationJobPhase.translation,
+                progress: 1,
+                completedBlocks: 10,
+                totalBlocks: 10,
+                degradedBlockCount: 2,
+                styleProfileEnabled: false,
+              ),
+            ],
+          ),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    await controller.retryJob('warning-job');
+
+    expect(repository.startCount, 1);
+    expect(repository.translateCount, 1);
+    expect(controller.state.logs, isNot(contains('Only failed or cancelled')));
+  });
+
+  test('handles an all-degraded result as a retryable failure', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _AllDegradedTranslationRepository(),
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    await controller.startInspection();
+    await controller.startTranslation();
+
+    expect(controller.state.job?.status, TranslationJobStatus.failed);
+    expect(controller.state.job?.hasExportableEpub, isFalse);
+    expect(controller.state.job?.degradedBlockCount, 2);
+    expect(controller.state.actionableError, isNotNull);
+    expect(
+      controller.state.logs.last,
+      contains('Every selected text block fell back'),
+    );
+    expect(
+      controller.state.logs,
+      isNot(
+        contains(
+          'Translation complete. Use Open EPUB to view the output file.',
+        ),
+      ),
+    );
   });
 
   test('redacts API keys from translation failure logs', () async {

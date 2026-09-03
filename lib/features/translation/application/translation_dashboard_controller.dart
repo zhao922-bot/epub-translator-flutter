@@ -760,7 +760,8 @@ class TranslationDashboardController
     final bool currentJobIsResumable =
         currentJob != null &&
         (currentJob.status == TranslationJobStatus.failed ||
-            currentJob.status == TranslationJobStatus.cancelled) &&
+            currentJob.status == TranslationJobStatus.cancelled ||
+            currentJob.status == TranslationJobStatus.completedWithWarnings) &&
         currentJob.phase != TranslationJobPhase.inspection &&
         currentJob.totalBlocks > 0;
     final _ResumeProgressHint? currentJobHint = currentJobIsResumable
@@ -799,6 +800,7 @@ class TranslationDashboardController
           resumeCheckpointBlocks: checkpointBlocks,
           cacheScanScannedBlocks: 0,
           cacheScanTotalBlocks: selectedBlocks,
+          degradedBlockCount: 0,
           errorMessage: null,
           styleProfile: state.styleProfile,
           styleProfileConfirmed: state.styleProfileConfirmed,
@@ -892,20 +894,45 @@ class TranslationDashboardController
         _handleCancellation(const TranslationCancelledException());
         return;
       }
-      final TranslationJob completedJob = _translationHistoryJob(
-        result.job.copyWith(phase: TranslationJobPhase.translation),
+      final bool failedResult =
+          result.job.status == TranslationJobStatus.failed;
+      final String? safeResultError = failedResult
+          ? _safeErrorText(
+              result.job.errorMessage ??
+                  'Translation did not produce a usable result.',
+            )
+          : null;
+      final TranslationJob terminalJob = _translationHistoryJob(
+        result.job.copyWith(
+          phase: TranslationJobPhase.translation,
+          errorMessage: safeResultError,
+        ),
       );
       state = state.copyWith(
-        job: completedJob,
-        jobHistory: _jobHistoryWith(completedJob),
-        runEstimate: _buildEstimate(job: completedJob),
+        job: terminalJob,
+        jobHistory: _jobHistoryWith(terminalJob),
+        runEstimate: _buildEstimate(job: terminalJob),
         inspectedChapters: result.chapters,
-        actionableError: null,
+        actionableError: failedResult
+            ? ActionableErrorFactory.fromMessage(
+                _s.logTranslationFailed(safeResultError!),
+                isChinese: state.config.uiLanguage == UiLanguage.chinese,
+                preferredKind: ActionableErrorKind.retryTranslation,
+              )
+            : null,
         logs: <String>[
           ...state.logs,
-          PlatformUtils.isAndroid
-              ? _s.logTranslationCompleteAndroid
-              : _s.logTranslationCompleteDesktop,
+          if (failedResult)
+            _s.logTranslationFailed(safeResultError!)
+          else if (terminalJob.status ==
+              TranslationJobStatus.completedWithWarnings)
+            _s.logTranslationCompletedWithWarnings(
+              terminalJob.degradedBlockCount,
+            )
+          else if (PlatformUtils.isAndroid)
+            _s.logTranslationCompleteAndroid
+          else
+            _s.logTranslationCompleteDesktop,
           if (result.job.cachedBlocks > 0 || result.job.resumedBlocks > 0)
             _s.logCacheResume(
               result.job.cachedBlocks,
@@ -1131,7 +1158,8 @@ class TranslationDashboardController
       return;
     }
     if (job.status != TranslationJobStatus.failed &&
-        job.status != TranslationJobStatus.cancelled) {
+        job.status != TranslationJobStatus.cancelled &&
+        job.status != TranslationJobStatus.completedWithWarnings) {
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logOnlyFailedOrCancelled],
       );

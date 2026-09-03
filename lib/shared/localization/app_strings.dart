@@ -79,6 +79,8 @@ class AppStrings {
       'inspected' => isChinese ? '检查完成' : 'Inspected',
       'cancelled' => isChinese ? '已取消' : 'Cancelled',
       'failed' => isChinese ? '失败' : 'Failed',
+      'completedWithWarnings' =>
+        isChinese ? '完成但有警告' : 'Completed with warnings',
       'completed' => isChinese ? '已完成' : 'Completed',
       _ => name,
     };
@@ -270,6 +272,12 @@ class AppStrings {
   String get logTranslationCompleteDesktop => isChinese
       ? '翻译完成。请用「打开」查看输出文件。'
       : 'Translation complete. Use Open EPUB to view the output file.';
+  String logTranslationCompletedWithWarnings(int count) => isChinese
+      ? '翻译已完成，但有 $count 个块保留了回退内容。'
+      : 'Translation completed with $count blocks retaining fallback content.';
+  String degradedBlocksWarning(int count) => isChinese
+      ? '$count 个块未能完成翻译，可导出当前 EPUB 后重试。'
+      : '$count blocks could not be translated. You can export this EPUB and retry.';
   String logCacheResume(int cached, int resumed) => isChinese
       ? '缓存/续传：$cached 缓存块 · $resumed 续传块。'
       : 'Cache/resume: $cached cached, $resumed resumed blocks.';
@@ -361,8 +369,8 @@ class AppStrings {
   String get logHistoryNotFound =>
       isChinese ? '找不到该历史项。' : 'Could not find that history item.';
   String get logOnlyFailedOrCancelled => isChinese
-      ? '仅失败或已取消的任务可重试。'
-      : 'Only failed or cancelled jobs can be retried.';
+      ? '仅失败、已取消或完成但有警告的任务可重试。'
+      : 'Only failed or cancelled jobs, plus completed jobs with warnings, can be retried.';
   String get logHistoryMissingPath => isChinese
       ? '该历史项没有可重试的 EPUB 路径。'
       : 'This history item does not include an EPUB path to retry.';

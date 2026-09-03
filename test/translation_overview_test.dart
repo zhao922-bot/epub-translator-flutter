@@ -50,6 +50,45 @@ void main() {
     );
   });
 
+  testWidgets('shows exportable warning state for partial output', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: TranslationOverview(
+              strings: const AppStrings(UiLanguage.chinese),
+              job: const TranslationJob(
+                id: 'warning-job',
+                inputPath: 'book.epub',
+                outputPath: 'book_translated.epub',
+                status: TranslationJobStatus.completedWithWarnings,
+                phase: TranslationJobPhase.translation,
+                progress: 1,
+                completedBlocks: 12,
+                totalBlocks: 12,
+                degradedBlockCount: 2,
+              ),
+              onTranslatePressed: () {},
+              onExportPressed: () {},
+              onSaveToDownloadsPressed: () {},
+              canTranslate: true,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('完成但有警告'), findsOneWidget);
+    expect(find.text('2 个块未能完成翻译，可导出当前 EPUB 后重试。'), findsOneWidget);
+    expect(
+      find.text('book_translated.epub', skipOffstage: false),
+      findsWidgets,
+    );
+    expect(find.byIcon(Icons.warning_amber_rounded), findsWidgets);
+  });
+
   testWidgets('does not show export UI after inspection-only jobs', (
     tester,
   ) async {

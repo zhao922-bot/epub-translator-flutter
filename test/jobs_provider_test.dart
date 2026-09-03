@@ -154,6 +154,17 @@ void main() {
               status: TranslationJobStatus.cancelled,
               progress: 0.4,
             ),
+            TranslationJob(
+              id: 'warning-job',
+              inputPath: 'C:\\Books\\partial.epub',
+              outputPath: 'C:\\Translated\\partial_translated.epub',
+              status: TranslationJobStatus.completedWithWarnings,
+              phase: TranslationJobPhase.translation,
+              progress: 1,
+              completedBlocks: 10,
+              totalBlocks: 10,
+              degradedBlockCount: 2,
+            ),
           ]),
         ),
       ],
@@ -177,5 +188,11 @@ void main() {
       jobs.firstWhere((job) => job.id == 'completed-job').canRetry,
       isFalse,
     );
+    final warningJob = jobs.firstWhere((job) => job.id == 'warning-job');
+    expect(warningJob.status, 'Completed with warnings');
+    expect(warningJob.canOpenOutput, isTrue);
+    expect(warningJob.canRetry, isTrue);
+    expect(warningJob.canResume, isTrue);
+    expect(warningJob.isActive, isFalse);
   });
 }

@@ -48,6 +48,8 @@ class TranslationOverview extends StatelessWidget {
     final TranslationJobStatus status =
         job?.status ?? TranslationJobStatus.idle;
     final bool canExport = job?.hasExportableEpub ?? false;
+    final bool hasWarnings =
+        status == TranslationJobStatus.completedWithWarnings;
     final String statusText = strings.jobStatusLabel(status);
     final double progress = (job?.progress ?? 0).clamp(0.0, 1.0);
     final int percent = (progress * 100).round();
@@ -129,6 +131,29 @@ class TranslationOverview extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
+          if (hasWarnings) ...<Widget>[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Icon(
+                  Icons.warning_amber_rounded,
+                  size: 18,
+                  color: scheme.tertiary,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    strings.degradedBlocksWarning(job!.degradedBlockCount),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onTertiaryContainer,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+          ],
           if (restoringCache) ...<Widget>[
             Wrap(
               spacing: 12,
@@ -188,9 +213,11 @@ class TranslationOverview extends StatelessWidget {
             Row(
               children: <Widget>[
                 Icon(
-                  Icons.check_circle_rounded,
+                  hasWarnings
+                      ? Icons.warning_amber_rounded
+                      : Icons.check_circle_rounded,
                   size: 18,
-                  color: scheme.primary,
+                  color: hasWarnings ? scheme.tertiary : scheme.primary,
                 ),
                 const SizedBox(width: 8),
                 Expanded(
@@ -230,6 +257,10 @@ class _StatusPill extends StatelessWidget {
       TranslationJobStatus.completed => (
         scheme.primary.withValues(alpha: 0.12),
         scheme.primary,
+      ),
+      TranslationJobStatus.completedWithWarnings => (
+        scheme.tertiaryContainer,
+        scheme.onTertiaryContainer,
       ),
       TranslationJobStatus.failed => (
         scheme.error.withValues(alpha: 0.12),
