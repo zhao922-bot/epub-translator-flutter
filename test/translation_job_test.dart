@@ -57,6 +57,38 @@ void main() {
     expect(completedEpub.hasExportableEpub, isTrue);
   });
 
+  test('warning jobs are exportable and resumable', () {
+    const TranslationJob job = TranslationJob(
+      id: 'warning-job',
+      inputPath: 'book.epub',
+      outputPath: 'book_translated.epub',
+      status: TranslationJobStatus.completedWithWarnings,
+      phase: TranslationJobPhase.translation,
+      progress: 1,
+      completedBlocks: 4,
+      totalBlocks: 4,
+      degradedBlockCount: 1,
+    );
+
+    expect(job.hasExportableEpub, isTrue);
+    expect(job.canResumeTranslation, isTrue);
+    expect(TranslationJob.fromJson(job.toJson()).degradedBlockCount, 1);
+  });
+
+  test('legacy and invalid degraded counts load as zero', () {
+    for (final Object? value in <Object?>[null, -1, 'invalid']) {
+      final TranslationJob job = TranslationJob.fromJson(<String, Object?>{
+        'id': 'legacy-$value',
+        'status': 'completed',
+        'phase': 'translation',
+        'progress': 1,
+        if (value != null) 'degradedBlockCount': value,
+      });
+
+      expect(job.degradedBlockCount, 0);
+    }
+  });
+
   test('copyWith can clear nullable progress labels', () {
     const TranslationJob job = TranslationJob(
       id: 'job-1',

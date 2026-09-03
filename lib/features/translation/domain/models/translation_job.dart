@@ -10,6 +10,9 @@ enum TranslationJobStatus {
   cancelled,
   failed,
 
+  /// Translation finished with an EPUB output, but some blocks fell back.
+  completedWithWarnings,
+
   /// Translation finished and a translated EPUB path is available.
   completed,
 }
@@ -38,6 +41,7 @@ class TranslationJob {
     this.resumeCheckpointBlocks = 0,
     this.cacheScanScannedBlocks = 0,
     this.cacheScanTotalBlocks = 0,
+    this.degradedBlockCount = 0,
     this.errorMessage,
     this.styleProfile = TranslationStyleProfile.empty,
     this.styleProfileConfirmed = false,
@@ -61,6 +65,7 @@ class TranslationJob {
   final int resumeCheckpointBlocks;
   final int cacheScanScannedBlocks;
   final int cacheScanTotalBlocks;
+  final int degradedBlockCount;
   final String? errorMessage;
   final TranslationStyleProfile styleProfile;
   final bool styleProfileConfirmed;
@@ -70,7 +75,8 @@ class TranslationJob {
 
   /// True when this job represents a finished translation with an EPUB output.
   bool get hasExportableEpub {
-    if (status != TranslationJobStatus.completed) {
+    if (status != TranslationJobStatus.completed &&
+        status != TranslationJobStatus.completedWithWarnings) {
       return false;
     }
     if (phase != TranslationJobPhase.translation) {
@@ -81,10 +87,13 @@ class TranslationJob {
   }
 
   bool get canResumeTranslation {
+    final bool resumableStatus =
+        status == TranslationJobStatus.failed ||
+        status == TranslationJobStatus.cancelled ||
+        status == TranslationJobStatus.completedWithWarnings;
     return (phase == TranslationJobPhase.translation ||
             phase == TranslationJobPhase.cacheRestoration) &&
-        (status == TranslationJobStatus.failed ||
-            status == TranslationJobStatus.cancelled) &&
+        resumableStatus &&
         (cachedBlocks > 0 || resumedBlocks > 0 || completedBlocks > 0);
   }
 
@@ -115,6 +124,7 @@ class TranslationJob {
         json['cacheScanScannedBlocks'],
       ),
       cacheScanTotalBlocks: _readNonNegativeInt(json['cacheScanTotalBlocks']),
+      degradedBlockCount: _readNonNegativeInt(json['degradedBlockCount']),
       errorMessage: _readNullableString(json['errorMessage']),
       styleProfile: _readStyleProfile(json['styleProfile']),
       styleProfileConfirmed: json['styleProfileConfirmed'] as bool? ?? false,
@@ -140,6 +150,7 @@ class TranslationJob {
     int? resumeCheckpointBlocks,
     int? cacheScanScannedBlocks,
     int? cacheScanTotalBlocks,
+    int? degradedBlockCount,
     Object? errorMessage = _unset,
     TranslationStyleProfile? styleProfile,
     bool? styleProfileConfirmed,
@@ -169,6 +180,7 @@ class TranslationJob {
       cacheScanScannedBlocks:
           cacheScanScannedBlocks ?? this.cacheScanScannedBlocks,
       cacheScanTotalBlocks: cacheScanTotalBlocks ?? this.cacheScanTotalBlocks,
+      degradedBlockCount: degradedBlockCount ?? this.degradedBlockCount,
       errorMessage: identical(errorMessage, _unset)
           ? this.errorMessage
           : errorMessage as String?,
@@ -200,6 +212,7 @@ class TranslationJob {
       'resumeCheckpointBlocks': resumeCheckpointBlocks,
       'cacheScanScannedBlocks': cacheScanScannedBlocks,
       'cacheScanTotalBlocks': cacheScanTotalBlocks,
+      'degradedBlockCount': degradedBlockCount,
       'errorMessage': errorMessage,
       if (styleProfileConfirmed) 'styleProfile': styleProfile.toJson(),
       'styleProfileConfirmed': styleProfileConfirmed,
@@ -273,7 +286,8 @@ TranslationJobPhase _readPhase(
     }
   }
   // Legacy history: completed with .epub path => translation.
-  if (status == TranslationJobStatus.completed) {
+  if (status == TranslationJobStatus.completed ||
+      status == TranslationJobStatus.completedWithWarnings) {
     return TranslationJobPhase.translation;
   }
   if (status == TranslationJobStatus.inspected) {

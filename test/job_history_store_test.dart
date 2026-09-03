@@ -51,4 +51,34 @@ void main() {
 
     expect(await store.load(), isEmpty);
   });
+
+  test('round-trips completed jobs with degraded-block warnings', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'job_history_warning_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+    final File historyFile = File('${temp.path}/job-history.json');
+    final JobHistoryStore store = JobHistoryStore(
+      historyFileProvider: () async => historyFile,
+    );
+
+    await store.save(const <TranslationJob>[
+      TranslationJob(
+        id: 'warning-job',
+        inputPath: 'book.epub',
+        outputPath: 'book_translated.epub',
+        status: TranslationJobStatus.completedWithWarnings,
+        phase: TranslationJobPhase.translation,
+        progress: 1,
+        completedBlocks: 5,
+        totalBlocks: 5,
+        degradedBlockCount: 2,
+      ),
+    ]);
+
+    final List<TranslationJob> loaded = await store.load();
+
+    expect(loaded.single.status, TranslationJobStatus.completedWithWarnings);
+    expect(loaded.single.degradedBlockCount, 2);
+  });
 }
