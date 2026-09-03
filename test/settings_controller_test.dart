@@ -17,13 +17,19 @@ class _ControlledSettingsStore extends SettingsStore {
 
   final Completer<TranslationConfig> loadCompleter;
   final List<TranslationConfig> saved = <TranslationConfig>[];
+  final List<Set<SettingsSecretSlot>?> explicitSecretMutations =
+      <Set<SettingsSecretSlot>?>[];
 
   @override
   Future<TranslationConfig> load() => loadCompleter.future;
 
   @override
-  Future<void> save(TranslationConfig config) async {
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {
     saved.add(config);
+    this.explicitSecretMutations.add(explicitSecretMutations);
   }
 }
 
@@ -38,7 +44,10 @@ class _OutOfOrderSettingsStore extends SettingsStore {
   Future<TranslationConfig> load() async => TranslationConfig.defaults();
 
   @override
-  Future<void> save(TranslationConfig config) async {
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {
     saveCount += 1;
     if (saveCount == 1) {
       firstSaveStarted.complete();
@@ -270,5 +279,30 @@ void main() {
 
     expect(controller.state.themeMode, AppThemeMode.system);
     expect(store.saved.single.themeMode, AppThemeMode.system);
+    expect(store.explicitSecretMutations.single, isEmpty);
   });
+
+  test(
+    'marks only active provider secrets as explicit API key edits',
+    () async {
+      final Completer<TranslationConfig> loadCompleter =
+          Completer<TranslationConfig>();
+      final _ControlledSettingsStore store = _ControlledSettingsStore(
+        loadCompleter,
+      );
+      final SettingsController controller = SettingsController(store);
+      loadCompleter.complete(
+        TranslationConfig.defaults().copyWith(
+          apiProviderSelection: ApiProviderSelection.custom,
+        ),
+      );
+
+      await controller.setApiKey('sk-custom');
+
+      expect(store.explicitSecretMutations.single, <SettingsSecretSlot>{
+        SettingsSecretSlot.legacy,
+        SettingsSecretSlot.custom,
+      });
+    },
+  );
 }

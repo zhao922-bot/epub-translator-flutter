@@ -22,7 +22,10 @@ class _WidgetSettingsStore extends SettingsStore {
   Future<TranslationConfig> load() => loadCompleter.future;
 
   @override
-  Future<void> save(TranslationConfig config) async {}
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {}
 }
 
 class _WidgetJobHistoryStore extends JobHistoryStore {

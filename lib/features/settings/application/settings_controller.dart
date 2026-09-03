@@ -42,18 +42,26 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     state = loaded;
   }
 
-  Future<void> _persist(TranslationConfig config) {
+  Future<void> _persist(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot> explicitSecretMutations =
+        const <SettingsSecretSlot>{},
+  }) {
     final Future<void> save = _pendingSave.then<void>(
-      (_) => _store.save(config),
-      onError: (_) => _store.save(config),
+      (_) =>
+          _store.save(config, explicitSecretMutations: explicitSecretMutations),
+      onError: (_) =>
+          _store.save(config, explicitSecretMutations: explicitSecretMutations),
     );
     _pendingSave = save.catchError((_) {});
     return save;
   }
 
   Future<void> _update(
-    TranslationConfig Function(TranslationConfig config) update,
-  ) async {
+    TranslationConfig Function(TranslationConfig config) update, {
+    Set<SettingsSecretSlot> explicitSecretMutations =
+        const <SettingsSecretSlot>{},
+  }) async {
     await _initialLoad;
     if (!mounted) {
       return;
@@ -63,7 +71,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return;
     }
     state = next;
-    await _persist(next);
+    await _persist(next, explicitSecretMutations: explicitSecretMutations);
   }
 
   Future<void> setApiBaseUrl(String value) => _update((config) {
@@ -77,12 +85,24 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     );
   });
 
-  Future<void> setApiKey(String value) => _update((config) {
-    final String nextKey = value.trim();
-    return config.apiProviderSelection == ApiProviderSelection.deepseek
-        ? config.copyWith(apiKey: nextKey, deepseekApiKey: nextKey)
-        : config.copyWith(apiKey: nextKey, customApiKey: nextKey);
-  });
+  Future<void> setApiKey(String value) async {
+    await _initialLoad;
+    if (!mounted) {
+      return;
+    }
+    final Set<SettingsSecretSlot> slots = <SettingsSecretSlot>{
+      SettingsSecretSlot.legacy,
+      state.apiProviderSelection == ApiProviderSelection.deepseek
+          ? SettingsSecretSlot.deepSeek
+          : SettingsSecretSlot.custom,
+    };
+    await _update((config) {
+      final String nextKey = value.trim();
+      return config.apiProviderSelection == ApiProviderSelection.deepseek
+          ? config.copyWith(apiKey: nextKey, deepseekApiKey: nextKey)
+          : config.copyWith(apiKey: nextKey, customApiKey: nextKey);
+    }, explicitSecretMutations: slots);
+  }
 
   Future<void> setModel(String value) => _update((config) {
     final String nextModel = value.trim();

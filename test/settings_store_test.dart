@@ -10,9 +10,12 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
   String? deepSeekApiKey;
   String? customApiKey;
   bool failReads = false;
+  bool failWrites = false;
+  int secretMutationCount = 0;
 
   @override
   Future<void> deleteApiKey() async {
+    secretMutationCount += 1;
     apiKey = null;
   }
 
@@ -26,11 +29,16 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
 
   @override
   Future<void> writeApiKey(String value) async {
+    if (failWrites) {
+      throw StateError('secret store unavailable');
+    }
+    secretMutationCount += 1;
     apiKey = value;
   }
 
   @override
   Future<void> deleteDeepSeekApiKey() async {
+    secretMutationCount += 1;
     deepSeekApiKey = null;
   }
 
@@ -44,11 +52,16 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
 
   @override
   Future<void> writeDeepSeekApiKey(String value) async {
+    if (failWrites) {
+      throw StateError('secret store unavailable');
+    }
+    secretMutationCount += 1;
     deepSeekApiKey = value;
   }
 
   @override
   Future<void> deleteCustomApiKey() async {
+    secretMutationCount += 1;
     customApiKey = null;
   }
 
@@ -62,6 +75,10 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
 
   @override
   Future<void> writeCustomApiKey(String value) async {
+    if (failWrites) {
+      throw StateError('secret store unavailable');
+    }
+    secretMutationCount += 1;
     customApiKey = value;
   }
 }
@@ -188,6 +205,80 @@ void main() {
     expect(loaded.customApiKey, isEmpty);
   });
 
+  test(
+    'keeps legacy plaintext key when secure migration write fails',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_failed_key_migration_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      await settingsFile.writeAsString(
+        jsonEncode(<String, dynamic>{
+          ...TranslationConfig.defaults()
+              .copyWith(apiKey: 'sk-legacy')
+              .toJson(),
+          'apiKey': 'sk-legacy',
+        }),
+      );
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..failWrites = true;
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.apiKey, 'sk-legacy');
+      expect(secrets.apiKey, isNull);
+      expect(await settingsFile.readAsString(), contains('sk-legacy'));
+    },
+  );
+
+  test(
+    'legacy migration preserves an unreadable inactive provider key',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_scoped_key_migration_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      await settingsFile.writeAsString(
+        jsonEncode(<String, dynamic>{
+          ...TranslationConfig.defaults()
+              .copyWith(
+                apiProviderSelection: ApiProviderSelection.custom,
+                apiKey: 'sk-legacy-custom',
+              )
+              .toJson(),
+          'apiKey': 'sk-legacy-custom',
+        }),
+      );
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..deepSeekApiKey = 'sk-unreadable-deepseek'
+        ..failReads = true;
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.apiKey, 'sk-legacy-custom');
+      expect(secrets.apiKey, 'sk-legacy-custom');
+      expect(secrets.deepSeekApiKey, 'sk-unreadable-deepseek');
+      expect(secrets.customApiKey, 'sk-legacy-custom');
+      expect(secrets.secretMutationCount, 2);
+      expect(
+        await settingsFile.readAsString(),
+        isNot(contains('sk-legacy-custom')),
+      );
+    },
+  );
+
   test('keeps non-secret settings when secure API key read fails', () async {
     final Directory temp = await Directory.systemTemp.createTemp(
       'epub_settings_store_test_',
@@ -220,5 +311,101 @@ void main() {
     expect(loaded.model, 'loaded-model');
     expect(loaded.outputSuffix, '_loaded');
     expect(loaded.apiKey, isEmpty);
+  });
+
+  test('unrelated save preserves secrets whose reads failed', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_unreadable_secrets_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+      ..apiKey = 'sk-legacy'
+      ..deepSeekApiKey = 'sk-deepseek'
+      ..customApiKey = 'sk-custom'
+      ..failReads = true;
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    final TranslationConfig loaded = await store.load();
+    await store.save(
+      loaded.copyWith(themeMode: AppThemeMode.dark),
+      explicitSecretMutations: const <SettingsSecretSlot>{},
+    );
+
+    expect(secrets.secretMutationCount, 0);
+    expect(secrets.apiKey, 'sk-legacy');
+    expect(secrets.deepSeekApiKey, 'sk-deepseek');
+    expect(secrets.customApiKey, 'sk-custom');
+  });
+
+  test(
+    'explicit key edit can replace only selected unreadable secrets',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_replace_unreadable_secrets_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..apiKey = 'sk-old-legacy'
+        ..deepSeekApiKey = 'sk-old-deepseek'
+        ..customApiKey = 'sk-old-custom'
+        ..failReads = true;
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      final TranslationConfig loaded = await store.load();
+      await store.save(
+        loaded.copyWith(apiKey: 'sk-new', customApiKey: 'sk-new'),
+        explicitSecretMutations: const <SettingsSecretSlot>{
+          SettingsSecretSlot.legacy,
+          SettingsSecretSlot.custom,
+        },
+      );
+
+      expect(secrets.secretMutationCount, 2);
+      expect(secrets.apiKey, 'sk-new');
+      expect(secrets.deepSeekApiKey, 'sk-old-deepseek');
+      expect(secrets.customApiKey, 'sk-new');
+    },
+  );
+
+  test('explicit key clear can delete selected unreadable secrets', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_clear_unreadable_secrets_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+      ..apiKey = 'sk-old-legacy'
+      ..deepSeekApiKey = 'sk-old-deepseek'
+      ..customApiKey = 'sk-old-custom'
+      ..failReads = true;
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    final TranslationConfig loaded = await store.load();
+    await store.save(
+      loaded,
+      explicitSecretMutations: const <SettingsSecretSlot>{
+        SettingsSecretSlot.legacy,
+        SettingsSecretSlot.custom,
+      },
+    );
+
+    expect(secrets.secretMutationCount, 2);
+    expect(secrets.apiKey, isNull);
+    expect(secrets.deepSeekApiKey, 'sk-old-deepseek');
+    expect(secrets.customApiKey, isNull);
   });
 }

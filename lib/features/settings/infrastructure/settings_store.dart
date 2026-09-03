@@ -26,6 +26,17 @@ abstract class SettingsSecretStore {
   Future<void> deleteCustomApiKey();
 }
 
+enum SettingsSecretSlot { legacy, deepSeek, custom }
+
+enum _SecretReadStatus { value, missing, readFailure }
+
+class _SecretReadResult {
+  const _SecretReadResult(this.status, this.value);
+
+  final _SecretReadStatus status;
+  final String? value;
+}
+
 class NativeSettingsSecretStore implements SettingsSecretStore {
   const NativeSettingsSecretStore();
 
@@ -85,28 +96,33 @@ class SettingsStore {
 
   final Future<File> Function()? settingsFileProvider;
   final SettingsSecretStore _secretStore;
+  final Map<SettingsSecretSlot, _SecretReadStatus> _secretReadStatuses =
+      <SettingsSecretSlot, _SecretReadStatus>{};
 
   Future<TranslationConfig> load() async {
     final TranslationConfig config = await _loadConfigFromFile();
-    final String? storedApiKey = await _readSecretOrNull(
+    final _SecretReadResult storedApiKey = await _readSecret(
+      SettingsSecretSlot.legacy,
       _secretStore.readApiKey,
     );
-    final String? storedDeepSeekKey = await _readSecretOrNull(
+    final _SecretReadResult storedDeepSeekKey = await _readSecret(
+      SettingsSecretSlot.deepSeek,
       _secretStore.readDeepSeekApiKey,
     );
-    final String? storedCustomKey = await _readSecretOrNull(
+    final _SecretReadResult storedCustomKey = await _readSecret(
+      SettingsSecretSlot.custom,
       _secretStore.readCustomApiKey,
     );
-    final String legacyKey = storedApiKey?.isNotEmpty == true
-        ? storedApiKey!
+    final String legacyKey = storedApiKey.value?.isNotEmpty == true
+        ? storedApiKey.value!
         : config.apiKey;
-    final String deepSeekKey = storedDeepSeekKey?.isNotEmpty == true
-        ? storedDeepSeekKey!
+    final String deepSeekKey = storedDeepSeekKey.value?.isNotEmpty == true
+        ? storedDeepSeekKey.value!
         : config.apiProviderSelection == ApiProviderSelection.deepseek
         ? legacyKey
         : config.deepseekApiKey;
-    final String customKey = storedCustomKey?.isNotEmpty == true
-        ? storedCustomKey!
+    final String customKey = storedCustomKey.value?.isNotEmpty == true
+        ? storedCustomKey.value!
         : config.apiProviderSelection == ApiProviderSelection.custom
         ? legacyKey
         : config.customApiKey;
@@ -121,7 +137,15 @@ class SettingsStore {
     );
     if (config.apiKey.isNotEmpty) {
       try {
-        await save(resolvedConfig);
+        await save(
+          resolvedConfig,
+          explicitSecretMutations: <SettingsSecretSlot>{
+            SettingsSecretSlot.legacy,
+            config.apiProviderSelection == ApiProviderSelection.deepseek
+                ? SettingsSecretSlot.deepSeek
+                : SettingsSecretSlot.custom,
+          },
+        );
       } catch (_) {
         // Loading settings should still succeed if legacy key migration fails.
       }
@@ -146,30 +170,54 @@ class SettingsStore {
     }
   }
 
-  Future<String?> _readSecretOrNull(Future<String?> Function() read) async {
+  Future<_SecretReadResult> _readSecret(
+    SettingsSecretSlot slot,
+    Future<String?> Function() read,
+  ) async {
     try {
-      return await read();
+      final String? value = await read();
+      final _SecretReadStatus status = value?.trim().isNotEmpty == true
+          ? _SecretReadStatus.value
+          : _SecretReadStatus.missing;
+      _secretReadStatuses[slot] = status;
+      return _SecretReadResult(status, value);
     } catch (_) {
-      return null;
+      _secretReadStatuses[slot] = _SecretReadStatus.readFailure;
+      return const _SecretReadResult(_SecretReadStatus.readFailure, null);
     }
   }
 
-  Future<void> save(TranslationConfig config) async {
-    await _writeOrDeleteSecret(
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {
+    final Set<SettingsSecretSlot> explicit =
+        explicitSecretMutations ?? SettingsSecretSlot.values.toSet();
+    await _saveSecret(
+      SettingsSecretSlot.legacy,
       config.apiKey,
+      explicit: explicit,
       write: _secretStore.writeApiKey,
       delete: _secretStore.deleteApiKey,
     );
-    await _writeOrDeleteSecret(
+    await _saveSecret(
+      SettingsSecretSlot.deepSeek,
       config.deepseekApiKey,
+      explicit: explicit,
       write: _secretStore.writeDeepSeekApiKey,
       delete: _secretStore.deleteDeepSeekApiKey,
     );
-    await _writeOrDeleteSecret(
+    await _saveSecret(
+      SettingsSecretSlot.custom,
       config.customApiKey,
+      explicit: explicit,
       write: _secretStore.writeCustomApiKey,
       delete: _secretStore.deleteCustomApiKey,
     );
+    await _writeSettingsJson(config);
+  }
+
+  Future<void> _writeSettingsJson(TranslationConfig config) async {
     final File file = await _settingsFile();
     await file.parent.create(recursive: true);
     await file.writeAsString(
@@ -178,13 +226,25 @@ class SettingsStore {
     );
   }
 
-  Future<void> _writeOrDeleteSecret(
+  Future<void> _saveSecret(
+    SettingsSecretSlot slot,
     String value, {
+    required Set<SettingsSecretSlot> explicit,
     required Future<void> Function(String value) write,
     required Future<void> Function() delete,
-  }) {
+  }) async {
+    if (_secretReadStatuses[slot] == _SecretReadStatus.readFailure &&
+        !explicit.contains(slot)) {
+      return;
+    }
     final String trimmed = value.trim();
-    return trimmed.isEmpty ? delete() : write(trimmed);
+    if (trimmed.isEmpty) {
+      await delete();
+      _secretReadStatuses[slot] = _SecretReadStatus.missing;
+    } else {
+      await write(trimmed);
+      _secretReadStatuses[slot] = _SecretReadStatus.value;
+    }
   }
 
   Future<File> _settingsFile() async {
