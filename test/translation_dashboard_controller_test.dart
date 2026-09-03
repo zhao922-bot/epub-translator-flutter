@@ -176,8 +176,8 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
       progress: 1,
       completedFiles: 1,
       totalFiles: 1,
-      completedBlocks: 1,
-      totalBlocks: 1,
+      completedBlocks: blockCount,
+      totalBlocks: blockCount,
     );
     onProgress?.call(job, 'Translation complete.');
     return TranslationRunResult(job: job, chapters: chapters);
@@ -243,6 +243,23 @@ class _WarningTranslationRepository extends _SuccessfulInspectionRepository {
     );
     onProgress?.call(job, 'Translation completed with warnings.');
     return TranslationRunResult(job: job, chapters: chapters);
+  }
+}
+
+class _ZeroBlockStyleRepository extends _SuccessfulInspectionRepository {
+  _ZeroBlockStyleRepository() : super(blockCount: 0);
+
+  @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    styleGenerateCount += 1;
+    return const TranslationStyleProfile(
+      primaryGenre: 'illustrated reference',
+      confidence: TranslationStyleConfidence.high,
+    );
   }
 }
 
@@ -1009,6 +1026,30 @@ void main() {
       ),
     );
   });
+
+  test(
+    'translates a selected zero-block run without style confirmation',
+    () async {
+      final _ZeroBlockStyleRepository repository = _ZeroBlockStyleRepository();
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: true),
+      );
+      controller.setInputPath('C:\\Books\\image-only.epub');
+
+      await controller.startInspection();
+      expect(controller.state.requiresStyleProfileConfirmation, isTrue);
+      await controller.startTranslation();
+
+      expect(repository.translateCount, 1);
+      expect(controller.state.job?.status, TranslationJobStatus.completed);
+      expect(controller.state.job?.totalBlocks, 0);
+    },
+  );
 
   test('retries completed-with-warnings history items', () async {
     final _SuccessfulInspectionRepository repository =

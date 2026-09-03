@@ -732,10 +732,7 @@ class TranslationDashboardController
     }
 
     final List<InspectedChapter> selectedChapters = state.inspectedChapters
-        .where(
-          (InspectedChapter chapter) =>
-              chapter.includeInTranslation && chapter.blocks.isNotEmpty,
-        )
+        .where((InspectedChapter chapter) => chapter.includeInTranslation)
         .toList();
     final int selectedBlocks = selectedChapters.fold<int>(
       0,
@@ -747,7 +744,7 @@ class TranslationDashboardController
       );
       return;
     }
-    if (state.requiresStyleProfileConfirmation) {
+    if (selectedBlocks > 0 && state.requiresStyleProfileConfirmation) {
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logConfirmStyleBeforeTranslate],
       );

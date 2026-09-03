@@ -29,11 +29,17 @@ class TranslationDashboardPage extends ConsumerWidget {
     );
     final settingsController = ref.read(settingsProvider.notifier);
     final strings = ref.watch(appStringsProvider);
-    final bool hasSelectedChapters = state.inspectedChapters.any(
-      (chapter) => chapter.includeInTranslation && chapter.blocks.isNotEmpty,
+    final selectedChapters = state.inspectedChapters.where(
+      (chapter) => chapter.includeInTranslation,
+    );
+    final bool hasSelectedChapters = selectedChapters.isNotEmpty;
+    final int selectedBlocks = selectedChapters.fold<int>(
+      0,
+      (int sum, chapter) => sum + chapter.blocks.length,
     );
     final bool canTranslate =
-        hasSelectedChapters && !state.requiresStyleProfileConfirmation;
+        hasSelectedChapters &&
+        (selectedBlocks == 0 || !state.requiresStyleProfileConfirmation);
     final bool isRunActive = state.isRunActive;
     final bool hasInput = state.inputPath.isNotEmpty;
     final bool hasInspected = state.inspectedChapters.isNotEmpty;
