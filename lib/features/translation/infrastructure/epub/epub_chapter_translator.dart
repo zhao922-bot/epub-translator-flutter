@@ -1693,40 +1693,6 @@ class EpubChapterTranslator {
           throw const TranslationCancelledException();
         }
         lastError = error;
-        if (error is FormatException ||
-            TranslationApiClient.isRequestTimeout(error)) {
-          try {
-            final File diagFile = File(
-              r'F:\vibe coding\epub-translator-flutter-clean\work\'
-              r'_p13_failure_diag.log',
-            );
-            final RandomAccessFile raf = await diagFile.open(
-              mode: FileMode.append,
-            );
-            final String sourcePreview = _linePreview(
-              block.sourceHtml.replaceFirst(RegExp(r'<[^>]*>'), ''),
-            );
-            String? lockedPreview;
-            try {
-              lockedPreview = _lockTranslatedHtmlStructure(
-                block,
-                lastCleaned ?? '',
-              );
-            } catch (_) {
-              lockedPreview = null;
-            }
-            final String entry =
-                'BLOCK=${block.id} attempt=$attempt '
-                'error=$error\nSOURCE=$sourcePreview\n'
-                'RAW=$lastCleaned\n'
-                'LOCKED=${lockedPreview ?? '<unavailable>'}\n---\n';
-            raf.writeStringSync(entry);
-            raf.flushSync();
-            await raf.close();
-          } catch (_) {
-            // Logging must never break translation.
-          }
-        }
         if (attempt >=
             TranslationApiClient.maxAttemptsForError(config, error)) {
           break;
