@@ -1,3 +1,5 @@
+import '../../../translation/domain/models/translation_job.dart';
+
 class JobSummary {
   const JobSummary({
     required this.id,
@@ -15,7 +17,7 @@ class JobSummary {
 
   final String id;
   final String title;
-  final String status;
+  final TranslationJobStatus status;
   final String progressLabel;
   final String outputPath;
   final String? errorMessage;
@@ -24,4 +26,6 @@ class JobSummary {
   final bool canRetry;
   final bool canResume;
   final String phaseLabel;
+
+  bool get hasWarnings => status == TranslationJobStatus.completedWithWarnings;
 }

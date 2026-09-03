@@ -92,7 +92,7 @@ void main() {
                 JobSummary(
                   id: 'job-1',
                   title: jobTitle,
-                  status: 'Completed',
+                  status: TranslationJobStatus.completed,
                   progressLabel: '10 / 10 blocks',
                   outputPath: '',
                   errorMessage: null,
@@ -119,6 +119,51 @@ void main() {
       expect(style?.fontFamily, expected?.fontFamily);
       expect(style?.fontFamily, isNot('Consolas'));
     });
+
+    for (final (UiLanguage language, String warningLabel, String resumeLabel)
+        in <(UiLanguage, String, String)>[
+          (UiLanguage.english, 'Completed with warnings', 'Resumable'),
+          (UiLanguage.chinese, '完成但有警告', '可续传'),
+        ]) {
+      testWidgets(
+        'warning status is localized and takes priority for ${language.name}',
+        (tester) async {
+          final ThemeData theme = AppTheme.light(language);
+
+          await tester.pumpWidget(
+            ProviderScope(
+              overrides: <Override>[
+                appStringsProvider.overrideWithValue(AppStrings(language)),
+                jobsProvider.overrideWith(
+                  (Ref ref) => const <JobSummary>[
+                    JobSummary(
+                      id: 'warning-job',
+                      title: 'partial.epub',
+                      status: TranslationJobStatus.completedWithWarnings,
+                      progressLabel: '9 / 10 blocks',
+                      outputPath: 'partial_translated.epub',
+                      errorMessage: null,
+                      isActive: false,
+                      canOpenOutput: true,
+                      canRetry: true,
+                      canResume: true,
+                    ),
+                  ],
+                ),
+                jobHistoryStoreProvider.overrideWithValue(
+                  _MemoryJobHistoryStore(),
+                ),
+              ],
+              child: MaterialApp(theme: theme, home: const JobsPage()),
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text(warningLabel), findsOneWidget);
+          expect(find.text(resumeLabel), findsNothing);
+        },
+      );
+    }
   });
 
   group('AppTheme font inheritance', () {

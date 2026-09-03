@@ -137,15 +137,18 @@ class SettingsStore {
     );
     if (config.apiKey.isNotEmpty) {
       try {
-        await save(
+        final Set<SettingsSecretSlot> migrationSlots = <SettingsSecretSlot>{
+          SettingsSecretSlot.legacy,
+          config.apiProviderSelection == ApiProviderSelection.deepseek
+              ? SettingsSecretSlot.deepSeek
+              : SettingsSecretSlot.custom,
+        };
+        await _saveSecrets(
           resolvedConfig,
-          explicitSecretMutations: <SettingsSecretSlot>{
-            SettingsSecretSlot.legacy,
-            config.apiProviderSelection == ApiProviderSelection.deepseek
-                ? SettingsSecretSlot.deepSeek
-                : SettingsSecretSlot.custom,
-          },
+          slotsToSave: migrationSlots,
+          explicit: migrationSlots,
         );
+        await _writeSettingsJson(resolvedConfig);
       } catch (_) {
         // Loading settings should still succeed if legacy key migration fails.
       }
@@ -193,28 +196,46 @@ class SettingsStore {
   }) async {
     final Set<SettingsSecretSlot> explicit =
         explicitSecretMutations ?? SettingsSecretSlot.values.toSet();
-    await _saveSecret(
-      SettingsSecretSlot.legacy,
-      config.apiKey,
+    await _saveSecrets(
+      config,
+      slotsToSave: SettingsSecretSlot.values.toSet(),
       explicit: explicit,
-      write: _secretStore.writeApiKey,
-      delete: _secretStore.deleteApiKey,
-    );
-    await _saveSecret(
-      SettingsSecretSlot.deepSeek,
-      config.deepseekApiKey,
-      explicit: explicit,
-      write: _secretStore.writeDeepSeekApiKey,
-      delete: _secretStore.deleteDeepSeekApiKey,
-    );
-    await _saveSecret(
-      SettingsSecretSlot.custom,
-      config.customApiKey,
-      explicit: explicit,
-      write: _secretStore.writeCustomApiKey,
-      delete: _secretStore.deleteCustomApiKey,
     );
     await _writeSettingsJson(config);
+  }
+
+  Future<void> _saveSecrets(
+    TranslationConfig config, {
+    required Set<SettingsSecretSlot> slotsToSave,
+    required Set<SettingsSecretSlot> explicit,
+  }) async {
+    if (slotsToSave.contains(SettingsSecretSlot.legacy)) {
+      await _saveSecret(
+        SettingsSecretSlot.legacy,
+        config.apiKey,
+        explicit: explicit,
+        write: _secretStore.writeApiKey,
+        delete: _secretStore.deleteApiKey,
+      );
+    }
+    if (slotsToSave.contains(SettingsSecretSlot.deepSeek)) {
+      await _saveSecret(
+        SettingsSecretSlot.deepSeek,
+        config.deepseekApiKey,
+        explicit: explicit,
+        write: _secretStore.writeDeepSeekApiKey,
+        delete: _secretStore.deleteDeepSeekApiKey,
+      );
+    }
+    if (slotsToSave.contains(SettingsSecretSlot.custom)) {
+      await _saveSecret(
+        SettingsSecretSlot.custom,
+        config.customApiKey,
+        explicit: explicit,
+        write: _secretStore.writeCustomApiKey,
+        delete: _secretStore.deleteCustomApiKey,
+      );
+    }
   }
 
   Future<void> _writeSettingsJson(TranslationConfig config) async {

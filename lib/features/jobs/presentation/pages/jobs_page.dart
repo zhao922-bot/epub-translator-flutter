@@ -87,9 +87,11 @@ class JobsPage extends ConsumerWidget {
                                 Text(
                                   job.isActive
                                       ? strings.activeRun
+                                      : job.hasWarnings
+                                      ? strings.jobStatusLabel(job.status)
                                       : job.canResume
                                       ? strings.canResumeLabel
-                                      : job.status,
+                                      : strings.jobStatusLabel(job.status),
                                   style: Theme.of(context).textTheme.labelMedium
                                       ?.copyWith(
                                         color: scheme.onSurfaceVariant,

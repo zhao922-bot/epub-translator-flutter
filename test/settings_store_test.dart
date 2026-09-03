@@ -11,6 +11,7 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
   String? customApiKey;
   bool failReads = false;
   bool failWrites = false;
+  bool failDeepSeekWrites = false;
   int secretMutationCount = 0;
 
   @override
@@ -52,7 +53,7 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
 
   @override
   Future<void> writeDeepSeekApiKey(String value) async {
-    if (failWrites) {
+    if (failWrites || failDeepSeekWrites) {
       throw StateError('secret store unavailable');
     }
     secretMutationCount += 1;
@@ -272,6 +273,47 @@ void main() {
       expect(secrets.deepSeekApiKey, 'sk-unreadable-deepseek');
       expect(secrets.customApiKey, 'sk-legacy-custom');
       expect(secrets.secretMutationCount, 2);
+      expect(
+        await settingsFile.readAsString(),
+        isNot(contains('sk-legacy-custom')),
+      );
+    },
+  );
+
+  test(
+    'legacy migration does not rewrite a readable inactive provider key',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_scoped_readable_key_migration_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      await settingsFile.writeAsString(
+        jsonEncode(<String, dynamic>{
+          ...TranslationConfig.defaults()
+              .copyWith(
+                apiProviderSelection: ApiProviderSelection.custom,
+                apiKey: 'sk-legacy-custom',
+              )
+              .toJson(),
+          'apiKey': 'sk-legacy-custom',
+        }),
+      );
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..deepSeekApiKey = 'sk-existing-deepseek'
+        ..failDeepSeekWrites = true;
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.apiKey, 'sk-legacy-custom');
+      expect(secrets.apiKey, 'sk-legacy-custom');
+      expect(secrets.deepSeekApiKey, 'sk-existing-deepseek');
+      expect(secrets.customApiKey, 'sk-legacy-custom');
       expect(
         await settingsFile.readAsString(),
         isNot(contains('sk-legacy-custom')),

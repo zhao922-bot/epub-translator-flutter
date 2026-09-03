@@ -122,7 +122,7 @@ void main() {
 
     expect(jobs, hasLength(1));
     expect(jobs.single.title, 'real-book.epub');
-    expect(jobs.single.status, 'Inspected');
+    expect(jobs.single.status, TranslationJobStatus.inspected);
     expect(jobs.single.progressLabel, '10 / 10 blocks');
     expect(jobs.single.canOpenOutput, isFalse);
   });
@@ -189,7 +189,7 @@ void main() {
       isFalse,
     );
     final warningJob = jobs.firstWhere((job) => job.id == 'warning-job');
-    expect(warningJob.status, 'Completed with warnings');
+    expect(warningJob.status, TranslationJobStatus.completedWithWarnings);
     expect(warningJob.canOpenOutput, isTrue);
     expect(warningJob.canRetry, isTrue);
     expect(warningJob.canResume, isTrue);

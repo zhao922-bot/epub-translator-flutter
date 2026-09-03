@@ -14,6 +14,46 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/tran
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('repackages selected chapters with zero translatable blocks', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_repository_zero_blocks_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File epubFile = File('${temp.path}/image_only.epub');
+    await _writeTestEpub(
+      epubFile,
+      chapters: const <String, String>{
+        'OPS/Text/cover.xhtml': '<img src="cover.jpg" alt=""/>',
+      },
+    );
+    final TranslationConfig config = TranslationConfig.defaults();
+    final EpubTranslationRepository repository = EpubTranslationRepository();
+    final inspection = await repository.startJob(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+    );
+    final chapters = inspection.chapters
+        .map((chapter) => chapter.copyWith(includeInTranslation: true))
+        .toList();
+    expect(chapters, isNotEmpty);
+    expect(chapters.expand((chapter) => chapter.blocks), isEmpty);
+
+    final result = await repository.translateChapters(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      config: config,
+      chapters: chapters,
+    );
+
+    expect(result.job.status, TranslationJobStatus.completed);
+    expect(result.job.totalBlocks, 0);
+    expect(result.job.degradedBlockCount, 0);
+    expect(result.job.hasExportableEpub, isTrue);
+    expect(await File(result.job.outputPath).exists(), isTrue);
+  });
+
   test(
     'cache restoration scans every block before the first API request',
     () async {

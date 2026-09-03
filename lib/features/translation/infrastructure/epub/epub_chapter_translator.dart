@@ -587,10 +587,7 @@ class EpubChapterTranslator {
     _beginDegradedTracking();
     try {
       final List<InspectedChapter> selectedChapters = chapters
-          .where(
-            (InspectedChapter chapter) =>
-                chapter.includeInTranslation && chapter.blocks.isNotEmpty,
-          )
+          .where((InspectedChapter chapter) => chapter.includeInTranslation)
           .map(
             (InspectedChapter chapter) => _prepareChapterForTarget(
               chapter,
@@ -608,9 +605,24 @@ class EpubChapterTranslator {
           'No chapters are selected. Check at least one chapter before starting translation.',
         );
       }
+      final String jobId = DateTime.now().millisecondsSinceEpoch.toString();
+      final String outputFilePath = _outputFilePath(
+        inputPath: inputPath,
+        outputDirectory: outputDirectory,
+        suffix: config.outputSuffix,
+      );
       if (totalBlocks == 0) {
-        throw const FormatException(
-          'The selected chapters do not contain any translatable text blocks yet.',
+        return _repackZeroBlockSelection(
+          jobId: jobId,
+          inputPath: inputPath,
+          outputFilePath: outputFilePath,
+          config: config,
+          chapters: chapters,
+          selectedChapterCount: selectedChapters.length,
+          cancelToken: cancelToken,
+          confirmedStyleProfile: confirmedStyleProfile,
+          onProgress: onProgress,
+          isCancelled: isCancelled,
         );
       }
       if (config.apiBaseUrl.trim().isEmpty ||
@@ -634,12 +646,6 @@ class EpubChapterTranslator {
       DateTime lastResumeSaveAt = DateTime.now();
       int blocksSinceResumeSave = 0;
 
-      final String jobId = DateTime.now().millisecondsSinceEpoch.toString();
-      final String outputFilePath = _outputFilePath(
-        inputPath: inputPath,
-        outputDirectory: outputDirectory,
-        suffix: config.outputSuffix,
-      );
       final TranslationStyleProfile? confirmedProfile =
           config.styleProfileEnabled ? confirmedStyleProfile : null;
       final TranslationStyleProfile? userStyleProfile =
@@ -1611,6 +1617,69 @@ class EpubChapterTranslator {
       }
       rethrow;
     }
+  }
+
+  Future<TranslationRunResult> _repackZeroBlockSelection({
+    required String jobId,
+    required String inputPath,
+    required String outputFilePath,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    required int selectedChapterCount,
+    required CancelToken cancelToken,
+    required TranslationStyleProfile? confirmedStyleProfile,
+    required TranslationProgressCallback? onProgress,
+    required TranslationCancellationCheck? isCancelled,
+  }) async {
+    void throwIfCancelled() {
+      if (cancelToken.isCancelled || (isCancelled?.call() ?? false)) {
+        throw const TranslationCancelledException();
+      }
+    }
+
+    final TranslationJob repackingJob = TranslationJob(
+      id: jobId,
+      inputPath: inputPath,
+      outputPath: outputFilePath,
+      status: TranslationJobStatus.running,
+      phase: TranslationJobPhase.translation,
+      progress: 0.98,
+      currentChapter: 'Repacking EPUB',
+      completedFiles: 0,
+      totalFiles: selectedChapterCount,
+      completedBlocks: 0,
+      totalBlocks: 0,
+      styleProfile: confirmedStyleProfile ?? TranslationStyleProfile.empty,
+      styleProfileConfirmed:
+          !config.styleProfileEnabled || confirmedStyleProfile != null,
+      styleProfileEnabled: config.styleProfileEnabled,
+    );
+    const String repackingLog =
+        'No translatable text blocks were selected. Repacking the EPUB without API requests.';
+    onProgress?.call(repackingJob, repackingLog);
+    AppLogger.debug(repackingLog, tag: 'translate');
+    throwIfCancelled();
+    await _repacker.writeTranslatedEpub(
+      inputPath: inputPath,
+      outputFilePath: outputFilePath,
+      config: config,
+      chapters: chapters,
+      cancelToken: cancelToken,
+      isCancelled: isCancelled,
+    );
+    throwIfCancelled();
+
+    final TranslationJob completedJob = repackingJob.copyWith(
+      status: TranslationJobStatus.completed,
+      progress: 1,
+      currentChapter: 'EPUB ready',
+      completedFiles: selectedChapterCount,
+    );
+    final String completedLog =
+        'Translation complete. Wrote EPUB with no translatable text blocks to $outputFilePath';
+    onProgress?.call(completedJob, completedLog);
+    AppLogger.debug(completedLog, tag: 'translate');
+    return TranslationRunResult(job: completedJob, chapters: chapters);
   }
 
   Future<String> _translateBlock({

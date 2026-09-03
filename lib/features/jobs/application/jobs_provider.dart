@@ -26,7 +26,7 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
         (TranslationJob job) => JobSummary(
           id: job.id,
           title: path.basename(job.inputPath),
-          status: _statusLabel(job.status),
+          status: job.status,
           progressLabel: _progressLabel(job),
           outputPath: job.outputPath,
           errorMessage: job.errorMessage,
@@ -44,19 +44,6 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
       )
       .toList(growable: false);
 });
-
-String _statusLabel(TranslationJobStatus status) {
-  return switch (status) {
-    TranslationJobStatus.idle => 'Idle',
-    TranslationJobStatus.queued => 'Queued',
-    TranslationJobStatus.running => 'Running',
-    TranslationJobStatus.inspected => 'Inspected',
-    TranslationJobStatus.cancelled => 'Cancelled',
-    TranslationJobStatus.failed => 'Failed',
-    TranslationJobStatus.completedWithWarnings => 'Completed with warnings',
-    TranslationJobStatus.completed => 'Completed',
-  };
-}
 
 String phaseLabel(TranslationJobPhase phase) {
   return switch (phase) {
