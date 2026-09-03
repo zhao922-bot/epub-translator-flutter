@@ -82,7 +82,7 @@ void main() {
         'status': 'completed',
         'phase': 'translation',
         'progress': 1,
-        if (value != null) 'degradedBlockCount': value,
+        'degradedBlockCount': ?value,
       });
 
       expect(job.degradedBlockCount, 0);
