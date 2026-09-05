@@ -67,6 +67,7 @@ app.*.map.json
 /work/
 /dist/
 /.worktrees/
+/.superpowers/
 
 # Local AI-assistant configuration (not part of the application)
 /.claude/
