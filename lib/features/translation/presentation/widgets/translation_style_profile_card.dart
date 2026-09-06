@@ -46,6 +46,7 @@ class TranslationStyleProfileCard extends StatefulWidget {
 
 class _TranslationStyleProfileCardState
     extends State<TranslationStyleProfileCard> {
+  bool _showConfirmedDetails = false;
   late final TextEditingController _genreController;
   late final TextEditingController _secondaryController;
   late final TextEditingController _toneController;
@@ -78,6 +79,7 @@ class _TranslationStyleProfileCardState
   @override
   void didUpdateWidget(covariant TranslationStyleProfileCard oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.confirmed != widget.confirmed) _showConfirmedDetails = false;
     if (!oldWidget.profile.sameContentAs(widget.profile)) {
       _syncController(_genreController, widget.profile.primaryGenre);
       _syncController(
@@ -128,6 +130,23 @@ class _TranslationStyleProfileCardState
         ? widget.strings.styleProfileConfirmedBadge
         : widget.strings.styleProfilePendingBadge;
 
+    if (widget.confirmed && !_showConfirmedDetails) {
+      return SectionCard(
+        title: widget.strings.styleProfileSectionTitle,
+        trailing: TextButton(
+          onPressed: () => setState(() => _showConfirmedDetails = true),
+          child: Text(widget.strings.expandLogs),
+        ),
+        child: Text(
+          [
+            widget.strings.styleProfileConfirmedBadge,
+            widget.profile.primaryGenre,
+            widget.profile.tone,
+          ].where((text) => text.isNotEmpty).join(' · '),
+          style: theme.textTheme.bodySmall,
+        ),
+      );
+    }
     return SectionCard(
       title: widget.strings.styleProfileSectionTitle,
       icon: Icons.auto_stories_rounded,
@@ -135,14 +154,13 @@ class _TranslationStyleProfileCardState
       trailing: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
-          color: (widget.confirmed ? scheme.tertiary : scheme.secondary)
-              .withValues(alpha: 0.14),
+          color: scheme.onSurface.withValues(alpha: 0.14),
           borderRadius: BorderRadius.circular(999),
         ),
         child: Text(
           badge,
           style: theme.textTheme.labelMedium?.copyWith(
-            color: widget.confirmed ? scheme.tertiary : scheme.secondary,
+            color: scheme.onSurfaceVariant,
             fontWeight: FontWeight.w700,
           ),
         ),
@@ -150,6 +168,14 @@ class _TranslationStyleProfileCardState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
+          if (widget.confirmed)
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton(
+                onPressed: () => setState(() => _showConfirmedDetails = false),
+                child: Text(widget.strings.collapseLogs),
+              ),
+            ),
           Text(
             widget.strings.styleProfileSectionBody,
             style: theme.textTheme.bodySmall?.copyWith(
@@ -277,11 +303,7 @@ class _TranslationStyleProfileCardState
         controller: controller,
         maxLines: maxLines,
         enabled: !widget.isGenerating && widget.editable,
-        decoration: InputDecoration(
-          labelText: label,
-          isDense: true,
-          border: const OutlineInputBorder(),
-        ),
+        decoration: InputDecoration(labelText: label, isDense: true),
         onChanged: onChanged,
       ),
     );

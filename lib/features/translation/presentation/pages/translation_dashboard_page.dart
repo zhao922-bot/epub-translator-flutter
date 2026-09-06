@@ -54,15 +54,7 @@ class TranslationDashboardPage extends ConsumerWidget {
 
     // Primary actions only when they add value beyond the drop zone.
     final List<Widget> primaryActions = <Widget>[];
-    if (isRunActive) {
-      primaryActions.add(
-        FilledButton.tonalIcon(
-          onPressed: controller.requestCancel,
-          icon: const Icon(Icons.stop_circle_outlined),
-          label: Text(strings.cancelRun),
-        ),
-      );
-    } else if (canTranslate) {
+    if (!isRunActive && canTranslate) {
       primaryActions.add(
         FilledButton.icon(
           onPressed: controller.startTranslation,
@@ -78,7 +70,7 @@ class TranslationDashboardPage extends ConsumerWidget {
           ),
         );
       }
-    } else if (hasInput) {
+    } else if (!isRunActive && hasInput) {
       primaryActions.add(
         FilledButton.icon(
           onPressed: controller.startInspection,
@@ -91,78 +83,10 @@ class TranslationDashboardPage extends ConsumerWidget {
     return PageScaffold(
       title: strings.translationPageTitle,
       subtitle: strings.translationPageSubtitle,
-      actions: primaryActions,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          TranslationInputs(
-            strings: strings,
-            inputPath: state.inputPath,
-            outputDirectory: state.outputDirectory,
-            targetLanguage: state.config.targetLanguage,
-            bilingual: state.config.bilingual,
-            enabled: !isRunActive,
-            onInputChanged: controller.setInputPath,
-            onOutputChanged: controller.setOutputDirectory,
-            onTargetLanguageChanged: (value) {
-              if (value != null) {
-                settingsController.setTargetLanguage(value);
-                controller.setTargetLanguage(value);
-              }
-            },
-            onBilingualChanged: (value) {
-              settingsController.setBilingual(value);
-              controller.setBilingual(value);
-            },
-            onPickInputPressed: isRunActive ? null : controller.pickInputPath,
-            onPickOutputPressed: isRunActive
-                ? null
-                : controller.pickOutputDirectory,
-          ),
-          const SizedBox(height: 12),
-          TranslationWorkflowSteps(
-            strings: strings,
-            hasInput: hasInput,
-            hasInspectedChapters: hasInspected,
-            canTranslate: canTranslate,
-            job: state.job,
-          ),
-          if (showStyleProfile) ...<Widget>[
-            const SizedBox(height: 16),
-            TranslationStyleProfileCard(
-              strings: strings,
-              profile: state.styleProfile,
-              confirmed: state.styleProfileConfirmed,
-              enabled: true,
-              editable: !isRunActive,
-              isGenerating: state.isGeneratingStyleProfile,
-              canGenerate: hasInspected && !isRunActive,
-              onGenerate: controller.generateStyleProfile,
-              onConfirm: controller.confirmStyleProfile,
-              onChanged:
-                  ({
-                    String? primaryGenre,
-                    String? secondaryGenresCsv,
-                    String? tone,
-                    String? sentenceStyle,
-                    String? constraintsText,
-                    String? avoidText,
-                    TranslationStyleConfidence? confidence,
-                  }) {
-                    controller.setStyleProfileField(
-                      primaryGenre: primaryGenre,
-                      secondaryGenresCsv: secondaryGenresCsv,
-                      tone: tone,
-                      sentenceStyle: sentenceStyle,
-                      constraintsText: constraintsText,
-                      avoidText: avoidText,
-                      confidence: confidence,
-                    );
-                  },
-            ),
-          ],
           if (showOverview) ...<Widget>[
-            const SizedBox(height: 16),
             TranslationOverview(
               strings: strings,
               job: state.job,
@@ -201,13 +125,97 @@ class TranslationDashboardPage extends ConsumerWidget {
                 }
               },
             ),
+            const SizedBox(height: 20),
+          ],
+          TranslationInputs(
+            actions: primaryActions,
+            chapterSummary: hasInspected
+                ? strings.chapterChecklistSummary(
+                    selectedChapters.length,
+                    state.inspectedChapters.length,
+                    selectedBlocks,
+                  )
+                : null,
+            onPreviewPressed: () => context.go('/preview'),
+            strings: strings,
+            inputPath: state.inputPath,
+            outputDirectory: state.outputDirectory,
+            targetLanguage: state.config.targetLanguage,
+            bilingual: state.config.bilingual,
+            enabled: !isRunActive,
+            onInputChanged: controller.setInputPath,
+            onOutputChanged: controller.setOutputDirectory,
+            onTargetLanguageChanged: (value) {
+              if (value != null) {
+                settingsController.setTargetLanguage(value);
+                controller.setTargetLanguage(value);
+              }
+            },
+            onBilingualChanged: (value) {
+              settingsController.setBilingual(value);
+              controller.setBilingual(value);
+            },
+            onPickInputPressed: isRunActive ? null : controller.pickInputPath,
+            onPickOutputPressed: isRunActive
+                ? null
+                : controller.pickOutputDirectory,
+          ),
+          const SizedBox(height: 12),
+          TranslationWorkflowSteps(
+            strings: strings,
+            hasInput: hasInput,
+            hasInspectedChapters: hasInspected,
+            canTranslate: canTranslate,
+            job: state.job,
+          ),
+          if (showStyleProfile) ...<Widget>[
+            const SizedBox(height: 16),
+            if (state.requiresStyleProfileConfirmation && selectedBlocks > 0)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  strings.reviewStyleFirst,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ),
+            TranslationStyleProfileCard(
+              strings: strings,
+              profile: state.styleProfile,
+              confirmed: state.styleProfileConfirmed,
+              enabled: true,
+              editable: !isRunActive,
+              isGenerating: state.isGeneratingStyleProfile,
+              canGenerate: hasInspected && !isRunActive,
+              onGenerate: controller.generateStyleProfile,
+              onConfirm: controller.confirmStyleProfile,
+              onChanged:
+                  ({
+                    String? primaryGenre,
+                    String? secondaryGenresCsv,
+                    String? tone,
+                    String? sentenceStyle,
+                    String? constraintsText,
+                    String? avoidText,
+                    TranslationStyleConfidence? confidence,
+                  }) {
+                    controller.setStyleProfileField(
+                      primaryGenre: primaryGenre,
+                      secondaryGenresCsv: secondaryGenresCsv,
+                      tone: tone,
+                      sentenceStyle: sentenceStyle,
+                      constraintsText: constraintsText,
+                      avoidText: avoidText,
+                      confidence: confidence,
+                    );
+                  },
+            ),
           ],
           if (showLogs) ...<Widget>[
             const SizedBox(height: 14),
             TranslationLogs(
               strings: strings,
               logs: state.logs,
-              initiallyExpanded: state.actionableError != null,
+              initiallyExpanded: false,
             ),
           ],
         ],

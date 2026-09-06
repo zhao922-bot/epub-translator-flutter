@@ -23,21 +23,10 @@ class _TranslationLogsState extends State<TranslationLogs> {
   late bool _expanded = widget.initiallyExpanded;
 
   @override
-  void didUpdateWidget(covariant TranslationLogs oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!_expanded &&
-        widget.logs.isNotEmpty &&
-        widget.logs.last.toLowerCase().contains('fail')) {
-      _expanded = true;
-    }
-  }
-
-  @override
   Widget build(BuildContext context) {
     final String latest = widget.logs.isEmpty ? '—' : widget.logs.last;
     final ThemeData theme = Theme.of(context);
     final ColorScheme scheme = theme.colorScheme;
-    final bool isDark = scheme.brightness == Brightness.dark;
     final String countLabel = widget.logs.isEmpty
         ? widget.strings.logsTitle
         : '${widget.strings.logsTitle} · ${widget.logs.length}';
@@ -58,10 +47,8 @@ class _TranslationLogsState extends State<TranslationLogs> {
               width: double.infinity,
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
-                color: isDark
-                    ? const Color(0xFF0A0E16)
-                    : const Color(0xFF0F172A),
-                borderRadius: BorderRadius.circular(12),
+                color: scheme.surfaceContainer,
+                borderRadius: BorderRadius.circular(6),
               ),
               child: Scrollbar(
                 child: SingleChildScrollView(
@@ -69,7 +56,7 @@ class _TranslationLogsState extends State<TranslationLogs> {
                     widget.logs.join('\n'),
                     style: theme.textTheme.bodySmall?.copyWith(
                       height: 1.45,
-                      color: const Color(0xFFCBD5E1),
+                      color: scheme.onSurface,
                     ),
                   ),
                 ),

@@ -137,6 +137,7 @@ void main() {
     expect(find.text('Light'), findsOneWidget);
     expect(find.text('Dark'), findsOneWidget);
 
+    await tester.ensureVisible(find.text('Light'));
     await tester.tap(find.text('Light'));
     await tester.pumpAndSettle();
 
@@ -169,8 +170,8 @@ void main() {
     await openSettings(tester);
     expect(find.byKey(const ValueKey<String>('page-scaffold')), findsOneWidget);
     expect(
-      find.byKey(const ValueKey<String>('section-card-emphasis')),
-      findsWidgets,
+      find.byKey(const ValueKey<String>('settings-api-key')),
+      findsOneWidget,
     );
     await tester.ensureVisible(find.byTooltip('Show API key'));
     await tester.tap(find.byTooltip('Show API key'));
@@ -196,8 +197,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey<String>('page-scaffold')), findsOneWidget);
     expect(
-      find.byKey(const ValueKey<String>('section-card-standard')),
-      findsWidgets,
+      find.byKey(const ValueKey<String>('page-scaffold-body')),
+      findsOneWidget,
     );
     expect(tester.takeException(), isNull);
 
@@ -205,8 +206,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey<String>('page-scaffold')), findsOneWidget);
     expect(
-      find.byKey(const ValueKey<String>('section-card-emphasis')),
-      findsWidgets,
+      find.byKey(const ValueKey<String>('page-scaffold-body')),
+      findsOneWidget,
     );
     expect(tester.takeException(), isNull);
   });

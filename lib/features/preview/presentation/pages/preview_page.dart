@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-
+import 'package:go_router/go_router.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
-import '../../../../shared/widgets/section_card.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
-import '../../../translation/domain/models/chapter_selection_preset.dart';
 import '../../application/preview_provider.dart';
 import '../../domain/models/preview_chapter.dart';
+import '../widgets/chapter_checklist.dart';
+import '../widgets/chapter_preview_content.dart';
 
 class PreviewPage extends ConsumerWidget {
   const PreviewPage({super.key});
@@ -15,355 +15,131 @@ class PreviewPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final chapters = ref.watch(previewChaptersProvider);
-    final selectedIndex = ref.watch(previewSelectedIndexProvider);
-    final int safeSelectedIndex = selectedIndex.clamp(0, chapters.length - 1);
-    final selectedChapter = chapters[safeSelectedIndex];
-    final selectedController = ref.read(previewSelectedIndexProvider.notifier);
-    if (safeSelectedIndex != selectedIndex) {
+    final index = ref.watch(previewSelectedIndexProvider);
+    final state = ref.watch(translationDashboardProvider);
+    final controller = ref.read(translationDashboardProvider.notifier);
+    final strings = ref.watch(appStringsProvider);
+    final empty = state.inspectedChapters.isEmpty || chapters.isEmpty;
+    final safeIndex = empty ? 0 : index.clamp(0, chapters.length - 1);
+    if (safeIndex != index) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!context.mounted ||
-            ref.read(previewSelectedIndexProvider) != selectedIndex) {
-          return;
+        if (context.mounted &&
+            ref.read(previewSelectedIndexProvider) == index) {
+          ref.read(previewSelectedIndexProvider.notifier).state = safeIndex;
         }
-        selectedController.state = safeSelectedIndex;
       });
     }
-    final dashboardState = ref.watch(translationDashboardProvider);
-    final dashboardController = ref.read(translationDashboardProvider.notifier);
-    final bool selectionEnabled = !dashboardState.isRunActive;
-    final strings = ref.watch(appStringsProvider);
-    final selectedCount = chapters
-        .where((PreviewChapter chapter) => chapter.includeInTranslation)
-        .length;
-    final selectedBlockCount = dashboardState.inspectedChapters
-        .where((chapter) => chapter.includeInTranslation)
-        .fold<int>(0, (int sum, chapter) => sum + chapter.blocks.length);
-
     return PageScaffold(
       title: strings.previewTitle,
       subtitle: strings.previewSubtitle,
-      child: LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) {
-          final bool stackedLayout = constraints.maxWidth < 980;
-          final Widget checklist = SizedBox(
-            width: stackedLayout ? double.infinity : 360,
-            child: SectionCard(
-              title: strings.chapterChecklist,
-              icon: Icons.checklist_rounded,
-              variant: SectionCardVariant.standard,
-              trailing: TextButton.icon(
-                onPressed:
-                    dashboardState.inspectedChapters.isEmpty ||
-                        !selectionEnabled
-                    ? null
-                    : dashboardController.resetChapterSelection,
-                icon: const Icon(Icons.restart_alt_rounded),
-                label: Text(strings.resetSelection),
-              ),
-              child: Column(
-                children: <Widget>[
-                  if (chapters.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: Align(
-                        alignment: Alignment.centerLeft,
-                        child: Text(
-                          strings.chapterChecklistSummary(
-                            selectedCount,
-                            chapters.length,
-                            selectedBlockCount,
-                          ),
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
-                      ),
-                    ),
-                  if (dashboardState.inspectedChapters.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 12),
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: <Widget>[
-                          ActionChip(
-                            label: Text(strings.presetRecommended),
-                            onPressed: selectionEnabled
-                                ? () => dashboardController
-                                      .applyChapterSelectionPreset(
-                                        ChapterSelectionPreset.recommended,
-                                      )
-                                : null,
-                          ),
-                          ActionChip(
-                            label: Text(strings.presetContentOnly),
-                            onPressed: selectionEnabled
-                                ? () => dashboardController
-                                      .applyChapterSelectionPreset(
-                                        ChapterSelectionPreset.contentOnly,
-                                      )
-                                : null,
-                          ),
-                          ActionChip(
-                            label: Text(strings.presetAll),
-                            onPressed: selectionEnabled
-                                ? () => dashboardController
-                                      .applyChapterSelectionPreset(
-                                        ChapterSelectionPreset.allChapters,
-                                      )
-                                : null,
-                          ),
-                          ActionChip(
-                            label: Text(strings.presetNone),
-                            onPressed: selectionEnabled
-                                ? () => dashboardController
-                                      .applyChapterSelectionPreset(
-                                        ChapterSelectionPreset.none,
-                                      )
-                                : null,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ...List<Widget>.generate(chapters.length, (int index) {
-                    final PreviewChapter chapter = chapters[index];
-                    return ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      selected: index == safeSelectedIndex,
-                      onTap: () => selectedController.state = index,
-                      leading: Checkbox(
-                        value: chapter.includeInTranslation,
-                        onChanged:
-                            chapter.path.isEmpty ||
-                                chapter.blockCount == 0 ||
-                                !selectionEnabled
-                            ? null
-                            : (bool? value) {
-                                if (value == null) {
-                                  return;
-                                }
-                                dashboardController.toggleChapterInclusion(
-                                  chapter.path,
-                                  value,
-                                );
-                              },
-                      ),
-                      title: Text(
-                        chapter.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: Text(
-                        strings.chapterCategoryBlocks(
-                          chapter.category,
-                          chapter.blockCount,
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing:
-                          chapter.recommendedForTranslation ==
-                              chapter.includeInTranslation
-                          ? null
-                          : Tooltip(
-                              message: strings.manualOverrideTooltip,
-                              child: const Icon(Icons.tune_rounded, size: 18),
-                            ),
-                    );
-                  }),
-                ],
-              ),
-            ),
-          );
-
-          final Widget detail = Column(
-            children: <Widget>[
-              SectionCard(
-                title: selectedChapter.title,
-                icon: Icons.menu_book_outlined,
-                variant: SectionCardVariant.emphasis,
-                trailing: _PreviewBadge(
-                  chapter: selectedChapter,
-                  strings: strings,
-                ),
+      scrollBody: false,
+      child: empty
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.auto_stories_outlined,
+                      size: 38,
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(height: 18),
                     Text(
-                      selectedChapter.path.isEmpty
-                          ? (strings.isChinese
-                                ? '尚无章节路径'
-                                : 'No chapter path yet')
-                          : selectedChapter.path,
-                      style: Theme.of(context).textTheme.bodySmall,
+                      strings.noPreviewYet,
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium,
                     ),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 12,
-                      runSpacing: 12,
-                      children: <Widget>[
-                        _MetricChip(
-                          label: strings.blocksLabel,
-                          value:
-                              '${selectedChapter.translatedBlockCount}/${selectedChapter.blockCount}',
-                        ),
-                        _MetricChip(
-                          label: strings.defaultLabel,
-                          value: selectedChapter.recommendedForTranslation
-                              ? strings.translateBadge
-                              : strings.skipBadge,
-                        ),
-                      ],
+                    const SizedBox(height: 18),
+                    FilledButton.icon(
+                      onPressed: () => context.go('/'),
+                      icon: const Icon(Icons.upload_file_outlined, size: 18),
+                      label: Text(strings.chooseEpub),
                     ),
-                    const SizedBox(height: 16),
-                    Text(
-                      strings.sourcePreview,
-                      style: Theme.of(context).textTheme.titleSmall,
-                    ),
-                    const SizedBox(height: 8),
-                    SelectableText(
-                      selectedChapter.body,
-                      style: Theme.of(
-                        context,
-                      ).textTheme.bodyLarge?.copyWith(height: 1.6),
-                    ),
-                    if (selectedChapter.translatedBlockCount > 0) ...<Widget>[
-                      const SizedBox(height: 20),
-                      Text(
-                        strings.translatedPreview,
-                        style: Theme.of(context).textTheme.titleSmall,
-                      ),
-                      const SizedBox(height: 8),
-                      SelectableText(
-                        _translatedExcerpt(dashboardState, selectedChapter),
-                        style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                          height: 1.6,
-                          color: Theme.of(context).colorScheme.primary,
-                        ),
-                      ),
-                    ],
                   ],
                 ),
               ),
-              const SizedBox(height: 16),
-              SectionCard(
-                title: strings.currentFilteringRule,
-                icon: Icons.filter_alt_outlined,
-                variant: SectionCardVariant.subtle,
-                child: Text(
-                  strings.currentFilteringRuleBody,
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-              ),
-            ],
-          );
-
-          if (stackedLayout) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[checklist, const SizedBox(height: 16), detail],
-            );
-          }
-
-          return Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              checklist,
-              const SizedBox(width: 16),
-              Expanded(child: detail),
-            ],
-          );
-        },
-      ),
+            )
+          : LayoutBuilder(
+              builder: (context, constraints) {
+                final selected = chapters[safeIndex];
+                final textScale = MediaQuery.textScalerOf(context).scale(1);
+                final wide = constraints.maxWidth >= 800 * textScale;
+                final parallel = constraints.maxWidth >= 1040 * textScale;
+                final checklist = ChapterChecklist(
+                  chapters: chapters,
+                  selectedIndex: safeIndex,
+                  strings: strings,
+                  enabled: !state.isRunActive,
+                  selectedBlocks: state.inspectedChapters
+                      .where((c) => c.includeInTranslation)
+                      .fold<int>(0, (sum, c) => sum + c.blocks.length),
+                  onSelect: (value) =>
+                      ref.read(previewSelectedIndexProvider.notifier).state =
+                          value,
+                  onToggle: controller.toggleChapterInclusion,
+                  onReset: controller.resetChapterSelection,
+                  onPreset: controller.applyChapterSelectionPreset,
+                );
+                final detail = SingleChildScrollView(
+                  key: ValueKey(selected.path),
+                  padding: const EdgeInsets.only(bottom: 28),
+                  child: ChapterPreviewContent(
+                    chapter: selected,
+                    translated: _translatedExcerpt(state, selected),
+                    strings: strings,
+                    parallel: parallel,
+                  ),
+                );
+                if (wide) {
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 20),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        SizedBox(width: 260, child: checklist),
+                        const SizedBox(width: 24),
+                        const VerticalDivider(width: 1),
+                        const SizedBox(width: 24),
+                        Expanded(child: detail),
+                      ],
+                    ),
+                  );
+                }
+                return Column(
+                  children: [
+                    SizedBox(
+                      height: (constraints.maxHeight * .46).clamp(160.0, 300.0),
+                      child: checklist,
+                    ),
+                    const SizedBox(height: 16),
+                    const Divider(),
+                    const SizedBox(height: 16),
+                    Expanded(child: detail),
+                  ],
+                );
+              },
+            ),
     );
   }
 }
 
-String _translatedExcerpt(
-  TranslationDashboardState dashboardState,
-  PreviewChapter selectedChapter,
+String? _translatedExcerpt(
+  TranslationDashboardState state,
+  PreviewChapter selected,
 ) {
-  for (final chapter in dashboardState.inspectedChapters) {
-    if (chapter.path != selectedChapter.path) {
-      continue;
-    }
-    final Iterable<String> parts = chapter.blocks
-        .map((block) => block.translatedHtml)
+  for (final chapter in state.inspectedChapters) {
+    if (chapter.path != selected.path) continue;
+    final text = chapter.blocks
+        .map((b) => b.translatedHtml)
         .whereType<String>()
         .map((html) => html.replaceAll(RegExp(r'<[^>]+>'), ' '))
         .map((text) => text.replaceAll(RegExp(r'\s+'), ' ').trim())
         .where((text) => text.isNotEmpty)
-        .take(8);
-    final String joined = parts.join('\n\n');
-    if (joined.isNotEmpty) {
-      return joined;
-    }
+        .take(8)
+        .join('\n\n');
+    return text.isEmpty ? null : text;
   }
-  return selectedChapter.body;
-}
-
-class _PreviewBadge extends StatelessWidget {
-  const _PreviewBadge({required this.chapter, required this.strings});
-
-  final PreviewChapter chapter;
-  final AppStrings strings;
-
-  @override
-  Widget build(BuildContext context) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
-    final Color background = chapter.includeInTranslation
-        ? scheme.secondaryContainer
-        : scheme.tertiaryContainer;
-    final Color foreground = chapter.includeInTranslation
-        ? scheme.onSecondaryContainer
-        : scheme.onTertiaryContainer;
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: background,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(
-        chapter.includeInTranslation
-            ? strings.translateBadge
-            : strings.skipBadge,
-        style: Theme.of(
-          context,
-        ).textTheme.labelLarge?.copyWith(color: foreground),
-      ),
-    );
-  }
-}
-
-class _MetricChip extends StatelessWidget {
-  const _MetricChip({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
-    return Container(
-      width: 148,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: scheme.surface,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: scheme.outlineVariant),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text(
-            label,
-            style: Theme.of(
-              context,
-            ).textTheme.labelMedium?.copyWith(color: scheme.onSurfaceVariant),
-          ),
-          const SizedBox(height: 4),
-          Text(value, style: Theme.of(context).textTheme.titleSmall),
-        ],
-      ),
-    );
-  }
+  return null;
 }

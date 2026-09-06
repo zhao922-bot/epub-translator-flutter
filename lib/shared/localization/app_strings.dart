@@ -46,6 +46,19 @@ class AppStrings {
   String get chooseOutputDirectory => isChinese ? '更改' : 'Change';
   String get targetLanguage => isChinese ? '目标语言' : 'Language';
   String get bilingualOutput => isChinese ? '双语' : 'Bilingual';
+  String get translatedOnly => isChinese ? '仅译文' : 'Translation only';
+  String get translationPreferences =>
+      isChinese ? '翻译偏好' : 'Translation preferences';
+  String get outputFormat => isChinese ? '译本格式' : 'Output format';
+  String get noPreviewYet => isChinese
+      ? '导入并检查 EPUB 后，在这里选择章节和预览正文。'
+      : 'Import and inspect an EPUB to select chapters and preview text here.';
+  String get noTranslationYet => isChinese
+      ? '此章节尚无可预览的译文。'
+      : 'No translated excerpt is available for this chapter yet.';
+  String get reviewStyleFirst => isChinese
+      ? '请先确认下方的书籍风格，再开始翻译。'
+      : 'Review and confirm the book style below before translating.';
 
   String get runOverview => isChinese ? '进度' : 'Progress';
   String get statusLabel => isChinese ? '状态' : 'Status';

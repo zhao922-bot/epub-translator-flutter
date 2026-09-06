@@ -49,7 +49,7 @@ void main() {
       expect(style?.fontFamily, theme.textTheme.bodySmall?.fontFamily);
       expect(style?.fontSize, theme.textTheme.bodySmall?.fontSize);
       expect(style?.height, 1.45);
-      expect(style?.color, const Color(0xFFCBD5E1));
+      expect(style?.color, theme.colorScheme.onSurface);
     });
 
     testWidgets('collapsed preview uses bodySmall without hardcoded Consolas', (

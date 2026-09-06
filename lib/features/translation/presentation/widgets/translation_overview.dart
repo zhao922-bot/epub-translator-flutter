@@ -83,6 +83,12 @@ class TranslationOverview extends StatelessWidget {
                 PlatformUtils.isAndroid ? strings.shareEpub : strings.openEpub,
               ),
             )
+          : canCancel
+          ? FilledButton.tonalIcon(
+              onPressed: onCancelPressed,
+              icon: const Icon(Icons.stop_circle_outlined, size: 18),
+              label: Text(strings.cancelRun),
+            )
           : null,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -255,8 +261,8 @@ class _StatusPill extends StatelessWidget {
     final ColorScheme scheme = Theme.of(context).colorScheme;
     final (Color bg, Color fg) = switch (status) {
       TranslationJobStatus.completed => (
-        scheme.primary.withValues(alpha: 0.12),
-        scheme.primary,
+        scheme.secondary.withValues(alpha: 0.12),
+        scheme.secondary,
       ),
       TranslationJobStatus.completedWithWarnings => (
         scheme.tertiaryContainer,
@@ -267,8 +273,8 @@ class _StatusPill extends StatelessWidget {
         scheme.error,
       ),
       TranslationJobStatus.running || TranslationJobStatus.queued => (
-        scheme.tertiary.withValues(alpha: 0.14),
-        scheme.tertiary,
+        scheme.primary.withValues(alpha: 0.10),
+        scheme.primary,
       ),
       _ => (scheme.surfaceContainer, scheme.onSurfaceVariant),
     };
@@ -277,7 +283,7 @@ class _StatusPill extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
         color: bg,
-        borderRadius: BorderRadius.circular(999),
+        borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
         label,

@@ -12,6 +12,14 @@ import 'package:epub_translator_flutter/shared/widgets/section_card.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:epub_translator_flutter/features/jobs/application/jobs_provider.dart';
+import 'package:epub_translator_flutter/features/jobs/domain/models/job_summary.dart';
+import 'package:epub_translator_flutter/features/jobs/presentation/pages/jobs_page.dart';
+import 'package:epub_translator_flutter/features/preview/presentation/pages/preview_page.dart';
+import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_inputs.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
+import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_style_profile_card.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 
 class _MemorySettingsStore extends SettingsStore {
   @override
@@ -49,6 +57,149 @@ void _viewport(WidgetTester tester, Size size) {
 }
 
 void main() {
+  testWidgets(
+    'confirmed style collapses while pending style remains editable',
+    (tester) async {
+      Widget profile(bool confirmed) => MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: TranslationStyleProfileCard(
+              strings: const AppStrings(UiLanguage.english),
+              profile: const TranslationStyleProfile(primaryGenre: 'Essay'),
+              confirmed: confirmed,
+              enabled: true,
+              editable: true,
+              isGenerating: false,
+              canGenerate: true,
+              onGenerate: () {},
+              onConfirm: () {},
+              onChanged:
+                  ({
+                    primaryGenre,
+                    secondaryGenresCsv,
+                    tone,
+                    sentenceStyle,
+                    constraintsText,
+                    avoidText,
+                    confidence,
+                  }) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpWidget(profile(true));
+      expect(find.byType(TextField), findsNothing);
+      await tester.pumpWidget(profile(false));
+      expect(find.byType(TextField), findsWidgets);
+    },
+  );
+  Widget jobsApp(int count) => ProviderScope(
+    overrides: [
+      settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+      jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
+      jobsProvider.overrideWith(
+        (ref) => List.generate(
+          count,
+          (i) => JobSummary(
+            id: '$i',
+            title: 'book-$i.epub',
+            status: TranslationJobStatus.completedWithWarnings,
+            progressLabel: '17 / 18 blocks',
+            outputPath: 'partial.epub',
+            errorMessage: null,
+            isActive: false,
+            canOpenOutput: true,
+            canRetry: true,
+          ),
+        ),
+      ),
+    ],
+    child: MaterialApp(
+      theme: AppTheme.light(UiLanguage.english),
+      home: const MediaQuery(
+        data: MediaQueryData(textScaler: TextScaler.linear(1.3)),
+        child: Scaffold(body: JobsPage()),
+      ),
+    ),
+  );
+  testWidgets('warning job actions fit a narrow window with enlarged text', (
+    tester,
+  ) async {
+    _viewport(tester, const Size(390, 844));
+    await tester.pumpWidget(jobsApp(1));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    const strings = AppStrings(UiLanguage.english);
+    expect(
+      find.text(
+        strings.jobStatusLabel(TranslationJobStatus.completedWithWarnings),
+      ),
+      findsOneWidget,
+    );
+    expect(find.byTooltip(strings.openOutput).hitTestable(), findsOneWidget);
+    expect(find.byTooltip(strings.retryJob).hitTestable(), findsOneWidget);
+  });
+  testWidgets('job list builds rows on demand', (tester) async {
+    _viewport(tester, const Size(1024, 768));
+    await tester.pumpWidget(jobsApp(200));
+    await tester.pumpAndSettle();
+    expect(find.text('book-0.epub'), findsOneWidget);
+    expect(find.text('book-199.epub'), findsNothing);
+  });
+  testWidgets('preview empty state does not masquerade as a chapter', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+          jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(UiLanguage.english),
+          home: const Scaffold(body: PreviewPage()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('No EPUB inspected yet'), findsNothing);
+    expect(
+      find.text(const AppStrings(UiLanguage.english).chooseEpub),
+      findsOneWidget,
+    );
+    expect(find.byType(Checkbox), findsNothing);
+  });
+  testWidgets('translation format has an explicit bilingual choice', (
+    tester,
+  ) async {
+    bool? selected;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: TranslationInputs(
+              strings: const AppStrings(UiLanguage.english),
+              inputPath: '',
+              outputDirectory: '',
+              targetLanguage: 'English',
+              bilingual: false,
+              enabled: true,
+              onInputChanged: (_) {},
+              onOutputChanged: (_) {},
+              onTargetLanguageChanged: (_) {},
+              onBilingualChanged: (value) => selected = value,
+              onPickInputPressed: () {},
+              onPickOutputPressed: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(find.byType(SegmentedButton<bool>), findsOneWidget);
+    await tester.ensureVisible(find.text('Bilingual'));
+    await tester.tap(find.text('Bilingual'));
+    expect(selected, isTrue);
+  });
   test('themes use compact monochrome surfaces and controls', () {
     final ThemeData light = AppTheme.light(UiLanguage.english);
     final ThemeData dark = AppTheme.dark(UiLanguage.chinese);

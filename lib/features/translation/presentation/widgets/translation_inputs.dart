@@ -1,11 +1,10 @@
-import 'dart:ui' as ui;
-
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/widgets/section_card.dart';
+import 'translation_preferences.dart';
 
 class TranslationInputs extends StatefulWidget {
   const TranslationInputs({
@@ -22,6 +21,9 @@ class TranslationInputs extends StatefulWidget {
     required this.onBilingualChanged,
     required this.onPickInputPressed,
     required this.onPickOutputPressed,
+    this.actions = const <Widget>[],
+    this.chapterSummary,
+    this.onPreviewPressed,
   });
 
   final AppStrings strings;
@@ -36,6 +38,9 @@ class TranslationInputs extends StatefulWidget {
   final ValueChanged<bool> onBilingualChanged;
   final VoidCallback? onPickInputPressed;
   final VoidCallback? onPickOutputPressed;
+  final List<Widget> actions;
+  final String? chapterSummary;
+  final VoidCallback? onPreviewPressed;
 
   @override
   State<TranslationInputs> createState() => _TranslationInputsState();
@@ -43,247 +48,189 @@ class TranslationInputs extends StatefulWidget {
 
 class _TranslationInputsState extends State<TranslationInputs> {
   bool _showAdvancedPaths = false;
-
   @override
   Widget build(BuildContext context) {
-    final bool canPickOutputDirectory = PlatformUtils.supportsDirectoryPicker;
-    final ThemeData theme = Theme.of(context);
-    final ColorScheme scheme = theme.colorScheme;
-    final bool isDark = scheme.brightness == Brightness.dark;
-    final bool hasFile = widget.inputPath.isNotEmpty;
-    final String fileName = hasFile
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final hasFile = widget.inputPath.isNotEmpty;
+    final fileName = hasFile
         ? path.basename(widget.inputPath)
         : widget.strings.noEpubSelected;
-
+    final book = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Material(
+          color: scheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(8),
+          child: InkWell(
+            key: const ValueKey<String>('translation-import-zone'),
+            borderRadius: BorderRadius.circular(8),
+            onTap: widget.enabled ? widget.onPickInputPressed : null,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    hasFile
+                        ? Icons.menu_book_outlined
+                        : Icons.upload_file_outlined,
+                    size: 32,
+                    color: scheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(height: 20),
+                  Tooltip(
+                    message: hasFile ? widget.inputPath : '',
+                    child: Text(
+                      hasFile
+                          ? fileName
+                          : PlatformUtils.isWindows
+                          ? widget.strings.dropOrChooseEpub
+                          : widget.strings.chooseEpub,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleMedium,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    hasFile ? 'EPUB' : fileName,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  OutlinedButton.icon(
+                    onPressed: widget.enabled
+                        ? widget.onPickInputPressed
+                        : null,
+                    icon: const Icon(Icons.folder_open_outlined, size: 17),
+                    label: Text(widget.strings.browse),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (widget.chapterSummary != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 12,
+              children: [
+                Text(widget.chapterSummary!, style: theme.textTheme.bodySmall),
+                TextButton(
+                  onPressed: widget.onPreviewPressed,
+                  child: Text(widget.strings.chapterChecklist),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+    final preferences = TranslationPreferences(
+      strings: widget.strings,
+      targetLanguage: widget.targetLanguage,
+      bilingual: widget.bilingual,
+      enabled: widget.enabled,
+      onTargetLanguageChanged: widget.onTargetLanguageChanged,
+      onBilingualChanged: widget.onBilingualChanged,
+    );
+    final output = Row(
+      children: [
+        Icon(Icons.folder_outlined, size: 18, color: scheme.onSurfaceVariant),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                widget.strings.outputDirectory,
+                style: theme.textTheme.bodySmall,
+              ),
+              const SizedBox(height: 4),
+              Tooltip(
+                message: widget.outputDirectory,
+                child: Text(
+                  widget.outputDirectory.isEmpty
+                      ? widget.strings.outputDirectoryHint
+                      : widget.outputDirectory,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (PlatformUtils.supportsDirectoryPicker)
+          IconButton(
+            tooltip: widget.strings.chooseOutputDirectory,
+            onPressed: widget.enabled ? widget.onPickOutputPressed : null,
+            icon: const Icon(Icons.edit_outlined, size: 18),
+          ),
+      ],
+    );
     return SectionCard(
       variant: SectionCardVariant.emphasis,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Semantics(
-            button: true,
-            label: PlatformUtils.isWindows
-                ? widget.strings.dropOrChooseEpub
-                : widget.strings.chooseEpub,
-            child: Material(
-              color: Colors.transparent,
-              borderRadius: BorderRadius.circular(16),
-              child: InkWell(
-                key: const ValueKey<String>('translation-import-zone'),
-                borderRadius: BorderRadius.circular(16),
-                onTap: widget.onPickInputPressed,
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: <Color>[
-                        hasFile
-                            ? scheme.tertiaryContainer.withValues(
-                                alpha: isDark ? 0.28 : 0.6,
-                              )
-                            : scheme.primaryContainer.withValues(
-                                alpha: isDark ? 0.34 : 0.75,
-                              ),
-                        scheme.surfaceContainerHighest.withValues(
-                          alpha: isDark ? 0.14 : 0.58,
-                        ),
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: CustomPaint(
-                    painter: _DashedRRectPainter(
-                      color: hasFile
-                          ? scheme.tertiary.withValues(alpha: 0.6)
-                          : scheme.primary.withValues(
-                              alpha: isDark ? 0.55 : 0.46,
-                            ),
-                      radius: 16,
-                    ),
-                    child: Padding(
-                      padding: EdgeInsets.symmetric(
-                        horizontal: 18,
-                        vertical: hasFile ? 18 : 26,
-                      ),
-                      child: LayoutBuilder(
-                        builder:
-                            (BuildContext context, BoxConstraints constraints) {
-                              final bool compactAction =
-                                  constraints.maxWidth < 420;
-                              final Widget browseAction = compactAction
-                                  ? IconButton.filledTonal(
-                                      tooltip: widget.strings.browse,
-                                      onPressed: widget.onPickInputPressed,
-                                      icon: const Icon(
-                                        Icons.folder_open_rounded,
-                                      ),
-                                    )
-                                  : FilledButton.tonalIcon(
-                                      onPressed: widget.onPickInputPressed,
-                                      icon: const Icon(
-                                        Icons.folder_open_rounded,
-                                        size: 18,
-                                      ),
-                                      label: Text(widget.strings.browse),
-                                    );
-                              return Row(
-                                children: <Widget>[
-                                  Container(
-                                    width: 48,
-                                    height: 48,
-                                    decoration: BoxDecoration(
-                                      color:
-                                          (hasFile
-                                                  ? scheme.tertiary
-                                                  : scheme.primary)
-                                              .withValues(
-                                                alpha: isDark ? 0.22 : 0.14,
-                                              ),
-                                      border: Border.all(
-                                        color:
-                                            (hasFile
-                                                    ? scheme.tertiary
-                                                    : scheme.primary)
-                                                .withValues(alpha: 0.18),
-                                      ),
-                                      borderRadius: BorderRadius.circular(12),
-                                    ),
-                                    child: Icon(
-                                      hasFile
-                                          ? Icons.menu_book_rounded
-                                          : Icons.upload_file_rounded,
-                                      color: hasFile
-                                          ? scheme.tertiary
-                                          : scheme.primary,
-                                      size: 25,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 14),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: <Widget>[
-                                        Text(
-                                          PlatformUtils.isWindows
-                                              ? widget.strings.dropOrChooseEpub
-                                              : widget.strings.chooseEpub,
-                                          style: theme.textTheme.titleMedium
-                                              ?.copyWith(
-                                                fontWeight: FontWeight.w700,
-                                              ),
-                                        ),
-                                        const SizedBox(height: 4),
-                                        Text(
-                                          fileName,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: theme.textTheme.bodySmall
-                                              ?.copyWith(
-                                                color: scheme.onSurfaceVariant,
-                                              ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  browseAction,
-                                ],
-                              );
-                            },
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-          const SizedBox(height: 14),
-          Material(
-            color: scheme.surfaceContainer.withValues(alpha: isDark ? 0.55 : 1),
-            borderRadius: BorderRadius.circular(12),
-            child: ListTile(
-              contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-              leading: Icon(Icons.folder_outlined, color: scheme.primary),
-              title: Text(
-                widget.strings.outputDirectory,
-                style: theme.textTheme.titleSmall,
-              ),
-              subtitle: Text(
-                widget.outputDirectory.isEmpty
-                    ? widget.strings.outputDirectoryHint
-                    : widget.outputDirectory,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: canPickOutputDirectory
-                  ? IconButton(
-                      tooltip: widget.strings.chooseOutputDirectory,
-                      onPressed: widget.onPickOutputPressed,
-                      icon: const Icon(Icons.edit_rounded, size: 20),
-                    )
-                  : null,
-            ),
-          ),
-          const SizedBox(height: 12),
+        children: [
           LayoutBuilder(
-            builder: (BuildContext context, BoxConstraints constraints) {
-              final Widget languageField = DropdownButtonFormField<String>(
-                initialValue: widget.targetLanguage,
-                onChanged: widget.enabled
-                    ? widget.onTargetLanguageChanged
-                    : null,
-                items:
-                    const <String>[
-                          'Chinese',
-                          'English',
-                          'Japanese',
-                          'Korean',
-                          'French',
-                          'German',
-                          'Spanish',
-                        ]
-                        .map(
-                          (value) => DropdownMenuItem<String>(
-                            value: value,
-                            child: Text(value),
-                          ),
-                        )
-                        .toList(),
-                decoration: InputDecoration(
-                  labelText: widget.strings.targetLanguage,
-                  prefixIcon: const Icon(Icons.language_rounded),
-                  isDense: true,
-                ),
-              );
-              final Widget bilingualSwitch = Material(
-                color: scheme.surfaceContainer.withValues(
-                  alpha: isDark ? 0.55 : 1,
-                ),
-                borderRadius: BorderRadius.circular(12),
-                child: SwitchListTile(
-                  dense: true,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-                  title: Text(widget.strings.bilingualOutput),
-                  value: widget.bilingual,
-                  onChanged: widget.enabled ? widget.onBilingualChanged : null,
-                ),
-              );
-
-              if (constraints.maxWidth < 560) {
+            builder: (context, constraints) {
+              if (constraints.maxWidth <
+                  808 * MediaQuery.textScalerOf(context).scale(1)) {
                 return Column(
-                  children: <Widget>[
-                    languageField,
-                    const SizedBox(height: 10),
-                    bilingualSwitch,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [book, const SizedBox(height: 26), preferences],
+                );
+              }
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(flex: 3, child: book),
+                  const SizedBox(width: 32),
+                  Expanded(flex: 2, child: preferences),
+                ],
+              );
+            },
+          ),
+          const SizedBox(height: 24),
+          const Divider(),
+          const SizedBox(height: 16),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final actions = Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: widget.actions,
+              );
+              if (constraints.maxWidth < 720 || widget.actions.isEmpty) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    output,
+                    if (widget.actions.isNotEmpty) ...[
+                      const SizedBox(height: 16),
+                      actions,
+                    ],
                   ],
                 );
               }
               return Row(
-                children: <Widget>[
-                  Expanded(child: languageField),
-                  const SizedBox(width: 12),
-                  Expanded(child: bilingualSwitch),
+                children: [
+                  Expanded(child: output),
+                  const SizedBox(width: 20),
+                  Flexible(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: actions,
+                    ),
+                  ),
                 ],
               );
             },
@@ -293,16 +240,12 @@ class _TranslationInputsState extends State<TranslationInputs> {
             child: TextButton(
               onPressed: () =>
                   setState(() => _showAdvancedPaths = !_showAdvancedPaths),
-              child: Text(
-                _showAdvancedPaths
-                    ? widget.strings.advancedPaths
-                    : widget.strings.advancedPaths,
-              ),
+              child: Text(widget.strings.advancedPaths),
             ),
           ),
-          if (_showAdvancedPaths) ...<Widget>[
+          if (_showAdvancedPaths) ...[
             TextFormField(
-              key: ValueKey<String>('input-${widget.inputPath}'),
+              key: ValueKey('input-${widget.inputPath}'),
               initialValue: widget.inputPath,
               enabled: widget.enabled,
               onChanged: widget.enabled ? widget.onInputChanged : null,
@@ -312,9 +255,9 @@ class _TranslationInputsState extends State<TranslationInputs> {
                 isDense: true,
               ),
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 12),
             TextFormField(
-              key: ValueKey<String>('output-${widget.outputDirectory}'),
+              key: ValueKey('output-${widget.outputDirectory}'),
               initialValue: widget.outputDirectory,
               enabled: widget.enabled,
               onChanged: widget.enabled ? widget.onOutputChanged : null,
@@ -328,44 +271,5 @@ class _TranslationInputsState extends State<TranslationInputs> {
         ],
       ),
     );
-  }
-}
-
-class _DashedRRectPainter extends CustomPainter {
-  _DashedRRectPainter({required this.color, required this.radius});
-
-  final Color color;
-  final double radius;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final RRect rrect = RRect.fromRectAndRadius(
-      Rect.fromLTWH(1, 1, size.width - 2, size.height - 2),
-      Radius.circular(radius),
-    );
-    final Path shape = Path()..addRRect(rrect);
-    final Paint paint = Paint()
-      ..color = color
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.25;
-
-    const double dashWidth = 5;
-    const double dashSpace = 4;
-    for (final ui.PathMetric metric in shape.computeMetrics()) {
-      double distance = 0;
-      while (distance < metric.length) {
-        final double next = distance + dashWidth;
-        canvas.drawPath(
-          metric.extractPath(distance, next.clamp(0, metric.length)),
-          paint,
-        );
-        distance = next + dashSpace;
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _DashedRRectPainter oldDelegate) {
-    return oldDelegate.color != color || oldDelegate.radius != radius;
   }
 }
