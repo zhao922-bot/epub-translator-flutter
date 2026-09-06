@@ -3,13 +3,10 @@ import 'package:flutter/material.dart';
 import '../../features/translation/domain/models/translation_config.dart';
 import '../../shared/platform/platform_utils.dart';
 
-/// Modern Material 3 theme — cool slate neutrals + indigo primary.
+/// Compact monochrome workbench, with semantic colors reserved for status.
 class AppTheme {
-  // Brand accents
-  static const Color _ink = Color(0xFF315B8F);
-  static const Color _inkLight = Color(0xFF9DBBFF);
-  static const Color _copper = Color(0xFFB4653B);
-  static const Color _teal = Color(0xFF23847B);
+  static const Color _ink = Color(0xFF303038);
+  static const Color _inkLight = Color(0xFFE7E7EB);
 
   static ThemeData light(UiLanguage language) {
     final ColorScheme scheme =
@@ -17,26 +14,27 @@ class AppTheme {
           seedColor: _ink,
           brightness: Brightness.light,
           primary: _ink,
-          secondary: _copper,
-          tertiary: _teal,
-          surface: const Color(0xFFF7F7F5),
+          secondary: _ink,
+          tertiary: _ink,
+          surface: Colors.white,
           error: const Color(0xFFDC2626),
         ).copyWith(
-          primaryContainer: const Color(0xFFE4EEFF),
-          onPrimaryContainer: const Color(0xFF102947),
-          secondaryContainer: const Color(0xFFF8E6D8),
-          onSecondaryContainer: const Color(0xFF54240F),
-          tertiaryContainer: const Color(0xFFD7F1EC),
-          onTertiaryContainer: const Color(0xFF083C36),
+          onPrimary: Colors.white,
+          primaryContainer: const Color(0xFFE7E7EB),
+          onPrimaryContainer: const Color(0xFF27272D),
+          secondaryContainer: const Color(0xFFF7F7F8),
+          onSecondaryContainer: const Color(0xFF27272D),
+          tertiaryContainer: const Color(0xFFF7F7F8),
+          onTertiaryContainer: const Color(0xFF27272D),
           surfaceContainerHighest: const Color(0xFFFFFFFF),
-          surfaceContainerHigh: const Color(0xFFF1F1EE),
-          surfaceContainer: const Color(0xFFE9E9E4),
-          onSurface: const Color(0xFF18212E),
-          onSurfaceVariant: const Color(0xFF64707D),
-          outline: const Color(0xFFC4C8CC),
-          outlineVariant: const Color(0xFFDFE1E1),
-          shadow: const Color(0xFF152033),
-          surfaceTint: _ink,
+          surfaceContainerHigh: const Color(0xFFF7F7F8),
+          surfaceContainer: const Color(0xFFF7F7F8),
+          onSurface: const Color(0xFF27272D),
+          onSurfaceVariant: const Color(0xFF666670),
+          outline: const Color(0xFFB9B9C2),
+          outlineVariant: const Color(0xFFE7E7EB),
+          shadow: Colors.transparent,
+          surfaceTint: Colors.transparent,
         );
     return _baseTheme(scheme, language);
   }
@@ -47,27 +45,27 @@ class AppTheme {
           seedColor: _inkLight,
           brightness: Brightness.dark,
           primary: _inkLight,
-          secondary: const Color(0xFFF0A878),
-          tertiary: const Color(0xFF66CFC1),
-          surface: const Color(0xFF101722),
+          secondary: _inkLight,
+          tertiary: _inkLight,
+          surface: const Color(0xFF151517),
           error: const Color(0xFFF87171),
         ).copyWith(
-          onPrimary: const Color(0xFF102947),
-          primaryContainer: const Color(0xFF203D65),
-          onPrimaryContainer: const Color(0xFFE4EEFF),
-          secondaryContainer: const Color(0xFF56321E),
-          onSecondaryContainer: const Color(0xFFFFE1CA),
-          tertiaryContainer: const Color(0xFF164F49),
-          onTertiaryContainer: const Color(0xFFCFF8F1),
-          surfaceContainerHighest: const Color(0xFF182231),
-          surfaceContainerHigh: const Color(0xFF141D2A),
-          surfaceContainer: const Color(0xFF111925),
-          onSurface: const Color(0xFFE7EBF0),
-          onSurfaceVariant: const Color(0xFFAAB5C3),
-          outline: const Color(0xFF3A4657),
-          outlineVariant: const Color(0xFF273242),
-          shadow: Colors.black,
-          surfaceTint: _inkLight,
+          onPrimary: const Color(0xFF202024),
+          primaryContainer: const Color(0xFF34343B),
+          onPrimaryContainer: const Color(0xFFEEEEF0),
+          secondaryContainer: const Color(0xFF232328),
+          onSecondaryContainer: const Color(0xFFEEEEF0),
+          tertiaryContainer: const Color(0xFF232328),
+          onTertiaryContainer: const Color(0xFFEEEEF0),
+          surfaceContainerHighest: const Color(0xFF232328),
+          surfaceContainerHigh: const Color(0xFF1B1B1F),
+          surfaceContainer: const Color(0xFF1B1B1F),
+          onSurface: const Color(0xFFEEEEF0),
+          onSurfaceVariant: const Color(0xFFAAAAB4),
+          outline: const Color(0xFF666670),
+          outlineVariant: const Color(0xFF34343B),
+          shadow: Colors.transparent,
+          surfaceTint: Colors.transparent,
         );
     return _baseTheme(scheme, language);
   }
@@ -92,8 +90,8 @@ class AppTheme {
     );
     final bool isDark = scheme.brightness == Brightness.dark;
 
-    final BorderRadius buttonRadius = BorderRadius.circular(14);
-    final BorderRadius fieldRadius = BorderRadius.circular(14);
+    final BorderRadius buttonRadius = BorderRadius.circular(8);
+    final BorderRadius fieldRadius = BorderRadius.circular(8);
 
     return ThemeData(
       useMaterial3: true,
@@ -108,7 +106,7 @@ class AppTheme {
         backgroundColor: Colors.transparent,
         indicatorColor: scheme.primary.withValues(alpha: isDark ? 0.22 : 0.14),
         indicatorShape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
+          borderRadius: BorderRadius.circular(8),
         ),
         selectedIconTheme: IconThemeData(color: scheme.primary, size: 22),
         unselectedIconTheme: IconThemeData(
@@ -155,7 +153,7 @@ class AppTheme {
         margin: EdgeInsets.zero,
         shadowColor: scheme.shadow.withValues(alpha: isDark ? 0.4 : 0.08),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
+          borderRadius: BorderRadius.circular(8),
           side: BorderSide(
             color: scheme.outlineVariant.withValues(alpha: isDark ? 0.6 : 0.85),
           ),
@@ -167,8 +165,8 @@ class AppTheme {
             ? scheme.surfaceContainer.withValues(alpha: 0.8)
             : scheme.surfaceContainer,
         contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 14,
+          horizontal: 12,
+          vertical: 10,
         ),
         border: OutlineInputBorder(
           borderRadius: fieldRadius,
@@ -198,7 +196,7 @@ class AppTheme {
             BorderSide(color: scheme.outlineVariant),
           ),
           shape: WidgetStatePropertyAll<OutlinedBorder>(
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           ),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.selected)) {
@@ -219,7 +217,7 @@ class AppTheme {
         style: FilledButton.styleFrom(
           elevation: 0,
           shape: RoundedRectangleBorder(borderRadius: buttonRadius),
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           textStyle: textTheme.labelLarge?.copyWith(
             fontWeight: FontWeight.w600,
             fontSize: 14,
@@ -231,7 +229,7 @@ class AppTheme {
           foregroundColor: scheme.onSurface,
           side: BorderSide(color: scheme.outline.withValues(alpha: 0.55)),
           shape: RoundedRectangleBorder(borderRadius: buttonRadius),
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         ),
       ),
       textButtonTheme: TextButtonThemeData(
@@ -242,9 +240,7 @@ class AppTheme {
       ),
       iconButtonTheme: IconButtonThemeData(
         style: IconButton.styleFrom(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
       ),
       chipTheme: ChipThemeData(
@@ -370,7 +366,7 @@ class AppTheme {
         height: compactHeight,
       ),
       bodyLarge: base.bodyLarge?.copyWith(
-        fontSize: 14.5,
+        fontSize: 14,
         fontWeight: FontWeight.w400,
         height: bodyHeight,
       ),
