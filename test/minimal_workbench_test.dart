@@ -110,6 +110,7 @@ void main() {
             isActive: false,
             canOpenOutput: true,
             canRetry: true,
+            degradedBlockCount: 2,
           ),
         ),
       ),
@@ -138,6 +139,8 @@ void main() {
     );
     expect(find.byTooltip(strings.openOutput).hitTestable(), findsOneWidget);
     expect(find.byTooltip(strings.retryJob).hitTestable(), findsOneWidget);
+    expect(find.textContaining('2 blocks'), findsOneWidget);
+    expect(find.textContaining('original text'), findsOneWidget);
   });
   testWidgets('job list builds rows on demand', (tester) async {
     _viewport(tester, const Size(1024, 768));

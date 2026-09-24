@@ -13,6 +13,7 @@ class JobSummary {
     required this.canRetry,
     this.canResume = false,
     this.phaseLabel = '',
+    this.degradedBlockCount = 0,
   });
 
   final String id;
@@ -26,6 +27,7 @@ class JobSummary {
   final bool canRetry;
   final bool canResume;
   final String phaseLabel;
+  final int degradedBlockCount;
 
   bool get hasWarnings => status == TranslationJobStatus.completedWithWarnings;
 }

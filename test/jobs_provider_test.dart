@@ -194,5 +194,6 @@ void main() {
     expect(warningJob.canRetry, isTrue);
     expect(warningJob.canResume, isTrue);
     expect(warningJob.isActive, isFalse);
+    expect(warningJob.degradedBlockCount, 2);
   });
 }

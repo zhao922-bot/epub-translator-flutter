@@ -99,6 +99,15 @@ class JobRow extends StatelessWidget {
             color: scheme.onSurfaceVariant,
           ),
         ),
+        if (job.hasWarnings) ...[
+          const SizedBox(height: 5),
+          Text(
+            job.degradedBlockCount > 0
+                ? strings.degradedBlocksWarning(job.degradedBlockCount)
+                : strings.partialOutputWarning,
+            style: theme.textTheme.bodySmall?.copyWith(color: scheme.tertiary),
+          ),
+        ],
       ],
     );
     return Padding(

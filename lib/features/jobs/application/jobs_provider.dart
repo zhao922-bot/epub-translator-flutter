@@ -40,6 +40,7 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
               job.status == TranslationJobStatus.completedWithWarnings,
           canResume: job.canResumeTranslation,
           phaseLabel: phaseLabel(job.phase),
+          degradedBlockCount: job.degradedBlockCount,
         ),
       )
       .toList(growable: false);
