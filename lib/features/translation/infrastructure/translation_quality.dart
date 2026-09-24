@@ -2014,7 +2014,7 @@ class TranslationQuality {
         // title-case proper names such as `Peter Thiel` or `Los Angeles`
         // and full English sentences still fail.
         final bool isShortLowercaseTransliteration =
-            translatedWords.length >= 1 &&
+            translatedWords.isNotEmpty &&
             translatedWords.length <= 4 &&
             translatedWords.every(
               (String word) => word == word.toLowerCase(),
@@ -2359,7 +2359,7 @@ class TranslationQuality {
       return false;
     }
     bool allTitleCaseWords(List<String> parts) =>
-        parts.length >= 1 &&
+        parts.isNotEmpty &&
         parts.every((String word) {
           final String stripped = word.replaceAll(RegExp(r'[.!.,]'), '');
           if (stripped.isEmpty) {

@@ -324,6 +324,7 @@ class _MixedProtocolAdapter implements HttpClientAdapter {
 class _ResidualDegradeAdapter implements HttpClientAdapter {
   final List<Map<String, dynamic>> payloads = <Map<String, dynamic>>[];
 
+  @override
   void close({bool force = false}) {}
 
   @override

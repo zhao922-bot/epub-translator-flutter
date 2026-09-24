@@ -108,9 +108,7 @@ class ProperNameNormalizer {
   ) {
     final String source = RegExp.escape(mapping.source);
     final RegExp pattern = RegExp(
-      r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' +
-          source +
-          r'\s*\)\s*',
+      r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' + source + r'\s*\)\s*',
     );
     if (!pattern.hasMatch(html)) {
       return html;
@@ -142,7 +140,6 @@ class ProperNameNormalizer {
     required String targetLanguage,
     ProperNameBookState? state,
   }) {
-    final String source = RegExp.escape(mapping.source);
     final RegExp english = _tolerantNamePattern(mapping.source);
     if (!english.hasMatch(html)) {
       return html;
@@ -225,21 +222,6 @@ class ProperNameNormalizer {
     return precededByOpen || followedByClose;
   }
 
-  static bool _isParenthesizedGloss(
-    String html,
-    int start,
-    int end,
-    String raw,
-  ) {
-    final String before = _leftContext(html, start);
-    final String after = _rightContext(html, end);
-    // 中文（English）: the name is immediately preceded by an opening paren.
-    final RegExp precededByOpen = RegExp(r'[（(]\s*$');
-    // English（中文）: the name is immediately followed by an opening paren.
-    final RegExp followedByOpen = RegExp(r'^\s*[（(]');
-    return followedByOpen.hasMatch(after) || precededByOpen.hasMatch(before);
-  }
-
   /// Rewrites `English（中文）` → `中文（English）` across the block before the
   /// bare-name state machine runs, so the trailing parenthetical never
   /// survives and the same name cannot be re-matched twice.
@@ -249,7 +231,9 @@ class ProperNameNormalizer {
   ) {
     final String source = RegExp.escape(mapping.source);
     final String pattern =
-        r'(\b' + source + r')\s*[（(]\s*'
+        r'(\b'
+        '$source'
+        r')\s*[（(]\s*'
         r'([^()（）]{1,40}?[\u3400-\u9FFF][^()（）]{0,24}?)\s*[)）]';
     final RegExp reverse = RegExp(pattern, caseSensitive: false);
     if (!reverse.hasMatch(html)) {
@@ -277,16 +261,6 @@ class ProperNameNormalizer {
     return 'full';
   }
 
-  static String _leftContext(String html, int start) {
-    final int from = (start - 8).clamp(0, html.length);
-    return html.substring(from, start);
-  }
-
-  static String _rightContext(String html, int end) {
-    final int to = (end + 8).clamp(0, html.length);
-    return html.substring(end, to);
-  }
-
   static bool _isLatinScript(String text) =>
       RegExp(r"^[A-Za-z][A-Za-z .'-]*$").hasMatch(text);
 
@@ -300,9 +274,7 @@ class ProperNameNormalizer {
   }
 
   static bool _containsCjk(String text) {
-    return RegExp(
-      r'[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF]',
-    ).hasMatch(text);
+    return RegExp(r'[\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF]').hasMatch(text);
   }
 
   /// Wraps Latin identifiers (URLs / email / footnote anchors / work-title
@@ -312,8 +284,7 @@ class ProperNameNormalizer {
     // anchor text and must not be treated as a name occurrence.
     String out = html.replaceAllMapped(
       RegExp(r'<a\b[^>]*>[^<]{0,12}</a>', caseSensitive: false),
-      (Match match) =>
-          '\uE000${_protect(match.group(0)!)}\uE001',
+      (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
     );
     // Protect inline work titles in 《》 already carrying the original Latin
     // gloss, e.g. 《国富论》（The Wealth of Nations）.
