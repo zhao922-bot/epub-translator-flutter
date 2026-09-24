@@ -612,7 +612,7 @@ class EpubChapterTranslator {
         suffix: config.outputSuffix,
       );
       if (totalBlocks == 0) {
-        return _repackZeroBlockSelection(
+        return await _repackZeroBlockSelection(
           jobId: jobId,
           inputPath: inputPath,
           outputFilePath: outputFilePath,
