@@ -79,11 +79,48 @@ class _BlockingRepository implements TranslationRepository {
 
 class _DelayedCancelRepository extends _BlockingRepository {
   final Completer<void> releaseCancellation = Completer<void>();
+  final Completer<void> releaseSecondCancellation = Completer<void>();
+  final Completer<InspectionResult> secondInspectionCompleter =
+      Completer<InspectionResult>();
+
+  @override
+  Future<InspectionResult> startJob({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) {
+    if (startCount == 0) {
+      return super.startJob(
+        inputPath: inputPath,
+        outputDirectory: outputDirectory,
+        config: config,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
+      );
+    }
+    startCount += 1;
+    onProgress?.call(
+      TranslationJob(
+        id: 'running-job',
+        inputPath: inputPath,
+        outputPath: outputDirectory,
+        status: TranslationJobStatus.running,
+        progress: 0.7,
+        currentChapter: 'Scanning again',
+      ),
+      'Scanning EPUB again...',
+    );
+    return secondInspectionCompleter.future;
+  }
 
   @override
   Future<void> cancelJob(String jobId) async {
     await super.cancelJob(jobId);
-    await releaseCancellation.future;
+    await (cancelCount == 1
+        ? releaseCancellation.future
+        : releaseSecondCancellation.future);
   }
 }
 
@@ -660,6 +697,59 @@ void main() {
     await cancellation;
     expect(controller.state.job?.status, TranslationJobStatus.cancelled);
     expect(controller.state.isRunActive, isFalse);
+  });
+
+  test('old cancellation response cannot overwrite a retried run', () async {
+    final _DelayedCancelRepository repository = _DelayedCancelRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    final Future<void> firstRun = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    final Future<void> firstCancellation = controller.requestCancel();
+    repository.inspectionCompleter.complete(
+      const InspectionResult(
+        job: TranslationJob(
+          id: 'running-job',
+          inputPath: 'C:\\Books\\book.epub',
+          outputPath: 'C:\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: <InspectedChapter>[],
+      ),
+    );
+    await firstRun;
+
+    final Future<void> secondRun = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.state.job?.progress, 0.7);
+    final Future<void> secondCancellation = controller.requestCancel();
+
+    repository.releaseCancellation.complete();
+    await firstCancellation;
+    expect(controller.state.job?.progress, 0.7);
+    expect(controller.state.job?.currentChapter, 'Scanning again');
+
+    repository.releaseSecondCancellation.complete();
+    await secondCancellation;
+    repository.secondInspectionCompleter.complete(
+      const InspectionResult(
+        job: TranslationJob(
+          id: 'running-job',
+          inputPath: 'C:\\Books\\book.epub',
+          outputPath: 'C:\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: <InspectedChapter>[],
+      ),
+    );
+    await secondRun;
   });
 
   test('blocks new inspection while cancellation is still pending', () async {
@@ -1448,6 +1538,27 @@ void main() {
 
     expect(pathStore.saves, isNotEmpty);
     expect(pathStore.saves.last.outputDirectory, 'C:\\Output');
+  });
+
+  test('rapid manual edits coalesce queued session writes', () async {
+    final _DelayedSessionPathStore pathStore = _DelayedSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    controller.setInputPath('C:\\Books\\a');
+    await Future<void>.delayed(Duration.zero);
+    controller.setInputPath('C:\\Books\\ab');
+    controller.setInputPath('C:\\Books\\abc.epub');
+    pathStore.releaseFirstWrite.complete();
+    await pathStore.firstWriteFinished.future;
+    await pathStore.secondWriteFinished.future;
+    await Future<void>.delayed(Duration.zero);
+
+    expect(pathStore.writeCount, 2);
+    expect(pathStore.savedInputPath, 'C:\\Books\\abc.epub');
   });
 
   test('older session save cannot overwrite a newer EPUB selection', () async {

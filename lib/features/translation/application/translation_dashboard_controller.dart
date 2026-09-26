@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -208,9 +209,11 @@ class TranslationDashboardController
   final SessionPathStore? pathStore;
   final Future<void> Function()? settingsReady;
   bool _cancelRequested = false;
+  int _cancellationRevision = 0;
   Stopwatch? _translationStopwatch;
   Future<void> _pendingHistorySave = Future<void>.value();
-  Future<void> _pendingSessionPathSave = Future<void>.value();
+  ({String inputPath, String outputDirectory})? _pendingSessionPaths;
+  bool _isSavingSessionPaths = false;
   late final Future<void> _initialJobHistoryLoad;
   int _sessionPathRevision = 0;
   int _historyClearRevision = 0;
@@ -1011,8 +1014,10 @@ class TranslationDashboardController
     }
 
     _cancelRequested = true;
+    final int cancellationRevision = ++_cancellationRevision;
     await repository.cancelJob(activeJob.id);
     if (!mounted ||
+        cancellationRevision != _cancellationRevision ||
         !_cancelRequested ||
         !state.isRunActive ||
         state.job?.id != activeJob.id) {
@@ -1375,20 +1380,31 @@ class TranslationDashboardController
     if (store == null) {
       return;
     }
-    // Keep disk writes ordered without blocking UI interactions.
-    _pendingSessionPathSave = _pendingSessionPathSave
-        .then<void>(
-          (_) => store.save(
-            inputPath: inputPath,
-            outputDirectory: outputDirectory,
-          ),
-        )
-        .catchError((Object error) {
-          AppLogger.warn(
-            'Failed to persist session paths: $error',
-            tag: 'paths',
-          );
-        });
+    _pendingSessionPaths = (
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+    );
+    if (_isSavingSessionPaths) {
+      return;
+    }
+    _isSavingSessionPaths = true;
+    unawaited(_drainSessionPathSaves(store));
+  }
+
+  Future<void> _drainSessionPathSaves(SessionPathStore store) async {
+    while (_pendingSessionPaths != null) {
+      final paths = _pendingSessionPaths!;
+      _pendingSessionPaths = null;
+      try {
+        await store.save(
+          inputPath: paths.inputPath,
+          outputDirectory: paths.outputDirectory,
+        );
+      } catch (error) {
+        AppLogger.warn('Failed to persist session paths: $error', tag: 'paths');
+      }
+    }
+    _isSavingSessionPaths = false;
   }
 
   TranslationJob _translationHistoryJob(TranslationJob job) {

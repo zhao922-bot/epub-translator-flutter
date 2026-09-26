@@ -546,7 +546,10 @@ void main() {
         chunkSize: 5000,
         maxRetries: 1,
       );
-      final EpubTranslationRepository repository = EpubTranslationRepository();
+      // Keep this API-request assertion independent of prior runs' disk cache.
+      final EpubTranslationRepository repository = EpubTranslationRepository(
+        cacheStore: _EventRecordingCacheStore(<String>[]),
+      );
       final inspection = await repository.startJob(
         inputPath: epubFile.path,
         outputDirectory: temp.path,
