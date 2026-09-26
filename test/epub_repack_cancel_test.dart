@@ -6,6 +6,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 
@@ -129,6 +130,50 @@ void main() {
       await expectLater(write, throwsA(isA<TranslationCancelledException>()));
       expect(await output.readAsString(), previous);
     });
+
+    test(
+      'cancellation after commit does not mark the finished EPUB cancelled',
+      () async {
+        final File input = File(path.join(tempDir.path, 'book.epub'));
+        final File output = File(path.join(tempDir.path, 'book_out.epub'));
+        await _writeMinimalEpub(input, body: 'source');
+
+        await EpubRepacker().writeTranslatedEpub(
+          inputPath: input.path,
+          outputFilePath: output.path,
+          config: TranslationConfig.defaults(),
+          chapters: <InspectedChapter>[
+            InspectedChapter(
+              path: 'OEBPS/chapter.xhtml',
+              title: 'Chapter',
+              body: 'source',
+              originalHtml:
+                  '<?xml version="1.0"?><html><body><p>source</p></body></html>',
+              blocks: const <ExtractedBlock>[
+                ExtractedBlock(
+                  id: 'b1',
+                  tagName: 'p',
+                  sourceHtml: '<p>source</p>',
+                  sourceText: 'source',
+                  translatedHtml: '<p>translated-new</p>',
+                ),
+              ],
+              category: ChapterCategory.content,
+              recommendedForTranslation: true,
+              includeInTranslation: true,
+            ),
+          ],
+          isCancelled: () => output.existsSync(),
+        );
+
+        final Map<String, List<int>> files =
+            await EpubIsolateWorker.loadArchiveFiles(output.path);
+        expect(
+          String.fromCharCodes(files['OEBPS/chapter.xhtml']!),
+          contains('translated-new'),
+        );
+      },
+    );
   });
 }
 

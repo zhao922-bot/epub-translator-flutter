@@ -933,10 +933,8 @@ class TranslationDashboardController
         },
         isCancelled: () => _cancelRequested,
       );
-      if (_cancelRequested) {
-        _handleCancellation(const TranslationCancelledException());
-        return;
-      }
+      // A returned terminal result means the repository already committed the
+      // EPUB. A cancellation arriving afterward cannot undo that output.
       final bool failedResult =
           result.job.status == TranslationJobStatus.failed;
       final String? safeResultError = failedResult

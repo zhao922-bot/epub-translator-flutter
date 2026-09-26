@@ -139,7 +139,8 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     if (!committed) {
       throw const TranslationCancelledException();
     }
-    throwIfCancelled();
+    // The final EPUB is already visible. Cancellation after this point must
+    // not report the committed output as an aborted translation.
   }
 
   String renderTranslatedChapter({

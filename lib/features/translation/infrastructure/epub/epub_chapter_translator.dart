@@ -1552,7 +1552,6 @@ class EpubChapterTranslator {
         cancelToken: cancelToken,
         isCancelled: isCancelled,
       );
-      throwIfCancelled();
       repackStopwatch.stop();
 
       final bool allBlocksDegraded =
@@ -1600,14 +1599,22 @@ class EpubChapterTranslator {
         terminalJob,
         'Performance: Translation run took ${_formatDuration(translationStopwatch.elapsed)}. Translated $apiTranslatedBlocks new blocks at ${_formatBlocksPerMinute(apiTranslatedBlocks, translationStopwatch.elapsed)} blocks/min on average, excluding cache and resume hits. Total API time ${_formatDuration(totalApiElapsed)}; book memory ${_formatDuration(totalMemoryElapsed)} across $memoryRequestCount requests; block cache writes ${_formatDuration(totalCacheWriteElapsed)} across $cacheWriteCount writes.${footnoteBatchCount == 0 ? '' : ' Cross-file footnotes used $footnoteBatchCount batches across $footnoteRequestCount API requests.'}',
       );
-      await _cacheStore.saveJobState(
-        _resumeStateFromJob(
-          jobKey: jobKey,
-          inputFingerprint: inputFingerprint,
-          job: terminalJob,
-          status: terminalStatus.name,
-        ),
-      );
+      try {
+        await _cacheStore.saveJobState(
+          _resumeStateFromJob(
+            jobKey: jobKey,
+            inputFingerprint: inputFingerprint,
+            job: terminalJob,
+            status: terminalStatus.name,
+          ),
+        );
+      } catch (error) {
+        // The EPUB is already committed; checkpoint metadata is best effort.
+        emit(
+          terminalJob,
+          'Final checkpoint could not be saved (${error.runtimeType}); the EPUB is ready at $outputFilePath.',
+        );
+      }
       return TranslationRunResult(job: terminalJob, chapters: updatedChapters);
     } on TranslationCancelledException {
       rethrow;
@@ -1667,7 +1674,6 @@ class EpubChapterTranslator {
       cancelToken: cancelToken,
       isCancelled: isCancelled,
     );
-    throwIfCancelled();
 
     final TranslationJob completedJob = repackingJob.copyWith(
       status: TranslationJobStatus.completed,

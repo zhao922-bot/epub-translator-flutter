@@ -593,6 +593,33 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 }
 
 void main() {
+  test('committed translation result wins over a late cancellation', () async {
+    final _BlockingTranslationRepository repository =
+        _BlockingTranslationRepository(blockCount: 1);
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    controller.setInputPath('C:\\Books\\book.epub');
+    await controller.startInspection();
+
+    final Future<void> translation = controller.startTranslation();
+    await repository.translationStarted.future;
+    await controller.requestCancel();
+    repository.releaseTranslation.complete();
+    await translation;
+
+    expect(controller.state.job?.status, TranslationJobStatus.completed);
+    expect(
+      controller.state.jobHistory.first.status,
+      TranslationJobStatus.completed,
+    );
+  });
+
   test('ignores duplicate inspection requests while a run is active', () async {
     final _BlockingRepository repository = _BlockingRepository();
     final TranslationDashboardController controller =
