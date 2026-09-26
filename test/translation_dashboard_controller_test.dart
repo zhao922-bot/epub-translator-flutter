@@ -1304,6 +1304,26 @@ void main() {
     );
   });
 
+  test('manual EPUB change clears recovery action from the old run', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _FailingTranslationRepository(),
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    controller.setInputPath('C:\\Books\\old.epub');
+    await controller.startInspection();
+    await controller.startTranslation();
+    expect(controller.state.actionableError, isNotNull);
+
+    controller.setInputPath('C:\\Books\\new.epub');
+
+    expect(controller.state.job, isNull);
+    expect(controller.state.actionableError, isNull);
+  });
+
   test('redacts API keys from translation failure logs', () async {
     final TranslationDashboardController controller =
         TranslationDashboardController(
@@ -1385,6 +1405,45 @@ void main() {
     expect(controller.state.inspectedChapters, isEmpty);
     expect(controller.state.job, isNull);
     expect(controller.state.logs.last, contains('Dropped EPUB'));
+  });
+
+  test('EPUB import does not override a newer output directory edit', () async {
+    final _RecordingSessionPathStore pathStore = _RecordingSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    final Future<bool> importing = controller.importDroppedEpubPath(
+      'C:\\Books\\new.epub',
+    );
+    controller.setOutputDirectory('C:\\ChosenOutput');
+    expect(await importing, isTrue);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.state.inputPath, 'C:\\Books\\new.epub');
+    expect(controller.state.outputDirectory, 'C:\\ChosenOutput');
+    expect(pathStore.saves.last.outputDirectory, 'C:\\ChosenOutput');
+  });
+
+  test('pending EPUB import cannot replace a newer manual EPUB edit', () async {
+    final _RecordingSessionPathStore pathStore = _RecordingSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    final Future<bool> importing = controller.importDroppedEpubPath(
+      'C:\\Books\\dropped.epub',
+    );
+    controller.setInputPath('C:\\Books\\manual.epub');
+    expect(await importing, isFalse);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.state.inputPath, 'C:\\Books\\manual.epub');
+    expect(pathStore.saves.last.inputPath, 'C:\\Books\\manual.epub');
   });
 
   test(
@@ -1508,6 +1567,38 @@ void main() {
 
     expect(controller.state.inputPath, 'C:\\Books\\new.epub');
     expect(controller.state.outputDirectory, isNot('C:\\OldOutput'));
+  });
+
+  test('late session restore cannot overwrite a retried job path', () async {
+    final _ControlledSessionPathStore pathStore = _ControlledSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          historyStore: _MemoryJobHistoryStore(
+            initial: const <TranslationJob>[
+              TranslationJob(
+                id: 'retry-old-job',
+                inputPath: 'C:\\Books\\retry.epub',
+                outputPath: 'C:\\RetryOutput',
+                status: TranslationJobStatus.failed,
+                phase: TranslationJobPhase.inspection,
+                progress: 0,
+              ),
+            ],
+          ),
+          pathStore: pathStore,
+        );
+    await Future<void>.delayed(Duration.zero);
+
+    await controller.retryJob('retry-old-job');
+    pathStore.loadCompleter.complete((
+      inputPath: 'C:\\Books\\stale.epub',
+      outputDirectory: 'C:\\StaleOutput',
+    ));
+    await Future<void>.delayed(Duration.zero);
+
+    expect(controller.state.inputPath, 'C:\\Books\\retry.epub');
+    expect(controller.state.outputDirectory, 'C:\\RetryOutput');
   });
 
   test('manual EPUB path is remembered without starting inspection', () async {

@@ -216,6 +216,7 @@ class TranslationDashboardController
   bool _isSavingSessionPaths = false;
   late final Future<void> _initialJobHistoryLoad;
   int _sessionPathRevision = 0;
+  int _inputPathRevision = 0;
   int _historyClearRevision = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
@@ -294,6 +295,7 @@ class TranslationDashboardController
       return;
     }
     _sessionPathRevision += 1;
+    _inputPathRevision += 1;
     state = state.copyWith(
       inputPath: value,
       job: null,
@@ -302,6 +304,7 @@ class TranslationDashboardController
       styleProfile: TranslationStyleProfile.empty,
       styleProfileConfirmed: false,
       isGeneratingStyleProfile: false,
+      actionableError: null,
     );
     _persistSessionPaths(
       inputPath: state.inputPath,
@@ -322,13 +325,20 @@ class TranslationDashboardController
     }
 
     _sessionPathRevision += 1;
+    final int inputPathRevision = ++_inputPathRevision;
     final String inferredOutput = state.outputDirectory.isEmpty
         ? await PlatformUtils.defaultOutputDirectory(normalizedPath)
+        : state.outputDirectory;
+    if (inputPathRevision != _inputPathRevision) {
+      return false;
+    }
+    final String outputDirectory = state.outputDirectory.isEmpty
+        ? inferredOutput
         : state.outputDirectory;
     final String base = path.basename(normalizedPath);
     state = state.copyWith(
       inputPath: normalizedPath,
-      outputDirectory: inferredOutput,
+      outputDirectory: outputDirectory,
       job: null,
       runEstimate: null,
       inspectedChapters: const <InspectedChapter>[],
@@ -343,7 +353,7 @@ class TranslationDashboardController
     );
     _persistSessionPaths(
       inputPath: normalizedPath,
-      outputDirectory: inferredOutput,
+      outputDirectory: outputDirectory,
     );
     return true;
   }
@@ -1205,6 +1215,8 @@ class TranslationDashboardController
             totalBlocks: job.totalBlocks,
           )
         : null;
+    _sessionPathRevision += 1;
+    _inputPathRevision += 1;
     state = state.copyWith(
       inputPath: job.inputPath,
       outputDirectory: outputDirectory,
