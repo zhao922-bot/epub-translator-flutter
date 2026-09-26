@@ -199,6 +199,7 @@ class TranslationDashboardController
     this.historyStore,
     this.pathStore,
     this.settingsReady,
+    this.defaultOutputDirectoryResolver,
   }) : super(TranslationDashboardState.initial()) {
     _initialJobHistoryLoad = _loadJobHistory();
     _loadSessionPaths();
@@ -208,6 +209,8 @@ class TranslationDashboardController
   final JobHistoryStore? historyStore;
   final SessionPathStore? pathStore;
   final Future<void> Function()? settingsReady;
+  final Future<String> Function(String? inputPath)?
+  defaultOutputDirectoryResolver;
   bool _cancelRequested = false;
   int _cancellationRevision = 0;
   Stopwatch? _translationStopwatch;
@@ -223,6 +226,11 @@ class TranslationDashboardController
   DateTime? _lastProgressHistoryPersistAt;
 
   AppStrings get _s => AppStrings(state.config.uiLanguage);
+
+  Future<String> _defaultOutputDirectory(String? inputPath) =>
+      (defaultOutputDirectoryResolver ?? PlatformUtils.defaultOutputDirectory)(
+        inputPath,
+      );
 
   Future<bool> _waitForSettingsReady() async {
     final Future<void> Function()? wait = settingsReady;
@@ -268,7 +276,7 @@ class TranslationDashboardController
     }
     if (!PlatformUtils.supportsDirectoryPicker) {
       _sessionPathRevision += 1;
-      final String outputDirectory = await PlatformUtils.defaultOutputDirectory(
+      final String outputDirectory = await _defaultOutputDirectory(
         state.inputPath,
       );
       state = state.copyWith(
@@ -327,9 +335,12 @@ class TranslationDashboardController
     _sessionPathRevision += 1;
     final int inputPathRevision = ++_inputPathRevision;
     final String inferredOutput = state.outputDirectory.isEmpty
-        ? await PlatformUtils.defaultOutputDirectory(normalizedPath)
+        ? await _defaultOutputDirectory(normalizedPath)
         : state.outputDirectory;
-    if (inputPathRevision != _inputPathRevision) {
+    if (!mounted || inputPathRevision != _inputPathRevision) {
+      return false;
+    }
+    if (_logIfRunActive(dropped ? _s.logDropAfterRun : _s.logSelectAfterRun)) {
       return false;
     }
     final String outputDirectory = state.outputDirectory.isEmpty
@@ -631,8 +642,21 @@ class TranslationDashboardController
       return;
     }
 
+    final String inputPath = state.inputPath;
+    final int inputPathRevision = _inputPathRevision;
+    final String inferredOutputDirectory = state.outputDirectory.isEmpty
+        ? await _defaultOutputDirectory(inputPath)
+        : state.outputDirectory;
+    if (!mounted ||
+        inputPathRevision != _inputPathRevision ||
+        state.inputPath != inputPath) {
+      return;
+    }
+    if (_logIfRunActive(_s.logRunAlreadyActiveInspect)) {
+      return;
+    }
     final String outputDirectory = state.outputDirectory.isEmpty
-        ? await PlatformUtils.defaultOutputDirectory(state.inputPath)
+        ? inferredOutputDirectory
         : state.outputDirectory;
     _cancelRequested = false;
 
@@ -641,7 +665,7 @@ class TranslationDashboardController
       actionableError: null,
       job: TranslationJob(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
-        inputPath: state.inputPath,
+        inputPath: inputPath,
         outputPath: outputDirectory,
         status: TranslationJobStatus.queued,
         phase: TranslationJobPhase.inspection,
@@ -654,17 +678,17 @@ class TranslationDashboardController
       isGeneratingStyleProfile: false,
       logs: <String>[
         ...state.logs,
-        _s.logStartingInspection(path.basename(state.inputPath)),
+        _s.logStartingInspection(path.basename(inputPath)),
       ],
     );
     _persistSessionPaths(
-      inputPath: state.inputPath,
+      inputPath: inputPath,
       outputDirectory: outputDirectory,
     );
 
     try {
       final InspectionResult result = await repository.startJob(
-        inputPath: state.inputPath,
+        inputPath: inputPath,
         outputDirectory: outputDirectory,
         config: state.config,
         onProgress: (TranslationJob job, String logLine) {

@@ -1446,6 +1446,46 @@ void main() {
     expect(pathStore.saves.last.inputPath, 'C:\\Books\\manual.epub');
   });
 
+  test('pending EPUB import cannot clear an inspection that started', () async {
+    final Completer<String> delayedOutputDirectory = Completer<String>();
+    final _BlockingRepository repository = _BlockingRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          defaultOutputDirectoryResolver: (String? inputPath) =>
+              inputPath == 'C:\\Books\\new.epub'
+              ? delayedOutputDirectory.future
+              : Future<String>.value('C:\\Books'),
+        );
+    controller.setInputPath('C:\\Books\\old.epub');
+
+    final Future<bool> importing = controller.importDroppedEpubPath(
+      'C:\\Books\\new.epub',
+    );
+    final Future<void> inspection = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    expect(controller.state.isRunActive, isTrue);
+
+    delayedOutputDirectory.complete('C:\\Books');
+    expect(await importing, isFalse);
+    expect(controller.state.inputPath, 'C:\\Books\\old.epub');
+    expect(controller.state.job?.status, TranslationJobStatus.running);
+
+    repository.inspectionCompleter.complete(
+      const InspectionResult(
+        job: TranslationJob(
+          id: 'running-job',
+          inputPath: 'C:\\Books\\old.epub',
+          outputPath: 'C:\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: <InspectedChapter>[],
+      ),
+    );
+    await inspection;
+  });
+
   test(
     'rejects dropped non-EPUB files without changing the input path',
     () async {
@@ -1513,6 +1553,57 @@ void main() {
     await run;
 
     expect(repository.startCount, 1);
+  });
+
+  test('inspection does not mix an old output with a new EPUB path', () async {
+    final Completer<void> lookupStarted = Completer<void>();
+    final Completer<String> oldOutputDirectory = Completer<String>();
+    final _SuccessfulInspectionRepository repository =
+        _SuccessfulInspectionRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          defaultOutputDirectoryResolver: (String? inputPath) {
+            lookupStarted.complete();
+            return oldOutputDirectory.future;
+          },
+        );
+    controller.setInputPath('C:\\OldBook\\old.epub');
+
+    final Future<void> inspection = controller.startInspection();
+    await lookupStarted.future;
+    controller.setInputPath('C:\\NewBook\\new.epub');
+    oldOutputDirectory.complete('C:\\OldBook');
+    await inspection;
+
+    expect(repository.startCount, 0);
+    expect(controller.state.inputPath, 'C:\\NewBook\\new.epub');
+    expect(controller.state.job, isNull);
+  });
+
+  test('inspection keeps a newer output directory edit', () async {
+    final Completer<void> lookupStarted = Completer<void>();
+    final Completer<String> inferredOutputDirectory = Completer<String>();
+    final _SuccessfulInspectionRepository repository =
+        _SuccessfulInspectionRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          defaultOutputDirectoryResolver: (String? inputPath) {
+            lookupStarted.complete();
+            return inferredOutputDirectory.future;
+          },
+        );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    final Future<void> inspection = controller.startInspection();
+    await lookupStarted.future;
+    controller.setOutputDirectory('C:\\ChosenOutput');
+    inferredOutputDirectory.complete('C:\\Books');
+    await inspection;
+
+    expect(repository.lastOutputDirectory, 'C:\\ChosenOutput');
+    expect(controller.state.outputDirectory, 'C:\\ChosenOutput');
   });
 
   test(
