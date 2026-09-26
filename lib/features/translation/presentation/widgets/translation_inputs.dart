@@ -48,6 +48,46 @@ class TranslationInputs extends StatefulWidget {
 
 class _TranslationInputsState extends State<TranslationInputs> {
   bool _showAdvancedPaths = false;
+  late final TextEditingController _inputPathController;
+  late final TextEditingController _outputDirectoryController;
+
+  @override
+  void initState() {
+    super.initState();
+    _inputPathController = TextEditingController(text: widget.inputPath);
+    _outputDirectoryController = TextEditingController(
+      text: widget.outputDirectory,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant TranslationInputs oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.inputPath != oldWidget.inputPath &&
+        widget.inputPath != _inputPathController.text) {
+      _inputPathController.value = TextEditingValue(
+        text: widget.inputPath,
+        selection: TextSelection.collapsed(offset: widget.inputPath.length),
+      );
+    }
+    if (widget.outputDirectory != oldWidget.outputDirectory &&
+        widget.outputDirectory != _outputDirectoryController.text) {
+      _outputDirectoryController.value = TextEditingValue(
+        text: widget.outputDirectory,
+        selection: TextSelection.collapsed(
+          offset: widget.outputDirectory.length,
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _inputPathController.dispose();
+    _outputDirectoryController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -245,8 +285,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
           ),
           if (_showAdvancedPaths) ...[
             TextFormField(
-              key: ValueKey('input-${widget.inputPath}'),
-              initialValue: widget.inputPath,
+              key: const ValueKey<String>('manual-input-path'),
+              controller: _inputPathController,
               enabled: widget.enabled,
               onChanged: widget.enabled ? widget.onInputChanged : null,
               decoration: InputDecoration(
@@ -257,8 +297,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
             ),
             const SizedBox(height: 12),
             TextFormField(
-              key: ValueKey('output-${widget.outputDirectory}'),
-              initialValue: widget.outputDirectory,
+              key: const ValueKey<String>('manual-output-directory'),
+              controller: _outputDirectoryController,
               enabled: widget.enabled,
               onChanged: widget.enabled ? widget.onOutputChanged : null,
               decoration: InputDecoration(
