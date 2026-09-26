@@ -210,6 +210,7 @@ class TranslationDashboardController
   bool _cancelRequested = false;
   Stopwatch? _translationStopwatch;
   Future<void> _pendingHistorySave = Future<void>.value();
+  Future<void> _pendingSessionPathSave = Future<void>.value();
   late final Future<void> _initialJobHistoryLoad;
   int _sessionPathRevision = 0;
   int _historyClearRevision = 0;
@@ -1360,9 +1361,14 @@ class TranslationDashboardController
     if (store == null) {
       return;
     }
-    // Fire-and-forget so UI interactions never block on disk IO.
-    store
-        .save(inputPath: inputPath, outputDirectory: outputDirectory)
+    // Keep disk writes ordered without blocking UI interactions.
+    _pendingSessionPathSave = _pendingSessionPathSave
+        .then<void>(
+          (_) => store.save(
+            inputPath: inputPath,
+            outputDirectory: outputDirectory,
+          ),
+        )
         .catchError((Object error) {
           AppLogger.warn(
             'Failed to persist session paths: $error',

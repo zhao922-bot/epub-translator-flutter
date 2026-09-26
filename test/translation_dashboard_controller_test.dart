@@ -446,6 +446,35 @@ class _ControlledSessionPathStore extends SessionPathStore {
   }) async {}
 }
 
+class _DelayedSessionPathStore extends SessionPathStore {
+  final Completer<void> releaseFirstWrite = Completer<void>();
+  final Completer<void> firstWriteFinished = Completer<void>();
+  final Completer<void> secondWriteFinished = Completer<void>();
+  int writeCount = 0;
+  String savedInputPath = '';
+
+  @override
+  Future<({String inputPath, String outputDirectory})> load() async =>
+      (inputPath: '', outputDirectory: '');
+
+  @override
+  Future<void> save({
+    required String inputPath,
+    required String outputDirectory,
+  }) async {
+    final int writeNumber = ++writeCount;
+    if (writeNumber == 1) {
+      await releaseFirstWrite.future;
+    }
+    savedInputPath = inputPath;
+    if (writeNumber == 1) {
+      firstWriteFinished.complete();
+    } else if (writeNumber == 2) {
+      secondWriteFinished.complete();
+    }
+  }
+}
+
 class _ControlledHistoryStore extends JobHistoryStore {
   final Completer<List<TranslationJob>> loadCompleter =
       Completer<List<TranslationJob>>();
@@ -1322,6 +1351,23 @@ void main() {
 
     expect(controller.state.inputPath, 'C:\\Books\\new.epub');
     expect(controller.state.outputDirectory, isNot('C:\\OldOutput'));
+  });
+
+  test('older session save cannot overwrite a newer EPUB selection', () async {
+    final _DelayedSessionPathStore pathStore = _DelayedSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    await controller.importDroppedEpubPath('C:\\Books\\first.epub');
+    await controller.importDroppedEpubPath('C:\\Books\\second.epub');
+    pathStore.releaseFirstWrite.complete();
+    await pathStore.firstWriteFinished.future;
+    await pathStore.secondWriteFinished.future;
+
+    expect(pathStore.savedInputPath, 'C:\\Books\\second.epub');
   });
 
   test('clearing history wins over a late startup history load', () async {
