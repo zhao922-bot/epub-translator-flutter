@@ -300,6 +300,10 @@ class TranslationDashboardController
       styleProfileConfirmed: false,
       isGeneratingStyleProfile: false,
     );
+    _persistSessionPaths(
+      inputPath: state.inputPath,
+      outputDirectory: state.outputDirectory,
+    );
   }
 
   Future<bool> _acceptInputPath(String value, {required bool dropped}) async {
@@ -348,6 +352,10 @@ class TranslationDashboardController
     }
     _sessionPathRevision += 1;
     state = state.copyWith(outputDirectory: value);
+    _persistSessionPaths(
+      inputPath: state.inputPath,
+      outputDirectory: state.outputDirectory,
+    );
   }
 
   void setTargetLanguage(String value) {
@@ -1004,6 +1012,12 @@ class TranslationDashboardController
 
     _cancelRequested = true;
     await repository.cancelJob(activeJob.id);
+    if (!mounted ||
+        !_cancelRequested ||
+        !state.isRunActive ||
+        state.job?.id != activeJob.id) {
+      return;
+    }
     final TranslationJob cancellingJob = activeJob.copyWith(
       currentChapter: 'Cancellation requested',
       currentBlock: null,

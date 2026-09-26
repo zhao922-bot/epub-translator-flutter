@@ -77,6 +77,16 @@ class _BlockingRepository implements TranslationRepository {
   }
 }
 
+class _DelayedCancelRepository extends _BlockingRepository {
+  final Completer<void> releaseCancellation = Completer<void>();
+
+  @override
+  Future<void> cancelJob(String jobId) async {
+    await super.cancelJob(jobId);
+    await releaseCancellation.future;
+  }
+}
+
 class _SuccessfulInspectionRepository implements TranslationRepository {
   _SuccessfulInspectionRepository({this.blockCount = 1});
 
@@ -446,6 +456,22 @@ class _ControlledSessionPathStore extends SessionPathStore {
   }) async {}
 }
 
+class _RecordingSessionPathStore extends SessionPathStore {
+  final List<({String inputPath, String outputDirectory})> saves = [];
+
+  @override
+  Future<({String inputPath, String outputDirectory})> load() async =>
+      (inputPath: '', outputDirectory: '');
+
+  @override
+  Future<void> save({
+    required String inputPath,
+    required String outputDirectory,
+  }) async {
+    saves.add((inputPath: inputPath, outputDirectory: outputDirectory));
+  }
+}
+
 class _DelayedSessionPathStore extends SessionPathStore {
   _DelayedSessionPathStore({this.failFirstWrite = false});
 
@@ -601,6 +627,40 @@ void main() {
       expect(controller.state.isRunActive, isFalse);
     },
   );
+
+  test('late cancellation response cannot revive a finished run', () async {
+    final _DelayedCancelRepository repository = _DelayedCancelRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.setInputPath('C:\\Books\\book.epub');
+
+    final Future<void> run = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    final Future<void> cancellation = controller.requestCancel();
+
+    repository.inspectionCompleter.complete(
+      const InspectionResult(
+        job: TranslationJob(
+          id: 'running-job',
+          inputPath: 'C:\\Books\\book.epub',
+          outputPath: 'C:\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: <InspectedChapter>[],
+      ),
+    );
+    await run;
+    expect(controller.state.job?.status, TranslationJobStatus.cancelled);
+
+    repository.releaseCancellation.complete();
+    await cancellation;
+    expect(controller.state.job?.status, TranslationJobStatus.cancelled);
+    expect(controller.state.isRunActive, isFalse);
+  });
 
   test('blocks new inspection while cancellation is still pending', () async {
     final _BlockingRepository repository = _BlockingRepository();
@@ -1358,6 +1418,36 @@ void main() {
 
     expect(controller.state.inputPath, 'C:\\Books\\new.epub');
     expect(controller.state.outputDirectory, isNot('C:\\OldOutput'));
+  });
+
+  test('manual EPUB path is remembered without starting inspection', () async {
+    final _RecordingSessionPathStore pathStore = _RecordingSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    controller.setInputPath('C:\\Books\\manual.epub');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(pathStore.saves, isNotEmpty);
+    expect(pathStore.saves.last.inputPath, 'C:\\Books\\manual.epub');
+  });
+
+  test('manual output directory is remembered without inspection', () async {
+    final _RecordingSessionPathStore pathStore = _RecordingSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    controller.setOutputDirectory('C:\\Output');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(pathStore.saves, isNotEmpty);
+    expect(pathStore.saves.last.outputDirectory, 'C:\\Output');
   });
 
   test('older session save cannot overwrite a newer EPUB selection', () async {
