@@ -447,6 +447,9 @@ class _ControlledSessionPathStore extends SessionPathStore {
 }
 
 class _DelayedSessionPathStore extends SessionPathStore {
+  _DelayedSessionPathStore({this.failFirstWrite = false});
+
+  final bool failFirstWrite;
   final Completer<void> releaseFirstWrite = Completer<void>();
   final Completer<void> firstWriteFinished = Completer<void>();
   final Completer<void> secondWriteFinished = Completer<void>();
@@ -465,6 +468,10 @@ class _DelayedSessionPathStore extends SessionPathStore {
     final int writeNumber = ++writeCount;
     if (writeNumber == 1) {
       await releaseFirstWrite.future;
+      if (failFirstWrite) {
+        firstWriteFinished.complete();
+        throw StateError('First write failed');
+      }
     }
     savedInputPath = inputPath;
     if (writeNumber == 1) {
@@ -1355,6 +1362,25 @@ void main() {
 
   test('older session save cannot overwrite a newer EPUB selection', () async {
     final _DelayedSessionPathStore pathStore = _DelayedSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    await controller.importDroppedEpubPath('C:\\Books\\first.epub');
+    await controller.importDroppedEpubPath('C:\\Books\\second.epub');
+    pathStore.releaseFirstWrite.complete();
+    await pathStore.firstWriteFinished.future;
+    await pathStore.secondWriteFinished.future;
+
+    expect(pathStore.savedInputPath, 'C:\\Books\\second.epub');
+  });
+
+  test('failed session save does not block a newer EPUB selection', () async {
+    final _DelayedSessionPathStore pathStore = _DelayedSessionPathStore(
+      failFirstWrite: true,
+    );
     final TranslationDashboardController controller =
         TranslationDashboardController(
           repository: _SuccessfulInspectionRepository(),

@@ -128,6 +128,7 @@ class TranslationDashboardPage extends ConsumerWidget {
             const SizedBox(height: 20),
           ],
           TranslationInputs(
+            key: const ValueKey<String>('translation-inputs'),
             actions: primaryActions,
             chapterSummary: hasInspected
                 ? strings.chapterChecklistSummary(
