@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
 
+import '../../../shared/localization/app_strings.dart';
 import '../../translation/application/translation_dashboard_controller.dart';
 import '../../translation/domain/models/translation_job.dart';
 import '../domain/models/job_summary.dart';
@@ -9,6 +10,7 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
   final TranslationDashboardState dashboard = ref.watch(
     translationDashboardProvider,
   );
+  final AppStrings strings = ref.watch(appStringsProvider);
   final TranslationJob? currentJob = dashboard.job;
   final Set<String> includedIds = <String>{};
   final List<TranslationJob> jobs = <TranslationJob>[
@@ -27,7 +29,7 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
           id: job.id,
           title: path.basename(job.inputPath),
           status: job.status,
-          progressLabel: _progressLabel(job),
+          progressLabel: _progressLabel(job, strings),
           outputPath: job.outputPath,
           errorMessage: job.errorMessage,
           isActive:
@@ -39,28 +41,19 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
               job.status == TranslationJobStatus.cancelled ||
               job.status == TranslationJobStatus.completedWithWarnings,
           canResume: job.canResumeTranslation,
-          phaseLabel: phaseLabel(job.phase),
           degradedBlockCount: job.degradedBlockCount,
         ),
       )
       .toList(growable: false);
 });
 
-String phaseLabel(TranslationJobPhase phase) {
-  return switch (phase) {
-    TranslationJobPhase.inspection => 'Inspection',
-    TranslationJobPhase.cacheRestoration => 'Cache restoration',
-    TranslationJobPhase.translation => 'Translation',
-  };
-}
-
-String _progressLabel(TranslationJob job) {
+String _progressLabel(TranslationJob job, AppStrings strings) {
   if (job.totalBlocks > 0) {
-    return '${job.completedBlocks} / ${job.totalBlocks} blocks';
+    return strings.jobProgressBlocks(job.completedBlocks, job.totalBlocks);
   }
   if (job.totalFiles > 0) {
-    return '${job.completedFiles} / ${job.totalFiles} chapters';
+    return strings.jobProgressChapters(job.completedFiles, job.totalFiles);
   }
   final int percent = (job.progress * 100).round().clamp(0, 100);
-  return '$percent% complete';
+  return strings.jobProgressPercent(percent);
 }

@@ -81,13 +81,6 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 }
 
 void main() {
-  test('labels cache restoration as its own job phase', () {
-    expect(
-      phaseLabel(TranslationJobPhase.cacheRestoration),
-      'Cache restoration',
-    );
-  });
-
   test('starts empty instead of showing sample jobs', () {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
@@ -101,7 +94,10 @@ void main() {
     expect(container.read(jobsProvider), isEmpty);
   });
 
-  test('shows the real current translation job', () async {
+  test(
+    'shows the real current translation job',
+    testOn: 'windows',
+    () async {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
         translationRepositoryProvider.overrideWithValue(

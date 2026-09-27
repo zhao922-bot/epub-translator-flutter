@@ -50,5 +50,36 @@ void main() {
       expect(error, isNotNull);
       expect(error!.actionKind, ActionableErrorKind.reduceConcurrency);
     });
+
+    test(
+      'encoding-unsupported never offers retry, even with preferredKind',
+      () {
+        const String raw =
+            'Unsupported text encoding "GBK" declared by OEBPS/ch1.html: '
+            'only UTF-8 encoded EPUB content is supported.';
+        final ActionableError? error = ActionableErrorFactory.fromMessage(
+          '检查失败：$raw',
+          isChinese: true,
+          preferredKind: ActionableErrorKind.retryInspection,
+        );
+        expect(error, isNotNull);
+        expect(error!.actionKind, ActionableErrorKind.dismiss);
+        expect(error.actionLabel, '知道了');
+        expect(error.title, '编码不受支持');
+        expect(error.message, contains('转码为 UTF-8'));
+      },
+    );
+
+    test('encoding-unsupported gets English hint without preferredKind', () {
+      final ActionableError? error = ActionableErrorFactory.fromMessage(
+        'Inspection failed: Unsupported text encoding "GBK" declared by '
+        'OEBPS/ch1.html: only UTF-8 encoded EPUB content is supported.',
+        isChinese: false,
+      );
+      expect(error, isNotNull);
+      expect(error!.actionKind, ActionableErrorKind.dismiss);
+      expect(error.actionLabel, 'Dismiss');
+      expect(error.message, contains('Convert it to UTF-8'));
+    });
   });
 }

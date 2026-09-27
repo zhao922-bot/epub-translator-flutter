@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -450,4 +451,210 @@ void main() {
     expect(secrets.deepSeekApiKey, 'sk-old-deepseek');
     expect(secrets.customApiKey, isNull);
   });
+
+  test(
+    'backs up a corrupt settings.json instead of silently resetting',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_corrupt_settings_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      const String corrupt = '{"outputSuffix": "_x", broken';
+      await settingsFile.writeAsString(corrupt);
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: _FakeSettingsSecretStore(),
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.outputSuffix, TranslationConfig.defaults().outputSuffix);
+      final List<File> backups = temp
+          .listSync()
+          .whereType<File>()
+          .where((File f) => f.path.contains('settings.json.bad-'))
+          .toList();
+      expect(backups, hasLength(1));
+      expect(await backups.single.readAsString(), corrupt);
+      // The corrupt file was moved aside, so a later save cannot silently
+      // overwrite it.
+      expect(await settingsFile.exists(), isFalse);
+    },
+  );
+
+  test(
+    'backs up settings.json when it is valid JSON but not an object',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_non_object_settings_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      await settingsFile.writeAsString('[1, 2, 3]');
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: _FakeSettingsSecretStore(),
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.model, TranslationConfig.defaults().model);
+      final List<File> backups = temp
+          .listSync()
+          .whereType<File>()
+          .where((File f) => f.path.contains('settings.json.bad-'))
+          .toList();
+      expect(backups, hasLength(1));
+      expect(await backups.single.readAsString(), '[1, 2, 3]');
+      expect(await settingsFile.exists(), isFalse);
+    },
+  );
+
+  test(
+    'does not back up settings.json when it parses cleanly',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_valid_settings_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      await settingsFile.writeAsString(
+        jsonEncode(
+          TranslationConfig.defaults().copyWith(outputSuffix: '_kept').toJson(),
+        ),
+      );
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: _FakeSettingsSecretStore(),
+      );
+
+      final TranslationConfig loaded = await store.load();
+
+      expect(loaded.outputSuffix, '_kept');
+      expect(
+        temp.listSync().where((e) => e.path.contains('.bad-')),
+        isEmpty,
+      );
+      expect(await settingsFile.exists(), isTrue);
+    },
+  );
+
+  test(
+    'save without a prior load does not delete keys when reads fail',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_save_before_load_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..apiKey = 'sk-keep'
+        ..deepSeekApiKey = 'sk-keep-deepseek'
+        ..customApiKey = 'sk-keep-custom'
+        ..failReads = true;
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      // Never loaded, and the caller did not explicitly mutate secrets: the
+      // store must read first and then protect the unreadable slots instead
+      // of deleting them blindly.
+      await store.save(
+        TranslationConfig.defaults(),
+        explicitSecretMutations: const <SettingsSecretSlot>{},
+      );
+
+      expect(secrets.apiKey, 'sk-keep');
+      expect(secrets.deepSeekApiKey, 'sk-keep-deepseek');
+      expect(secrets.customApiKey, 'sk-keep-custom');
+      expect(secrets.secretMutationCount, 0);
+    },
+  );
+
+  test(
+    'save without a prior load still persists keys when reads succeed',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'epub_save_before_load_ok_test_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+
+      final File settingsFile = File('${temp.path}/settings.json');
+      final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+        ..apiKey = 'sk-old';
+      final SettingsStore store = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+
+      await store.save(
+        TranslationConfig.defaults().copyWith(apiKey: 'sk-new'),
+      );
+
+      expect(secrets.apiKey, 'sk-new');
+    },
+  );
+
+  test('save writes the three secret slots concurrently', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_concurrent_secrets_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _BarrierSecretStore secrets = _BarrierSecretStore();
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    // If the slot writes ran sequentially, the first write would block on the
+    // barrier until the 10s timeout and this save would throw.
+    await store.save(
+      TranslationConfig.defaults().copyWith(
+        apiKey: 'sk-legacy',
+        deepseekApiKey: 'sk-deepseek',
+        customApiKey: 'sk-custom',
+      ),
+    );
+
+    expect(secrets.apiKey, 'sk-legacy');
+    expect(secrets.deepSeekApiKey, 'sk-deepseek');
+    expect(secrets.customApiKey, 'sk-custom');
+  });
+}
+
+/// A fake secret store whose writes only proceed once all three slots have
+/// started writing: proves the slots are written concurrently rather than
+/// serially.
+class _BarrierSecretStore extends _FakeSettingsSecretStore {
+  int _startedWrites = 0;
+  final Completer<void> _allStarted = Completer<void>();
+
+  Future<void> _gateWrite(Future<void> Function() write) async {
+    _startedWrites += 1;
+    if (_startedWrites >= 3 && !_allStarted.isCompleted) {
+      _allStarted.complete();
+    }
+    await _allStarted.future.timeout(const Duration(seconds: 10));
+    await write();
+  }
+
+  @override
+  Future<void> writeApiKey(String value) =>
+      _gateWrite(() => super.writeApiKey(value));
+
+  @override
+  Future<void> writeDeepSeekApiKey(String value) =>
+      _gateWrite(() => super.writeDeepSeekApiKey(value));
+
+  @override
+  Future<void> writeCustomApiKey(String value) =>
+      _gateWrite(() => super.writeCustomApiKey(value));
 }

@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:math';
 
 import 'package:dio/dio.dart';
@@ -22,6 +21,19 @@ class EpubRepacker {
     : _extractor = extractor ?? const EpubHtmlExtractor();
 
   final EpubHtmlExtractor _extractor;
+
+  /// Chapter-scoped key for a degraded block. Block ids restart per chapter
+  /// (`p-1` exists in nearly every chapter), so a bare block id would collide
+  /// across chapters and mis-mark innocent blocks as untranslated.
+  /// [EpubChapterTranslator] records degradation with this key and passes the
+  /// accumulated set back here for the final render.
+  static String degradedKeyForBlock({
+    required String chapterPath,
+    required String blockId,
+  }) {
+    return '$chapterPath\u0000$blockId';
+  }
+
   static const String _cjkCompatibilityStyleTitle =
       'EPUB Translator CJK compatibility';
   static const String _cjkCompatibilityCss = '''
@@ -72,10 +84,15 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     required List<InspectedChapter> chapters,
     required String targetLanguage,
   }) {
-    return _renderNavigationMetadata(
+    final Map<String, String> labelsByPath = <String, String>{
+      for (final InspectedChapter chapter in chapters)
+        if (_navigationLabelForChapter(chapter) case final String label)
+          path.posix.normalize(chapter.path): label,
+    };
+    return EpubIsolateWorker.renderNavigationMetadata(
       archiveFiles: archiveFiles,
-      chapters: chapters,
-      targetLanguage: targetLanguage,
+      labelsByPath: labelsByPath,
+      languageTag: _languageTagForTarget(targetLanguage),
     );
   }
 
@@ -96,6 +113,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
     bool Function()? isCancelled,
+    Set<String> degradedBlockIds = const <String>{},
   }) async {
     void throwIfCancelled() {
       if (cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)) {
@@ -104,34 +122,44 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
 
     throwIfCancelled();
-    final ProperNameBookState properNameState = ProperNameNormalizer.bookState();
-    final Map<String, String> translatedHtmlByPath = <String, String>{
-      for (final InspectedChapter chapter in chapters)
-        if (chapter.includeInTranslation)
-          chapter.path: renderTranslatedChapter(
-            chapter: chapter,
-            bilingual: config.bilingual,
-            targetLanguage: config.targetLanguage,
-            lockedGlossary: config.lockedGlossary,
-            properNameState: properNameState,
-          ),
-    };
-    _synchronizeHtmlTocLabels(translatedHtmlByPath, chapters);
-    final Map<String, List<int>> archiveFiles =
-        await EpubIsolateWorker.loadArchiveFiles(inputPath);
-    translatedHtmlByPath.addAll(
-      _renderNavigationMetadata(
-        archiveFiles: archiveFiles,
-        chapters: chapters,
+    final ProperNameBookState properNameState =
+        ProperNameNormalizer.bookState();
+    // Rendered chapter by chapter (not in one collection literal) so a
+    // pending cancellation is honored between chapters instead of only
+    // before the isolate ZIP step. Repacking makes no API calls, so this is
+    // purely about cancel responsiveness on large books.
+    final Map<String, String> translatedHtmlByPath = <String, String>{};
+    for (final InspectedChapter chapter in chapters) {
+      throwIfCancelled();
+      if (!chapter.includeInTranslation) {
+        continue;
+      }
+      translatedHtmlByPath[chapter.path] = renderTranslatedChapter(
+        chapter: chapter,
+        bilingual: config.bilingual,
         targetLanguage: config.targetLanguage,
-      ),
-    );
+        lockedGlossary: config.lockedGlossary,
+        properNameState: properNameState,
+        degradedBlockIds: degradedBlockIds,
+      );
+    }
+    _synchronizeHtmlTocLabels(translatedHtmlByPath, chapters);
+    // Navigation metadata (OPF language + translated NCX labels) is rendered
+    // inside the isolate from the same decoded archive, so the whole book is
+    // never loaded into the main isolate just to read three small XML files.
+    final Map<String, String> navigationLabelsByPath = <String, String>{
+      for (final InspectedChapter chapter in chapters)
+        if (_navigationLabelForChapter(chapter) case final String label)
+          path.posix.normalize(chapter.path): label,
+    };
     _validateXmlReplacements(translatedHtmlByPath);
     throwIfCancelled();
     final bool committed = await EpubIsolateWorker.writeTranslatedEpub(
       inputPath: inputPath,
       outputFilePath: outputFilePath,
       translatedHtmlByPath: translatedHtmlByPath,
+      navigationLabelsByPath: navigationLabelsByPath,
+      navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
       // Isolate cannot be hard-interrupted; refuse final commit on cancel.
       shouldCommit: () =>
           !(cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)),
@@ -149,6 +177,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     String targetLanguage = 'Chinese',
     String lockedGlossary = '',
     ProperNameBookState? properNameState,
+    Set<String> degradedBlockIds = const <String>{},
   }) {
     final List<ProperNameMap> nameMappings = ProperNameNormalizer.parseGlossary(
       lockedGlossary,
@@ -174,7 +203,10 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
           containsCjkTranslation || _containsCjk(normalizedTranslation);
       var replacement = bilingual
           ? '${target.outerHtml}\n${_sanitizeForBilingual(normalizedTranslation)}'
-          : _safelyUnwrapReplacementForStructuralTag(target, normalizedTranslation);
+          : _safelyUnwrapReplacementForStructuralTag(
+              target,
+              normalizedTranslation,
+            );
       if (nameMappings.isNotEmpty) {
         replacement = ProperNameNormalizer.normalizeHtml(
           replacement,
@@ -182,6 +214,18 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
           targetLanguage: targetLanguage,
           state: properNameState,
         );
+      }
+      if (degradedBlockIds.contains(
+        EpubRepacker.degradedKeyForBlock(
+          chapterPath: chapter.path,
+          blockId: block.id,
+        ),
+      )) {
+        // This block fell back to source/partial content. Leave an HTML
+        // comment so the untranslated paragraph can be located in the EPUB
+        // source. It trails the replacement so node-replacement mechanics
+        // (first-node swap, td/th wrapper check) behave exactly as before.
+        replacement = '$replacement<!-- UNTRANSLATED -->';
       }
       _replaceNodeWithHtml(target, replacement);
     }
@@ -211,7 +255,9 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
       container: target.parent?.localName ?? 'body',
     );
-    final dom.Node? first = fragment.nodes.isEmpty ? null : fragment.nodes.first;
+    final dom.Node? first = fragment.nodes.isEmpty
+        ? null
+        : fragment.nodes.first;
     if (first is dom.Element && first.localName == tag) {
       return replacementHtml;
     }
@@ -413,113 +459,6 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     ).hasMatch(value);
   }
 
-  Map<String, String> _renderNavigationMetadata({
-    required Map<String, List<int>> archiveFiles,
-    required List<InspectedChapter> chapters,
-    required String targetLanguage,
-  }) {
-    final String? languageTag = _languageTagForTarget(targetLanguage);
-    if (languageTag == null) {
-      return const <String, String>{};
-    }
-    final List<int>? containerBytes = archiveFiles['META-INF/container.xml'];
-    if (containerBytes == null) {
-      return const <String, String>{};
-    }
-    final xml.XmlDocument container = xml.XmlDocument.parse(
-      utf8.decode(containerBytes),
-    );
-    final xml.XmlElement rootFile = container.descendants
-        .whereType<xml.XmlElement>()
-        .firstWhere(
-          (xml.XmlElement element) => element.name.local == 'rootfile',
-          orElse: () => xml.XmlElement(xml.XmlName('missing')),
-        );
-    final String opfPath = rootFile.getAttribute('full-path') ?? '';
-    final List<int>? opfBytes = archiveFiles[opfPath];
-    if (opfPath.isEmpty || opfBytes == null) {
-      return const <String, String>{};
-    }
-
-    final xml.XmlDocument opf = xml.XmlDocument.parse(utf8.decode(opfBytes));
-    for (final xml.XmlElement language
-        in opf.descendants.whereType<xml.XmlElement>().where(
-          (xml.XmlElement element) => element.name.local == 'language',
-        )) {
-      language.innerText = languageTag;
-    }
-
-    final Map<String, String> replacements = <String, String>{
-      opfPath: opf.toXmlString(),
-    };
-    final xml.XmlElement? spine = opf.descendants
-        .whereType<xml.XmlElement>()
-        .where((xml.XmlElement element) => element.name.local == 'spine')
-        .firstOrNull;
-    final String ncxId = spine?.getAttribute('toc') ?? '';
-    xml.XmlElement? ncxItem;
-    for (final xml.XmlElement item
-        in opf.descendants.whereType<xml.XmlElement>().where(
-          (xml.XmlElement element) => element.name.local == 'item',
-        )) {
-      if ((ncxId.isNotEmpty && item.getAttribute('id') == ncxId) ||
-          item.getAttribute('media-type') == 'application/x-dtbncx+xml') {
-        ncxItem = item;
-        break;
-      }
-    }
-    final String ncxHref = ncxItem?.getAttribute('href') ?? '';
-    if (ncxHref.isEmpty) {
-      return replacements;
-    }
-    final String ncxPath = path.posix.normalize(
-      path.posix.join(path.posix.dirname(opfPath), ncxHref),
-    );
-    final List<int>? ncxBytes = archiveFiles[ncxPath];
-    if (ncxBytes == null) {
-      return replacements;
-    }
-
-    final Map<String, String> labelsByPath = <String, String>{};
-    for (final InspectedChapter chapter in chapters) {
-      final String? label = _navigationLabelForChapter(chapter);
-      if (label != null) {
-        labelsByPath[path.posix.normalize(chapter.path)] = label;
-      }
-    }
-    final xml.XmlDocument ncx = xml.XmlDocument.parse(utf8.decode(ncxBytes));
-    ncx.rootElement.setAttribute('xml:lang', languageTag);
-    for (final xml.XmlElement navPoint
-        in ncx.descendants.whereType<xml.XmlElement>().where(
-          (xml.XmlElement element) => element.name.local == 'navPoint',
-        )) {
-      final xml.XmlElement? content = navPoint.descendants
-          .whereType<xml.XmlElement>()
-          .where((xml.XmlElement element) => element.name.local == 'content')
-          .firstOrNull;
-      final String source = content?.getAttribute('src') ?? '';
-      if (source.isEmpty) {
-        continue;
-      }
-      final String chapterPath = path.posix.normalize(
-        path.posix.join(path.posix.dirname(ncxPath), source.split('#').first),
-      );
-      final String? label = labelsByPath[chapterPath];
-      if (label == null) {
-        continue;
-      }
-      final xml.XmlElement? text = navPoint.descendants
-          .whereType<xml.XmlElement>()
-          .where((xml.XmlElement element) => element.name.local == 'text')
-          .firstOrNull;
-      if (text != null) {
-        text.innerText = label;
-      }
-    }
-    replacements[ncxPath] = ncx.toXmlString();
-    return replacements;
-  }
-
   void _synchronizeHtmlTocLabels(
     Map<String, String> renderedByPath,
     List<InspectedChapter> chapters,
@@ -562,13 +501,32 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
         if (label == null || anchor.text.trim().isEmpty) {
           continue;
         }
-        anchor.text = label;
+        _setAnchorLabelPreservingNestedElements(anchor, label);
         changed = true;
       }
       if (changed) {
         renderedByPath[chapter.path] =
             XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
       }
+    }
+  }
+
+  /// Replaces an anchor's direct text children with [label] while keeping
+  /// nested elements (e.g. `<span class="pagenum">`) intact. `anchor.text =`
+  /// would flatten those nested tags away.
+  void _setAnchorLabelPreservingNestedElements(
+    dom.Element anchor,
+    String label,
+  ) {
+    final List<dom.Text> textNodes = anchor.nodes
+        .whereType<dom.Text>()
+        .toList(growable: false);
+    if (textNodes.isEmpty) {
+      return;
+    }
+    textNodes.first.text = label;
+    for (final dom.Text extra in textNodes.skip(1)) {
+      extra.remove();
     }
   }
 

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -7,6 +8,9 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_quality.dart';
@@ -249,6 +253,18 @@ class _FootnoteResponseAdapter implements HttpClientAdapter {
         Headers.contentTypeHeader: <String>[Headers.jsonContentType],
       },
     );
+  }
+}
+
+/// A cache store whose writes always fail, simulating a full disk or a
+/// revoked permission. Reads fall through to the real store.
+class _AlwaysFailingCacheStore extends TranslationCacheStore {
+  @override
+  Future<void> putBlockTranslation(
+    String cacheKey,
+    String translatedHtml,
+  ) async {
+    throw const FileSystemException('disk is full (test double)');
   }
 }
 
@@ -590,6 +606,146 @@ class _ProtectedSlotQualityRetryAdapter implements HttpClientAdapter {
         'choices': <Object?>[
           <String, Object?>{
             'message': <String, Object?>{'content': responseContent},
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+/// The strict batch reply is always empty (forcing the individual-slot
+/// fallback); the second slot's first attempt fails with a transient 429.
+class _ProtectedSlotFlakySecondSlotAdapter implements HttpClientAdapter {
+  int strictRequestCount = 0;
+  final Map<String, int> plainRequestCounts = <String, int>{};
+  bool secondSlotFailedOnce = false;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    Object responseContent;
+    try {
+      final Object? decoded = jsonDecode(userContent);
+      if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+        strictRequestCount += 1;
+        responseContent = jsonEncode(<String, Object?>{
+          'blocks': const <Object?>[],
+        });
+      } else {
+        throw const FormatException();
+      }
+    } on FormatException {
+      plainRequestCounts.update(
+        userContent,
+        (int count) => count + 1,
+        ifAbsent: () => 1,
+      );
+      if (userContent == 'Translate this tail too.' && !secondSlotFailedOnce) {
+        secondSlotFailedOnce = true;
+        return ResponseBody.fromString(
+          jsonEncode(<String, Object?>{
+            'error': <String, Object?>{'message': 'rate limited'},
+          }),
+          429,
+          headers: <String, List<String>>{
+            Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+          },
+        );
+      }
+      responseContent = userContent == 'Read this sentence right now.'
+          ? '第一段已经翻译。'
+          : '第二段已经翻译。';
+    }
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': responseContent},
+          },
+        ],
+      }),
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+      },
+    );
+  }
+}
+
+/// The strict batch endpoint answers with a JSON array instead of the
+/// chat-completions object (as a misbehaving gateway might); plain slot
+/// requests translate normally.
+class _ProtectedSlotNonJsonBatchAdapter implements HttpClientAdapter {
+  final List<int> strictBlockCounts = <int>[];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final BytesBuilder builder = BytesBuilder();
+    if (requestStream != null) {
+      await for (final Uint8List chunk in requestStream) {
+        builder.add(chunk);
+      }
+    }
+    final Map<String, dynamic> request =
+        jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
+    final List<dynamic> messages = request['messages'] as List<dynamic>;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+
+    Object? decoded;
+    try {
+      decoded = jsonDecode(userContent);
+    } on FormatException {
+      decoded = null;
+    }
+    if (decoded is Map<String, dynamic> && decoded.containsKey('blocks')) {
+      strictBlockCounts.add((decoded['blocks'] as List<dynamic>).length);
+      // A JSON array: not a chat-completions object, so the client reports a
+      // deterministic TranslationParseException instead of a TypeError.
+      return ResponseBody.fromString(
+        '["not", "a", "map"]',
+        200,
+        headers: <String, List<String>>{
+          Headers.contentTypeHeader: <String>[Headers.jsonContentType],
+        },
+      );
+    }
+
+    return ResponseBody.fromString(
+      jsonEncode(<String, Object?>{
+        'choices': <Object?>[
+          <String, Object?>{
+            'message': <String, Object?>{'content': '该槽位已经翻译。'},
           },
         ],
       }),
@@ -1758,10 +1914,14 @@ void main() {
       expect(translated[0], contains('untranslated'));
       expect(
         translator.getDegradedBlockIdsForTest(),
-        contains('degraded-target'),
+        contains(
+          EpubChapterTranslator.degradedKeyForTest(blockId: 'degraded-target'),
+        ),
       );
       expect(
-        translator.getDegradedBlockIdsForTest().contains('good-a'),
+        translator.getDegradedBlockIdsForTest().contains(
+          EpubChapterTranslator.degradedKeyForTest(blockId: 'good-a'),
+        ),
         isFalse,
       );
     },
@@ -1805,12 +1965,88 @@ void main() {
       expect(translated, hasLength(1));
       expect(
         translator.getDegradedBlockIdsForTest(),
-        contains('protected-slot-degrade'),
+        contains(
+          EpubChapterTranslator.degradedKeyForTest(
+            blockId: 'protected-slot-degrade',
+          ),
+        ),
       );
       expect(adapter.strictRequestCount, greaterThan(0));
       expect(adapter.plainRequestCount, greaterThan(0));
     },
   );
+
+  test('degraded block marks are scoped to their chapter when repacking', () {
+    InspectedChapter chapter(String path) {
+      return InspectedChapter(
+        path: path,
+        title: 'Title $path',
+        body: 'Source text.',
+        originalHtml: '<html><body><p>Source text.</p></body></html>',
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'p-1',
+            tagName: 'p',
+            sourceHtml: '<p>Source text.</p>',
+            sourceText: 'Source text.',
+            translatedHtml: '<p>源文本。</p>',
+          ),
+        ],
+        category: ChapterCategory.content,
+        recommendedForTranslation: true,
+        includeInTranslation: true,
+      );
+    }
+
+    final EpubRepacker repacker = EpubRepacker();
+    final Set<String> degraded = <String>{
+      EpubRepacker.degradedKeyForBlock(
+        chapterPath: 'OPS/Text/ch-a.xhtml',
+        blockId: 'p-1',
+      ),
+    };
+
+    // Only the chapter that actually degraded gets the marker: the other
+    // chapter's identical block id must not leak into it.
+    expect(
+      repacker.renderTranslatedChapter(
+        chapter: chapter('OPS/Text/ch-a.xhtml'),
+        bilingual: false,
+        degradedBlockIds: degraded,
+      ),
+      contains('<!-- UNTRANSLATED -->'),
+    );
+    expect(
+      repacker.renderTranslatedChapter(
+        chapter: chapter('OPS/Text/ch-b.xhtml'),
+        bilingual: false,
+        degradedBlockIds: degraded,
+      ),
+      isNot(contains('<!-- UNTRANSLATED -->')),
+    );
+
+    // And when both chapters degrade the same block id, both are marked
+    // independently instead of collapsing into one entry.
+    final Set<String> bothDegraded = <String>{
+      EpubRepacker.degradedKeyForBlock(
+        chapterPath: 'OPS/Text/ch-a.xhtml',
+        blockId: 'p-1',
+      ),
+      EpubRepacker.degradedKeyForBlock(
+        chapterPath: 'OPS/Text/ch-b.xhtml',
+        blockId: 'p-1',
+      ),
+    };
+    expect(bothDegraded, hasLength(2));
+    expect(
+      repacker.renderTranslatedChapter(
+        chapter: chapter('OPS/Text/ch-b.xhtml'),
+        bilingual: false,
+        degradedBlockIds: bothDegraded,
+      ),
+      contains('<!-- UNTRANSLATED -->'),
+    );
+  });
 
   test(
     'retries a complete individual-slot round after rebuilt HTML fails quality',
@@ -1851,6 +2087,116 @@ void main() {
       expect(translated.single, contains('第二段已经翻译。'));
       expect(translated.single, contains('id="body"'));
       expect(translated.single, contains('id="ref-1" href="#note-1"'));
+    },
+  );
+
+  test('a transient slot failure does not re-bill earlier slots', () async {
+    final _ProtectedSlotFlakySecondSlotAdapter adapter =
+        _ProtectedSlotFlakySecondSlotAdapter();
+    final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+      ..httpClientAdapter = adapter;
+
+    final List<String>
+    translated = await EpubChapterTranslator().translateBlockBatchForTest(
+      dio: dio,
+      config: TranslationConfig.defaults().copyWith(
+        apiKey: 'sk-test',
+        targetLanguage: 'Chinese',
+        maxRetries: 2,
+      ),
+      blocks: const <ExtractedBlock>[
+        ExtractedBlock(
+          id: 'protected-flaky-slot',
+          tagName: 'p',
+          sourceHtml:
+              '<p id="body">Read this sentence right now.<a id="ref-1" href="#note-1"><sup>1</sup></a>Translate this tail too.</p>',
+          sourceText:
+              'Read this sentence right now. 1 Translate this tail too.',
+        ),
+      ],
+    );
+
+    // Slot 1 translated cleanly on the first try and must not be
+    // re-requested (and re-billed) when slot 2 hits a transient 429.
+    expect(adapter.plainRequestCounts['Read this sentence right now.'], 1);
+    expect(adapter.plainRequestCounts['Translate this tail too.'], 2);
+    expect(translated.single, contains('第一段已经翻译。'));
+    expect(translated.single, contains('第二段已经翻译。'));
+  });
+
+  test(
+    'a non-JSON strict batch reply skips the bisect and falls back per block',
+    () async {
+      final _ProtectedSlotNonJsonBatchAdapter adapter =
+          _ProtectedSlotNonJsonBatchAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      final List<String>
+      translated = await EpubChapterTranslator().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+        ),
+        blocks: <ExtractedBlock>[
+          for (int i = 0; i < 3; i += 1)
+            ExtractedBlock(
+              id: 'protected-batch-$i',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>Body text $i.<a href="#n$i"><span>[$i]</span></a>Tail $i.</p>',
+              sourceText: 'Body text $i. [$i] Tail $i.',
+            ),
+        ],
+      );
+
+      // A deterministic parse failure must not trigger half-batch bisect
+      // retries: every strict request is the full batch or a single block.
+      expect(adapter.strictBlockCounts, isNotEmpty);
+      expect(
+        adapter.strictBlockCounts,
+        everyElement(anyOf(equals(3), equals(1))),
+      );
+      expect(translated, hasLength(3));
+      for (final String html in translated) {
+        expect(html, contains('已经翻译'));
+      }
+    },
+  );
+
+  test(
+    'extractMessageContent reports a non-object API response as a parse failure',
+    () {
+      // A proxy/gateway may answer with a JSON array or a plain string
+      // instead of the chat-completions object. That must surface as a
+      // deterministic TranslationParseException (never retried as a
+      // transient error), not a TypeError from an unchecked cast.
+      expect(
+        () => const TranslationApiClient().extractMessageContent(<dynamic>[
+          'not',
+          'a',
+          'map',
+        ]),
+        throwsA(isA<TranslationParseException>()),
+      );
+      expect(
+        () => const TranslationApiClient().extractMessageContent(
+          'plain text, not JSON',
+        ),
+        throwsA(isA<TranslationParseException>()),
+      );
+      expect(
+        const TranslationApiClient().extractMessageContent(<String, dynamic>{
+          'choices': <dynamic>[
+            <String, dynamic>{
+              'message': <String, dynamic>{'content': '  你好  '},
+            },
+          ],
+        }),
+        '你好',
+      );
     },
   );
 
@@ -2095,7 +2441,19 @@ void main() {
           'f0:p-1': '<p>First timed-out note.</p>',
           'f1:p-1': '<p>Second timed-out note.</p>',
         });
-        expect(translator.getDegradedBlockIdsForTest(), contains('p-1'));
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          containsAll(<String>{
+            EpubChapterTranslator.degradedKeyForTest(
+              chapterPath: 'OPS/Text/note-0-fn.xhtml',
+              blockId: 'p-1',
+            ),
+            EpubChapterTranslator.degradedKeyForTest(
+              chapterPath: 'OPS/Text/note-1-fn.xhtml',
+              blockId: 'p-1',
+            ),
+          }),
+        );
         expect(adapter.fetchCount, 3);
       },
     );
@@ -2128,10 +2486,53 @@ void main() {
           'f0:p-1': '<p>First unreachable note.</p>',
           'f1:p-1': '<p>Second unreachable note.</p>',
         });
-        expect(translator.getDegradedBlockIdsForTest(), contains('p-1'));
+        expect(
+          translator.getDegradedBlockIdsForTest(),
+          containsAll(<String>{
+            EpubChapterTranslator.degradedKeyForTest(
+              chapterPath: 'OPS/Text/note-0-fn.xhtml',
+              blockId: 'p-1',
+            ),
+            EpubChapterTranslator.degradedKeyForTest(
+              chapterPath: 'OPS/Text/note-1-fn.xhtml',
+              blockId: 'p-1',
+            ),
+          }),
+        );
         expect(adapter.fetchCount, 2);
       },
     );
+
+    test('footnote translation survives block cache write failures', () async {
+      final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+        <Map<String, Object?>>[
+          <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+        ],
+      );
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+      // Every cache write throws, as if the disk were full: the cache is
+      // an acceleration layer and must never abort the translation.
+      final EpubChapterTranslator translator = EpubChapterTranslator(
+        cacheStore: _AlwaysFailingCacheStore(),
+      );
+
+      final Map<String, String> translated = await translator
+          .translateFootnoteBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
+            ),
+            references: <FootnoteBlockReference>[
+              _footnoteReference(0, 'First footnote.'),
+            ],
+          );
+
+      expect(translated, <String, String>{'f0:p-1': '<p>第一条脚注。</p>'});
+      expect(translator.getDegradedBlockIdsForTest(), isEmpty);
+    });
 
     test('same-file short marker uses slots in the footnote batch', () async {
       final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
@@ -2402,47 +2803,96 @@ void main() {
       });
     }
 
-    for (final MapEntry<String, List<Map<String, Object?>>> malformed
-        in <String, List<Map<String, Object?>>>{
-          'missing id': <Map<String, Object?>>[
-            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
-          ],
-          'duplicate id': <Map<String, Object?>>[
-            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
-            <String, Object?>{'id': 'f0:p-1', 'html': '<p>重复脚注。</p>'},
-          ],
-          'unknown id': <Map<String, Object?>>[
-            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
-            <String, Object?>{'id': 'f9:p-1', 'html': '<p>未知脚注。</p>'},
-          ],
-          'empty html': <Map<String, Object?>>[
-            <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
-            <String, Object?>{'id': 'f1:p-1', 'html': ' '},
-          ],
-        }.entries) {
-      test('rejects ${malformed.key} instead of guessing ownership', () async {
-        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
-          malformed.value,
-        );
-        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
-          ..httpClientAdapter = adapter;
-
-        await expectLater(
-          EpubChapterTranslator().translateFootnoteBatchForTest(
-            dio: dio,
-            config: TranslationConfig.defaults().copyWith(
-              apiKey: 'sk-test',
-              targetLanguage: 'Chinese',
-              maxRetries: 1,
-            ),
-            references: <FootnoteBlockReference>[
-              _footnoteReference(0, 'First footnote.'),
-              _footnoteReference(1, 'Second footnote.'),
+    for (final MapEntry<String, _MalformedFootnoteCase> malformed
+        in <String, _MalformedFootnoteCase>{
+          'missing id': _MalformedFootnoteCase(
+            response: <Map<String, Object?>>[
+              <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
             ],
+            // f0 recovers on its single-reference retry; f1 still has no
+            // usable reply and degrades to its source HTML.
+            expected: <String, String>{
+              'f0:p-1': '<p>第一条脚注。</p>',
+              'f1:p-1': '<p>Second footnote.</p>',
+            },
           ),
-          throwsA(isA<FormatException>()),
-        );
-      });
+          'duplicate id': _MalformedFootnoteCase(
+            response: <Map<String, Object?>>[
+              <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+              <String, Object?>{'id': 'f0:p-1', 'html': '<p>重复脚注。</p>'},
+            ],
+            expected: <String, String>{
+              'f0:p-1': '<p>First footnote.</p>',
+              'f1:p-1': '<p>Second footnote.</p>',
+            },
+          ),
+          'unknown id': _MalformedFootnoteCase(
+            response: <Map<String, Object?>>[
+              <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+              <String, Object?>{'id': 'f9:p-1', 'html': '<p>未知脚注。</p>'},
+            ],
+            expected: <String, String>{
+              'f0:p-1': '<p>First footnote.</p>',
+              'f1:p-1': '<p>Second footnote.</p>',
+            },
+          ),
+          'empty html': _MalformedFootnoteCase(
+            response: <Map<String, Object?>>[
+              <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
+              <String, Object?>{'id': 'f1:p-1', 'html': ' '},
+            ],
+            expected: <String, String>{
+              'f0:p-1': '<p>First footnote.</p>',
+              'f1:p-1': '<p>Second footnote.</p>',
+            },
+          ),
+        }.entries) {
+      test(
+        'degrades ${malformed.key} instead of guessing ownership or aborting',
+        () async {
+          final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+            malformed.value.response,
+          );
+          final Dio dio = Dio(
+            BaseOptions(baseUrl: 'https://api.example.test/v1'),
+          )..httpClientAdapter = adapter;
+          final EpubChapterTranslator translator = EpubChapterTranslator();
+
+          final Map<String, String> translated = await translator
+              .translateFootnoteBatchForTest(
+                dio: dio,
+                config: TranslationConfig.defaults().copyWith(
+                  apiKey: 'sk-test',
+                  targetLanguage: 'Chinese',
+                  maxRetries: 1,
+                ),
+                references: <FootnoteBlockReference>[
+                  _footnoteReference(0, 'First footnote.'),
+                  _footnoteReference(1, 'Second footnote.'),
+                ],
+              );
+
+          // No id is ever guessed: each entry is either the model's reply
+          // for exactly that request id or the block's own source HTML, and
+          // the degraded blocks are reported instead of aborting the book.
+          expect(translated, malformed.value.expected);
+          final Set<String> degraded = translator.getDegradedBlockIdsForTest();
+          // Degraded marks are scoped to the owning chapter, so two
+          // footnotes that share block id 'p-1' record distinct entries.
+          expect(degraded, isNotEmpty);
+          expect(degraded, everyElement(endsWith('\u0000p-1')));
+          if (malformed.key == 'missing id') {
+            // Only the second footnote degrades here; its record must point
+            // at chapter 1, not chapter 0.
+            expect(degraded, <String>{
+              EpubChapterTranslator.degradedKeyForTest(
+                chapterPath: 'OPS/Text/note-1-fn.xhtml',
+                blockId: 'p-1',
+              ),
+            });
+          }
+        },
+      );
     }
   });
 
@@ -2665,7 +3115,9 @@ void main() {
         expect(translated, const <String>['<p>This block timed out.</p>']);
         expect(
           translator.getDegradedBlockIdsForTest(),
-          contains('timeout-block'),
+          contains(
+            EpubChapterTranslator.degradedKeyForTest(blockId: 'timeout-block'),
+          ),
         );
         expect(adapter.fetchCount, 3);
       },
@@ -2704,7 +3156,11 @@ void main() {
         ]);
         expect(
           translator.getDegradedBlockIdsForTest(),
-          contains('connection-timeout-block'),
+          contains(
+            EpubChapterTranslator.degradedKeyForTest(
+              blockId: 'connection-timeout-block',
+            ),
+          ),
         );
         expect(adapter.fetchCount, 2);
       },
@@ -2741,7 +3197,9 @@ void main() {
         config: config,
         blocks: const <ExtractedBlock>[first],
       );
-      expect(translator.getDegradedBlockIdsForTest(), <String>{'p-0'});
+      expect(translator.getDegradedBlockIdsForTest(), <String>{
+        EpubChapterTranslator.degradedKeyForTest(blockId: 'p-0'),
+      });
 
       final _SequencedHtmlBatchAdapter successAdapter =
           _SequencedHtmlBatchAdapter(<String>['<p>第二段。</p>']);
@@ -2791,7 +3249,11 @@ void main() {
         ]);
         expect(
           translator.getDegradedBlockIdsForTest(),
-          contains('timeout-protected-block'),
+          contains(
+            EpubChapterTranslator.degradedKeyForTest(
+              blockId: 'timeout-protected-block',
+            ),
+          ),
         );
         expect(adapter.fetchCount, 1);
       },
@@ -2831,7 +3293,11 @@ void main() {
         ]);
         expect(
           translator.getDegradedBlockIdsForTest(),
-          contains('connection-timeout-protected-block'),
+          contains(
+            EpubChapterTranslator.degradedKeyForTest(
+              blockId: 'connection-timeout-protected-block',
+            ),
+          ),
         );
         expect(adapter.fetchCount, 2);
       },
@@ -3754,6 +4220,19 @@ InspectedChapter _chapter({
     recommendedForTranslation: true,
     includeInTranslation: includeInTranslation,
   );
+}
+
+/// One malformed footnote-batch case: the model's reply plus the map the
+/// translator is expected to produce for it (model replies keyed by their
+/// exact request ids, degraded blocks falling back to source HTML).
+class _MalformedFootnoteCase {
+  const _MalformedFootnoteCase({
+    required this.response,
+    required this.expected,
+  });
+
+  final List<Map<String, Object?>> response;
+  final Map<String, String> expected;
 }
 
 FootnoteBlockReference _footnoteReference(

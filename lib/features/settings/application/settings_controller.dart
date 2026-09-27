@@ -15,8 +15,28 @@ final settingsRepositoryProvider = Provider<TranslationRepository>(
 
 final settingsProvider =
     StateNotifierProvider<SettingsController, TranslationConfig>(
-      (ref) => SettingsController(ref.watch(settingsStoreProvider)),
+      (ref) => SettingsController(
+        ref.watch(settingsStoreProvider),
+        onSaveError: (String? error) =>
+            ref.read(settingsSaveErrorProvider.notifier).state = (
+              id: DateTime.now().microsecondsSinceEpoch,
+              message: error,
+            ),
+      ),
     );
+
+/// Holds the latest settings persistence failure event, if any.
+///
+/// Settings writes (secret store + settings.json) can fail after the UI
+/// already shows the new value; this surfaces the failure so the settings
+/// page can warn the user instead of failing silently.
+///
+/// Each failure is wrapped in a distinct event (unique id + message) instead
+/// of a plain string: Riverpod suppresses state updates that equal the current
+/// value, so two consecutive failures with identical text would otherwise only
+/// notify once and the second SnackBar would be swallowed.
+final settingsSaveErrorProvider =
+    StateProvider<({int id, String? message})?>((ref) => null);
 
 final connectionTestProvider =
     StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>(
@@ -24,11 +44,16 @@ final connectionTestProvider =
     );
 
 class SettingsController extends StateNotifier<TranslationConfig> {
-  SettingsController(this._store) : super(TranslationConfig.defaults()) {
+  SettingsController(this._store, {this.onSaveError})
+    : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
 
   final SettingsStore _store;
+
+  /// Called with the failure message when persisting settings fails, or with
+  /// null after a successful persist (clears a previous error).
+  final void Function(String? error)? onSaveError;
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
 
@@ -71,7 +96,15 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return;
     }
     state = next;
-    await _persist(next, explicitSecretMutations: explicitSecretMutations);
+    try {
+      await _persist(next, explicitSecretMutations: explicitSecretMutations);
+      onSaveError?.call(null);
+    } catch (error) {
+      // The UI already shows the new value, so a silent failure would leave
+      // it lying about what is actually persisted. Surface it instead of
+      // letting the future go unhandled at the call site.
+      onSaveError?.call('$error');
+    }
   }
 
   Future<void> setApiBaseUrl(String value) => _update((config) {

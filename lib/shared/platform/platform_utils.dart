@@ -14,12 +14,16 @@ class PlatformUtils {
 
   static bool get supportsDirectoryPicker => !isAndroid;
 
-  static Future<String?> pickEpubFile() {
-    return NativePlatformBridge.pickEpubFile();
+  static Future<String?> pickEpubFile({
+    void Function(WindowsPathNotice notice)? onWindowsNotice,
+  }) {
+    return NativePlatformBridge.pickEpubFile(onWindowsNotice: onWindowsNotice);
   }
 
-  static Future<String?> pickDirectory() {
-    return NativePlatformBridge.pickDirectory();
+  static Future<String?> pickDirectory({
+    void Function(WindowsPathNotice notice)? onWindowsNotice,
+  }) {
+    return NativePlatformBridge.pickDirectory(onWindowsNotice: onWindowsNotice);
   }
 
   static Future<String?> saveToDownloads({
@@ -35,10 +39,12 @@ class PlatformUtils {
   static Future<void> shareFile({
     required String sourcePath,
     required String displayName,
+    String? chooserTitle,
   }) {
     return NativePlatformBridge.shareFile(
       sourcePath: sourcePath,
       displayName: displayName,
+      chooserTitle: chooserTitle,
     );
   }
 

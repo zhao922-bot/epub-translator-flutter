@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Tight grants only: shareFile() shares either a staging copy under
+     cacheDir/share_staging, or the translated EPUB itself, which always
+     lives under filesDir/translated_epubs on Android (the output
+     directory is fixed there; Android has no directory picker). Nothing
+     else under filesDir/ or cacheDir/ is ever handed to another app. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <files-path
-        name="files"
-        path="." />
+        name="translated_epubs"
+        path="translated_epubs/" />
     <cache-path
-        name="cache"
-        path="." />
+        name="share_staging"
+        path="share_staging/" />
 </paths>

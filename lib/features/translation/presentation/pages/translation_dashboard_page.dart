@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/platform/android_service_bridge.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../settings/application/settings_controller.dart';
 import '../../application/translation_dashboard_controller.dart';
@@ -52,6 +53,26 @@ class TranslationDashboardPage extends ConsumerWidget {
     final bool showStyleProfile =
         state.config.styleProfileEnabled && hasInspected;
 
+    // Storage permission permanently denied (Android 6-9): guide the user to
+    // the app settings page. permissionNoticeId is bumped by the controller
+    // once per denial so the SnackBar is not re-shown on rebuilds.
+    ref.listen(
+      translationDashboardProvider.select((s) => s.permissionNoticeId),
+      (previous, next) {
+        if (next > (previous ?? 0)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(strings.storagePermissionPermanentlyDenied),
+              action: SnackBarAction(
+                label: strings.openAppSettingsAction,
+                onPressed: () => AndroidServiceBridge.openAppSettings(),
+              ),
+            ),
+          );
+        }
+      },
+    );
+
     // Primary actions only when they add value beyond the drop zone.
     final List<Widget> primaryActions = <Widget>[];
     if (!isRunActive && canTranslate) {
@@ -98,6 +119,8 @@ class TranslationDashboardPage extends ConsumerWidget {
               estimate: state.runEstimate,
               canCancel: isRunActive,
               onCancelPressed: controller.requestCancel,
+              isSaving: state.isSaving,
+              isSharing: state.isSharing,
               actionableErrorTitle: state.actionableError?.title,
               actionableErrorBody: state.actionableError?.message,
               actionableErrorActionLabel: state.actionableError?.actionLabel,

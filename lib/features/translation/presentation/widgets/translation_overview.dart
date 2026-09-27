@@ -19,6 +19,11 @@ class TranslationOverview extends StatelessWidget {
     this.estimate,
     this.onCancelPressed,
     this.canCancel = false,
+    // H2: while a save/share is in flight the controller sets these so the
+    // buttons render disabled (greyed out, onPressed null), preventing
+    // double-tap duplicate files. Defaults keep existing callers working.
+    this.isSaving = false,
+    this.isSharing = false,
     this.actionableErrorTitle,
     this.actionableErrorBody,
     this.actionableErrorActionLabel,
@@ -32,6 +37,8 @@ class TranslationOverview extends StatelessWidget {
   final VoidCallback onExportPressed;
   final VoidCallback onSaveToDownloadsPressed;
   final bool canTranslate;
+  final bool isSaving;
+  final bool isSharing;
   final TranslationRunEstimate? estimate;
   final VoidCallback? onCancelPressed;
   final bool canCancel;
@@ -72,7 +79,9 @@ class TranslationOverview extends StatelessWidget {
       variant: SectionCardVariant.standard,
       trailing: canExport
           ? FilledButton.tonalIcon(
-              onPressed: onExportPressed,
+              // H2: null onPressed renders the button disabled while a
+              // share is in flight.
+              onPressed: isSharing ? null : onExportPressed,
               icon: Icon(
                 PlatformUtils.isAndroid
                     ? Icons.ios_share_rounded
@@ -101,6 +110,7 @@ class TranslationOverview extends StatelessWidget {
               actionLabel: actionableErrorActionLabel,
               onAction: onActionableErrorPressed,
               onDismiss: onDismissActionableError,
+              okLabel: strings.dialogOk,
             ),
             const SizedBox(height: 12),
           ],
@@ -130,7 +140,7 @@ class TranslationOverview extends StatelessWidget {
           ],
           const SizedBox(height: 12),
           Semantics(
-            label: 'Translation progress $percent%',
+            label: strings.translationProgressSemantics(percent),
             child: ClipRRect(
               borderRadius: BorderRadius.circular(999),
               child: LinearProgressIndicator(value: progress, minHeight: 8),
@@ -238,7 +248,9 @@ class TranslationOverview extends StatelessWidget {
                 ),
                 if (PlatformUtils.isAndroid)
                   TextButton(
-                    onPressed: onSaveToDownloadsPressed,
+                    // H2: null onPressed renders the button disabled while
+                    // a save is in flight.
+                    onPressed: isSaving ? null : onSaveToDownloadsPressed,
                     child: Text(strings.saveToDownloads),
                   ),
               ],
@@ -321,6 +333,7 @@ class _ActionableErrorBanner extends StatelessWidget {
     this.actionLabel,
     this.onAction,
     this.onDismiss,
+    required this.okLabel,
   });
 
   final String title;
@@ -328,6 +341,7 @@ class _ActionableErrorBanner extends StatelessWidget {
   final String? actionLabel;
   final VoidCallback? onAction;
   final VoidCallback? onDismiss;
+  final String okLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -368,7 +382,7 @@ class _ActionableErrorBanner extends StatelessWidget {
                     child: Text(actionLabel!),
                   ),
                 if (onDismiss != null)
-                  TextButton(onPressed: onDismiss, child: const Text('OK')),
+                  TextButton(onPressed: onDismiss, child: Text(okLabel)),
               ],
             ),
           ],

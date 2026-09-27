@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
@@ -133,6 +134,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
   String? lastOutputDirectory;
   int styleGenerateCount = 0;
   TranslationStyleProfile? lastConfirmedStyleProfile;
+  TranslationStyleProfile generatedStyleProfile = TranslationStyleProfile.empty;
 
   @override
   Future<void> cancelJob(String jobId) async {}
@@ -195,7 +197,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     TranslationCancellationCheck? isCancelled,
   }) async {
     styleGenerateCount += 1;
-    return TranslationStyleProfile.empty;
+    return generatedStyleProfile;
   }
 
   int translateCount = 0;
@@ -475,6 +477,56 @@ class _RestorationCancellationRepository
     restorationStarted.complete();
     await releaseTranslation.future;
     throw const TranslationCancelledException();
+  }
+}
+
+/// Emits one cache-restoration progress report that carries a stale
+/// checkpoint (progress 0.9 / 9 blocks) while only 3 blocks are actually
+/// verified, then blocks so the test can inspect the controller state.
+class _StaleCheckpointProgressRepository
+    extends _SuccessfulInspectionRepository {
+  final Completer<void> progressEmitted = Completer<void>();
+  final Completer<void> releaseTranslation = Completer<void>();
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    onProgress?.call(
+      TranslationJob(
+        id: 'stale-checkpoint',
+        inputPath: inputPath,
+        outputPath: outputDirectory,
+        status: TranslationJobStatus.running,
+        phase: TranslationJobPhase.cacheRestoration,
+        progress: 0.9,
+        completedBlocks: 9,
+        totalBlocks: 10,
+        cachedBlocks: 3,
+        resumedBlocks: 3,
+        resumeCheckpointBlocks: 9,
+        cacheScanScannedBlocks: 4,
+        cacheScanTotalBlocks: 10,
+      ),
+      'Cache scan 4/10: verified 3 reusable blocks.',
+    );
+    progressEmitted.complete();
+    await releaseTranslation.future;
+    return super.translateChapters(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      config: config,
+      chapters: chapters,
+      confirmedStyleProfile: confirmedStyleProfile,
+      onProgress: onProgress,
+      isCancelled: isCancelled,
+    );
   }
 }
 
@@ -909,6 +961,7 @@ void main() {
 
   test(
     'retries a failed translation by inspecting then translating again',
+    testOn: 'windows',
     () async {
       final _SuccessfulInspectionRepository repository =
           _SuccessfulInspectionRepository();
@@ -968,7 +1021,7 @@ void main() {
   );
 
   test(
-    'retry immediately exposes checkpoint as cache restoration progress',
+    'retry starts cache restoration at zero until the scan verifies the checkpoint',
     () async {
       final _BlockingTranslationRepository repository =
           _BlockingTranslationRepository(blockCount: 1643);
@@ -1003,12 +1056,50 @@ void main() {
       await repository.translationStarted.future;
 
       expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
-      expect(controller.state.job?.completedBlocks, 605);
+      // The checkpoint is unverified until the cache scan runs: progress and
+      // counters start at zero while resumeCheckpointBlocks keeps the
+      // pending figure for the "to verify" UI line.
+      expect(controller.state.job?.completedBlocks, 0);
       expect(controller.state.job?.resumeCheckpointBlocks, 605);
-      expect(controller.state.job?.progress, closeTo(605 / 1643, 0.0001));
+      expect(controller.state.job?.progress, 0);
 
       repository.releaseTranslation.complete();
       await retry;
+    },
+  );
+
+  test(
+    'cache restoration progress bar follows verified blocks, not the stale checkpoint',
+    () async {
+      final _StaleCheckpointProgressRepository repository =
+          _StaleCheckpointProgressRepository();
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      controller.setInputPath(r'C:\\Books\\book.epub');
+      await controller.startInspection();
+
+      final Future<void> run = controller.startTranslation();
+      await repository.progressEmitted.future;
+
+      expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
+      // The repository reported the old checkpoint (0.9 / 9 blocks); the bar
+      // must show the verified fraction (3/10) instead.
+      expect(controller.state.job?.progress, closeTo(0.3, 0.0001));
+      expect(controller.state.job?.cachedBlocks, 3);
+      // completedBlocks intentionally keeps the checkpoint during restoration
+      // (resume semantics); only the bar is re-based.
+      expect(controller.state.job?.completedBlocks, 9);
+      expect(controller.state.job?.resumeCheckpointBlocks, 9);
+
+      repository.releaseTranslation.complete();
+      await run;
+      expect(controller.state.job?.status, TranslationJobStatus.completed);
     },
   );
 
@@ -1072,11 +1163,13 @@ void main() {
       await repository.secondTranslationStarted.future;
 
       expect(controller.state.job?.phase, TranslationJobPhase.cacheRestoration);
-      expect(controller.state.job?.completedBlocks, 2);
+      // Counters start at zero while the scan verifies the checkpoint; only
+      // resumeCheckpointBlocks keeps the pending figure.
+      expect(controller.state.job?.completedBlocks, 0);
       expect(controller.state.job?.resumeCheckpointBlocks, 2);
       expect(controller.state.job?.errorMessage, isNull);
       expect(controller.state.jobHistory.first.errorMessage, isNull);
-      expect(controller.state.jobHistory.first.completedBlocks, 2);
+      expect(controller.state.jobHistory.first.completedBlocks, 0);
 
       repository.releaseSecondTranslation.complete();
       await retry;
@@ -1297,7 +1390,71 @@ void main() {
     expect(repository.startCount, 1);
     expect(repository.translateCount, 1);
     expect(controller.state.logs, isNot(contains('Only failed or cancelled')));
+    // The run really started, so the "continuing" log is accurate here.
+    expect(
+      controller.state.logs,
+      contains('Inspection ready. Continuing with translation for the retry.'),
+    );
   });
+
+  test(
+    'retry does not claim to continue translation when style confirmation blocks it',
+    () async {
+      final _SuccessfulInspectionRepository repository =
+          _SuccessfulInspectionRepository();
+      // A non-empty generated profile stays unconfirmed, so the style gate
+      // really blocks translation (an empty profile would auto-confirm).
+      repository.generatedStyleProfile =
+          const TranslationStyleProfile(primaryGenre: 'Literary fiction');
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(
+              initial: const <TranslationJob>[
+                TranslationJob(
+                  id: 'failed-unconfirmed-style',
+                  inputPath: 'unconfirmed.epub',
+                  outputPath: 'unconfirmed-out',
+                  status: TranslationJobStatus.failed,
+                  phase: TranslationJobPhase.translation,
+                  progress: 0.2,
+                  currentChapter: 'Translation failed',
+                  completedBlocks: 2,
+                  totalBlocks: 10,
+                  styleProfileEnabled: true,
+                  styleProfileConfirmed: false,
+                ),
+              ],
+            ),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: true),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      await controller.retryJob('failed-unconfirmed-style');
+
+      // Inspection ran, but translation never started: the style gate stopped
+      // it, so the "continuing" log must not appear. The gate's own
+      // "confirm style profile" log covers the situation instead.
+      expect(repository.startCount, 1);
+      expect(repository.translateCount, 0);
+      expect(
+        controller.state.logs,
+        isNot(
+          contains(
+            'Inspection ready. Continuing with translation for the retry.',
+          ),
+        ),
+      );
+      expect(
+        controller.state.logs,
+        contains(
+          'Confirm the book style profile before starting full-book translation.',
+        ),
+      );
+    },
+  );
 
   test('handles an all-degraded result as a retryable failure', () async {
     final TranslationDashboardController controller =
@@ -1418,7 +1575,10 @@ void main() {
     },
   );
 
-  test('accepts a dropped EPUB path and infers the output directory', () async {
+  test(
+    'accepts a dropped EPUB path and infers the output directory',
+    testOn: 'windows',
+    () async {
     final TranslationDashboardController controller =
         TranslationDashboardController(
           repository: _SuccessfulInspectionRepository(),
@@ -1717,6 +1877,75 @@ void main() {
 
     expect(controller.state.inputPath, 'C:\\Books\\retry.epub');
     expect(controller.state.outputDirectory, 'C:\\RetryOutput');
+  });
+
+  test('session restore skips an EPUB path that no longer exists', () async {
+    final _ControlledSessionPathStore pathStore = _ControlledSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+    final String sep = Platform.pathSeparator;
+    final String missingEpub =
+        '${Directory.systemTemp.path}${sep}epub-translator-missing-test${sep}gone.epub';
+    final String missingDir =
+        '${Directory.systemTemp.path}${sep}epub-translator-missing-test${sep}out';
+
+    pathStore.loadCompleter.complete((
+      inputPath: missingEpub,
+      outputDirectory: missingDir,
+    ));
+    // The restore chain includes a real File.exists() stat call, which needs
+    // actual event-loop turns; two zero-duration delays starve under load.
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    // The dead EPUB path is not restored and no "restored" log is emitted...
+    expect(controller.state.inputPath, isEmpty);
+    expect(
+      controller.state.logs.where(
+        (String log) => log.startsWith('Restored last EPUB'),
+      ),
+      isEmpty,
+    );
+    // ...but the output directory is restored as-is; translation creates it
+    // when missing.
+    expect(controller.state.outputDirectory, missingDir);
+    expect(
+      controller.state.logs.any(
+        (String log) => log.startsWith('Restored last output directory'),
+      ),
+      isTrue,
+    );
+  });
+
+  test('session restore keeps an EPUB path that still exists', () async {
+    final Directory tempDir = await Directory.systemTemp.createTemp(
+      'epub_translator_session_',
+    );
+    addTearDown(() => tempDir.delete(recursive: true));
+    final File book = File(
+      '${tempDir.path}${Platform.pathSeparator}book.epub',
+    );
+    await book.writeAsString('fake epub');
+
+    final _ControlledSessionPathStore pathStore = _ControlledSessionPathStore();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          pathStore: pathStore,
+        );
+
+    pathStore.loadCompleter.complete((
+      inputPath: book.path,
+      outputDirectory: tempDir.path,
+    ));
+    // The restore chain includes a real File.exists() stat call, which needs
+    // actual event-loop turns; two zero-duration delays starve under load.
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+
+    expect(controller.state.inputPath, book.path);
+    expect(controller.state.logs, contains('Restored last EPUB: book.epub'));
   });
 
   test('manual EPUB path is remembered without starting inspection', () async {

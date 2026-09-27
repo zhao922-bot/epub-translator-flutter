@@ -135,7 +135,7 @@ class _TranslationStyleProfileCardState
         title: widget.strings.styleProfileSectionTitle,
         trailing: TextButton(
           onPressed: () => setState(() => _showConfirmedDetails = true),
-          child: Text(widget.strings.expandLogs),
+          child: Text(widget.strings.showDetails),
         ),
         child: Text(
           [
@@ -173,7 +173,7 @@ class _TranslationStyleProfileCardState
               alignment: Alignment.centerRight,
               child: TextButton(
                 onPressed: () => setState(() => _showConfirmedDetails = false),
-                child: Text(widget.strings.collapseLogs),
+                child: Text(widget.strings.hideDetails),
               ),
             ),
           Text(
@@ -262,18 +262,18 @@ class _TranslationStyleProfileCardState
           ),
           const SizedBox(height: 6),
           SegmentedButton<TranslationStyleConfidence>(
-            segments: const <ButtonSegment<TranslationStyleConfidence>>[
+            segments: <ButtonSegment<TranslationStyleConfidence>>[
               ButtonSegment<TranslationStyleConfidence>(
                 value: TranslationStyleConfidence.high,
-                label: Text('high'),
+                label: Text(widget.strings.styleConfidenceHigh),
               ),
               ButtonSegment<TranslationStyleConfidence>(
                 value: TranslationStyleConfidence.medium,
-                label: Text('medium'),
+                label: Text(widget.strings.styleConfidenceMedium),
               ),
               ButtonSegment<TranslationStyleConfidence>(
                 value: TranslationStyleConfidence.low,
-                label: Text('low'),
+                label: Text(widget.strings.styleConfidenceLow),
               ),
             ],
             selected: <TranslationStyleConfidence>{widget.profile.confidence},

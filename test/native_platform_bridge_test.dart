@@ -59,4 +59,105 @@ $OutputEncoding = $utf8NoBom
     },
     skip: Platform.isWindows ? null : 'Windows-only DPAPI storage test.',
   );
+
+  test('parses LongPathsEnabled registry output', () {
+    expect(NativePlatformBridge.parseLongPathsEnabledOutput('1\r\n'), isTrue);
+    expect(NativePlatformBridge.parseLongPathsEnabledOutput('1'), isTrue);
+    // Missing value prints nothing; missing counts as disabled.
+    expect(NativePlatformBridge.parseLongPathsEnabledOutput(''), isFalse);
+    expect(NativePlatformBridge.parseLongPathsEnabledOutput('0'), isFalse);
+    expect(NativePlatformBridge.parseLongPathsEnabledOutput('nope'), isFalse);
+  });
+
+  test('builds Linux secret-tool arguments', () {
+    expect(
+      NativePlatformBridge.linuxSecretLookupArgs(
+        'epub-translator',
+        'api_key',
+      ),
+      <String>[
+        'secret-tool',
+        'lookup',
+        'service',
+        'epub-translator',
+        'name',
+        'api_key',
+      ],
+    );
+    expect(
+      NativePlatformBridge.linuxSecretStoreArgs('epub-translator', 'api_key'),
+      <String>[
+        'secret-tool',
+        'store',
+        '--label',
+        'EPUB Translator (api_key)',
+        'service',
+        'epub-translator',
+        'name',
+        'api_key',
+      ],
+    );
+    expect(
+      NativePlatformBridge.linuxSecretClearArgs('epub-translator', 'api_key'),
+      <String>[
+        'secret-tool',
+        'clear',
+        'service',
+        'epub-translator',
+        'name',
+        'api_key',
+      ],
+    );
+  });
+
+  test('builds macOS security store args for interactive mode', () {
+    // Writes go through `security -i`: the full command (with the
+    // shell-quoted password) is fed via stdin, so the secret never appears in
+    // argv (visible via `ps`) and never passes through readpassphrase(3),
+    // which prefers /dev/tty over the pipe when a controlling terminal
+    // exists.
+    expect(
+      NativePlatformBridge.macosSecretStoreArgs(),
+      <String>['security', '-i'],
+    );
+
+    expect(
+      NativePlatformBridge.macosSecretLookupArgs(
+        'epub-translator',
+        'api_key',
+      ),
+      <String>[
+        'security',
+        'find-generic-password',
+        '-a',
+        'api_key',
+        '-s',
+        'epub-translator',
+        '-w',
+      ],
+    );
+    expect(
+      NativePlatformBridge.macosSecretDeleteArgs('epub-translator', 'api_key'),
+      <String>[
+        'security',
+        'delete-generic-password',
+        '-a',
+        'api_key',
+        '-s',
+        'epub-translator',
+      ],
+    );
+  });
+
+  test(
+    'returns null for a missing Linux secret without throwing',
+    () async {
+      // Whether or not secret-tool is installed, looking up a never-stored
+      // key must degrade to null so desktop startup is never interrupted.
+      final String name =
+          'codex_test_missing_${DateTime.now().microsecondsSinceEpoch}';
+      expect(await NativePlatformBridge.readSecret(name), isNull);
+    },
+    skip: Platform.isLinux ? null : 'Linux-only secret-tool lookup test.',
+  );
 }

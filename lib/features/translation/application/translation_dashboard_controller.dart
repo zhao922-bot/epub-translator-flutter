@@ -2,11 +2,14 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
+import '../../../../shared/platform/android_service_bridge.dart';
+import '../../../../shared/platform/native_platform_bridge.dart';
 import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/security/sensitive_text.dart';
 import '../../settings/application/settings_controller.dart';
@@ -91,6 +94,14 @@ class TranslationDashboardState {
     this.styleProfile = TranslationStyleProfile.empty,
     this.styleProfileConfirmed = false,
     this.isGeneratingStyleProfile = false,
+    // H2: mirrors of the controller's _isSaving/_isSharing re-entrancy
+    // guards so the UI can disable the buttons while a save/share runs.
+    this.isSaving = false,
+    this.isSharing = false,
+    // C-M6: bumped every time a permanently-denied storage permission is
+    // reported; UI layers can listen and show a Snackbar with an
+    // "open app settings" action.
+    this.permissionNoticeId = 0,
   });
 
   final TranslationConfig config;
@@ -105,6 +116,9 @@ class TranslationDashboardState {
   final TranslationStyleProfile styleProfile;
   final bool styleProfileConfirmed;
   final bool isGeneratingStyleProfile;
+  final bool isSaving;
+  final bool isSharing;
+  final int permissionNoticeId;
 
   bool get isRunActive {
     final TranslationJobStatus? status = job?.status;
@@ -149,6 +163,9 @@ class TranslationDashboardState {
     Object? styleProfile = _unset,
     bool? styleProfileConfirmed,
     bool? isGeneratingStyleProfile,
+    bool? isSaving,
+    bool? isSharing,
+    int? permissionNoticeId,
   }) {
     return TranslationDashboardState(
       config: config ?? this.config,
@@ -171,6 +188,9 @@ class TranslationDashboardState {
           styleProfileConfirmed ?? this.styleProfileConfirmed,
       isGeneratingStyleProfile:
           isGeneratingStyleProfile ?? this.isGeneratingStyleProfile,
+      isSaving: isSaving ?? this.isSaving,
+      isSharing: isSharing ?? this.isSharing,
+      permissionNoticeId: permissionNoticeId ?? this.permissionNoticeId,
     );
   }
 
@@ -213,6 +233,26 @@ class TranslationDashboardController
   defaultOutputDirectoryResolver;
   bool _cancelRequested = false;
   int _cancellationRevision = 0;
+  // Synchronous re-entrancy guards: checked and set before the first await so
+  // a rapid double-tap cannot start two overlapping async flows.
+  bool _styleProfileInFlight = false;
+  bool _isRetrying = false;
+  // H2: save/share re-entrancy guards, checked and set before the first
+  // await so a rapid double-tap cannot produce duplicate files. Mirrored
+  // into state.isSaving/isSharing so the UI can disable the buttons; works
+  // together with the native in-flight guard (Track B).
+  bool _isSaving = false;
+  bool _isSharing = false;
+  // C-M7: last values pushed to the Android foreground-service
+  // notification; used to throttle updates (every 5% or on chapter change).
+  int _lastFgServicePercent = -1;
+  String? _lastFgServiceChapter;
+  // API key in effect when the current/last run started, used for error
+  // redaction even if the user changes the key mid-run.
+  String? _runApiKey;
+  // Monotonic suffix so two jobs created within the same millisecond still get
+  // distinct ids.
+  int _jobIdSequence = 0;
   Stopwatch? _translationStopwatch;
   Future<void> _pendingHistorySave = Future<void>.value();
   ({String inputPath, String outputDirectory})? _pendingSessionPaths;
@@ -244,9 +284,27 @@ class TranslationDashboardController
     if (_logIfRunActive(_s.logSelectAfterRun)) {
       return;
     }
+    // Windows path observations (dialog opened / long path / OneDrive) are
+    // fired by the bridge; dialogOpened is time-sensitive so it is logged
+    // immediately, the path-dependent ones after a path is chosen.
+    final List<WindowsPathNotice> pendingNotices = <WindowsPathNotice>[];
     String? selectedPath;
     try {
-      selectedPath = await PlatformUtils.pickEpubFile();
+      // Guard against the native side never responding (e.g. the Android
+      // activity was destroyed while the picker was open): treat it like a
+      // cancelled pick instead of hanging forever.
+      selectedPath = await PlatformUtils.pickEpubFile(
+        onWindowsNotice: (WindowsPathNotice notice) {
+          if (notice == WindowsPathNotice.dialogOpened) {
+            _logWindowsPathNotice(notice, null);
+          } else {
+            pendingNotices.add(notice);
+          }
+        },
+      ).timeout(
+        const Duration(minutes: 5),
+        onTimeout: () => null,
+      );
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
@@ -258,6 +316,9 @@ class TranslationDashboardController
     }
     if (selectedPath == null || selectedPath.isEmpty) {
       return;
+    }
+    for (final WindowsPathNotice notice in pendingNotices) {
+      _logWindowsPathNotice(notice, selectedPath);
     }
     await _acceptInputPath(selectedPath, dropped: false);
   }
@@ -286,9 +347,37 @@ class TranslationDashboardController
       return;
     }
 
-    final String? selectedDirectory = await PlatformUtils.pickDirectory();
+    String? selectedDirectory;
+    final List<WindowsPathNotice> pendingNotices = <WindowsPathNotice>[];
+    try {
+      // Same guard as pickInputPath: never let a hanging or crashing native
+      // dialog take down the UI or hang forever.
+      selectedDirectory = await PlatformUtils.pickDirectory(
+        onWindowsNotice: (WindowsPathNotice notice) {
+          if (notice == WindowsPathNotice.dialogOpened) {
+            _logWindowsPathNotice(notice, null);
+          } else {
+            pendingNotices.add(notice);
+          }
+        },
+      ).timeout(
+        const Duration(minutes: 5),
+        onTimeout: () => null,
+      );
+    } catch (error) {
+      state = state.copyWith(
+        logs: <String>[
+          ...state.logs,
+          _s.logCouldNotSelectDirectory(_safeErrorText(error)),
+        ],
+      );
+      return;
+    }
     if (selectedDirectory == null || selectedDirectory.isEmpty) {
       return;
+    }
+    for (final WindowsPathNotice notice in pendingNotices) {
+      _logWindowsPathNotice(notice, selectedDirectory);
     }
     _sessionPathRevision += 1;
     state = state.copyWith(
@@ -469,6 +558,18 @@ class TranslationDashboardController
   }
 
   Future<void> generateStyleProfile() async {
+    if (_styleProfileInFlight) {
+      return;
+    }
+    _styleProfileInFlight = true;
+    try {
+      await _generateStyleProfile();
+    } finally {
+      _styleProfileInFlight = false;
+    }
+  }
+
+  Future<void> _generateStyleProfile() async {
     if (!await _waitForSettingsReady()) {
       return;
     }
@@ -495,6 +596,7 @@ class TranslationDashboardController
     }
 
     _cancelRequested = false;
+    _runApiKey = state.config.apiKey;
     state = state.copyWith(
       isGeneratingStyleProfile: true,
       styleProfileConfirmed: false,
@@ -659,12 +761,13 @@ class TranslationDashboardController
         ? inferredOutputDirectory
         : state.outputDirectory;
     _cancelRequested = false;
+    _runApiKey = state.config.apiKey;
 
     state = state.copyWith(
       outputDirectory: outputDirectory,
       actionableError: null,
       job: TranslationJob(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        id: _newJobId(),
         inputPath: inputPath,
         outputPath: outputDirectory,
         status: TranslationJobStatus.queued,
@@ -736,7 +839,7 @@ class TranslationDashboardController
             errorMessage: safeError,
           ) ??
           TranslationJob(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
+            id: _newJobId(),
             inputPath: state.inputPath,
             outputPath: outputDirectory,
             status: TranslationJobStatus.failed,
@@ -763,18 +866,39 @@ class TranslationDashboardController
     }
   }
 
-  Future<void> startTranslation() async {
+  /// While the repository is still verifying the local block cache, its
+  /// progress reports carry the previous run's checkpoint as `progress`.
+  /// Drive the progress bar from the verified block count instead so it
+  /// never shows a stale checkpoint that jumps back down once the scan
+  /// finishes. `completedBlocks` keeps the checkpoint on purpose (see
+  /// `_confirmedProgressBlocks`); only the bar is re-based.
+  TranslationJob _verifiedCacheProgress(TranslationJob job) {
+    if (job.phase != TranslationJobPhase.cacheRestoration) {
+      return job;
+    }
+    final double verified = job.totalBlocks <= 0
+        ? 0.0
+        : (job.cachedBlocks / job.totalBlocks).clamp(0.0, 1.0).toDouble();
+    return job.copyWith(progress: verified);
+  }
+
+  /// Starts translation for the inspected selection.
+  ///
+  /// Returns true when the run actually started; false when a guard stopped
+  /// it (settings not ready, another run active, nothing inspected, or the
+  /// style-profile confirmation gate).
+  Future<bool> startTranslation({bool logRetryContinuation = false}) async {
     if (!await _waitForSettingsReady()) {
-      return;
+      return false;
     }
     if (_logIfRunActive(_s.logRunAlreadyActiveTranslate)) {
-      return;
+      return false;
     }
     if (state.inspectedChapters.isEmpty) {
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logInspectBeforeTranslate],
       );
-      return;
+      return false;
     }
 
     final List<InspectedChapter> selectedChapters = state.inspectedChapters
@@ -788,16 +912,17 @@ class TranslationDashboardController
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logNoChaptersChecked],
       );
-      return;
+      return false;
     }
     if (selectedBlocks > 0 && state.requiresStyleProfileConfirmation) {
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logConfirmStyleBeforeTranslate],
       );
-      return;
+      return false;
     }
 
     _cancelRequested = false;
+    _runApiKey = state.config.apiKey;
     _translationStopwatch = Stopwatch()..start();
     final TranslationJob? currentJob = state.job;
     final bool currentJobIsResumable =
@@ -824,19 +949,19 @@ class TranslationDashboardController
       0,
       selectedBlocks,
     );
-    final double checkpointProgress = selectedBlocks == 0
-        ? 0
-        : checkpointBlocks / selectedBlocks;
+    // The checkpoint is unverified until the cache scan runs: the progress
+    // bar and block counters start at zero while `resumeCheckpointBlocks`
+    // keeps the pending figure (the UI labels it as "to verify").
     final TranslationJob queuedJob =
         state.job?.copyWith(
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
-          progress: checkpointProgress,
+          progress: 0,
           currentChapter: 'Restoring cached translations',
           currentBlock: null,
           completedFiles: 0,
           totalFiles: selectedChapters.length,
-          completedBlocks: checkpointBlocks,
+          completedBlocks: 0,
           totalBlocks: selectedBlocks,
           cachedBlocks: 0,
           resumedBlocks: 0,
@@ -850,16 +975,16 @@ class TranslationDashboardController
           styleProfileEnabled: state.config.styleProfileEnabled,
         ) ??
         TranslationJob(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          id: _newJobId(),
           inputPath: state.inputPath,
           outputPath: state.outputDirectory,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
-          progress: checkpointProgress,
+          progress: 0,
           currentChapter: 'Restoring cached translations',
           completedFiles: 0,
           totalFiles: selectedChapters.length,
-          completedBlocks: checkpointBlocks,
+          completedBlocks: 0,
           totalBlocks: selectedBlocks,
           resumeCheckpointBlocks: checkpointBlocks,
           cacheScanScannedBlocks: 0,
@@ -879,6 +1004,10 @@ class TranslationDashboardController
       logs: <String>[
         ...state.logs,
         _s.logQueuedTranslation(selectedChapters.length, selectedBlocks),
+        // Only logged when the retry path asked for it: this state update
+        // happens after every early-return gate, so the line always precedes
+        // any run output and only appears when the run really started.
+        if (logRetryContinuation) _s.logRetryContinueTranslate,
         if (estimate != null)
           _s.logRoughLoad(
             estimate.estimatedApiBatches,
@@ -889,6 +1018,9 @@ class TranslationDashboardController
     );
 
     bool cacheRestorationLogged = false;
+    // C-M7: keep the run alive under Doze via the Android foreground service
+    // (Track B native side); stopped in the finally below on every exit path.
+    _startTranslationForegroundService();
     try {
       final TranslationRunResult result = await repository.translateChapters(
         inputPath: state.inputPath,
@@ -904,7 +1036,7 @@ class TranslationDashboardController
             return;
           }
           final TranslationJob progressJob = _translationHistoryJob(
-            job.copyWith(errorMessage: null),
+            _verifiedCacheProgress(job.copyWith(errorMessage: null)),
           );
           final List<String> nextLogs = <String>[
             ...state.logs,
@@ -929,6 +1061,7 @@ class TranslationDashboardController
             runEstimate: _buildEstimate(job: progressJob),
             logs: nextLogs,
           );
+          _updateTranslationForegroundService(progressJob);
           _persistProgressHistoryIfDue();
         },
         isCancelled: () => _cancelRequested,
@@ -985,7 +1118,8 @@ class TranslationDashboardController
       _translationStopwatch?.stop();
     } catch (error) {
       if (_handleCancellation(error)) {
-        return;
+        // The run started and was then cancelled; report it as started.
+        return true;
       }
       final String safeError = _safeErrorText(error);
       AppLogger.error('Translation failed', tag: 'dashboard', error: safeError);
@@ -998,7 +1132,7 @@ class TranslationDashboardController
               errorMessage: safeError,
             ) ??
             TranslationJob(
-              id: DateTime.now().millisecondsSinceEpoch.toString(),
+              id: _newJobId(),
               inputPath: state.inputPath,
               outputPath: state.outputDirectory,
               status: TranslationJobStatus.failed,
@@ -1026,7 +1160,12 @@ class TranslationDashboardController
       );
       _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
+    } finally {
+      // C-M7: completion, failure and cancellation (including the early
+      // `return true` in the catch path above) all stop the service here.
+      _stopTranslationForegroundService();
     }
+    return true;
   }
 
   Future<void> requestCancel() async {
@@ -1071,128 +1210,211 @@ class TranslationDashboardController
   }
 
   Future<void> exportTranslatedEpub() async {
-    final String? outputPath = await _completedOutputPath();
-    if (outputPath == null) {
+    // H2: synchronous re-entrancy guard — a rapid double-tap cannot open two
+    // share sheets / produce duplicate files. Doubled with the native
+    // in-flight guard (Track B). UI also disables the button via
+    // state.isSharing.
+    if (_isSharing) {
       return;
     }
-
+    _isSharing = true;
+    state = state.copyWith(isSharing: true);
     try {
-      if (PlatformUtils.isAndroid) {
-        await PlatformUtils.shareFile(
-          sourcePath: outputPath,
-          displayName: path.basename(outputPath),
-        );
-        state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            _s.logOpenedShare(path.basename(outputPath)),
-          ],
-        );
+      final String? outputPath = await _completedOutputPath();
+      if (outputPath == null) {
         return;
       }
 
-      final OpenResult result = await OpenFilex.open(outputPath);
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          result.type == ResultType.done
-              ? _s.logOpenedEpub(path.basename(outputPath))
-              : _s.logCouldNotOpenEpub(result.message),
-        ],
-      );
-    } catch (error) {
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          _s.logCouldNotExport(_safeErrorText(error)),
-        ],
-      );
+      try {
+        if (PlatformUtils.isAndroid) {
+          await PlatformUtils.shareFile(
+            sourcePath: outputPath,
+            displayName: path.basename(outputPath),
+            // C-M4: localized chooser title (Track C adds the optional
+            // `chooserTitle` parameter to the Dart share method).
+            chooserTitle: _s.shareChooserTitle,
+          );
+          state = state.copyWith(
+            logs: <String>[
+              ...state.logs,
+              _s.logOpenedShare(path.basename(outputPath)),
+            ],
+          );
+          return;
+        }
+
+        final OpenResult result = await OpenFilex.open(outputPath);
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            result.type == ResultType.done
+                ? _s.logOpenedEpub(path.basename(outputPath))
+                : _s.logCouldNotOpenEpub(result.message),
+          ],
+        );
+      } catch (error) {
+        // C-M6: permanently-denied storage permission gets its own notice.
+        if (_handlePermanentPermissionDenial(error)) {
+          return;
+        }
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            _s.logCouldNotExport(_safeErrorText(error)),
+          ],
+        );
+      }
+    } finally {
+      _isSharing = false;
+      if (mounted) {
+        state = state.copyWith(isSharing: false);
+      }
     }
   }
 
   Future<void> saveTranslatedEpubToDownloads() async {
-    final String? outputPath = await _completedOutputPath();
-    if (outputPath == null) {
+    // H2: same double-tap guard as export; UI disables via state.isSaving.
+    if (_isSaving) {
       return;
     }
-
+    _isSaving = true;
+    state = state.copyWith(isSaving: true);
     try {
-      final String displayName = path.basename(outputPath);
-      final String? savedPath = await PlatformUtils.saveToDownloads(
-        sourcePath: outputPath,
-        displayName: displayName,
-      );
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          savedPath == null
-              ? _s.logDownloadsAndroidOnly
-              : _s.logSavedToDownloads(savedPath),
-        ],
-      );
-    } catch (error) {
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          _s.logCouldNotSaveDownloads(_safeErrorText(error)),
-        ],
-      );
+      final String? outputPath = await _completedOutputPath();
+      if (outputPath == null) {
+        return;
+      }
+
+      try {
+        final String displayName = path.basename(outputPath);
+        final String? savedPath = await PlatformUtils.saveToDownloads(
+          sourcePath: outputPath,
+          displayName: displayName,
+        );
+        // C-L4: the native return value is log-only and inconsistent across
+        // OS versions — Android 10+ returns a display pseudo-path
+        // "Downloads/<name>", Android 9 and below an absolute path. Never
+        // join it into a real file path; it is only shown to the user.
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            savedPath == null
+                ? _s.logDownloadsAndroidOnly
+                : _s.logSavedToDownloads(savedPath),
+          ],
+        );
+      } catch (error) {
+        // C-M6: permanently-denied storage permission gets its own notice.
+        if (_handlePermanentPermissionDenial(error)) {
+          return;
+        }
+        final String safeError = _safeErrorText(error);
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            // H3: the 5-minute Dart-side timeout only stops *waiting* — the
+            // native worker keeps running to completion in the background,
+            // so tell the user where to find the finished file.
+            safeError.contains('timed out')
+                ? _s.saveTimeoutContinuesBackground
+                : _s.logCouldNotSaveDownloads(safeError),
+          ],
+        );
+      }
+    } finally {
+      _isSaving = false;
+      if (mounted) {
+        state = state.copyWith(isSaving: false);
+      }
     }
   }
 
   Future<void> openJobOutput(String jobId) async {
-    final TranslationJob? job = _findKnownJob(jobId);
-    final String outputPath = job?.outputPath ?? '';
-    if (job == null || !job.hasExportableEpub) {
-      state = state.copyWith(
-        logs: <String>[...state.logs, _s.logNoOutputForHistory],
-      );
+    // H2: same share re-entrancy guard as exportTranslatedEpub (history
+    // items share through the same native channel).
+    if (_isSharing) {
       return;
     }
-
-    final File outputFile = File(outputPath);
-    final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
-    if (type != FileSystemEntityType.file || !await outputFile.exists()) {
-      state = state.copyWith(
-        logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
-      );
-      return;
-    }
-
+    _isSharing = true;
+    state = state.copyWith(isSharing: true);
     try {
-      if (PlatformUtils.isAndroid) {
-        await PlatformUtils.shareFile(
-          sourcePath: outputPath,
-          displayName: path.basename(outputPath),
-        );
+      final TranslationJob? job = _findKnownJob(jobId);
+      final String outputPath = job?.outputPath ?? '';
+      if (job == null || !job.hasExportableEpub) {
         state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            _s.logOpenedShare(path.basename(outputPath)),
-          ],
+          logs: <String>[...state.logs, _s.logNoOutputForHistory],
         );
         return;
       }
-      final OpenResult result = await OpenFilex.open(outputPath);
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          result.type == ResultType.done
-              ? _s.logOpenedEpub(path.basename(outputPath))
-              : _s.logCouldNotOpenEpub(result.message),
-        ],
-      );
-    } catch (error) {
-      state = state.copyWith(
-        logs: <String>[
-          ...state.logs,
-          _s.logCouldNotOpenJobOutput(_safeErrorText(error)),
-        ],
-      );
+
+      final File outputFile = File(outputPath);
+      final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
+      if (type != FileSystemEntityType.file || !await outputFile.exists()) {
+        state = state.copyWith(
+          logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
+        );
+        return;
+      }
+
+      try {
+        if (PlatformUtils.isAndroid) {
+          await PlatformUtils.shareFile(
+            sourcePath: outputPath,
+            displayName: path.basename(outputPath),
+            // C-M4: localized chooser title (Track C adds the optional
+            // `chooserTitle` parameter to the Dart share method).
+            chooserTitle: _s.shareChooserTitle,
+          );
+          state = state.copyWith(
+            logs: <String>[
+              ...state.logs,
+              _s.logOpenedShare(path.basename(outputPath)),
+            ],
+          );
+          return;
+        }
+        final OpenResult result = await OpenFilex.open(outputPath);
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            result.type == ResultType.done
+                ? _s.logOpenedEpub(path.basename(outputPath))
+                : _s.logCouldNotOpenEpub(result.message),
+          ],
+        );
+      } catch (error) {
+        // C-M6: permanently-denied storage permission gets its own notice.
+        if (_handlePermanentPermissionDenial(error)) {
+          return;
+        }
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            _s.logCouldNotOpenJobOutput(_safeErrorText(error)),
+          ],
+        );
+      }
+    } finally {
+      _isSharing = false;
+      if (mounted) {
+        state = state.copyWith(isSharing: false);
+      }
     }
   }
 
   Future<void> retryJob(String jobId) async {
+    if (_isRetrying) {
+      return;
+    }
+    _isRetrying = true;
+    try {
+      await _retryJob(jobId);
+    } finally {
+      _isRetrying = false;
+    }
+  }
+
+  Future<void> _retryJob(String jobId) async {
     if (!await _waitForSettingsReady()) {
       return;
     }
@@ -1267,16 +1489,22 @@ class TranslationDashboardController
     );
     if (state.job?.status == TranslationJobStatus.inspected &&
         readyToTranslate) {
-      state = state.copyWith(
-        logs: <String>[...state.logs, _s.logRetryContinueTranslate],
-      );
-      await startTranslation();
+      // The "continuing" line is appended inside startTranslation at queue
+      // time so it always precedes run output; if the style-profile
+      // confirmation gate stops startTranslation, it already logs
+      // logConfirmStyleBeforeTranslate itself.
+      await startTranslation(logRetryContinuation: true);
       return;
     }
     _pendingResumeProgressHint = null;
   }
 
   void clearJobHistory() {
+    // A run in progress would re-insert its job on the next progress callback
+    // and silently undo the clear.
+    if (_logIfRunActive(_s.logRunAlreadyActiveGeneric)) {
+      return;
+    }
     _historyClearRevision += 1;
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
@@ -1307,6 +1535,13 @@ class TranslationDashboardController
     return outputPath;
   }
 
+  /// Unique-enough job id: wall-clock millis plus a process-local monotonic
+  /// suffix so two jobs created within the same millisecond cannot collide.
+  String _newJobId() {
+    _jobIdSequence += 1;
+    return '${DateTime.now().millisecondsSinceEpoch}-$_jobIdSequence';
+  }
+
   bool _logIfRunActive(String message) {
     if (!state.isRunActive) {
       return false;
@@ -1315,11 +1550,105 @@ class TranslationDashboardController
     return true;
   }
 
+  /// Maps a Windows path observation from the native bridge to a localized
+  /// log line. Best-effort: never throws.
+  void _logWindowsPathNotice(WindowsPathNotice notice, String? selectedPath) {
+    final String message;
+    switch (notice) {
+      case WindowsPathNotice.dialogOpened:
+        message = _s.logFileDialogOpened;
+        break;
+      case WindowsPathNotice.longPathWithoutPolicy:
+        final String? path = selectedPath;
+        if (path == null || path.isEmpty) {
+          return;
+        }
+        message = _s.logLongPathWithoutPolicy(path);
+        break;
+      case WindowsPathNotice.oneDrivePlaceholder:
+        message = _s.logOneDrivePlaceholderHint;
+        break;
+    }
+    state = state.copyWith(logs: <String>[...state.logs, message]);
+  }
+
   String _safeErrorText(Object error) {
-    return SensitiveText.redact(
+    // Redact with the key that was in effect when the run started (an error
+    // may surface the old key after the user changes it mid-run) as well as
+    // the current key.
+    String redacted = SensitiveText.redact(
       error.toString(),
-      configuredApiKey: state.config.apiKey,
+      configuredApiKey: _runApiKey,
     );
+    final String currentKey = state.config.apiKey;
+    if (_runApiKey != currentKey) {
+      redacted = SensitiveText.redact(redacted, configuredApiKey: currentKey);
+    }
+    return redacted;
+  }
+
+  /// C-M6: surfaces a permanently-denied storage permission (native error
+  /// code `PERMISSION_PERMANENTLY_DENIED`) as a log line plus a notice id
+  /// the UI can listen on to show a Snackbar whose action opens the system
+  /// app-settings screen. Returns true when the error was handled.
+  bool _handlePermanentPermissionDenial(Object error) {
+    if (error is! PlatformException ||
+        error.code != 'PERMISSION_PERMANENTLY_DENIED') {
+      return false;
+    }
+    state = state.copyWith(
+      permissionNoticeId: state.permissionNoticeId + 1,
+      logs: <String>[...state.logs, _s.storagePermissionPermanentlyDenied],
+    );
+    return true;
+  }
+
+  /// C-M7: starts the Android foreground service that keeps translation
+  /// alive under Doze. No-op off Android (also guarded inside the bridge,
+  /// so desktop builds pay nothing).
+  void _startTranslationForegroundService() {
+    if (!PlatformUtils.isAndroid) {
+      return;
+    }
+    _lastFgServicePercent = -1;
+    _lastFgServiceChapter = null;
+    unawaited(
+      AndroidServiceBridge.startTranslationService(
+        title: _s.foregroundServiceTitle,
+        text: path.basename(state.inputPath),
+      ),
+    );
+  }
+
+  /// C-M7: throttled notification refresh — every 5% of progress or on
+  /// chapter change, so per-block progress callbacks don't spam the channel.
+  void _updateTranslationForegroundService(TranslationJob job) {
+    if (!PlatformUtils.isAndroid) {
+      return;
+    }
+    final int percent = (job.progress.clamp(0.0, 1.0) * 100).round();
+    final String? chapter = job.currentChapter;
+    if (percent - _lastFgServicePercent < 5 &&
+        chapter == _lastFgServiceChapter) {
+      return;
+    }
+    _lastFgServicePercent = percent;
+    _lastFgServiceChapter = chapter;
+    unawaited(
+      AndroidServiceBridge.updateTranslationNotification(
+        progress: percent,
+        text: _s.foregroundServiceText,
+      ),
+    );
+  }
+
+  /// C-M7: stops the foreground service; always called from a finally block
+  /// so completion, failure and cancellation all clean up.
+  void _stopTranslationForegroundService() {
+    if (!PlatformUtils.isAndroid) {
+      return;
+    }
+    unawaited(AndroidServiceBridge.stopTranslationService());
   }
 
   String _safeLogText(String logLine) {
@@ -1338,7 +1667,7 @@ class TranslationDashboardController
             currentBlock: null,
           ) ??
           TranslationJob(
-            id: DateTime.now().millisecondsSinceEpoch.toString(),
+            id: _newJobId(),
             inputPath: state.inputPath,
             outputPath: state.outputDirectory,
             status: TranslationJobStatus.cancelled,
@@ -1391,15 +1720,21 @@ class TranslationDashboardController
         (paths.inputPath.isEmpty && paths.outputDirectory.isEmpty)) {
       return;
     }
+    // A remembered EPUB may have been moved, renamed, or deleted between
+    // sessions; only restore it when the file still exists. The output
+    // directory is restored as-is: translation creates it when missing.
+    final bool inputExists =
+        paths.inputPath.isNotEmpty && await File(paths.inputPath).exists();
     state = state.copyWith(
-      inputPath: paths.inputPath.isEmpty ? state.inputPath : paths.inputPath,
+      inputPath: inputExists ? paths.inputPath : state.inputPath,
       outputDirectory: paths.outputDirectory.isEmpty
           ? state.outputDirectory
           : paths.outputDirectory,
       logs: <String>[
         ...state.logs,
-        if (paths.inputPath.isNotEmpty)
-          _s.logRestoredEpub(path.basename(paths.inputPath)),
+        if (inputExists) _s.logRestoredEpub(path.basename(paths.inputPath)),
+        if (!inputExists && paths.inputPath.isNotEmpty)
+          _s.logSkippedMissingInputPath(path.basename(paths.inputPath)),
         if (paths.outputDirectory.isNotEmpty)
           _s.logRestoredOutput(paths.outputDirectory),
       ],

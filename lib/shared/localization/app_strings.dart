@@ -30,6 +30,33 @@ class AppStrings {
   String get translationPageSubtitle => '';
   String get inspectEpub => isChinese ? '检查' : 'Inspect';
   String get reinspectEpub => isChinese ? '重新检查' : 'Re-inspect';
+
+  // --- Track C (Windows) additions ---
+  /// Deterministic inspection failure: the EPUB declares a non-UTF-8
+  /// encoding. Shown instead of the raw English FormatException, with no
+  /// retry action (retrying cannot help).
+  String get encodingUnsupportedHint => isChinese
+      ? '该 EPUB 声明了非 UTF-8 编码（如 GBK），请先转码为 UTF-8 后再导入。'
+      : 'This EPUB declares a non-UTF-8 encoding (e.g. GBK). Convert it to UTF-8 before importing.';
+
+  /// The native file dialog has no owner window and may open behind the app.
+  String get logFileDialogOpened => isChinese
+      ? '正在打开文件选择对话框，如未看到请检查任务栏。'
+      : 'Opening the file dialog — check the taskbar if you do not see it.';
+
+  /// Chosen path exceeds MAX_PATH (260) while the system long-path policy
+  /// is off.
+  String logLongPathWithoutPolicy(String selectedPath) => isChinese
+      ? '所选路径超过 260 个字符，但系统未开启长路径支持，文件操作可能失败。可在注册表中将 HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem\\LongPathsEnabled 设为 1。路径：$selectedPath'
+      : 'The selected path exceeds 260 characters but Windows long-path support is off, so file operations may fail. Set LongPathsEnabled to 1 under HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem. Path: $selectedPath';
+
+  /// The chosen path lives under OneDrive; on-demand placeholders may need
+  /// to download first.
+  String get logOneDrivePlaceholderHint => isChinese
+      ? '检测到 OneDrive 路径：按需占位文件可能需要先下载，导入可能较慢。'
+      : 'OneDrive path detected: on-demand placeholder files may need to download first, so import may be slow.';
+  // --- end Track C (Windows) additions ---
+
   String get translateSelected => isChinese ? '开始翻译' : 'Translate';
 
   String get bookSetup => isChinese ? '图书' : 'Book';
@@ -79,6 +106,8 @@ class AppStrings {
       currentBlock != null && currentBlock.isNotEmpty
       ? (isChinese ? '当前：$currentBlock' : 'Current: $currentBlock')
       : '';
+  String translationProgressSemantics(int percent) =>
+      isChinese ? '翻译进度 $percent%' : 'Translation progress $percent%';
   String estimateSummary(int batches, int tokens) => isChinese
       ? '$batches 批次 · $tokens tokens'
       : '$batches batches · $tokens tokens';
@@ -125,6 +154,8 @@ class AppStrings {
   String get logsTitle => isChinese ? '日志' : 'Logs';
   String get expandLogs => isChinese ? '展开' : 'Expand';
   String get collapseLogs => isChinese ? '收起' : 'Collapse';
+  String get showDetails => isChinese ? '显示详情' : 'Show details';
+  String get hideDetails => isChinese ? '隐藏详情' : 'Hide details';
 
   String get previewTitle => isChinese ? '预览' : 'Preview';
   String get previewSubtitle =>
@@ -153,6 +184,9 @@ class AppStrings {
 
   String get settingsTitle => isChinese ? '设置' : 'Settings';
   String get settingsSubtitle => '';
+  String get settingsSaveFailed => isChinese
+      ? '设置保存失败，显示的值可能未实际保存，请重试'
+      : 'Failed to save settings; the shown values may not have persisted. Please retry.';
   String get appearanceSection => isChinese ? '外观' : 'Appearance';
   String get uiLanguage => isChinese ? '语言' : 'Language';
   String get englishLabel => 'English';
@@ -166,8 +200,25 @@ class AppStrings {
   String get testingConnection => isChinese ? '测试中…' : 'Testing…';
   String get connectionOk => isChinese ? '连接成功' : 'Connection OK';
   String get connectionFailed => isChinese ? '连接失败' : 'Connection failed';
+  String httpAuthError(String host) => isChinese
+      ? 'HTTP 401 认证失败（$host）：请前往设置页检查 API Key 是否有效、可用，且复制时没有多余空格。'
+      : 'HTTP 401 authentication failed for $host. Check the API key in the settings page: it must be valid, active, and copied without extra spaces.';
+  String httpForbiddenError(String host, String model) => isChinese
+      ? 'HTTP 403 无权限（$host）：请前往设置页检查该 API Key 是否可以使用 $model，以及账号是否有访问权限。'
+      : 'HTTP 403 permission denied for $host. Check in the settings page whether this API key can use $model and whether the account has access.';
+  String httpNotFoundError(String host, String model) => isChinese
+      ? 'HTTP 404（$host）：请前往设置页检查接口地址（只保留服务商根地址或 /v1 路径），并确认模型 $model 存在。'
+      : 'HTTP 404 from $host. Check the Base URL in the settings page (keep only the provider root or /v1 path) and verify that $model exists.';
+  String connectionDetail(String host, String content) => isChinese
+      ? '已成功连接到 $host。模型回复：$content'
+      : 'Connected to $host successfully. Model responded: $content';
+  String outputFileLocked(String path) => isChinese
+      ? '输出文件被其他程序占用：$path。请关闭正在打开它的阅读器，然后重新开始翻译。'
+      : 'The output file is locked by another program: $path. Close the reader that has it open, then restart the translation.';
   String get baseUrl => isChinese ? '接口地址' : 'Base URL';
   String get apiKey => 'API Key';
+  String get showApiKey => isChinese ? '显示 API key' : 'Show API key';
+  String get hideApiKey => isChinese ? '隐藏 API key' : 'Hide API key';
   String get model => isChinese ? '模型' : 'Model';
   String get translationSection => isChinese ? '翻译' : 'Translation';
   String get advancedTuning => isChinese ? '高级参数' : 'Advanced parameters';
@@ -198,6 +249,12 @@ class AppStrings {
   String get openOutput => isChinese ? '打开' : 'Open';
   String get retryJob => isChinese ? '重试' : 'Retry';
   String get noRecentJobs => isChinese ? '暂无任务' : 'No jobs yet';
+  String jobProgressBlocks(int done, int total) =>
+      isChinese ? '$done / $total 块' : '$done / $total blocks';
+  String jobProgressChapters(int done, int total) =>
+      isChinese ? '$done / $total 章' : '$done / $total chapters';
+  String jobProgressPercent(int percent) =>
+      isChinese ? '$percent% 完成' : '$percent% complete';
   String get activeRun => isChinese ? '运行中' : 'Active';
   String get canResumeLabel => isChinese ? '可续传' : 'Resumable';
   String get estimatedTokensLabel => isChinese ? '预估 Token' : 'Est. tokens';
@@ -240,6 +297,9 @@ class AppStrings {
   String get styleProfileAvoid =>
       isChinese ? '应避免（每行一条）' : 'Avoid (one per line)';
   String get styleProfileConfidence => isChinese ? '置信度' : 'Confidence';
+  String get styleConfidenceHigh => isChinese ? '高' : 'High';
+  String get styleConfidenceMedium => isChinese ? '中' : 'Medium';
+  String get styleConfidenceLow => isChinese ? '低' : 'Low';
   String get styleProfileEmptyHint => isChinese
       ? '检查完成后可生成风格档案；也可先手填。'
       : 'Generate a style profile after inspection, or fill it in manually.';
@@ -252,6 +312,7 @@ class AppStrings {
       isChinese ? '支持 Windows、Android' : 'Windows, Android';
   String get accessibilitySection => isChinese ? '无障碍' : 'Accessibility';
   String get qualitySection => isChinese ? '质量与术语' : 'Quality';
+  String get dialogOk => isChinese ? '确定' : 'OK';
 
   // —— Runtime log messages (dashboard) ——
   String logSelectedEpub(String name) =>
@@ -333,6 +394,8 @@ class AppStrings {
       : 'Output directory is locked while a run is in progress.';
   String logCouldNotSelectEpub(String error) =>
       isChinese ? '无法选择 EPUB：$error' : 'Could not select EPUB: $error';
+  String logCouldNotSelectDirectory(String error) =>
+      isChinese ? '无法选择目录：$error' : 'Could not select directory: $error';
   String logSelectedOutput(String dir) =>
       isChinese ? '已选择输出目录：$dir' : 'Selected output directory: $dir';
   String logAndroidOutputDir(String dir) => isChinese
@@ -404,6 +467,9 @@ class AppStrings {
       isChinese ? '已恢复上次 EPUB：$name' : 'Restored last EPUB: $name';
   String logRestoredOutput(String dir) =>
       isChinese ? '已恢复上次输出目录：$dir' : 'Restored last output directory: $dir';
+  String logSkippedMissingInputPath(String name) => isChinese
+      ? '上次的 EPUB 已不存在，跳过恢复：$name'
+      : 'Last EPUB no longer exists; skipped restoring: $name';
   String get logConfirmStyleBeforeTranslate => isChinese
       ? '请先确认书籍风格档案，再开始整书翻译。'
       : 'Confirm the book style profile before starting full-book translation.';
@@ -430,4 +496,29 @@ class AppStrings {
   String get logStyleProfileNeedContent => isChinese
       ? '请先填写或生成风格档案内容，再确认。'
       : 'Fill or generate style profile content before confirming.';
+
+  // —— Track D (round 5) additions ——
+  /// H3: the Dart-side 5-minute timeout only stops waiting; the native
+  /// worker keeps running to completion in the background.
+  String get saveTimeoutContinuesBackground => isChinese
+      ? '操作超时，但任务仍在后台继续，完成后可在下载目录查看。'
+      : 'The operation timed out, but the task continues in the background; check the Downloads folder once it finishes.';
+
+  /// C-M4: localized title for the Android share chooser.
+  String get shareChooserTitle => isChinese ? '分享 EPUB' : 'Share EPUB';
+
+  /// C-M6: shown when storage permission is permanently denied.
+  String get storagePermissionPermanentlyDenied => isChinese
+      ? '存储权限被永久拒绝，请前往应用设置开启。'
+      : 'Storage permission was permanently denied. Please enable it in the app settings.';
+
+  /// C-M6: Snackbar action label that opens the system app-settings screen.
+  String get openAppSettingsAction => isChinese ? '前往设置' : 'Open settings';
+
+  /// C-M7: Android foreground-service notification while translating.
+  String get foregroundServiceTitle =>
+      isChinese ? 'EPUB 翻译器正在翻译' : 'EPUB Translator is translating';
+  String get foregroundServiceText => isChinese
+      ? '翻译进行中，可在通知栏查看进度。'
+      : 'Translation in progress; check the notification for progress.';
 }

@@ -80,6 +80,7 @@ class SettingsTextField extends StatefulWidget {
     required this.value,
     required this.onChanged,
     required this.decoration,
+    required this.strings,
     this.obscureText = false,
     this.canToggleObscureText = false,
     this.maxLines = 1,
@@ -90,6 +91,7 @@ class SettingsTextField extends StatefulWidget {
   final String value;
   final ValueChanged<String> onChanged;
   final InputDecoration decoration;
+  final AppStrings strings;
   final bool obscureText;
   final bool canToggleObscureText;
   final int maxLines;
@@ -135,7 +137,10 @@ class SettingsTextFieldState extends State<SettingsTextField> {
     final InputDecoration decoration = widget.canToggleObscureText
         ? widget.decoration.copyWith(
             suffixIcon: IconButton(
-              tooltip: _obscureText ? 'Show API key' : 'Hide API key',
+              key: const ValueKey<String>('toggleApiKeyVisibility'),
+              tooltip: _obscureText
+                  ? widget.strings.showApiKey
+                  : widget.strings.hideApiKey,
               onPressed: () {
                 setState(() {
                   _obscureText = !_obscureText;

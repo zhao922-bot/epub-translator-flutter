@@ -8,6 +8,7 @@ import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 
+import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
 import '../../../../shared/security/sensitive_text.dart';
 import '../../domain/models/inspected_chapter.dart';
@@ -44,11 +45,45 @@ class EpubChapterTranslator {
        _footnoteBatchPlanner =
            footnoteBatchPlanner ?? const FootnoteBatchPlanner();
 
-  /// Blocks whose translation could not pass quality checks or whose API
-  /// connection/response timed out. They degrade to their last usable
+  /// Blocks whose translation could not pass quality checks or whose
+  /// API connection/response timed out. They degrade to their last usable
   /// translation (or source HTML when no response arrived) so the whole book
   /// can continue. Recorded so the run report can list them honestly.
-  final Set<ExtractedBlock> _degradedBlocks = <ExtractedBlock>{};
+  /// Keyed by chapter-scoped degraded key
+  /// ([EpubRepacker.degradedKeyForBlock]), not by bare block id: block ids
+  /// restart per chapter (`p-1` exists in nearly every chapter), so a bare
+  /// id would collide across chapters and mis-mark innocent blocks as
+  /// untranslated. (Not keyed by identity either: block instances are copied
+  /// around ([ExtractedBlock.copyWith]), so identity checks would silently
+  /// miss.)
+  final Set<String> _degradedBlocks = <String>{};
+
+  /// Records [blockId] of [chapterPath] as degraded. The chapter scope is
+  /// required because block ids are only unique within a chapter.
+  void _markDegradedBlock({
+    required String chapterPath,
+    required String blockId,
+  }) {
+    _degradedBlocks.add(
+      EpubRepacker.degradedKeyForBlock(
+        chapterPath: chapterPath,
+        blockId: blockId,
+      ),
+    );
+  }
+
+  /// Whether [blockId] of [chapterPath] was recorded as degraded.
+  bool _isDegradedBlock({
+    required String chapterPath,
+    required String blockId,
+  }) {
+    return _degradedBlocks.contains(
+      EpubRepacker.degradedKeyForBlock(
+        chapterPath: chapterPath,
+        blockId: blockId,
+      ),
+    );
+  }
 
   final TranslationCacheStore _cacheStore;
   final EpubRepacker _repacker;
@@ -71,6 +106,23 @@ class EpubChapterTranslator {
 
   static String sanitizeOutputSuffixForTest(String suffix) {
     return TranslationApiClient.sanitizeOutputSuffix(suffix);
+  }
+
+  /// Test-visible core of the run-local `cachePutBestEffort` closure: null
+  /// when the write succeeded, or the swallowed error when it failed. The
+  /// closure itself adds the warn-once logging on top of this and converts
+  /// the result to the bool the write counters consume.
+  static Future<Object?> putBlockCacheErrorForTest(
+    TranslationCacheStore cacheStore,
+    String cacheKey,
+    String translatedHtml,
+  ) async {
+    try {
+      await cacheStore.putBlockTranslation(cacheKey, translatedHtml);
+      return null;
+    } catch (error) {
+      return error;
+    }
   }
 
   static String prepareBlockHtmlForTargetForTest({
@@ -165,8 +217,21 @@ class EpubChapterTranslator {
   }
 
   /// Test-only view of the blocks degraded for this translator instance.
-  Set<String> getDegradedBlockIdsForTest() =>
-      _degradedBlocks.map((ExtractedBlock block) => block.id).toSet();
+  /// Keys are chapter-scoped (see [EpubRepacker.degradedKeyForBlock]); build
+  /// the expected key with [degradedKeyForTest].
+  Set<String> getDegradedBlockIdsForTest() => _degradedBlocks.toSet();
+
+  /// Builds the chapter-scoped degraded key a test should expect in
+  /// [getDegradedBlockIdsForTest].
+  static String degradedKeyForTest({
+    String chapterPath = '',
+    required String blockId,
+  }) {
+    return EpubRepacker.degradedKeyForBlock(
+      chapterPath: chapterPath,
+      blockId: blockId,
+    );
+  }
 
   void _beginDegradedTracking() {
     _degradedBlocks.clear();
@@ -177,6 +242,7 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required List<ExtractedBlock> blocks,
     String chapterTitle = '',
+    String chapterPath = '',
     List<ExtractedBlock> contextBefore = const <ExtractedBlock>[],
     List<ExtractedBlock> contextAfter = const <ExtractedBlock>[],
     Map<String, Object?>? bookMemory,
@@ -185,6 +251,7 @@ class EpubChapterTranslator {
     return _translateBlockBatch(
       dio: dio,
       config: config,
+      chapterPath: chapterPath,
       batch: TranslationBlockBatch(
         blocks,
         context: TranslationBatchContext(
@@ -240,12 +307,18 @@ class EpubChapterTranslator {
       return TranslationStyleProfile.empty;
     }
     final Dio dio = _apiClient.buildDio(config);
-    return _generateStyleProfile(
-      dio: dio,
-      config: config,
-      chapters: chapters,
-      cancelToken: cancelToken,
-    );
+    try {
+      return await _generateStyleProfile(
+        dio: dio,
+        config: config,
+        chapters: chapters,
+        cancelToken: cancelToken,
+      );
+    } finally {
+      // Fresh Dio per call (own HttpClient pool); close it so sockets/FDs
+      // do not accumulate across runs.
+      dio.close(force: true);
+    }
   }
 
   Future<TranslationStyleProfile> generateStyleProfileForTest({
@@ -585,6 +658,17 @@ class EpubChapterTranslator {
     TranslationCancellationCheck? isCancelled,
   }) async {
     _beginDegradedTracking();
+    // Set once the translated EPUB has been committed to disk. A late error
+    // or cancellation after that point must not reframe the finished output
+    // as an aborted translation (see M5).
+    TranslationRunResult? committedResult;
+    // Effective concurrency, clamped so a misconfigured maxConcurrent (<= 0)
+    // can never wedge the batch loop below (see M9).
+    final int concurrency = config.maxConcurrent < 1 ? 1 : config.maxConcurrent;
+    // The Dio built for this run owns an HttpClient connection pool; it is
+    // closed in the finally below so sockets/FDs do not accumulate (see M7).
+    late final Dio dio;
+    bool dioReady = false;
     try {
       final List<InspectedChapter> selectedChapters = chapters
           .where((InspectedChapter chapter) => chapter.includeInTranslation)
@@ -611,6 +695,27 @@ class EpubChapterTranslator {
         outputDirectory: outputDirectory,
         suffix: config.outputSuffix,
       );
+      // Windows: a reader holding the previous output file open (no share
+      // access) would make the final commit fail at ~98% after every API
+      // call was already billed. Probe for an exclusive-access lock now so
+      // the user can close the file before any paid work starts. Opening
+      // in append mode never truncates; a locked file throws
+      // FileSystemException here.
+      if (Platform.isWindows) {
+        final File outputFile = File(outputFilePath);
+        if (await outputFile.exists()) {
+          try {
+            final RandomAccessFile probe = await outputFile.open(
+              mode: FileMode.append,
+            );
+            await probe.close();
+          } on FileSystemException {
+            throw StateError(
+              AppStrings(config.uiLanguage).outputFileLocked(outputFilePath),
+            );
+          }
+        }
+      }
       if (totalBlocks == 0) {
         return await _repackZeroBlockSelection(
           jobId: jobId,
@@ -633,7 +738,8 @@ class EpubChapterTranslator {
         );
       }
 
-      final Dio dio = _apiClient.buildDio(config);
+      dio = _apiClient.buildDio(config);
+      dioReady = true;
       final Stopwatch translationStopwatch = Stopwatch()..start();
       Duration totalApiElapsed = Duration.zero;
       Duration totalCacheWriteElapsed = Duration.zero;
@@ -699,7 +805,16 @@ class EpubChapterTranslator {
 
       void emit(TranslationJob job, String logLine) {
         currentJob = job;
-        onProgress?.call(job, logLine);
+        try {
+          onProgress?.call(job, logLine);
+        } catch (error) {
+          // A UI-side progress listener must never abort a translation run.
+          // Log the failure and keep the pipeline going.
+          AppLogger.warn(
+            'Progress callback failed (${error.runtimeType}); continuing.',
+            tag: 'translate',
+          );
+        }
         AppLogger.debug(logLine, tag: 'translate');
       }
 
@@ -707,6 +822,44 @@ class EpubChapterTranslator {
         if (cancelToken.isCancelled || (isCancelled?.call() ?? false)) {
           throw const TranslationCancelledException();
         }
+      }
+
+      bool cacheWriteFailed = false;
+      bool checkpointSaveFailed = false;
+
+      /// Best-effort block-cache write. The cache is an acceleration layer,
+      /// not part of correctness: a full disk, a permission change, or an
+      /// antivirus file lock must never abort a translation whose API
+      /// responses are already in memory. The in-memory translations keep
+      /// flowing to the final repack; the first failure is logged once so
+      /// the run report stays honest. Returns whether the write succeeded
+      /// so write counters do not inflate the final report with failed
+      /// writes.
+      Future<bool> cachePutBestEffort(
+        String cacheKey,
+        String translatedHtml,
+      ) async {
+        final Object? cacheError = await putBlockCacheErrorForTest(
+          _cacheStore,
+          cacheKey,
+          translatedHtml,
+        );
+        if (cacheError != null) {
+          AppLogger.warn(
+            'Block cache write failed (${cacheError.runtimeType}); continuing '
+            'without cache.',
+            tag: 'translate',
+          );
+          if (!cacheWriteFailed) {
+            cacheWriteFailed = true;
+            emit(
+              currentJob,
+              'Block cache writes are failing (${cacheError.runtimeType}); '
+              'continuing without cache.',
+            );
+          }
+        }
+        return cacheError == null;
       }
 
       Future<void> saveResumeState(
@@ -728,6 +881,36 @@ class EpubChapterTranslator {
         );
         lastResumeSaveAt = now;
         blocksSinceResumeSave = 0;
+      }
+
+      /// Best-effort checkpoint write. Mirrors [cachePutBestEffort]: the
+      /// checkpoint is a resume aid, not part of correctness, and on
+      /// Windows a transient antivirus/OneDrive lock can make the atomic
+      /// rename of `jobs/<jobKey>.json` throw a FileSystemException. That
+      /// must never kill a run whose translations are already in memory
+      /// (and paid for). The first failure is logged once and reported to
+      /// the job log; later saves keep being attempted silently.
+      Future<void> saveResumeStateBestEffort(
+        TranslationJob job, {
+        bool force = false,
+      }) async {
+        try {
+          await saveResumeState(job, force: force);
+        } catch (error) {
+          AppLogger.warn(
+            'Checkpoint save failed (${error.runtimeType}); continuing '
+            'without a fresh checkpoint.',
+            tag: 'translate',
+          );
+          if (!checkpointSaveFailed) {
+            checkpointSaveFailed = true;
+            emit(
+              currentJob,
+              'Checkpoint saves are failing (${error.runtimeType}); '
+              'continuing without fresh checkpoints.',
+            );
+          }
+        }
       }
 
       if (previousState != null) {
@@ -1066,9 +1249,14 @@ class EpubChapterTranslator {
                 'Translated footnote ${reference.requestId} is missing before cache write.',
               );
             }
-            final bool cacheable = !_degradedBlocks.contains(reference.block);
+            final bool cacheable = !_isDegradedBlock(
+              chapterPath: reference.chapter.path,
+              blockId: reference.block.id,
+            );
             if (cacheable) {
-              await _cacheStore.putBlockTranslation(
+              // Count only successful writes: a swallowed cache failure
+              // must not inflate the final "cache writes" report.
+              if (await cachePutBestEffort(
                 _blockCacheKey(
                   config,
                   reference.block,
@@ -1076,8 +1264,9 @@ class EpubChapterTranslator {
                   confirmedStyleProfile: userStyleProfile,
                 ),
                 translated,
-              );
-              cacheWriteCount += 1;
+              )) {
+                cacheWriteCount += 1;
+              }
             }
             translatedByChapterIndex[reference.chapterIndex]![reference
                 .block
@@ -1208,6 +1397,14 @@ class EpubChapterTranslator {
             'Completed chapter $completedFiles/${selectedChapters.length}: ${chapter.title}',
           );
           await saveResumeState(chapterDoneJob, force: true);
+          // Footnote-run chapters are done: release their per-block source
+          // strings (see _releaseChapterSourceStrings).
+          selectedChapters[chapterIndex] = _releaseChapterSourceStrings(
+            chapter,
+          );
+          updatedByPath[chapter.path] = _releaseChapterSourceStrings(
+            updatedByPath[chapter.path]!,
+          );
         }
         return endChapterIndex;
       }
@@ -1302,13 +1499,10 @@ class EpubChapterTranslator {
           for (
             int batchStart = 0;
             batchStart < batches.length;
-            batchStart += config.maxConcurrent
+            batchStart += concurrency
           ) {
             throwIfCancelled();
-            final int batchEnd = min(
-              batchStart + config.maxConcurrent,
-              batches.length,
-            );
+            final int batchEnd = min(batchStart + concurrency, batches.length);
             final List<TranslationBlockBatch> batchWindow = batches.sublist(
               batchStart,
               batchEnd,
@@ -1323,9 +1517,58 @@ class EpubChapterTranslator {
                       dio: dio,
                       config: config,
                       batch: batch,
+                      chapterPath: chapter.path,
                       cancelToken: cancelToken,
                     );
                     apiStopwatch.stop();
+                    // Persist this batch's translations immediately. If a
+                    // sibling batch in this window fails fatally, the
+                    // Future.wait above rethrows — but this batch's
+                    // already-billed translations are already on disk, so a
+                    // later resume reuses them instead of paying twice.
+                    // Degraded marks for this batch's own blocks are all
+                    // recorded by now, so the cacheable check is complete.
+                    final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
+                    final List<int> cacheableIndexes = <int>[
+                      for (
+                        int index = 0;
+                        index < batch.blocks.length;
+                        index += 1
+                      )
+                        if (!_isDegradedBlock(
+                          chapterPath: chapter.path,
+                          blockId: batch.blocks[index].id,
+                        ))
+                          index,
+                    ];
+                    final List<bool> cacheWriteResults = await Future.wait<bool>(
+                      <Future<bool>>[
+                        for (final int index in cacheableIndexes)
+                          cachePutBestEffort(
+                            _blockCacheKey(
+                              config,
+                              batch.blocks[index],
+                              chapterPath: chapter.path,
+                              confirmedStyleProfile: userStyleProfile,
+                            ),
+                            translated[index],
+                          ),
+                      ],
+                    );
+                    cacheWriteStopwatch.stop();
+                    // Count only the writes that actually succeeded: a
+                    // swallowed cache failure must not inflate the final
+                    // "cache writes" report.
+                    final int succeededCacheWrites = cacheWriteResults
+                        .where((bool ok) => ok)
+                        .length;
+                    // Each compound assignment below executes synchronously
+                    // (no await between read and write), so concurrent
+                    // window closures cannot interleave mid-update.
+                    chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+                    totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+                    chapterCacheWrites += succeededCacheWrites;
+                    cacheWriteCount += succeededCacheWrites;
                     return _TimedBatchResult(
                       batch: batch,
                       translatedBlocks: translated,
@@ -1357,28 +1600,6 @@ class EpubChapterTranslator {
                 ),
                 'Performance: API batch ${timedBatch.batchNumber}/${batches.length} for ${chapter.title} (${batch.blocks.length} blocks) took ${_formatDuration(timedBatch.elapsed)}.',
               );
-              final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
-              final List<int> cacheableIndexes = <int>[
-                for (int index = 0; index < batch.blocks.length; index += 1)
-                  if (!_degradedBlocks.contains(batch.blocks[index])) index,
-              ];
-              await Future.wait<void>(<Future<void>>[
-                for (final int index in cacheableIndexes)
-                  _cacheStore.putBlockTranslation(
-                    _blockCacheKey(
-                      config,
-                      batch.blocks[index],
-                      chapterPath: chapter.path,
-                      confirmedStyleProfile: userStyleProfile,
-                    ),
-                    translatedBatch[index],
-                  ),
-              ]);
-              cacheWriteStopwatch.stop();
-              chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-              totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-              chapterCacheWrites += cacheableIndexes.length;
-              cacheWriteCount += cacheableIndexes.length;
 
               for (int index = 0; index < batch.blocks.length; index += 1) {
                 throwIfCancelled();
@@ -1476,28 +1697,47 @@ class EpubChapterTranslator {
             );
           }
           throwIfCancelled();
-          await saveResumeState(chapterDoneJob, force: true);
+          await saveResumeStateBestEffort(chapterDoneJob, force: true);
+          // This chapter is fully translated and cached: release its
+          // per-block source strings (see _releaseChapterSourceStrings).
+          selectedChapters[chapterIndex] = _releaseChapterSourceStrings(
+            chapter,
+          );
+          updatedByPath[chapter.path] = _releaseChapterSourceStrings(
+            updatedByPath[chapter.path]!,
+          );
         }
       } catch (error) {
         final bool cancelled =
             error is TranslationCancelledException || _isCancelError(error);
-        await _cacheStore.saveJobState(
-          JobResumeState(
-            jobKey: jobKey,
-            inputFingerprint: inputFingerprint,
-            inputPath: currentJob.inputPath,
-            outputPath: currentJob.outputPath,
-            status: cancelled ? 'cancelled' : 'failed',
-            completedFiles: completedFiles,
-            totalFiles: selectedChapters.length,
-            completedBlocks: completedBlocks,
-            totalBlocks: totalBlocks,
-            cachedBlocks: cachedBlocks,
-            resumedBlocks: resumedBlocks,
+        // The final checkpoint is best-effort: a locked jobs/<jobKey>.json
+        // (Windows antivirus/OneDrive) must not mask the original
+        // translation error that brought us here.
+        try {
+          await _cacheStore.saveJobState(
+            JobResumeState(
+              jobKey: jobKey,
+              inputFingerprint: inputFingerprint,
+              inputPath: currentJob.inputPath,
+              outputPath: currentJob.outputPath,
+              status: cancelled ? 'cancelled' : 'failed',
+              completedFiles: completedFiles,
+              totalFiles: selectedChapters.length,
+              completedBlocks: completedBlocks,
+              totalBlocks: totalBlocks,
+              cachedBlocks: cachedBlocks,
+              resumedBlocks: resumedBlocks,
             currentChapter: currentJob.currentChapter ?? '',
             updatedAtIso8601: DateTime.now().toIso8601String(),
-          ),
-        );
+            ),
+          );
+        } catch (checkpointError) {
+          AppLogger.warn(
+            'Final checkpoint save failed (${checkpointError.runtimeType}); '
+            'rethrowing the original error.',
+            tag: 'translate',
+          );
+        }
         if (cancelled) {
           throw const TranslationCancelledException();
         }
@@ -1528,9 +1768,10 @@ class EpubChapterTranslator {
           .toList();
       final int degradedBlockCount = _degradedBlocks.length;
       if (degradedBlockCount > 0) {
+        // Scoped keys use \u0000 as the separator; render it readably.
         final String degradedBlockSample = _degradedBlocks
             .take(20)
-            .map((ExtractedBlock block) => block.id)
+            .map((String key) => key.replaceAll('\u0000', ':'))
             .join(',');
         emit(
           currentJob.copyWith(
@@ -1551,6 +1792,7 @@ class EpubChapterTranslator {
         chapters: updatedChapters,
         cancelToken: cancelToken,
         isCancelled: isCancelled,
+        degradedBlockIds: _degradedBlocks,
       );
       repackStopwatch.stop();
 
@@ -1583,6 +1825,13 @@ class EpubChapterTranslator {
             : null,
       );
       translationStopwatch.stop();
+      // The EPUB file is committed from here on. Capture the terminal result
+      // now so a late error or cancellation below still reports the finished
+      // output instead of an aborted translation.
+      committedResult = TranslationRunResult(
+        job: terminalJob,
+        chapters: updatedChapters,
+      );
       emit(
         terminalJob,
         allBlocksDegraded
@@ -1615,14 +1864,32 @@ class EpubChapterTranslator {
           'Final checkpoint could not be saved (${error.runtimeType}); the EPUB is ready at $outputFilePath.',
         );
       }
-      return TranslationRunResult(job: terminalJob, chapters: updatedChapters);
-    } on TranslationCancelledException {
-      rethrow;
+      return committedResult;
     } catch (error) {
+      final TranslationRunResult? done = committedResult;
+      if (done != null) {
+        // The translated EPUB is already committed to disk. A late error
+        // (progress callback, checkpoint save) or a cancellation that
+        // arrived after the commit must not reframe the finished output as
+        // an aborted translation.
+        AppLogger.warn(
+          'Ignoring late ${error.runtimeType} after the translated EPUB was '
+          'committed; reporting the completed run.',
+          tag: 'translate',
+        );
+        return done;
+      }
+      if (error is TranslationCancelledException) {
+        rethrow;
+      }
       if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
         throw const TranslationCancelledException();
       }
       rethrow;
+    } finally {
+      if (dioReady) {
+        dio.close(force: true);
+      }
     }
   }
 
@@ -1663,7 +1930,16 @@ class EpubChapterTranslator {
     );
     const String repackingLog =
         'No translatable text blocks were selected. Repacking the EPUB without API requests.';
-    onProgress?.call(repackingJob, repackingLog);
+    // A UI-side progress listener must never abort the repack: swallow
+    // callback errors the same way the main path's emit() does.
+    try {
+      onProgress?.call(repackingJob, repackingLog);
+    } catch (error) {
+      AppLogger.warn(
+        'Progress callback failed (${error.runtimeType}); continuing.',
+        tag: 'translate',
+      );
+    }
     AppLogger.debug(repackingLog, tag: 'translate');
     throwIfCancelled();
     await _repacker.writeTranslatedEpub(
@@ -1683,7 +1959,14 @@ class EpubChapterTranslator {
     );
     final String completedLog =
         'Translation complete. Wrote EPUB with no translatable text blocks to $outputFilePath';
-    onProgress?.call(completedJob, completedLog);
+    try {
+      onProgress?.call(completedJob, completedLog);
+    } catch (error) {
+      AppLogger.warn(
+        'Progress callback failed (${error.runtimeType}); continuing.',
+        tag: 'translate',
+      );
+    }
     AppLogger.debug(completedLog, tag: 'translate');
     return TranslationRunResult(job: completedJob, chapters: chapters);
   }
@@ -1692,12 +1975,15 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required ExtractedBlock block,
+    String? chapterPath,
+    Duration? retryDelayOverride,
     CancelToken? cancelToken,
     TranslationStyleProfile styleProfile = TranslationStyleProfile.empty,
     bool styleProfileConfirmed = false,
   }) async {
     Object? lastError;
     String? lastCleaned;
+    String? lastLocked;
     for (int attempt = 1; ; attempt += 1) {
       try {
         if (cancelToken?.isCancelled ?? false) {
@@ -1757,6 +2043,7 @@ class EpubChapterTranslator {
           );
         }
         final String locked = _lockTranslatedHtmlStructure(block, cleaned);
+        lastLocked = locked;
         _validateTranslatedBlockQuality(
           config: config,
           block: block,
@@ -1767,13 +2054,30 @@ class EpubChapterTranslator {
         if (_isCancelError(error) || error is TranslationCancelledException) {
           throw const TranslationCancelledException();
         }
+        // 401/403/404 are deterministic configuration errors: fail fast with
+        // the precise diagnostic instead of burning maxRetries attempts.
+        if (TranslationApiClient.isDeterministicHttpError(error)) {
+          throw StateError(
+            TranslationApiClient.deterministicHttpErrorMessage(error, config),
+          );
+        }
         lastError = error;
-        if (attempt >=
-            TranslationApiClient.maxAttemptsForError(config, error)) {
+        // A parse failure is deterministic for the same prompt (re-sending
+        // the block would just bill the same request again), and a 413 on a
+        // single block means even one block is too large to ever succeed:
+        // break out and let the normal failure path degrade/throw instead
+        // of wasting retries.
+        final bool payloadTooLarge =
+            error is DioException && error.response?.statusCode == 413;
+        if (error is TranslationParseException ||
+            payloadTooLarge ||
+            attempt >=
+                TranslationApiClient.maxAttemptsForError(config, error)) {
           break;
         }
         await TranslationApiClient.delayUnlessCancelled(
-          TranslationApiClient.retryDelayForError(config, error, attempt),
+          retryDelayOverride ??
+              TranslationApiClient.retryDelayForError(config, error, attempt),
           cancelToken: cancelToken,
         );
       }
@@ -1784,11 +2088,21 @@ class EpubChapterTranslator {
     // when the same block translates correctly on another call. Degrade that
     // one block to its last usable translation (or the source HTML when no
     // reply ever came back), record it for the run report, and keep going.
+    // Degrade to the last usable translation. Prefer the structure-locked
+    // variant so a quality rejection does not let tag/attribute drift from
+    // the raw model reply leak into the EPUB.
+    String degradeFallback() {
+      final String? usable =
+          lastLocked ??
+          (lastCleaned != null && lastCleaned.trim().isNotEmpty
+              ? lastCleaned
+              : null);
+      return usable ?? block.sourceHtml;
+    }
+
     if (lastError is FormatException && _isQualityRejection(lastError)) {
-      _degradedBlocks.add(block);
-      return lastCleaned != null && lastCleaned.trim().isNotEmpty
-          ? lastCleaned
-          : block.sourceHtml;
+      _markDegradedBlock(chapterPath: chapterPath ?? '', blockId: block.id);
+      return degradeFallback();
     }
     if (lastError is FormatException &&
         _isEmptyTranslationResponse(lastError)) {
@@ -1798,10 +2112,8 @@ class EpubChapterTranslator {
       );
     }
     if (TranslationApiClient.isRequestTimeout(lastError)) {
-      _degradedBlocks.add(block);
-      return lastCleaned != null && lastCleaned.trim().isNotEmpty
-          ? lastCleaned
-          : block.sourceHtml;
+      _markDegradedBlock(chapterPath: chapterPath ?? '', blockId: block.id);
+      return degradeFallback();
     }
     if (lastError is DioException && lastError.error is HandshakeException) {
       final String host = Uri.parse(
@@ -2022,6 +2334,23 @@ class EpubChapterTranslator {
 
   static String _plainTextFromHtmlFragment(String value) {
     return html_parser.parseFragment(value).text ?? '';
+  }
+
+  /// Drops the per-block source HTML/text of a finished chapter to release
+  /// memory. The chapter's translations are already in the block cache and
+  /// staged for repack; repack only needs [InspectedChapter.originalHtml]
+  /// plus each block's translated HTML (see `renderTranslatedChapter`), and
+  /// nothing later in the run reads source strings again (cache restoration
+  /// ran upfront; pending-block checks only read block ids).
+  static InspectedChapter _releaseChapterSourceStrings(
+    InspectedChapter chapter,
+  ) {
+    return chapter.copyWith(
+      blocks: <ExtractedBlock>[
+        for (final ExtractedBlock block in chapter.blocks)
+          block.copyWith(sourceHtml: '', sourceText: ''),
+      ],
+    );
   }
 
   static String _trimMemoryText(String value) {
@@ -2841,24 +3170,21 @@ class EpubChapterTranslator {
         <FootnoteBlockReference>[];
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
     for (final FootnoteBlockReference reference in batch.references) {
-      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
-        reference.block.sourceHtml,
-      )) {
-        htmlReferences.add(reference);
-        continue;
-      }
-      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+      final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
         reference.block.sourceHtml,
       );
-      if (template.hasProtectedAnchors) {
+      if (template != null && template.hasProtectedAnchors) {
         slotRequests.add(
           _ProtectedSlotRequest(
             id: reference.requestId,
             block: reference.block,
             template: template,
+            chapterPath: reference.chapter.path,
           ),
         );
+        continue;
       }
+      htmlReferences.add(reference);
     }
 
     final Map<String, String> translatedById = <String, String>{};
@@ -2881,7 +3207,10 @@ class EpubChapterTranslator {
           // related. The batch already retried once, so retain its source
           // blocks instead of multiplying the outage into per-block calls.
           for (final FootnoteBlockReference reference in htmlReferences) {
-            _degradedBlocks.add(reference.block);
+            _markDegradedBlock(
+              chapterPath: reference.chapter.path,
+              blockId: reference.block.id,
+            );
             translatedById[reference.requestId] = reference.block.sourceHtml;
           }
         } else {
@@ -2908,9 +3237,39 @@ class EpubChapterTranslator {
               if (!TranslationApiClient.isReceiveTimeout(singleError)) {
                 rethrow;
               }
-              _degradedBlocks.add(reference.block);
+              _markDegradedBlock(
+                chapterPath: reference.chapter.path,
+                blockId: reference.block.id,
+              );
               translatedById[reference.requestId] = reference.block.sourceHtml;
             }
+          }
+        }
+      } on FormatException {
+        // A malformed model reply is usually deterministic for the same
+        // prompt, so the whole batch is not re-sent. Retry each reference
+        // on its own; one that still comes back malformed degrades to its
+        // source HTML and is reported with the run instead of aborting the
+        // whole book.
+        for (final FootnoteBlockReference reference in htmlReferences) {
+          try {
+            translatedById.addAll(
+              await _translateFootnoteHtmlBatch(
+                dio: dio,
+                config: config,
+                references: <FootnoteBlockReference>[reference],
+                context: batch.context,
+                retryDelayOverride: retryDelayOverride,
+                cancelToken: cancelToken,
+                onRequestAttempt: onRequestAttempt,
+              ),
+            );
+          } on FormatException {
+            _markDegradedBlock(
+              chapterPath: reference.chapter.path,
+              blockId: reference.block.id,
+            );
+            translatedById[reference.requestId] = reference.block.sourceHtml;
           }
         }
       }
@@ -2990,12 +3349,8 @@ class EpubChapterTranslator {
           data: requestData,
           cancelToken: cancelToken,
         );
-        final String parsedContent = _apiClient.extractMessageContent(
-          response.data,
-        );
-        final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
-          parsedContent,
-        );
+        final Map<String, dynamic> jsonPayload = _apiClient
+            .decodeBatchJsonPayload(response.data);
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
             rawBlocks.length != references.length) {
@@ -3066,6 +3421,7 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+    int? maxBatchAttempts,
   }) async {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
@@ -3082,8 +3438,9 @@ class EpubChapterTranslator {
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         onRequestAttempt: onRequestAttempt,
+        maxAttemptsOverride: maxBatchAttempts,
       );
-    } on FormatException {
+    } on FormatException catch (error) {
       if (requests.length == 1) {
         try {
           return await _translateProtectedSlotsIndividually(
@@ -3095,9 +3452,12 @@ class EpubChapterTranslator {
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
           );
-        } on FormatException catch (error) {
-          if (_isQualityRejection(error)) {
-            _degradedBlocks.add(requests.single.block);
+        } on FormatException catch (singleError) {
+          if (_isQualityRejection(singleError)) {
+            _markDegradedBlock(
+              chapterPath: requests.single.chapterPath,
+              blockId: requests.single.block.id,
+            );
             return <String, String>{
               requests.single.id: requests.single.block.sourceHtml,
             };
@@ -3105,14 +3465,72 @@ class EpubChapterTranslator {
           rethrow;
         }
       }
+      if (error is TranslationParseException) {
+        // Deterministic failure: the model did not return JSON for this
+        // prompt shape, so bisecting would just re-bill the same broken
+        // prompt at every level of the split. Translate each block's slots
+        // directly instead (the single-request path below still degrades
+        // quality rejections per block).
+        final Map<String, String> translated = <String, String>{};
+        for (final _ProtectedSlotRequest request in requests) {
+          translated.addAll(
+            await _translateProtectedSlotBatch(
+              dio: dio,
+              config: config,
+              requests: <_ProtectedSlotRequest>[request],
+              context: context,
+              retryDelayOverride: retryDelayOverride,
+              cancelToken: cancelToken,
+              onRequestAttempt: onRequestAttempt,
+            ),
+          );
+        }
+        return translated;
+      }
+      // Validation failure on a well-formed reply: bisect, but each level
+      // gets a single attempt. A deterministic validation failure must not
+      // eat maxRetries at every level of the split.
+      final int midpoint = requests.length ~/ 2;
+      final Map<String, String> left = await _translateProtectedSlotBatch(
+        dio: dio,
+        config: config,
+        requests: requests.sublist(0, midpoint),
+        context: context,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+        onRequestAttempt: onRequestAttempt,
+        maxBatchAttempts: 1,
+      );
+      final Map<String, String> right = await _translateProtectedSlotBatch(
+        dio: dio,
+        config: config,
+        requests: requests.sublist(midpoint),
+        context: context,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+        onRequestAttempt: onRequestAttempt,
+        maxBatchAttempts: 1,
+      );
+      return <String, String>{...left, ...right};
     } on DioException catch (error) {
       if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
-      if (TranslationApiClient.isConnectionTimeout(error)) {
-        _degradedBlocks.addAll(
-          requests.map((_ProtectedSlotRequest request) => request.block),
+      // 401/403/404 are deterministic configuration errors: fail fast with
+      // the precise diagnostic instead of billing per-block fallback
+      // requests that would all fail the same way.
+      if (TranslationApiClient.isDeterministicHttpError(error)) {
+        throw StateError(
+          TranslationApiClient.deterministicHttpErrorMessage(error, config),
         );
+      }
+      if (TranslationApiClient.isConnectionTimeout(error)) {
+        for (final _ProtectedSlotRequest request in requests) {
+          _markDegradedBlock(
+            chapterPath: request.chapterPath,
+            blockId: request.block.id,
+          );
+        }
         return <String, String>{
           for (final _ProtectedSlotRequest request in requests)
             request.id: request.block.sourceHtml,
@@ -3120,7 +3538,10 @@ class EpubChapterTranslator {
       }
       if (TranslationApiClient.isReceiveTimeout(error) &&
           requests.length == 1) {
-        _degradedBlocks.add(requests.single.block);
+        _markDegradedBlock(
+          chapterPath: requests.single.chapterPath,
+          blockId: requests.single.block.id,
+        );
         return <String, String>{
           requests.single.id: requests.single.block.sourceHtml,
         };
@@ -3131,6 +3552,8 @@ class EpubChapterTranslator {
       }
     }
 
+    // Transport-level fallback (e.g. 413 payload too large): split the batch
+    // with the normal per-level retry policy; smaller payloads usually pass.
     final int midpoint = requests.length ~/ 2;
     final Map<String, String> left = await _translateProtectedSlotBatch(
       dio: dio,
@@ -3161,6 +3584,7 @@ class EpubChapterTranslator {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+    int? maxAttemptsOverride,
   }) {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
@@ -3182,6 +3606,7 @@ class EpubChapterTranslator {
       retryDelayOverride: retryDelayOverride,
       shouldRetry: TranslationApiClient.shouldRetryBatchError,
       cancelToken: cancelToken,
+      maxAttemptsOverride: maxAttemptsOverride,
       operation: () async {
         if (cancelToken?.isCancelled ?? false) {
           throw const TranslationCancelledException();
@@ -3208,9 +3633,8 @@ class EpubChapterTranslator {
           data: requestData,
           cancelToken: cancelToken,
         );
-        final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
-          _apiClient.extractMessageContent(response.data),
-        );
+        final Map<String, dynamic> jsonPayload = _apiClient
+            .decodeBatchJsonPayload(response.data);
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
             rawBlocks.length != requests.length) {
@@ -3315,6 +3739,7 @@ class EpubChapterTranslator {
         config: config,
         request: request,
         context: context,
+        retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         onRequestAttempt: onRequestAttempt,
       ),
@@ -3326,19 +3751,30 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required _ProtectedSlotRequest request,
     required TranslationBatchContext context,
+    Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
   }) async {
     final List<String> translatedSlots = <String>[];
     for (final String sourceText in request.template.slotTexts) {
+      // Retry at the slot level: a transient failure on slot k must not
+      // re-bill the slots that already translated cleanly. A render/quality
+      // failure of the rebuilt block still retries the whole round via the
+      // outer runRetried in [_translateProtectedSlotsIndividually].
       translatedSlots.add(
-        await _translateProtectedSlotTextOnce(
-          dio: dio,
+        await _apiClient.runRetried<String>(
           config: config,
-          sourceText: sourceText,
-          context: context,
+          retryDelayOverride: retryDelayOverride,
+          shouldRetry: TranslationApiClient.shouldRetryBatchError,
           cancelToken: cancelToken,
-          onRequestAttempt: onRequestAttempt,
+          operation: () => _translateProtectedSlotTextOnce(
+            dio: dio,
+            config: config,
+            sourceText: sourceText,
+            context: context,
+            cancelToken: cancelToken,
+            onRequestAttempt: onRequestAttempt,
+          ),
         ),
       );
     }
@@ -3484,30 +3920,47 @@ class EpubChapterTranslator {
     return rendered;
   }
 
+  /// Parses [sourceHtml] for protected-anchor slot translation, returning
+  /// null when the fragment does not meet [ProtectedAnchorTextSlots.parse]'s
+  /// single-root requirement. [ProtectedAnchorTextSlots.containsProtectedAnchors]
+  /// is intentionally looser than [parse] (it also covers ordinary
+  /// multi-root HTML), so a block can pass the check yet fail the parse;
+  /// falling back to the plain HTML path keeps one odd block from failing
+  /// its whole batch.
+  static ProtectedAnchorTextSlots? _tryParseProtectedSlots(String sourceHtml) {
+    try {
+      return ProtectedAnchorTextSlots.parse(sourceHtml);
+    } on FormatException {
+      return null;
+    }
+  }
+
   Future<List<String>> _translateBlockBatch({
     required Dio dio,
     required TranslationConfig config,
     required TranslationBlockBatch batch,
+    String? chapterPath,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
   }) async {
     final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
     for (final ExtractedBlock block in batch.blocks) {
-      if (!ProtectedAnchorTextSlots.containsProtectedAnchors(
-        block.sourceHtml,
-      )) {
-        htmlBlocks.add(block);
-        continue;
-      }
-      final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
+      final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
         block.sourceHtml,
       );
-      if (template.hasProtectedAnchors) {
+      if (template != null && template.hasProtectedAnchors) {
         slotRequests.add(
-          _ProtectedSlotRequest(id: block.id, block: block, template: template),
+          _ProtectedSlotRequest(
+            id: block.id,
+            block: block,
+            template: template,
+            chapterPath: chapterPath ?? '',
+          ),
         );
+        continue;
       }
+      htmlBlocks.add(block);
     }
 
     final Map<String, String> translatedById = <String, String>{};
@@ -3515,6 +3968,7 @@ class EpubChapterTranslator {
       final List<String> translatedHtml = await _translateHtmlBlockBatch(
         dio: dio,
         config: config,
+        chapterPath: chapterPath,
         batch: TranslationBlockBatch(htmlBlocks, context: batch.context),
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
@@ -3544,6 +3998,7 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required TranslationBlockBatch batch,
+    String? chapterPath,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
   }) async {
@@ -3561,7 +4016,8 @@ class EpubChapterTranslator {
     final String payload = jsonEncode(payloadMap);
 
     try {
-      return await _apiClient.runRetried<List<String>>(
+      final _BatchParseOutcome
+      parsed = await _apiClient.runRetried<_BatchParseOutcome>(
         config: config,
         retryDelayOverride: retryDelayOverride,
         shouldRetry: TranslationApiClient.shouldRetryBatchError,
@@ -3595,12 +4051,8 @@ class EpubChapterTranslator {
                 cancelToken: cancelToken,
               );
 
-          final String parsedContent = _apiClient.extractMessageContent(
-            response.data,
-          );
-          final Map<String, dynamic> jsonPayload = _apiClient.decodeJsonObject(
-            parsedContent,
-          );
+          final Map<String, dynamic> jsonPayload = _apiClient
+              .decodeBatchJsonPayload(response.data);
           final List<dynamic> blocksJson =
               jsonPayload['blocks'] as List<dynamic>? ?? <dynamic>[];
           if (blocksJson.length != batch.blocks.length) {
@@ -3626,32 +4078,87 @@ class EpubChapterTranslator {
             translatedById[id] = html.trim();
           }
 
-          return batch.blocks.map((ExtractedBlock block) {
-            final String? translated = translatedById[block.id];
-            if (translated == null || translated.isEmpty) {
-              throw const FormatException(
-                'A translated block is missing from the batch response.',
+          final Map<String, String> okById = <String, String>{};
+          final List<ExtractedBlock> failedBlocks = <ExtractedBlock>[];
+          for (final ExtractedBlock block in batch.blocks) {
+            try {
+              final String? translated = translatedById[block.id];
+              if (translated == null || translated.isEmpty) {
+                throw const FormatException(
+                  'A translated block is missing from the batch response.',
+                );
+              }
+              final String locked = _lockTranslatedHtmlStructure(
+                block,
+                translated,
               );
+              _validateTranslatedBlockQuality(
+                config: config,
+                block: block,
+                translatedHtml: locked,
+              );
+              okById[block.id] = locked;
+            } on FormatException catch (error) {
+              // A residual-quality rejection is often transient: let it
+              // bubble up so the whole batch is retried instead of paying
+              // per-block fallback requests for a glitch that a re-send
+              // usually fixes.
+              if (_isQualityRejection(error)) {
+                rethrow;
+              }
+              // One structurally bad block must not discard the blocks that
+              // already parsed cleanly and passed quality: only the failures
+              // are re-sent individually below instead of re-billing the
+              // whole batch.
+              failedBlocks.add(block);
             }
-            final String locked = _lockTranslatedHtmlStructure(
-              block,
-              translated,
-            );
-            _validateTranslatedBlockQuality(
-              config: config,
-              block: block,
-              translatedHtml: locked,
-            );
-            return locked;
-          }).toList();
+          }
+          return _BatchParseOutcome(okById: okById, failedBlocks: failedBlocks);
         },
       );
+      if (parsed.failedBlocks.isNotEmpty) {
+        final TranslationStyleProfile fallbackStyleProfile =
+            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
+        final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
+          batch.context.bookMemory,
+        );
+        final List<String> retried = await _translateBlocksIndividually(
+          dio: dio,
+          config: config,
+          batch: TranslationBlockBatch(
+            parsed.failedBlocks,
+            context: batch.context,
+          ),
+          chapterPath: chapterPath,
+          styleProfile: fallbackStyleProfile,
+          styleProfileConfirmed: fallbackConfirmed,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+        );
+        for (int index = 0; index < parsed.failedBlocks.length; index += 1) {
+          parsed.okById[parsed.failedBlocks[index].id] = retried[index];
+        }
+      }
+      return <String>[
+        for (final ExtractedBlock block in batch.blocks)
+          parsed.okById[block.id]!,
+      ];
     } on DioException catch (error) {
       if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
+      // 401/403/404 are deterministic configuration errors: fail fast with
+      // the precise diagnostic instead of billing per-block fallback
+      // requests that would all fail the same way.
+      if (TranslationApiClient.isDeterministicHttpError(error)) {
+        throw StateError(
+          TranslationApiClient.deterministicHttpErrorMessage(error, config),
+        );
+      }
       if (TranslationApiClient.isConnectionTimeout(error)) {
-        _degradedBlocks.addAll(batch.blocks);
+        for (final ExtractedBlock block in batch.blocks) {
+          _markDegradedBlock(chapterPath: chapterPath ?? '', blockId: block.id);
+        }
         return batch.blocks
             .map((ExtractedBlock block) => block.sourceHtml)
             .toList(growable: false);
@@ -3662,17 +4169,15 @@ class EpubChapterTranslator {
         final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
           batch.context.bookMemory,
         );
-        return Future.wait<String>(
-          batch.blocks.map(
-            (ExtractedBlock block) => _translateBlock(
-              dio: dio,
-              config: config,
-              block: block,
-              cancelToken: cancelToken,
-              styleProfile: fallbackStyleProfile,
-              styleProfileConfirmed: fallbackConfirmed,
-            ),
-          ),
+        return _translateBlocksIndividually(
+          dio: dio,
+          config: config,
+          batch: batch,
+          chapterPath: chapterPath,
+          styleProfile: fallbackStyleProfile,
+          styleProfileConfirmed: fallbackConfirmed,
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
         );
       }
       rethrow;
@@ -3682,19 +4187,89 @@ class EpubChapterTranslator {
       final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
         batch.context.bookMemory,
       );
-      return Future.wait<String>(
-        batch.blocks.map(
-          (ExtractedBlock block) => _translateBlock(
-            dio: dio,
-            config: config,
-            block: block,
-            cancelToken: cancelToken,
-            styleProfile: fallbackStyleProfile,
-            styleProfileConfirmed: fallbackConfirmed,
-          ),
-        ),
+      return _translateBlocksIndividually(
+        dio: dio,
+        config: config,
+        batch: batch,
+        chapterPath: chapterPath,
+        styleProfile: fallbackStyleProfile,
+        styleProfileConfirmed: fallbackConfirmed,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
       );
     }
+  }
+
+  /// Fallback for a failed batch: re-translate its blocks individually, but
+  /// still honoring [config.maxConcurrent]. A batch can hold dozens of small
+  /// blocks, so an unbounded [Future.wait] here would burst that many
+  /// simultaneous API requests and trip server-side rate limits.
+  Future<List<String>> _translateBlocksIndividually({
+    required Dio dio,
+    required TranslationConfig config,
+    required TranslationBlockBatch batch,
+    String? chapterPath,
+    required TranslationStyleProfile styleProfile,
+    required bool styleProfileConfirmed,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    bool Function()? isCancelled,
+  }) async {
+    bool cancelled() =>
+        cancelToken?.isCancelled == true || (isCancelled?.call() ?? false);
+    final int limit = config.maxConcurrent < 1 ? 1 : config.maxConcurrent;
+    final List<String> results = <String>[];
+    for (int start = 0; start < batch.blocks.length; start += limit) {
+      if (cancelled()) {
+        throw const TranslationCancelledException();
+      }
+      final int end = min(start + limit, batch.blocks.length);
+      final List<String> window = await Future.wait<String>(
+        batch.blocks.sublist(start, end).map((ExtractedBlock block) async {
+          try {
+            return await _translateBlock(
+              dio: dio,
+              config: config,
+              block: block,
+              chapterPath: chapterPath,
+              retryDelayOverride: retryDelayOverride,
+              cancelToken: cancelToken,
+              styleProfile: styleProfile,
+              styleProfileConfirmed: styleProfileConfirmed,
+            );
+          } catch (error) {
+            if (error is TranslationCancelledException ||
+                _isCancelError(error)) {
+              rethrow;
+            }
+            // Fatal block failures stay loud: _translateBlock only throws
+            // StateError for systemic problems (a persistently empty reply,
+            // a TLS failure, ...), and the caller reports those with the
+            // block id instead of silently shipping source text.
+            if (error is StateError) {
+              rethrow;
+            }
+            // One stubborn block with an unexpected non-fatal error must not
+            // discard the windows that already succeeded (and were already
+            // billed) or abort the whole book. Degrade it to its source
+            // HTML, record it for the run report, and keep translating the
+            // rest.
+            _markDegradedBlock(
+              chapterPath: chapterPath ?? '',
+              blockId: block.id,
+            );
+            AppLogger.warn(
+              'Block ${block.id} kept its source text after repeated '
+              'failures (${error.runtimeType}).',
+              tag: 'translate',
+            );
+            return block.sourceHtml;
+          }
+        }),
+      );
+      results.addAll(window);
+    }
+    return results;
   }
 
   TranslationStyleProfile _styleProfileFromBookMemoryJson(
@@ -4388,11 +4963,16 @@ class _ProtectedSlotRequest {
     required this.id,
     required this.block,
     required this.template,
+    required this.chapterPath,
   });
 
   final String id;
   final ExtractedBlock block;
   final ProtectedAnchorTextSlots template;
+
+  /// Scopes degraded-block tracking: block ids restart per chapter, so the
+  /// bare id would collide across chapters.
+  final String chapterPath;
 
   List<String> get slotIds => List<String>.generate(
     template.slotTexts.length,
@@ -4423,4 +5003,13 @@ class _TimedBatchResult {
   final List<String> translatedBlocks;
   final int batchNumber;
   final Duration elapsed;
+}
+
+/// Outcome of parsing one translated batch: blocks that parsed cleanly and
+/// passed quality, plus the blocks that failed and need an individual retry.
+class _BatchParseOutcome {
+  const _BatchParseOutcome({required this.okById, required this.failedBlocks});
+
+  final Map<String, String> okById;
+  final List<ExtractedBlock> failedBlocks;
 }

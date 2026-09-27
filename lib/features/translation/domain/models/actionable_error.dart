@@ -37,9 +37,36 @@ class ActionableErrorFactory {
       return null;
     }
 
+    // Deterministic failures must never offer retry, even when a caller
+    // passes a preferredKind such as retryInspection: a GBK-declared EPUB
+    // chapter will fail the encoding sniff identically on every attempt.
+    if (_isEncodingUnsupported(message)) {
+      return _encodingUnsupported(isChinese);
+    }
+
     final ActionableErrorKind kind =
         preferredKind ?? _classify(message) ?? ActionableErrorKind.dismiss;
     return _forKind(kind, message, isChinese);
+  }
+
+  /// Matches the FormatException thrown by decodeEpubText for non-UTF-8
+  /// declared encodings (message starts with "Unsupported text encoding").
+  static bool _isEncodingUnsupported(String message) {
+    return message.toLowerCase().contains('unsupported text encoding');
+  }
+
+  /// Non-retryable banner for unsupported declared encodings: localized hint,
+  /// dismiss-only action.
+  static ActionableError _encodingUnsupported(bool isChinese) {
+    return ActionableError(
+      title: isChinese ? '编码不受支持' : 'Unsupported encoding',
+      message: isChinese
+          ? '该 EPUB 声明了非 UTF-8 编码（如 GBK），请先转码为 UTF-8 后再导入。'
+          : 'This EPUB declares a non-UTF-8 encoding (e.g. GBK). '
+                'Convert it to UTF-8 before importing.',
+      actionLabel: isChinese ? '知道了' : 'Dismiss',
+      actionKind: ActionableErrorKind.dismiss,
+    );
   }
 
   static ActionableErrorKind? _classify(String message) {

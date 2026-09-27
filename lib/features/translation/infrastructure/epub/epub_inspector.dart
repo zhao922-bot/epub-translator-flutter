@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
@@ -11,6 +9,7 @@ import '../../domain/models/translation_job.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'epub_text_decoder.dart';
 
 /// Loads an EPUB (via isolate) and extracts chapter/block inventory.
 class EpubInspector {
@@ -70,7 +69,11 @@ class EpubInspector {
     }
 
     final XmlDocument containerDocument = XmlDocument.parse(
-      utf8.decode(containerBytes),
+      decodeEpubText(
+        bytes: containerBytes,
+        filePath: 'META-INF/container.xml',
+        strict: true,
+      ),
     );
     final XmlElement? rootFile = containerDocument.descendants
         .whereType<XmlElement>()
@@ -99,10 +102,9 @@ class EpubInspector {
       'Located package document: $opfPath',
     );
 
-    final List<String> chapterPaths = chapterPathsFromOpfBytes(
-      files: files,
-      opfPath: opfPath,
-    );
+    final ({List<String> chapterPaths, List<String> unresolvedIdRefs})
+    spine = chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
+    final List<String> chapterPaths = spine.chapterPaths;
 
     if (chapterPaths.isEmpty) {
       emit(
@@ -116,6 +118,10 @@ class EpubInspector {
       return InspectionResult(
         job: currentJob,
         chapters: const <InspectedChapter>[],
+        warnings: <String>[
+          for (final String idRef in spine.unresolvedIdRefs)
+            'Spine itemref "$idRef" has no matching manifest item; skipped.',
+        ],
       );
     }
 
@@ -129,12 +135,17 @@ class EpubInspector {
     );
 
     final List<InspectedChapter> chapters = <InspectedChapter>[];
+    final List<String> missingChapterFiles = <String>[];
     int totalBlocks = 0;
     for (int index = 0; index < chapterPaths.length; index += 1) {
       throwIfCancelled();
       final String chapterPath = chapterPaths[index];
       final List<int>? chapterBytes = files[chapterPath];
       if (chapterBytes == null) {
+        // A damaged EPUB may list spine entries whose files are absent from
+        // the archive. Skip them but remember them for the completion
+        // warning below; the remaining chapters are still translatable.
+        missingChapterFiles.add(chapterPath);
         continue;
       }
       final InspectedChapter chapter = _extractor.inspectChapterBytes(
@@ -158,6 +169,12 @@ class EpubInspector {
       );
     }
 
+    final List<String> warnings = <String>[
+      for (final String idRef in spine.unresolvedIdRefs)
+        'Spine itemref "$idRef" has no matching manifest item; skipped.',
+      for (final String missing in missingChapterFiles)
+        'Chapter file missing from archive, skipped: $missing.',
+    ];
     final TranslationJob inspectedJob = currentJob.copyWith(
       status: TranslationJobStatus.inspected,
       progress: 1,
@@ -171,11 +188,35 @@ class EpubInspector {
       inspectedJob,
       'EPUB inspection complete. Preview now shows ${chapters.length} real chapters with a basic translation filter.',
     );
+    if (warnings.isNotEmpty) {
+      const int maxShown = 8;
+      final String shown = warnings.take(maxShown).join(' ');
+      final String overflow = warnings.length > maxShown
+          ? ' (+${warnings.length - maxShown} more)'
+          : '';
+      AppLogger.warn(
+        'Inspection skipped ${warnings.length} spine entr${warnings.length == 1 ? 'y' : 'ies'} '
+        'with missing files: $shown$overflow',
+        tag: 'inspect',
+      );
+      emit(
+        inspectedJob,
+        'Warning: skipped ${warnings.length} chapter(s) referenced by the spine '
+        'but missing from the archive: $shown$overflow. '
+        'The remaining chapters can still be translated. / '
+        '警告：spine 引用的 ${warnings.length} 个章节文件在 EPUB 中缺失，已跳过：$shown$overflow。'
+        '其余章节仍可正常翻译。',
+      );
+    }
     emit(
       inspectedJob,
       'Performance: EPUB inspection took ${_formatDuration(inspectionStopwatch.elapsed)} for ${chapters.length} chapters and $totalBlocks text blocks.',
     );
-    return InspectionResult(job: inspectedJob, chapters: chapters);
+    return InspectionResult(
+      job: inspectedJob,
+      chapters: chapters,
+      warnings: warnings,
+    );
   }
 
   /// Public for stress tests and reuse by translator fingerprinting paths.
@@ -189,7 +230,12 @@ class EpubInspector {
     };
   }
 
-  static List<String> chapterPathsFromOpfBytes({
+  /// Resolves spine itemrefs to archive paths. Returns both the resolved
+  /// chapter paths and the idrefs that had no matching manifest item, so
+  /// callers can warn about damaged books instead of silently dropping
+  /// chapters.
+  static ({List<String> chapterPaths, List<String> unresolvedIdRefs})
+  chapterPathsFromOpfBytes({
     required Map<String, List<int>> files,
     required String opfPath,
   }) {
@@ -200,7 +246,9 @@ class EpubInspector {
       );
     }
 
-    final XmlDocument opfDocument = XmlDocument.parse(utf8.decode(opfBytes));
+    final XmlDocument opfDocument = XmlDocument.parse(
+      decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+    );
     final String opfDirectory = path.posix.dirname(opfPath);
 
     final Map<String, String> manifest = <String, String>{};
@@ -218,6 +266,7 @@ class EpubInspector {
     }
 
     final List<String> chapterPaths = <String>[];
+    final List<String> unresolvedIdRefs = <String>[];
     for (final XmlElement itemRef
         in opfDocument.descendants.whereType<XmlElement>()) {
       if (itemRef.name.local != 'itemref') {
@@ -226,13 +275,16 @@ class EpubInspector {
       final String? idRef = itemRef.getAttribute('idref');
       final String? chapterPath = idRef == null ? null : manifest[idRef];
       if (chapterPath == null) {
+        if (idRef != null) {
+          unresolvedIdRefs.add(idRef);
+        }
         continue;
       }
       if (_isHtmlDocument(chapterPath)) {
         chapterPaths.add(chapterPath);
       }
     }
-    return chapterPaths;
+    return (chapterPaths: chapterPaths, unresolvedIdRefs: unresolvedIdRefs);
   }
 
   static bool _isHtmlDocument(String filePath) {
@@ -244,7 +296,14 @@ class EpubInspector {
 
   static String _resolveManifestHref(String opfDirectory, String href) {
     final String hrefPath = href.split('#').first.split('?').first;
-    final String decodedHref = Uri.decodeFull(hrefPath);
+    String decodedHref;
+    try {
+      decodedHref = Uri.decodeFull(hrefPath);
+    } catch (_) {
+      // A literal '%' (e.g. "100%.xhtml") is not a valid escape sequence;
+      // keep the original href instead of failing the whole inspection.
+      decodedHref = hrefPath;
+    }
     return path.posix.normalize(path.posix.join(opfDirectory, decodedHref));
   }
 

@@ -5,8 +5,23 @@ import 'dart:math';
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
 
+import '../../../../shared/localization/app_strings.dart';
+
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
+
+/// Thrown when a batch translation reply cannot be parsed as JSON at all
+/// (the message content is missing or is not a JSON object).
+///
+/// Unlike a well-formed reply that fails validation (wrong block ids, a
+/// failed residual-quality gate, an empty block), an unparseable reply is —
+/// at temperature 0.2 — almost always deterministic for the same prompt, so
+/// the batch-level retry policy skips re-sending the whole batch and goes
+/// straight to the cheaper per-block fallback instead of billing
+/// [TranslationConfig.maxRetries] identical full-batch requests.
+class TranslationParseException extends FormatException {
+  const TranslationParseException(super.message);
+}
 
 /// OpenAI-compatible chat client with retry / rate-limit handling.
 class TranslationApiClient {
@@ -76,7 +91,9 @@ class TranslationApiClient {
       );
       final String content = extractMessageContent(response.data);
       final String host = Uri.parse(normalizedBaseUrl(config.apiBaseUrl)).host;
-      return 'Connected to $host successfully. Model responded: ${content.isEmpty ? 'OK' : content}';
+      return AppStrings(
+        config.uiLanguage,
+      ).connectionDetail(host, content.isEmpty ? 'OK' : content);
     } on DioException catch (error) {
       if (error.error is HandshakeException) {
         final String host = Uri.parse(
@@ -91,6 +108,10 @@ class TranslationApiClient {
       throw StateError(
         'Connection test failed for $host${statusCode != null ? ' with HTTP $statusCode' : ''}: ${error.message}',
       );
+    } finally {
+      // Each probe builds a fresh Dio (with its own HttpClient connection
+      // pool); close it so sockets are not left lingering.
+      dio.close(force: true);
     }
   }
 
@@ -112,6 +133,7 @@ class TranslationApiClient {
     bool Function(Object error)? shouldRetry,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
+    int? maxAttemptsOverride,
   }) async {
     for (int attempt = 1; ; attempt += 1) {
       try {
@@ -124,7 +146,8 @@ class TranslationApiClient {
           throw const TranslationCancelledException();
         }
         final bool retryable = shouldRetry?.call(error) ?? true;
-        final int maxAttempts = maxAttemptsForError(config, error);
+        final int maxAttempts =
+            maxAttemptsOverride ?? maxAttemptsForError(config, error);
         if (!retryable || attempt >= maxAttempts) {
           Error.throwWithStackTrace(error, stackTrace);
         }
@@ -173,9 +196,18 @@ class TranslationApiClient {
   }
 
   String extractMessageContent(dynamic responseData) {
+    // A proxy/gateway may answer with a plain string (or another non-JSON
+    // shape) instead of the chat-completions object. Report that as a
+    // deterministic parse failure so the retry policy does not burn
+    // maxRetries re-sending a request the endpoint cannot answer.
+    if (responseData is! Map<String, dynamic>) {
+      throw TranslationParseException(
+        'Translation API response is not a JSON object '
+        '(${responseData.runtimeType}).',
+      );
+    }
     final dynamic rawContent =
-        (responseData
-            as Map<String, dynamic>)['choices']?[0]?['message']?['content'];
+        responseData['choices']?[0]?['message']?['content'];
     final String content = switch (rawContent) {
       String value => value.trim(),
       List<dynamic> value =>
@@ -200,10 +232,7 @@ class TranslationApiClient {
   /// for untranslated source text in single-block mode.
   String _stripReasoningBlocks(String content) {
     final String stripped = content.replaceAllMapped(
-      RegExp(
-        r'<think(?:\s[^>]*)?>[\s\S]*?</think>',
-        caseSensitive: false,
-      ),
+      RegExp(r'<think(?:\s[^>]*)?>[\s\S]*?</think>', caseSensitive: false),
       (Match match) => '',
     );
     return stripped.trim();
@@ -237,6 +266,19 @@ class TranslationApiClient {
       throw const FormatException('Model response is not a JSON object.');
     }
     return decoded;
+  }
+
+  /// Extracts the message content from a chat-completions response and
+  /// decodes it as a JSON object for a batch request. Any failure to even
+  /// parse the reply becomes a [TranslationParseException] so the batch
+  /// retry policy can tell "the model did not return JSON" apart from
+  /// "the JSON failed validation".
+  Map<String, dynamic> decodeBatchJsonPayload(dynamic responseData) {
+    try {
+      return decodeJsonObject(extractMessageContent(responseData));
+    } on FormatException catch (error) {
+      throw TranslationParseException(error.message);
+    }
   }
 
   void _ensureNoDuplicateObjectKeys(String source) {
@@ -403,35 +445,143 @@ class TranslationApiClient {
         error.type == DioExceptionType.receiveTimeout;
   }
 
+  static bool isSendTimeout(Object error) {
+    return error is DioException &&
+        error.type == DioExceptionType.sendTimeout;
+  }
+
   static bool isConnectionTimeout(Object error) {
     return error is DioException &&
         error.type == DioExceptionType.connectionTimeout;
   }
 
   static bool isRequestTimeout(Object error) {
-    return isReceiveTimeout(error) || isConnectionTimeout(error);
+    return isReceiveTimeout(error) ||
+        isSendTimeout(error) ||
+        isConnectionTimeout(error);
   }
 
   static bool shouldFallbackBatchDioException(DioException error) {
     if (error.response?.statusCode == 413) {
       return true;
     }
-    // A receive timeout on a large batch often means the endpoint is too slow
-    // for the whole batch rather than that translation failed. Fall back to
-    // smaller single-block requests, which are far less likely to time out,
-    // instead of failing the entire translation run.
-    return error.type == DioExceptionType.receiveTimeout;
+    // A send or receive timeout on a large batch often means the endpoint is
+    // too slow for the whole batch rather than that translation failed. Fall
+    // back to smaller single-block requests, which are far less likely to
+    // time out, instead of failing the entire translation run.
+    return error.type == DioExceptionType.receiveTimeout ||
+        error.type == DioExceptionType.sendTimeout;
+  }
+
+  /// HTTP status codes that are deterministic configuration errors: a wrong
+  /// or inactive API key (401), a key without access to the model (403), or
+  /// a wrong Base URL / model name (404). Re-sending the same request cannot
+  /// fix them, so callers must fail fast instead of burning retry attempts.
+  ///
+  /// A 403 is only deterministic when it is genuinely a permission problem:
+  /// some gateways report rate limiting as 403 instead of 429. When the
+  /// response carries a `Retry-After` header or the body mentions rate
+  /// limiting / quota exhaustion, the error counts as a rate limit
+  /// ([isRateLimitError]) and takes the retry path instead of failing fast.
+  static bool isDeterministicHttpError(Object error) {
+    final int? statusCode = error is DioException
+        ? error.response?.statusCode
+        : null;
+    if (statusCode == 401 || statusCode == 404) {
+      return true;
+    }
+    return statusCode == 403 && !isRateLimitError(error);
+  }
+
+  /// Precise user-facing message for [isDeterministicHttpError] failures,
+  /// mirroring the settings-page connection diagnostic wording so a
+  /// misconfigured key/URL fails loudly with an actionable hint.
+  static String deterministicHttpErrorMessage(
+    Object error,
+    TranslationConfig config,
+  ) {
+    final int? statusCode = error is DioException
+        ? error.response?.statusCode
+        : null;
+    final AppStrings strings = AppStrings(config.uiLanguage);
+    final String host = _diagnosticHost(config);
+    switch (statusCode) {
+      case 401:
+        return strings.httpAuthError(host);
+      case 403:
+        return strings.httpForbiddenError(host, config.model);
+      case 404:
+        return strings.httpNotFoundError(host, config.model);
+      default:
+        return 'HTTP $statusCode from $host. The provider rejected the request; check the Base URL, API key, and model name.';
+    }
+  }
+
+  static String _diagnosticHost(TranslationConfig config) {
+    try {
+      final String value = config.apiBaseUrl.trim();
+      final Uri uri = Uri.parse(
+        value.contains('://') ? value : 'https://$value',
+      );
+      return uri.host.isEmpty ? 'the API host' : uri.host;
+    } catch (_) {
+      return 'the API host';
+    }
   }
 
   static bool shouldRetryBatchError(Object error) {
     if (error is TranslationCancelledException || isCancelError(error)) {
       return false;
     }
+    // 401/403/404 are deterministic configuration errors (a 403 that looks
+    // like rate limiting is already excluded by [isDeterministicHttpError]):
+    // re-sending the whole batch would just bill the same doomed request
+    // again.
+    if (isDeterministicHttpError(error)) {
+      return false;
+    }
+    // An unparseable reply is almost always deterministic for the same
+    // prompt (see [TranslationParseException]): re-sending the whole batch
+    // would just bill the same request again, so go straight to the
+    // per-block fallback. Validation failures on a well-formed reply
+    // (wrong ids, residual-quality gate, empty block) are often transient
+    // and keep the normal batch retry policy.
+    if (error is TranslationParseException) {
+      return false;
+    }
     return error is! DioException || !shouldFallbackBatchDioException(error);
   }
 
   static bool isRateLimitError(Object error) {
-    return error is DioException && error.response?.statusCode == 429;
+    if (error is! DioException) {
+      return false;
+    }
+    if (error.response?.statusCode == 429) {
+      return true;
+    }
+    // Some gateways signal rate limiting with 403 instead of 429 (often
+    // with a Retry-After header or a "quota exceeded" style body). Those
+    // must be retried, not treated as deterministic configuration errors.
+    return error.response?.statusCode == 403 &&
+        _looksLikeRateLimitResponse(error);
+  }
+
+  /// True when a 403 response carries the hallmarks of rate limiting: a
+  /// `Retry-After` header, or a body mentioning rate limits / quota
+  /// exhaustion (case-insensitive).
+  static bool _looksLikeRateLimitResponse(DioException error) {
+    final String? retryAfter = error.response?.headers
+        .value('retry-after')
+        ?.trim();
+    if (retryAfter != null && retryAfter.isNotEmpty) {
+      return true;
+    }
+    final String body = (error.response?.data?.toString() ?? '').toLowerCase();
+    return body.contains('rate limit') ||
+        body.contains('rate-limit') ||
+        body.contains('ratelimit') ||
+        body.contains('quota') ||
+        body.contains('too many requests');
   }
 
   static int maxAttemptsForError(TranslationConfig config, Object error) {
@@ -439,10 +589,11 @@ class TranslationApiClient {
     if (isRateLimitError(error)) {
       return max(normalMaxAttempts, 8);
     }
-    // A connection or receive timeout means the endpoint did not become
-    // usable within the configured window. Retrying the same request four or
-    // more times can block the whole EPUB for many minutes; one retry is
-    // enough to distinguish a transient stall before the caller degrades it.
+    // A connection, send, or receive timeout means the endpoint did not
+    // become usable within the configured window. Retrying the same request
+    // four or more times can block the whole EPUB for many minutes; one
+    // retry is enough to distinguish a transient stall before the caller
+    // degrades it.
     if (isRequestTimeout(error)) {
       return min(normalMaxAttempts, 2);
     }

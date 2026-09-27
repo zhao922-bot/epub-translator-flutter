@@ -31,6 +31,7 @@ class JobResumeState {
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
+      'version': 1,
       'jobKey': jobKey,
       'inputFingerprint': inputFingerprint,
       'inputPath': inputPath,
@@ -48,6 +49,12 @@ class JobResumeState {
   }
 
   factory JobResumeState.fromJson(Map<String, dynamic> json) {
+    final Object? version = json['version'];
+    if (version != null && version != 1) {
+      // Unknown schema: fail loudly so the caller falls back to scanning the
+      // block caches instead of silently resuming from misparsed data.
+      throw FormatException('Unsupported JobResumeState version: $version');
+    }
     return JobResumeState(
       jobKey: _readString(json['jobKey']),
       inputFingerprint: _readString(json['inputFingerprint']),

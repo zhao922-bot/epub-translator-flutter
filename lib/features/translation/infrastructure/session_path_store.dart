@@ -3,9 +3,10 @@ import 'dart:io';
 
 import 'package:path/path.dart' as path;
 
+import '../../../shared/io/atomic_file_writer.dart';
 import '../../../shared/platform/platform_utils.dart';
 
-/// Remembers last EPUB input and output directory for Windows/Android.
+/// Remembers the last EPUB input path and output directory across sessions.
 class SessionPathStore {
   SessionPathStore({this.fileProvider});
 
@@ -36,12 +37,12 @@ class SessionPathStore {
   }) async {
     final File file = await _file();
     await file.parent.create(recursive: true);
-    await file.writeAsString(
+    await writeFileAtomically(
+      file,
       const JsonEncoder.withIndent('  ').convert(<String, String>{
         'inputPath': inputPath,
         'outputDirectory': outputDirectory,
       }),
-      flush: true,
     );
   }
 

@@ -26,6 +26,16 @@ class SettingsPage extends ConsumerWidget {
     final connectionTestController = ref.read(connectionTestProvider.notifier);
     final strings = ref.watch(appStringsProvider);
 
+    // Surface persistence failures (e.g. the secret store timing out): the
+    // fields already show the new values, so warn instead of failing silently.
+    ref.listen(settingsSaveErrorProvider, (previous, next) {
+      if (next != null && next.message != null && next.id != previous?.id) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(strings.settingsSaveFailed)),
+        );
+      }
+    });
+
     return PageScaffold(
       title: strings.settingsTitle,
       subtitle: strings.settingsSubtitle,
@@ -73,6 +83,7 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 12),
                 SettingsTextField(
+                  strings: strings,
                   fieldKey: const ValueKey<String>('settings-api-base-url'),
                   value: config.apiBaseUrl,
                   onChanged: controller.setApiBaseUrl,
@@ -85,6 +96,7 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 SettingsTextField(
+                  strings: strings,
                   fieldKey: const ValueKey<String>('settings-api-key'),
                   value: config.apiKey,
                   onChanged: controller.setApiKey,
@@ -99,6 +111,7 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 SettingsTextField(
+                  strings: strings,
                   fieldKey: const ValueKey<String>('settings-model'),
                   value: config.model,
                   onChanged: controller.setModel,
@@ -233,6 +246,7 @@ class SettingsPage extends ConsumerWidget {
                           : controller.setRetryDelaySeconds,
                     ),
                     SettingsTextField(
+                      strings: strings,
                       fieldKey: const ValueKey<String>(
                         'settings-output-suffix',
                       ),
@@ -246,6 +260,7 @@ class SettingsPage extends ConsumerWidget {
                     ),
                     const SizedBox(height: 10),
                     SettingsTextField(
+                      strings: strings,
                       fieldKey: const ValueKey<String>(
                         'settings-locked-glossary',
                       ),

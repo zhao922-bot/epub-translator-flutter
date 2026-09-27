@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:path/path.dart' as path;
 
+import '../../../shared/io/atomic_file_writer.dart';
 import '../../../shared/platform/platform_utils.dart';
 import '../domain/models/translation_job.dart';
 
@@ -45,9 +46,9 @@ class JobHistoryStore {
         .take(20)
         .map((TranslationJob job) => job.toJson())
         .toList(growable: false);
-    await file.writeAsString(
+    await writeFileAtomically(
+      file,
       const JsonEncoder.withIndent('  ').convert(payload),
-      flush: true,
     );
   }
 

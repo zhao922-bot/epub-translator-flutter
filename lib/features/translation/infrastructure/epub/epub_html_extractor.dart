@@ -1,10 +1,9 @@
-import 'dart:convert';
-
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 
 import '../../domain/models/inspected_chapter.dart';
+import 'epub_text_decoder.dart';
 import 'xhtml_html_compatibility.dart';
 
 /// Shared HTML extraction / chapter categorization for inspect + repack.
@@ -52,7 +51,9 @@ class EpubHtmlExtractor {
     required String chapterPath,
     required List<int> bytes,
   }) {
-    final String decoded = utf8.decode(bytes, allowMalformed: true);
+    // Non-UTF-8 chapters fail loud here (see epub_text_decoder.dart) instead
+    // of degrading into U+FFFD confetti that would burn translation tokens.
+    final String decoded = decodeEpubText(bytes: bytes, filePath: chapterPath);
     final dom.Document document = html_parser.parse(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(decoded),
     );
@@ -357,8 +358,29 @@ class EpubHtmlExtractor {
     ).where((dom.Element element) => elementText(element).isNotEmpty).toList();
   }
 
+  /// Plain-text rendering of [element] for previews and translation
+  /// bookkeeping. `<br>` contributes a space so line breaks don't glue words
+  /// together; the DOM itself is never mutated, so `sourceHtml` (what is sent
+  /// to the translation API) is unaffected.
   String elementText(dom.Element element) {
-    return element.text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final StringBuffer buffer = StringBuffer();
+    void visit(dom.Node node) {
+      if (node is dom.Text) {
+        buffer.write(node.data);
+      } else if (node is dom.Element) {
+        if (node.localName == 'br') {
+          buffer.write(' ');
+        } else {
+          for (final dom.Node child in node.nodes) {
+            visit(child);
+          }
+        }
+      }
+    }
+    for (final dom.Node child in element.nodes) {
+      visit(child);
+    }
+    return buffer.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
   bool hasTranslatableAncestor(dom.Element element) {
@@ -405,9 +427,17 @@ class EpubHtmlExtractor {
   }
 
   ChapterCategory categorizeChapter(String chapterPath, String title) {
-    final String token = '${chapterPath.toLowerCase()} ${title.toLowerCase()}';
+    final String pathToken = chapterPath.toLowerCase();
+    final String titleToken = title.toLowerCase();
+    // Title matching uses word boundaries so generic substrings don't misfire
+    // ("advert" inside "advertisement", "notes" inside "footnotes"). Path
+    // matching intentionally stays substring-based: EPUB filenames are
+    // conventional markers like `book_cvi_r1.htm`, not prose.
+    bool matches(List<String> needles) =>
+        _matchesAny(pathToken, needles) ||
+        _matchesTitleWord(titleToken, needles);
 
-    if (_matchesAny(token, const <String>[
+    if (matches(const <String>[
       'cover',
       'copyright',
       'credit',
@@ -423,7 +453,7 @@ class EpubHtmlExtractor {
       return ChapterCategory.ancillary;
     }
 
-    if (_matchesAny(token, const <String>[
+    if (matches(const <String>[
       'index',
       'endnote',
       'notes',
@@ -435,7 +465,7 @@ class EpubHtmlExtractor {
       return ChapterCategory.reference;
     }
 
-    if (_matchesAny(token, const <String>[
+    if (matches(const <String>[
       'ack',
       'acknowledg',
       'authorbio',
@@ -448,7 +478,7 @@ class EpubHtmlExtractor {
       return ChapterCategory.backMatter;
     }
 
-    if (_matchesAny(token, const <String>[
+    if (matches(const <String>[
       'dedication',
       'prologue',
       'foreword',
@@ -494,10 +524,21 @@ class EpubHtmlExtractor {
     }
     return RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
         RegExp(r'^\d{1,3}$').hasMatch(compact) ||
-        RegExp(r'^[a-zA-Z]$').hasMatch(compact);
+        RegExp(r'^[a-zA-Z]$').hasMatch(compact) ||
+        // EPUB3 page-list markers ("Page 12", "page 7"): keep them verbatim
+        // instead of translating them. Whitespace is already stripped above,
+        // so "Page 12" arrives here as "page12".
+        RegExp(r'^page\d{1,4}$', caseSensitive: false).hasMatch(compact);
   }
 
   bool _matchesAny(String source, List<String> needles) {
     return needles.any(source.contains);
+  }
+
+  bool _matchesTitleWord(String title, List<String> needles) {
+    return needles.any(
+      (String needle) =>
+          RegExp('\\b${RegExp.escape(needle)}\\b').hasMatch(title),
+    );
   }
 }
