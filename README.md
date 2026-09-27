@@ -2,10 +2,10 @@
 
 一款面向整本书翻译的 Flutter EPUB 工具。它不只是把文本发送给模型，而是围绕 EPUB 结构解析、风格确认、上下文翻译、质量校验、断点续传和兼容性输出，提供完整的书籍翻译工作流。
 
-当前版本：**v1.4.0**
+当前版本：**v1.4.1**
 
-- Windows x64：已验证并发布完整便携包。
-- Android：保留源码与构建支持；v1.4.0 暂不发布 APK，待完成真机全链路验证后再提供。
+- Windows x64：v1.4.0 已验证并发布完整便携包；v1.4.1 的 Windows 包待补充。
+- Android：v1.4.1 起发布正式签名 APK，可直接安装升级。
 
 ## 核心能力
 
@@ -66,13 +66,30 @@
 
 ## Windows 安装
 
-从 [GitHub Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) 下载：
+从 [v1.4.0 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.0)下载（v1.4.1 的 Windows 便携包待补充）：
 
 `epub-translator-flutter-v1.4.0-windows-x64-portable.zip`
 
 完整解压 ZIP 后运行 `epub_translator_flutter_clean.exe`。请不要只单独复制 EXE；Flutter Windows 程序还需要同目录中的 DLL 和 `data` 文件夹。
 
 当前发布包面向 64 位 Windows。由于应用暂未进行商业代码签名，Windows SmartScreen 首次运行时可能显示安全提醒。
+
+## Android 安装
+
+从 [GitHub Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) 下载：
+
+`epub-translator-flutter-v1.4.1-android.apk`
+
+安装时如提示"未知来源应用"，按系统指引允许安装即可。APK 使用正式签名密钥签名，后续版本可直接覆盖升级。
+
+## v1.4.1 重点更新
+
+- Android 新增前台服务：灭屏或切换到后台后翻译继续进行，通知栏实时显示进度。
+- Android 正式发布签名 APK，可直接安装。
+- 401/403/404 等确定性错误立即失败并给出中文指引，不再浪费重试请求烧 API 费用。
+- 非 UTF-8 编码章节直接报错而非产出乱码；续翻 checkpoint 写入改为尽力而为，Windows 下杀毒软件短暂锁文件不再杀死整个任务。
+- 输出文件被阅读器占用时，翻译开始前提前报错，避免浪费 API 费用。
+- 另有数十项 Windows/Android 稳定性与本地化修复。
 
 ## v1.4.0 重点更新
 
@@ -100,7 +117,7 @@ Windows 构建输出位于：
 build\windows\x64\runner\Release\
 ```
 
-Android 构建命令仍可使用，但 v1.4.0 未将 APK 列为正式验证和发布产物：
+Android 构建命令仍可使用；v1.4.1 起 APK 为正式发布产物（release 签名）：
 
 ```powershell
 flutter build apk --release
