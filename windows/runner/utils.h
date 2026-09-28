@@ -16,4 +16,13 @@ std::string Utf8FromUtf16(const wchar_t* utf16_string);
 // encoded in UTF-8. Returns an empty std::vector<std::string> on failure.
 std::vector<std::string> GetCommandLineArguments();
 
+// Resolves relative command-line file arguments against the current
+// working directory, replacing existing relative file paths with their
+// absolute form. Arguments that look like flags (leading '-' or '/'), or
+// that don't resolve to an existing file, are returned unchanged. Call
+// BEFORE any SetCurrentDirectory so relative paths keep the meaning they
+// had at launch.
+std::vector<std::string> ResolveRelativeFileArguments(
+    std::vector<std::string> arguments);
+
 #endif  // RUNNER_UTILS_H_

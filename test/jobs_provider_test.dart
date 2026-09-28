@@ -74,10 +74,14 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
   final List<TranslationJob> initial;
 
   @override
-  Future<List<TranslationJob>> load() async => initial;
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: initial, clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {}
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
 }
 
 void main() {
@@ -94,10 +98,7 @@ void main() {
     expect(container.read(jobsProvider), isEmpty);
   });
 
-  test(
-    'shows the real current translation job',
-    testOn: 'windows',
-    () async {
+  test('shows the real current translation job', testOn: 'windows', () async {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
         translationRepositoryProvider.overrideWithValue(
@@ -191,5 +192,52 @@ void main() {
     expect(warningJob.canResume, isTrue);
     expect(warningJob.isActive, isFalse);
     expect(warningJob.degradedBlockCount, 2);
+  });
+
+  test('retry is reported blocked while another run is active', () async {
+    final ProviderContainer container = ProviderContainer(
+      overrides: <Override>[
+        jobHistoryStoreProvider.overrideWithValue(
+          _MemoryJobHistoryStore(const <TranslationJob>[
+            TranslationJob(
+              id: 'failed-job',
+              inputPath: 'failed.epub',
+              outputPath: 'out',
+              status: TranslationJobStatus.failed,
+              progress: 0.2,
+            ),
+          ]),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    final controller = container.read(translationDashboardProvider.notifier);
+    // Simulate an active run: the retry button must stay tappable and
+    // explain the situation instead of silently no-op'ing.
+    controller.state = controller.state.copyWith(
+      job: const TranslationJob(
+        id: 'active-job',
+        inputPath: 'active.epub',
+        outputPath: 'out',
+        status: TranslationJobStatus.running,
+        progress: 0.1,
+      ),
+    );
+    await Future<void>.delayed(Duration.zero);
+
+    final blocked = container
+        .read(jobsProvider)
+        .firstWhere((job) => job.id == 'failed-job');
+    expect(blocked.canRetry, isTrue);
+    expect(blocked.retryBlocked, isTrue);
+
+    controller.state = controller.state.copyWith(job: null);
+    await Future<void>.delayed(Duration.zero);
+
+    final unblocked = container
+        .read(jobsProvider)
+        .firstWhere((job) => job.id == 'failed-job');
+    expect(unblocked.retryBlocked, isFalse);
   });
 }

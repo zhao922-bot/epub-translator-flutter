@@ -25,123 +25,115 @@ import 'package:path/path.dart' as path;
 void main() {
   final String? epubPath = _resolveRealEpubPath();
 
-  test(
-    'optional real EPUB: isolate open + inspect + repack',
-    () async {
-      if (epubPath == null) {
-        // ignore: avoid_print
-        print(
-          'SKIP real EPUB stress: set EPUB_STRESS_PATH or '
-          'EPUB_TRANSLATOR_STRESS_EPUB to a local .epub file.',
-        );
-        return;
-      }
-
-      final File epubFile = File(epubPath);
-      expect(
-        await epubFile.exists(),
-        isTrue,
-        reason: 'Missing file: $epubPath',
-      );
-      expect(path.extension(epubPath).toLowerCase(), '.epub');
-
-      final int epubBytes = await epubFile.length();
-      final Directory temp = await Directory.systemTemp.createTemp(
-        'epub_real_stress_',
-      );
-      addTearDown(() async {
-        if (await temp.exists()) {
-          await temp.delete(recursive: true);
-        }
-      });
-
-      final Stopwatch openWatch = Stopwatch()..start();
-      final Map<String, List<int>> files = await EpubInspector.openArchiveFiles(
-        epubFile.path,
-      );
-      openWatch.stop();
-      expect(files, isNotEmpty);
-      expect(files.containsKey('META-INF/container.xml'), isTrue);
-
-      final Stopwatch inspectWatch = Stopwatch()..start();
-      final inspection = await EpubInspector().inspect(
-        inputPath: epubFile.path,
-        outputDirectory: temp.path,
-        cancelToken: CancelToken(),
-      );
-      inspectWatch.stop();
-      expect(inspection.chapters, isNotEmpty);
-
-      final int totalBlocks = inspection.chapters.fold<int>(
-        0,
-        (int sum, InspectedChapter c) => sum + c.blocks.length,
-      );
-
-      // Only rewrite chapters that already have extractable blocks, and only
-      // a capped subset so huge books still finish in CI-like timeouts.
-      final List<InspectedChapter> toRewrite = inspection.chapters
-          .where((InspectedChapter c) => c.blocks.isNotEmpty)
-          .take(12)
-          .map((InspectedChapter chapter) {
-            final List<ExtractedBlock> blocks = chapter.blocks
-                .take(8)
-                .map(
-                  (ExtractedBlock block) => block.copyWith(
-                    translatedHtml:
-                        '<${block.tagName}>[stress] ${block.sourceText}</${block.tagName}>',
-                  ),
-                )
-                .toList(growable: false);
-            // Keep remaining blocks without translation so render is a partial rewrite.
-            final List<ExtractedBlock> merged = <ExtractedBlock>[
-              ...blocks,
-              ...chapter.blocks.skip(blocks.length),
-            ];
-            return chapter.copyWith(includeInTranslation: true, blocks: merged);
-          })
-          .toList(growable: false);
-
-      expect(toRewrite, isNotEmpty);
-
-      final String outputPath = path.join(
-        temp.path,
-        '${path.basenameWithoutExtension(epubPath)}_stress_out.epub',
-      );
-      final Stopwatch repackWatch = Stopwatch()..start();
-      await EpubRepacker().writeTranslatedEpub(
-        inputPath: epubFile.path,
-        outputFilePath: outputPath,
-        config: TranslationConfig.defaults(),
-        chapters: toRewrite,
-      );
-      repackWatch.stop();
-
-      final File outFile = File(outputPath);
-      expect(await outFile.exists(), isTrue);
-      expect(await outFile.length(), greaterThan(1024));
-
-      final Map<String, dynamic> outFiles =
-          await EpubIsolateWorker.loadArchiveFiles(outputPath);
-      expect(outFiles.length, greaterThanOrEqualTo(files.length ~/ 2));
-
-      // Soft budgets for real books (generous).
-      expect(openWatch.elapsed, lessThan(const Duration(minutes: 2)));
-      expect(inspectWatch.elapsed, lessThan(const Duration(minutes: 5)));
-      expect(repackWatch.elapsed, lessThan(const Duration(minutes: 3)));
-
+  test('optional real EPUB: isolate open + inspect + repack', () async {
+    if (epubPath == null) {
       // ignore: avoid_print
       print(
-        'real EPUB stress: path=$epubPath size=${epubBytes ~/ 1024}KB '
-        'chapters=${inspection.chapters.length} blocks=$totalBlocks '
-        'rewrittenChapters=${toRewrite.length} '
-        'open=${openWatch.elapsedMilliseconds}ms '
-        'inspect=${inspectWatch.elapsedMilliseconds}ms '
-        'repack=${repackWatch.elapsedMilliseconds}ms '
-        'out=${await outFile.length() ~/ 1024}KB',
+        'SKIP real EPUB stress: set EPUB_STRESS_PATH or '
+        'EPUB_TRANSLATOR_STRESS_EPUB to a local .epub file.',
       );
-    },
-    timeout: const Timeout(Duration(minutes: 8)),
-  );
+      return;
+    }
+
+    final File epubFile = File(epubPath);
+    expect(await epubFile.exists(), isTrue, reason: 'Missing file: $epubPath');
+    expect(path.extension(epubPath).toLowerCase(), '.epub');
+
+    final int epubBytes = await epubFile.length();
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_real_stress_',
+    );
+    addTearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    final Stopwatch openWatch = Stopwatch()..start();
+    final Map<String, List<int>> files = await EpubInspector.openArchiveFiles(
+      epubFile.path,
+    );
+    openWatch.stop();
+    expect(files, isNotEmpty);
+    expect(files.containsKey('META-INF/container.xml'), isTrue);
+
+    final Stopwatch inspectWatch = Stopwatch()..start();
+    final inspection = await EpubInspector().inspect(
+      inputPath: epubFile.path,
+      outputDirectory: temp.path,
+      cancelToken: CancelToken(),
+    );
+    inspectWatch.stop();
+    expect(inspection.chapters, isNotEmpty);
+
+    final int totalBlocks = inspection.chapters.fold<int>(
+      0,
+      (int sum, InspectedChapter c) => sum + c.blocks.length,
+    );
+
+    // Only rewrite chapters that already have extractable blocks, and only
+    // a capped subset so huge books still finish in CI-like timeouts.
+    final List<InspectedChapter> toRewrite = inspection.chapters
+        .where((InspectedChapter c) => c.blocks.isNotEmpty)
+        .take(12)
+        .map((InspectedChapter chapter) {
+          final List<ExtractedBlock> blocks = chapter.blocks
+              .take(8)
+              .map(
+                (ExtractedBlock block) => block.copyWith(
+                  translatedHtml:
+                      '<${block.tagName}>[stress] ${block.sourceText}</${block.tagName}>',
+                ),
+              )
+              .toList(growable: false);
+          // Keep remaining blocks without translation so render is a partial rewrite.
+          final List<ExtractedBlock> merged = <ExtractedBlock>[
+            ...blocks,
+            ...chapter.blocks.skip(blocks.length),
+          ];
+          return chapter.copyWith(includeInTranslation: true, blocks: merged);
+        })
+        .toList(growable: false);
+
+    expect(toRewrite, isNotEmpty);
+
+    final String outputPath = path.join(
+      temp.path,
+      '${path.basenameWithoutExtension(epubPath)}_stress_out.epub',
+    );
+    final Stopwatch repackWatch = Stopwatch()..start();
+    await EpubRepacker().writeTranslatedEpub(
+      inputPath: epubFile.path,
+      outputFilePath: outputPath,
+      config: TranslationConfig.defaults(),
+      chapters: toRewrite,
+    );
+    repackWatch.stop();
+
+    final File outFile = File(outputPath);
+    expect(await outFile.exists(), isTrue);
+    expect(await outFile.length(), greaterThan(1024));
+
+    final Map<String, dynamic> outFiles =
+        await EpubIsolateWorker.loadArchiveFiles(outputPath);
+    expect(outFiles.length, greaterThanOrEqualTo(files.length ~/ 2));
+
+    // Soft budgets for real books (generous).
+    expect(openWatch.elapsed, lessThan(const Duration(minutes: 2)));
+    expect(inspectWatch.elapsed, lessThan(const Duration(minutes: 5)));
+    expect(repackWatch.elapsed, lessThan(const Duration(minutes: 3)));
+
+    // ignore: avoid_print
+    print(
+      'real EPUB stress: path=$epubPath size=${epubBytes ~/ 1024}KB '
+      'chapters=${inspection.chapters.length} blocks=$totalBlocks '
+      'rewrittenChapters=${toRewrite.length} '
+      'open=${openWatch.elapsedMilliseconds}ms '
+      'inspect=${inspectWatch.elapsedMilliseconds}ms '
+      'repack=${repackWatch.elapsedMilliseconds}ms '
+      'out=${await outFile.length() ~/ 1024}KB',
+    );
+  }, timeout: const Timeout(Duration(minutes: 8)));
 }
 
 String? _resolveRealEpubPath() {

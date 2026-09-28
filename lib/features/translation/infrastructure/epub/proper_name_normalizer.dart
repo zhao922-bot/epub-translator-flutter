@@ -98,10 +98,67 @@ class ProperNameNormalizer {
     return _stripIdentifierSentinels(working);
   }
 
+  /// Applies [pattern] to the markup-masked copy of [html] and splices the
+  /// [buildReplacement] results back into the original HTML at the same
+  /// offsets (the mask is length-preserving, so match offsets stay valid).
+  ///
+  /// Capture-group slices are taken from the ORIGINAL [html], so text-flow
+  /// markup between the matched parts is preserved exactly as before.
+  /// Matches are impossible inside tag names or attribute values: those
+  /// regions are fully masked, and neither gloss pattern can anchor there
+  /// (the forward gloss needs a CJK character, the reverse gloss a Latin
+  /// name start, and masked regions contain neither).
+  static String _rewriteOnMaskedText(
+    String html,
+    RegExp pattern,
+    String Function(String html, String masked, Match maskedMatch)
+    buildReplacement,
+  ) {
+    final String masked = _maskHtmlMarkup(html);
+    if (!pattern.hasMatch(masked)) {
+      return html;
+    }
+    final StringBuffer output = StringBuffer();
+    int cursor = 0;
+    bool changed = false;
+    for (final Match match in pattern.allMatches(masked)) {
+      output
+        ..write(html.substring(cursor, match.start))
+        ..write(buildReplacement(html, masked, match));
+      cursor = match.end;
+      changed = true;
+    }
+    if (!changed) {
+      return html;
+    }
+    output.write(html.substring(cursor));
+    return output.toString();
+  }
+
+  /// Maps a [maskedText] slice -- taken from the masked copy at [maskedStart]
+  /// -- back to the original HTML. The mask is length-preserving, so every
+  /// maximal mask run maps 1:1 onto the original substring at the same
+  /// offsets; everything else is copied through unchanged.
+  static String _unmaskSlice(String html, String maskedText, int maskedStart) {
+    final StringBuffer out = StringBuffer();
+    int cursor = 0;
+    final RegExp runs = RegExp(r'[\uE002\uE003]+');
+    for (final Match run in runs.allMatches(maskedText)) {
+      out.write(maskedText.substring(cursor, run.start));
+      out.write(html.substring(maskedStart + run.start, maskedStart + run.end));
+      cursor = run.end;
+    }
+    out.write(maskedText.substring(cursor));
+    return out.toString();
+  }
+
   /// Folds a half-width forward gloss `中文 (English)` to the canonical
   /// `中文（English）` shape BEFORE the bare-name state machine runs, so a
   /// model that emitted `亚当·斯密 (Adam Smith)` converges to the same
   /// full-width shape as everything else instead of being double-glossed.
+  ///
+  /// Runs on the markup-masked text: attribute values such as
+  /// `alt="亚当 (Adam Smith) pic"` are metadata and are never canonicalized.
   static String _canonicalizeForwardHalfWidthGloss(
     String html,
     ProperNameMap mapping,
@@ -110,19 +167,20 @@ class ProperNameNormalizer {
     final RegExp pattern = RegExp(
       r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' + source + r'\s*\)\s*',
     );
-    if (!pattern.hasMatch(html)) {
-      return html;
-    }
-    final StringBuffer output = StringBuffer();
-    int cursor = 0;
-    for (final Match match in pattern.allMatches(html)) {
-      output
-        ..write(html.substring(cursor, match.start))
-        ..write('${match.group(1)?.trim()}（${mapping.source}）');
-      cursor = match.end;
-    }
-    output.write(html.substring(cursor));
-    return output.toString();
+    return _rewriteOnMaskedText(html, pattern, (
+      String original,
+      String masked,
+      Match match,
+    ) {
+      // Group 1 opens the match, so its masked offsets map 1:1 back onto
+      // the original HTML.
+      final String head = _unmaskSlice(
+        original,
+        match.group(1)!,
+        match.start,
+      ).trim();
+      return '$head（${mapping.source}）';
+    });
   }
 
   static bool _isBibliographicOrIndexEntry(String html) {
@@ -141,18 +199,37 @@ class ProperNameNormalizer {
     ProperNameBookState? state,
   }) {
     final RegExp english = _tolerantNamePattern(mapping.source);
-    if (!english.hasMatch(html)) {
+    // Match against a markup-masked copy: tag names and attribute values are
+    // invisible to the pattern, so a locked `Li` can never rewrite `<li>`
+    // into `<李（li）>` or corrupt `id="li-note"`. The mask is
+    // length-preserving, so match offsets stay valid for splicing the
+    // original HTML back together.
+    final String masked = _maskHtmlMarkup(html);
+    if (!english.hasMatch(masked)) {
       return html;
     }
+    // Identifier spans (URLs, emails, footnote anchors, …) wrapped in
+    // `\uE000…\uE001` are off-limits: the sentinel characters read as word
+    // boundaries, so the boundary check alone cannot protect them — without
+    // this skip a locked `Li` would rewrite `https://example.com/li`.
+    final List<(int, int)> identifierSpans = _identifierSentinelSpans(masked);
 
     final StringBuffer output = StringBuffer();
     int cursor = 0;
-    for (final Match match in english.allMatches(html)) {
+    for (final Match match in english.allMatches(masked)) {
+      if (_inSpans(identifierSpans, match.start, match.end)) {
+        continue;
+      }
+      // "alliance" must not match a locked `Li`; "blacksmith" must not
+      // match a locked `Smith`.
+      if (!_hasNameWordBoundary(masked, match)) {
+        continue;
+      }
       final String raw = match.group(0)!;
       // A bare English name that sits inside an existing `中文（English）`
-      // gloss (immediately after an opening paren or before a closing paren)
-      // is already canonical and must not be re-glossed.
-      if (_isCanonicalGlossInnerName(html, match)) {
+      // gloss (between an opening paren and its closing paren) is already
+      // canonical and must not be re-glossed.
+      if (_isCanonicalGlossInnerName(masked, match)) {
         if (state?.countedNames.contains(mapping.source) == false) {
           state?.countedNames.add(mapping.source);
         }
@@ -178,6 +255,104 @@ class ProperNameNormalizer {
     return output.toString();
   }
 
+  /// Spans wrapped in `\uE000…\uE001` identifier sentinels inside [masked].
+  /// Nesting (an email match inside an already-wrapped URL) collapses to
+  /// the outermost span.
+  static List<(int, int)> _identifierSentinelSpans(String masked) {
+    final List<(int, int)> spans = <(int, int)>[];
+    int depth = 0;
+    int spanStart = 0;
+    for (int i = 0; i < masked.length; i++) {
+      final String char = masked[i];
+      if (char == '\uE000') {
+        if (depth == 0) {
+          spanStart = i;
+        }
+        depth++;
+      } else if (char == '\uE001' && depth > 0) {
+        depth--;
+        if (depth == 0) {
+          spans.add((spanStart, i + 1));
+        }
+      }
+    }
+    return spans;
+  }
+
+  static bool _inSpans(List<(int, int)> spans, int start, int end) {
+    for (final (int, int) span in spans) {
+      if (start < span.$2 && end > span.$1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Masks every HTML tag with a same-length run of mask characters so the
+  /// bare-name matcher can only ever see text content: tag names and
+  /// attribute values become invisible to it.
+  ///
+  /// Empty tag pairs (`<span …></span>`, e.g. a pagebreak anchor) are masked
+  /// with a distinct character (`\uE003`): the tolerant name matcher
+  /// deliberately matches a name split by an empty inline tag, and the
+  /// word-boundary check looks through the `\uE003` run — so
+  /// `Adam<span></span>Smith` still matches while `Li<span></span>mited`
+  /// no longer gains a fake word boundary.
+  ///
+  /// A `<` only starts markup when followed by a tag-name character, `!`
+  /// (comment/doctype), `?` (processing instruction) or `/` (close tag):
+  /// unescaped prose such as `Tom < Jerry > Spike` stays visible as text
+  /// instead of being swallowed as a tag.
+  ///
+  /// The mask is length-preserving, so match offsets stay valid for
+  /// splicing the original HTML back together.
+  static String _maskHtmlMarkup(String html) {
+    final StringBuffer out = StringBuffer();
+    int cursor = 0;
+    final RegExp markup = RegExp(
+      r'</?[A-Za-z!?/][^>]*>\s*</[A-Za-z][^>]*>|</?[A-Za-z!?/][^>]*>',
+    );
+    for (final Match match in markup.allMatches(html)) {
+      out.write(html.substring(cursor, match.start));
+      final String tag = match.group(0)!;
+      // An empty tag pair (open tag immediately followed by its close tag)
+      // is transparent to the tolerant matcher; everything else is opaque.
+      final bool isEmptyPair = RegExp(
+        r'^</?[A-Za-z!?/][^>]*>\s*</[A-Za-z][^>]*>$',
+      ).hasMatch(tag);
+      out.write(isEmptyPair ? '\uE003' * tag.length : '\uE002' * tag.length);
+      cursor = match.end;
+    }
+    out.write(html.substring(cursor));
+    return out.toString();
+  }
+
+  /// Word-boundary check tuned for mixed CJK/Latin prose: a bare name must
+  /// not be glued to ASCII letters, digits or `_` on either side, so a
+  /// locked `Li` never fires inside "alliance" and a locked `Smith` never
+  /// fires inside "blacksmith". CJK characters, punctuation, whitespace,
+  /// the opaque mask (`\uE002`) and the identifier sentinels all count as
+  /// boundaries; the empty-tag mask (`\uE003`) is transparent and looked
+  /// through, so `Li<span></span>mited` is seen as the glued word it is.
+  static bool _hasNameWordBoundary(String masked, Match match) {
+    bool isWordChar(String char) => RegExp(r'[A-Za-z0-9_]').hasMatch(char);
+    int start = match.start;
+    while (start > 0 && masked[start - 1] == '\uE003') {
+      start--;
+    }
+    int end = match.end;
+    while (end < masked.length && masked[end] == '\uE003') {
+      end++;
+    }
+    if (start > 0 && isWordChar(masked[start - 1])) {
+      return false;
+    }
+    if (end < masked.length && isWordChar(masked[end])) {
+      return false;
+    }
+    return true;
+  }
+
   /// Builds a matching regex for a possibly multi-token proper name. Tokens
   /// may be separated by whitespace and by an empty inline tag pair (for
   /// example an EPUB `pagebreak` anchor embedded in the middle of a model
@@ -189,7 +364,11 @@ class ProperNameNormalizer {
       return RegExp(escaped, caseSensitive: false);
     }
     final String emptyTagPair = r'<[^>]+>\s*</[^>]+>';
-    final String gap = r'[\s\u00A0]*(?:' + emptyTagPair + r')?[\s\u00A0]*';
+    // The empty-tag mask character (\uE003) is transparent to the matcher,
+    // just like whitespace: a pagebreak anchor between name tokens must not
+    // break the match.
+    final String gap =
+        r'[\s\u00A0\uE003]*(?:' + emptyTagPair + r')?[\s\u00A0\uE003]*';
     final String pattern = source
         .split(RegExp(r'\s+'))
         .map(RegExp.escape)
@@ -204,6 +383,7 @@ class ProperNameNormalizer {
     return value
         .replaceAll(RegExp(r'<[^>]+>\s*</[^>]+>'), '')
         .replaceAll(RegExp(r'<[^>]+>'), '')
+        .replaceAll(RegExp(r'[\uE002\uE003]'), '')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
   }
@@ -212,6 +392,10 @@ class ProperNameNormalizer {
   /// already-canonical `中文（English）` gloss — a full-width paren pair that
   /// is the shape we emit. A half-width `(English)` pair is NOT canonical: it
   /// must be folded to full-width so the whole book converges on one shape.
+  ///
+  /// Both parens must be present: an unmatched `）` (or `（`) is ordinary
+  /// prose punctuation, not a gloss, and the name next to it still needs
+  /// its first-occurrence annotation.
   static bool _isCanonicalGlossInnerName(String html, Match match) {
     final bool precededByOpen = RegExp(
       r'[（]\s*$',
@@ -219,12 +403,15 @@ class ProperNameNormalizer {
     final bool followedByClose = RegExp(
       r'^\s*[）]',
     ).hasMatch(html.substring(match.end));
-    return precededByOpen || followedByClose;
+    return precededByOpen && followedByClose;
   }
 
   /// Rewrites `English（中文）` → `中文（English）` across the block before the
   /// bare-name state machine runs, so the trailing parenthetical never
   /// survives and the same name cannot be re-matched twice.
+  ///
+  /// Runs on the markup-masked text: attribute values such as
+  /// `title="Adam Smith（亚当）"` are metadata and are never canonicalized.
   static String _canonicalizeReverseGlosses(
     String html,
     ProperNameMap mapping,
@@ -236,20 +423,26 @@ class ProperNameNormalizer {
         r')\s*[（(]\s*'
         r'([^()（）]{1,40}?[\u3400-\u9FFF][^()（）]{0,24}?)\s*[)）]';
     final RegExp reverse = RegExp(pattern, caseSensitive: false);
-    if (!reverse.hasMatch(html)) {
-      return html;
-    }
-    final StringBuffer output = StringBuffer();
-    int cursor = 0;
-    for (final Match match in reverse.allMatches(html)) {
-      final String translated = match.group(2)?.trim() ?? mapping.target;
-      output
-        ..write(html.substring(cursor, match.start))
-        ..write('$translated（${match.group(1)}）');
-      cursor = match.end;
-    }
-    output.write(html.substring(cursor));
-    return output.toString();
+    return _rewriteOnMaskedText(html, reverse, (
+      String original,
+      String masked,
+      Match match,
+    ) {
+      final String name = _unmaskSlice(original, match.group(1)!, match.start);
+      // Group 2 follows `name` + `\\s*[（(]\\s*`; locate it in the masked
+      // copy so its offsets map 1:1 back onto the original HTML.
+      final int afterName = match.start + match.group(1)!.length;
+      final Match? separator = RegExp(
+        r'\s*[（(]\s*',
+      ).matchAsPrefix(masked, afterName);
+      final int group2Start = separator?.end ?? afterName;
+      final String translated = _unmaskSlice(
+        original,
+        match.group(2)!,
+        group2Start,
+      ).trim();
+      return '$translated（$name）';
+    });
   }
 
   /// Guesses the bracket style already used by the surrounding block so the
@@ -302,6 +495,13 @@ class ProperNameNormalizer {
         r'''(?:(?:https?|ftp)://|www\.)[A-Z0-9._~:/?#\[\]@!$&'()*+,;=%-]+''',
         caseSensitive: false,
       ),
+      (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
+    );
+    // Email addresses: the local part is a Latin identifier that must not
+    // be rewritten even when it equals a locked name (`li@example.com`
+    // with `Li` locked).
+    out = out.replaceAllMapped(
+      RegExp(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'),
       (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
     );
     return out;

@@ -29,10 +29,14 @@ class _WidgetSettingsStore extends SettingsStore {
 
 class _WidgetJobHistoryStore extends JobHistoryStore {
   @override
-  Future<List<TranslationJob>> load() async => const <TranslationJob>[];
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {}
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
 }
 
 void main() {
@@ -61,8 +65,6 @@ void main() {
     await tester.tap(find.byIcon(Icons.translate_rounded).first);
     await tester.pumpAndSettle();
   }
-
-
 
   testWidgets('settings page does not expose unsupported thinking toggle', (
     tester,
@@ -103,7 +105,6 @@ void main() {
       ThemeMode.light,
     );
   });
-
 
   testWidgets('jobs and preview pages keep shared scaffold structure', (
     tester,
@@ -202,7 +203,6 @@ void main() {
     expect(targetLanguageField.initialValue, 'Japanese');
   });
 
-
   testWidgets('API key field is obscured by default', (tester) async {
     await tester.pumpWidget(testApp());
     await tester.pumpAndSettle();
@@ -244,6 +244,10 @@ void main() {
       await tester.enterText(baseUrlField, 'https://custom.example/v1');
       await tester.enterText(apiKeyField, 'sk-custom-profile');
       await tester.enterText(modelField, 'custom-model');
+      // Settings text fields debounce their commits (per-keystroke persists
+      // used to spawn a PowerShell per secret slot on Windows); let the
+      // debounce elapse so the typed values reach the controller.
+      await tester.pump(const Duration(milliseconds: 900));
       await tester.pumpAndSettle();
 
       final Finder deepSeekChip = find.byKey(

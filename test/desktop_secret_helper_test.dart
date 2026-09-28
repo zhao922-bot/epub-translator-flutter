@@ -29,10 +29,10 @@ void main() {
 
         final String output =
             await NativePlatformBridge.runDesktopSecretHelperForTest(
-          script.path,
-          builderArgs,
-          stdinInput: 's3cr3t-value',
-        );
+              script.path,
+              builderArgs,
+              stdinInput: 's3cr3t-value',
+            );
 
         // The child must receive exactly argv[1..]: no duplicated program
         // name (the old bug ran `secret-tool secret-tool store …`).
@@ -42,22 +42,18 @@ void main() {
       skip: Platform.isWindows ? 'Needs a POSIX shell.' : null,
     );
 
-    test(
-      'reports a non-zero helper exit as StateError',
-      () async {
-        final File script = await _writeFailingScript('fake-secret-helper');
-        addTearDown(() => script.parent.delete(recursive: true));
+    test('reports a non-zero helper exit as StateError', () async {
+      final File script = await _writeFailingScript('fake-secret-helper');
+      addTearDown(() => script.parent.delete(recursive: true));
 
-        await expectLater(
-          NativePlatformBridge.runDesktopSecretHelperForTest(
-            script.path,
-            <String>[script.path, 'lookup'],
-          ),
-          throwsA(isA<StateError>()),
-        );
-      },
-      skip: Platform.isWindows ? 'Needs a POSIX shell.' : null,
-    );
+      await expectLater(
+        NativePlatformBridge.runDesktopSecretHelperForTest(
+          script.path,
+          <String>[script.path, 'lookup'],
+        ),
+        throwsA(isA<StateError>()),
+      );
+    }, skip: Platform.isWindows ? 'Needs a POSIX shell.' : null);
 
     test('throws StateError when the helper executable is missing', () async {
       await expectLater(
@@ -72,10 +68,10 @@ void main() {
 
   group('macos security -i command', () {
     test('store args target interactive mode', () {
-      expect(
-        NativePlatformBridge.macosSecretStoreArgs(),
-        <String>['security', '-i'],
-      );
+      expect(NativePlatformBridge.macosSecretStoreArgs(), <String>[
+        'security',
+        '-i',
+      ]);
     });
 
     test('builds the interactive command for a plain password', () {

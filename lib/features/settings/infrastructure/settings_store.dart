@@ -2,12 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../shared/logging/app_logger.dart';
+import '../../../shared/platform/native_platform_bridge.dart';
 import '../../../shared/platform/platform_utils.dart';
 import '../../../shared/io/atomic_file_writer.dart';
 import '../../translation/domain/models/translation_config.dart';
+import '../../translation/infrastructure/epub_isolate_worker.dart';
 
 abstract class SettingsSecretStore {
   Future<String?> readApiKey();
@@ -30,6 +33,19 @@ abstract class SettingsSecretStore {
 }
 
 enum SettingsSecretSlot { legacy, deepSeek, custom }
+
+/// settings.json could not be written because another program holds a
+/// Windows file lock (sharing violation) on it — e.g. a second app instance,
+/// antivirus, or a file indexer. Carries the file path so the UI can show an
+/// actionable localized message instead of a raw English OS error.
+class SettingsFileLockedException implements Exception {
+  SettingsFileLockedException(this.filePath);
+
+  final String filePath;
+
+  @override
+  String toString() => 'SettingsFileLockedException: $filePath';
+}
 
 enum _SecretReadStatus { value, missing, readFailure }
 
@@ -102,6 +118,17 @@ class SettingsStore {
   final Map<SettingsSecretSlot, _SecretReadStatus> _secretReadStatuses =
       <SettingsSecretSlot, _SecretReadStatus>{};
 
+  /// Set when an Android KeyStore read reported SECRET_KEY_ROTATED (the
+  /// device key was invalidated and regenerated): previously stored keys
+  /// are unrecoverable and the user must re-enter them. Surfaced to the
+  /// settings page via [SettingsController].
+  bool _secretKeyRotated = false;
+
+  /// Whether the Android KeyStore key was rotated (invalidated and
+  /// regenerated) during the last secret load. The settings page shows a
+  /// warning banner when true.
+  bool get secretKeyRotated => _secretKeyRotated;
+
   /// Whether the secret read statuses are populated (via [load] or a
   /// read-first [save]). Guards [_saveSecret] against deleting keys whose
   /// state was never observed.
@@ -121,6 +148,15 @@ class SettingsStore {
 
   /// Lazily GCs stale atomic-write temp files once per store instance.
   bool _cleanedTempFiles = false;
+
+  /// Whether the last [load] fell back to defaults because settings.json was
+  /// unreadable or corrupt (as opposed to a first run with no settings file).
+  bool didCorruptReset = false;
+
+  /// Backup path of the corrupt settings file when [didCorruptReset] is true,
+  /// or null when the backup itself failed. The UI surfaces this so the user
+  /// knows their settings were reset and where the original file went.
+  String? lastCorruptBackupPath;
 
   Future<TranslationConfig> load() async {
     final TranslationConfig config = await _loadConfigFromFile();
@@ -202,13 +238,15 @@ class SettingsStore {
     // Read the secret slots concurrently: on Windows each read spawns a
     // PowerShell process, so sequential reads would add seconds to startup.
     // _readSecret already swallows per-slot failures, so Future.wait is safe.
-    final List<_SecretReadResult> storedKeys = await Future.wait(
-      <Future<_SecretReadResult>>[
-        _readSecret(SettingsSecretSlot.legacy, _secretStore.readApiKey),
-        _readSecret(SettingsSecretSlot.deepSeek, _secretStore.readDeepSeekApiKey),
-        _readSecret(SettingsSecretSlot.custom, _secretStore.readCustomApiKey),
-      ],
-    );
+    final List<_SecretReadResult> storedKeys =
+        await Future.wait(<Future<_SecretReadResult>>[
+          _readSecret(SettingsSecretSlot.legacy, _secretStore.readApiKey),
+          _readSecret(
+            SettingsSecretSlot.deepSeek,
+            _secretStore.readDeepSeekApiKey,
+          ),
+          _readSecret(SettingsSecretSlot.custom, _secretStore.readCustomApiKey),
+        ]);
     _didLoad = true;
     return storedKeys;
   }
@@ -216,31 +254,56 @@ class SettingsStore {
   Future<TranslationConfig> _loadConfigFromFile() async {
     final File file = await _settingsFile();
     if (!await file.exists()) {
+      didCorruptReset = false;
+      lastCorruptBackupPath = null;
       return TranslationConfig.defaults();
     }
     try {
-      final String raw = await file.readAsString();
-      final Object? decoded = jsonDecode(raw);
-      if (decoded is! Map<String, dynamic>) {
-        throw const FormatException('settings.json is not a JSON object');
-      }
-      return TranslationConfig.fromJson(decoded);
+      final TranslationConfig config = await _readConfigFile(file);
+      didCorruptReset = false;
+      lastCorruptBackupPath = null;
+      return config;
     } catch (error) {
-      // Back the corrupt file up before it gets overwritten by the next save:
-      // a silent reset would lose every setting with no way to recover.
-      await _backupCorruptSettingsFile(file);
-      AppLogger.error(
-        'Failed to parse settings.json; using defaults.',
-        tag: 'settings',
-        error: error,
-      );
-      return TranslationConfig.defaults();
+      // A transient Windows lock (antivirus/OneDrive sharing violation)
+      // fails the first read; retry once before declaring the file corrupt,
+      // otherwise a momentary lock would rename a healthy settings.json
+      // aside and reset a dozen user settings.
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      try {
+        final TranslationConfig config = await _readConfigFile(file);
+        didCorruptReset = false;
+        lastCorruptBackupPath = null;
+        return config;
+      } catch (retryError) {
+        // Back the corrupt file up before it gets overwritten by the next
+        // save: a silent reset would lose every setting with no way to
+        // recover. The backup path is exposed via [lastCorruptBackupPath]
+        // so the UI can tell the user where their settings went.
+        didCorruptReset = true;
+        lastCorruptBackupPath = await _backupCorruptSettingsFile(file);
+        AppLogger.error(
+          'Failed to parse settings.json; using defaults.',
+          tag: 'settings',
+          error: retryError,
+        );
+        return TranslationConfig.defaults();
+      }
     }
+  }
+
+  Future<TranslationConfig> _readConfigFile(File file) async {
+    final String raw = await file.readAsString();
+    final Object? decoded = jsonDecode(raw);
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('settings.json is not a JSON object');
+    }
+    return TranslationConfig.fromJson(decoded);
   }
 
   /// Renames a corrupt settings file aside (best effort) so a later save
   /// cannot silently destroy the user's settings with no recovery path.
-  Future<void> _backupCorruptSettingsFile(File file) async {
+  /// Returns the backup path, or null when the backup itself failed.
+  Future<String?> _backupCorruptSettingsFile(File file) async {
     try {
       final String backupPath =
           '${file.path}.bad-${DateTime.now().microsecondsSinceEpoch}';
@@ -253,8 +316,10 @@ class SettingsStore {
         'Backed up corrupt settings file to $backupPath',
         tag: 'settings',
       );
+      return backupPath;
     } catch (_) {
       // Best effort: the backup must never break startup.
+      return null;
     }
   }
 
@@ -268,11 +333,12 @@ class SettingsStore {
   /// first.
   Future<void> _pruneCorruptBackups(Directory dir, String prefix) async {
     final List<FileSystemEntity> entries = await dir.list().toList();
-    final List<File> backups = entries
-        .whereType<File>()
-        .where((File f) => path.basename(f.path).startsWith(prefix))
-        .toList()
-      ..sort((File a, File b) => a.path.compareTo(b.path));
+    final List<File> backups =
+        entries
+            .whereType<File>()
+            .where((File f) => path.basename(f.path).startsWith(prefix))
+            .toList()
+          ..sort((File a, File b) => a.path.compareTo(b.path));
     for (int i = 0; i + _maxCorruptBackups < backups.length; i++) {
       await backups[i].delete();
     }
@@ -292,6 +358,14 @@ class SettingsStore {
           : _SecretReadStatus.missing;
       _secretReadStatuses[slot] = status;
       return _SecretReadResult(status, trimmed);
+    } on SecretKeyRotatedException {
+      // The Android KeyStore key was invalidated (lock-screen/biometric
+      // change) and regenerated: the stored ciphertext is unrecoverable.
+      // Record it distinctly from a generic read failure so the UI can
+      // tell the user to re-enter their keys.
+      _secretKeyRotated = true;
+      _secretReadStatuses[slot] = _SecretReadStatus.readFailure;
+      return const _SecretReadResult(_SecretReadStatus.readFailure, null);
     } catch (_) {
       _secretReadStatuses[slot] = _SecretReadStatus.readFailure;
       return const _SecretReadResult(_SecretReadStatus.readFailure, null);
@@ -311,12 +385,20 @@ class SettingsStore {
       // protected instead of being deleted blindly.
       await _readAllSecrets();
     }
-    await _saveSecrets(
-      config,
-      slotsToSave: SettingsSecretSlot.values.toSet(),
-      explicit: explicit,
-    );
-    await _writeSettingsJson(config);
+    // The JSON write sits in a finally block on purpose: a secret-store
+    // failure (e.g. the Windows DPAPI file being locked so deleteSecret
+    // throws StateError) must not silently discard the non-secret settings
+    // the user just changed. The secret error still propagates so the
+    // caller reports the failed key save and the user can retry.
+    try {
+      await _saveSecrets(
+        config,
+        slotsToSave: SettingsSecretSlot.values.toSet(),
+        explicit: explicit,
+      );
+    } finally {
+      await _writeSettingsJson(config);
+    }
   }
 
   Future<void> _saveSecrets(
@@ -403,15 +485,35 @@ class SettingsStore {
     }
   }
 
+  /// Maps a settings.json write failure to the exception the UI should
+  /// surface: a Windows sharing violation becomes a classified
+  /// [SettingsFileLockedException] (actionable localized message); anything
+  /// else passes through unchanged.
+  ///
+  /// Visible for testing: a real sharing violation needs an actual Windows
+  /// file lock, so the mapping is tested with synthetic exceptions.
+  @visibleForTesting
+  static Object mapSettingsWriteError(String filePath, Object error) {
+    if (error is FileSystemException &&
+        EpubIsolateWorker.isFileLockError(error)) {
+      return SettingsFileLockedException(filePath);
+    }
+    return error;
+  }
+
   Future<void> _writeSettingsJson(TranslationConfig config) async {
     final File file = await _settingsFile();
     await file.parent.create(recursive: true);
     // Atomic write: a kill mid-save must not leave a truncated settings.json
     // behind (that would silently reset all settings on next load).
-    await writeFileAtomically(
-      file,
-      const JsonEncoder.withIndent('  ').convert(config.toJson()),
-    );
+    try {
+      await writeFileAtomically(
+        file,
+        const JsonEncoder.withIndent('  ').convert(config.toJson()),
+      );
+    } catch (error) {
+      throw mapSettingsWriteError(file.path, error);
+    }
   }
 
   Future<void> _saveSecret(

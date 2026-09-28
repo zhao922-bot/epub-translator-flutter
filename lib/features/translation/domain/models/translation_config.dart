@@ -30,6 +30,7 @@ class TranslationConfig {
     required this.styleProfileEnabled,
     required this.textScale,
     required this.lockedGlossary,
+    required this.httpProxy,
   });
 
   final String apiBaseUrl;
@@ -67,6 +68,12 @@ class TranslationConfig {
   /// User-locked glossary lines: `source => target` per line.
   final String lockedGlossary;
 
+  /// Optional HTTP proxy for API traffic ("host:port" or "http://host:port").
+  /// Empty means no explicit proxy (system proxy settings on Windows/Android
+  /// are not visible to Dart's HttpClient, hence this manual override).
+  /// Local and private destinations always bypass it (no_proxy semantics).
+  final String httpProxy;
+
   factory TranslationConfig.defaults() {
     return const TranslationConfig(
       apiBaseUrl: 'https://api.deepseek.com',
@@ -91,6 +98,7 @@ class TranslationConfig {
       styleProfileEnabled: true,
       textScale: 1.0,
       lockedGlossary: '',
+      httpProxy: '',
     );
   }
 
@@ -117,6 +125,7 @@ class TranslationConfig {
     bool? styleProfileEnabled,
     double? textScale,
     String? lockedGlossary,
+    String? httpProxy,
   }) {
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
@@ -141,6 +150,7 @@ class TranslationConfig {
       styleProfileEnabled: styleProfileEnabled ?? this.styleProfileEnabled,
       textScale: textScale ?? this.textScale,
       lockedGlossary: lockedGlossary ?? this.lockedGlossary,
+      httpProxy: httpProxy ?? this.httpProxy,
     );
   }
 
@@ -165,6 +175,7 @@ class TranslationConfig {
       'styleProfileEnabled': styleProfileEnabled,
       'textScale': textScale,
       'lockedGlossary': lockedGlossary,
+      'httpProxy': httpProxy,
     };
   }
 
@@ -263,6 +274,7 @@ class TranslationConfig {
       styleProfileEnabled: json['styleProfileEnabled'] as bool? ?? true,
       textScale: textScale,
       lockedGlossary: _readTrimmedString(json['lockedGlossary']),
+      httpProxy: _readTrimmedStringAllowEmpty(json['httpProxy']),
     );
   }
 

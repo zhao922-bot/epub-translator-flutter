@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
+import '../../../translation/domain/models/inspected_chapter.dart';
 import '../../application/preview_provider.dart';
 import '../../domain/models/preview_chapter.dart';
 import '../widgets/chapter_checklist.dart';
@@ -16,10 +17,20 @@ class PreviewPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final chapters = ref.watch(previewChaptersProvider);
     final index = ref.watch(previewSelectedIndexProvider);
-    final state = ref.watch(translationDashboardProvider);
+    // The preview only needs the inspected chapters (for the excerpt) and
+    // the run-active flag (to disable the checklist); watching the whole
+    // dashboard state would rebuild this page on every log tick.
+    final previewState = ref.watch(
+      translationDashboardProvider.select(
+        (s) => (
+          inspectedChapters: s.inspectedChapters,
+          isRunActive: s.isRunActive,
+        ),
+      ),
+    );
     final controller = ref.read(translationDashboardProvider.notifier);
     final strings = ref.watch(appStringsProvider);
-    final empty = state.inspectedChapters.isEmpty || chapters.isEmpty;
+    final empty = previewState.inspectedChapters.isEmpty || chapters.isEmpty;
     final safeIndex = empty ? 0 : index.clamp(0, chapters.length - 1);
     if (safeIndex != index) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -71,8 +82,8 @@ class PreviewPage extends ConsumerWidget {
                   chapters: chapters,
                   selectedIndex: safeIndex,
                   strings: strings,
-                  enabled: !state.isRunActive,
-                  selectedBlocks: state.inspectedChapters
+                  enabled: !previewState.isRunActive,
+                  selectedBlocks: previewState.inspectedChapters
                       .where((c) => c.includeInTranslation)
                       .fold<int>(0, (sum, c) => sum + c.blocks.length),
                   onSelect: (value) =>
@@ -87,7 +98,10 @@ class PreviewPage extends ConsumerWidget {
                   padding: const EdgeInsets.only(bottom: 28),
                   child: ChapterPreviewContent(
                     chapter: selected,
-                    translated: _translatedExcerpt(state, selected),
+                    translated: _translatedExcerpt(
+                      previewState.inspectedChapters,
+                      selected,
+                    ),
                     strings: strings,
                     parallel: parallel,
                   ),
@@ -126,10 +140,10 @@ class PreviewPage extends ConsumerWidget {
 }
 
 String? _translatedExcerpt(
-  TranslationDashboardState state,
+  List<InspectedChapter> inspectedChapters,
   PreviewChapter selected,
 ) {
-  for (final chapter in state.inspectedChapters) {
+  for (final chapter in inspectedChapters) {
     if (chapter.path != selected.path) continue;
     final text = chapter.blocks
         .map((b) => b.translatedHtml)

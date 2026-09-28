@@ -9,7 +9,10 @@ import '../../domain/repositories/translation_repository.dart';
 import '../epub/epub_chapter_translator.dart';
 import '../epub/epub_inspector.dart';
 import '../epub/epub_repacker.dart';
+import '../epub_isolate_worker.dart';
 import '../translation_cache_store.dart';
+import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/platform/native_platform_bridge.dart';
 
 /// Facade that wires [EpubInspector], [EpubChapterTranslator], and [EpubRepacker].
 ///
@@ -199,9 +202,20 @@ class EpubTranslationRepository implements TranslationRepository {
         cancelToken: cancelToken,
         onProgress: onProgress,
         isCancelled: isCancelled,
+        strings: AppStrings(config.uiLanguage),
       );
     } on TranslationCancelledException {
       rethrow;
+    } on InputFileLockedException catch (error) {
+      // Pre-payment failure (Windows sharing violation on the source file):
+      // actionable localized message instead of a raw English OS error.
+      throw StateError(
+        AppStrings(config.uiLanguage).inputFileLocked(error.inputPath),
+      );
+    } on EpubDecompressionLimitException {
+      throw StateError(
+        AppStrings(config.uiLanguage).epubDecompressionLimit(inputPath),
+      );
     } catch (error) {
       if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
         throw const TranslationCancelledException();
@@ -236,6 +250,13 @@ class EpubTranslationRepository implements TranslationRepository {
       );
     } on TranslationCancelledException {
       rethrow;
+    } on WindowsLongPathException catch (error) {
+      // Pre-payment failure (Windows MAX_PATH on the final output path):
+      // actionable localized message instead of a raw English OS error at
+      // ~98% of the run.
+      throw StateError(
+        AppStrings(config.uiLanguage).outputPathTooLong(error.detail),
+      );
     } catch (error) {
       if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
         throw const TranslationCancelledException();

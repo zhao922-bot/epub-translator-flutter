@@ -14,10 +14,14 @@ import 'package:flutter_test/flutter_test.dart';
 
 class _MemoryJobHistoryStore extends JobHistoryStore {
   @override
-  Future<List<TranslationJob>> load() async => const <TranslationJob>[];
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {}
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
 }
 
 void main() {

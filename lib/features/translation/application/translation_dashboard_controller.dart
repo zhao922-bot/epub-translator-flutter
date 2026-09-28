@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
 import 'package:open_filex/open_filex.dart';
@@ -220,9 +221,13 @@ class TranslationDashboardController
     this.pathStore,
     this.settingsReady,
     this.defaultOutputDirectoryResolver,
+    this.epubPickerOverride,
+    this.directoryPickerOverride,
+    this.windowsPathObserverOverride,
   }) : super(TranslationDashboardState.initial()) {
     _initialJobHistoryLoad = _loadJobHistory();
     _loadSessionPaths();
+    _checkPendingForegroundServiceTimeout();
   }
 
   final TranslationRepository repository;
@@ -231,12 +236,31 @@ class TranslationDashboardController
   final Future<void> Function()? settingsReady;
   final Future<String> Function(String? inputPath)?
   defaultOutputDirectoryResolver;
+  // Test seams: override the native file pickers so re-entrancy can be tested
+  // without a real file dialog.
+  final Future<String?> Function({
+    void Function(WindowsPathNotice notice)? onWindowsNotice,
+  })?
+  epubPickerOverride;
+  final Future<String?> Function({
+    void Function(WindowsPathNotice notice)? onWindowsNotice,
+  })?
+  directoryPickerOverride;
+  // Test seam: overrides the Windows path observation (long-path / OneDrive
+  // notices) for drag-drop / manual-entry paths so the wiring can be tested
+  // off Windows, where [PlatformUtils.isWindows] is false.
+  final Future<void> Function(String path)? windowsPathObserverOverride;
   bool _cancelRequested = false;
   int _cancellationRevision = 0;
   // Synchronous re-entrancy guards: checked and set before the first await so
   // a rapid double-tap cannot start two overlapping async flows.
   bool _styleProfileInFlight = false;
   bool _isRetrying = false;
+  // WinForms dialogs have no owner window and may open behind the app, so a
+  // user who thinks nothing happened can double-tap the picker buttons.
+  // Without this guard two PowerShell + two modal dialogs stack up and the
+  // later-finishing one silently overwrites the earlier choice.
+  bool _isPicking = false;
   // H2: save/share re-entrancy guards, checked and set before the first
   // await so a rapid double-tap cannot produce duplicate files. Mirrored
   // into state.isSaving/isSharing so the UI can disable the buttons; works
@@ -247,6 +271,10 @@ class TranslationDashboardController
   // notification; used to throttle updates (every 5% or on chapter change).
   int _lastFgServicePercent = -1;
   String? _lastFgServiceChapter;
+  // C-M7: opaque token identifying the current foreground-service run;
+  // passed to start/update so the native side never applies one run's
+  // stashed notification updates to another run.
+  String _fgServiceRunId = '';
   // API key in effect when the current/last run started, used for error
   // redaction even if the user changes the key mid-run.
   String? _runApiKey;
@@ -261,6 +289,10 @@ class TranslationDashboardController
   int _sessionPathRevision = 0;
   int _inputPathRevision = 0;
   int _historyClearRevision = 0;
+  // Milliseconds-since-epoch of the newest clear tombstone this instance has
+  // seen. Guards against a second app instance resurrecting cleared history
+  // entries through its periodic persistence (see _persistJobHistory).
+  int _lastSeenHistoryClearedAt = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
   DateTime? _lastProgressHistoryPersistAt;
@@ -281,19 +313,46 @@ class TranslationDashboardController
   }
 
   Future<void> pickInputPath() async {
+    if (_isPicking) {
+      // A picker dialog is already open (possibly behind the app window, as
+      // the WinForms dialogs have no owner): ignore the duplicate tap
+      // instead of stacking a second dialog whose later result would
+      // silently overwrite the first choice.
+      return;
+    }
     if (_logIfRunActive(_s.logSelectAfterRun)) {
       return;
     }
+    _isPicking = true;
+    try {
+      await _pickInputPathGuarded();
+    } finally {
+      _isPicking = false;
+    }
+  }
+
+  Future<void> _pickInputPathGuarded() async {
     // Windows path observations (dialog opened / long path / OneDrive) are
     // fired by the bridge; dialogOpened is time-sensitive so it is logged
     // immediately, the path-dependent ones after a path is chosen.
     final List<WindowsPathNotice> pendingNotices = <WindowsPathNotice>[];
     String? selectedPath;
     try {
+      // Wait for the initial history load before syncing: syncing an empty
+      // list on a cold start would tell the native side that nothing is
+      // referenced and let its 7-day sweep delete a source file a history
+      // entry may still retry.
+      await _initialJobHistoryLoad;
+      // Sync the history's input paths to the Android native side:
+      // its 7-day stale-import sweep must not delete a source file a
+      // history entry may still retry. No-op off Android.
+      await PlatformUtils.setProtectedImportPaths(
+        state.jobHistory.map((TranslationJob job) => job.inputPath).toList(),
+      );
       // Guard against the native side never responding (e.g. the Android
       // activity was destroyed while the picker was open): treat it like a
       // cancelled pick instead of hanging forever.
-      selectedPath = await PlatformUtils.pickEpubFile(
+      selectedPath = await (epubPickerOverride ?? PlatformUtils.pickEpubFile)(
         onWindowsNotice: (WindowsPathNotice notice) {
           if (notice == WindowsPathNotice.dialogOpened) {
             _logWindowsPathNotice(notice, null);
@@ -301,15 +360,12 @@ class TranslationDashboardController
             pendingNotices.add(notice);
           }
         },
-      ).timeout(
-        const Duration(minutes: 5),
-        onTimeout: () => null,
-      );
+      ).timeout(const Duration(minutes: 5), onTimeout: () => null);
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          _s.logCouldNotSelectEpub(_safeErrorText(error)),
+          _pickErrorLog(error, _s.logCouldNotSelectEpub),
         ],
       );
       return;
@@ -320,7 +376,11 @@ class TranslationDashboardController
     for (final WindowsPathNotice notice in pendingNotices) {
       _logWindowsPathNotice(notice, selectedPath);
     }
-    await _acceptInputPath(selectedPath, dropped: false);
+    await _acceptInputPath(
+      selectedPath,
+      dropped: false,
+      skipWindowsNotices: true,
+    );
   }
 
   /// Returns true when an EPUB path was accepted into state.
@@ -328,13 +388,28 @@ class TranslationDashboardController
     if (_logIfRunActive(_s.logDropAfterRun)) {
       return false;
     }
+    // Unlike the picker dialogs (whose notices the bridge already fired),
+    // drag-drop bypasses the observation hook, so run it here.
     return _acceptInputPath(droppedPath, dropped: true);
   }
 
   Future<void> pickOutputDirectory() async {
+    if (_isPicking) {
+      // Same guard as pickInputPath: never stack two native dialogs.
+      return;
+    }
     if (_logIfRunActive(_s.logChangeOutputAfterRun)) {
       return;
     }
+    _isPicking = true;
+    try {
+      await _pickOutputDirectoryGuarded();
+    } finally {
+      _isPicking = false;
+    }
+  }
+
+  Future<void> _pickOutputDirectoryGuarded() async {
     if (!PlatformUtils.supportsDirectoryPicker) {
       _sessionPathRevision += 1;
       final String outputDirectory = await _defaultOutputDirectory(
@@ -352,23 +427,21 @@ class TranslationDashboardController
     try {
       // Same guard as pickInputPath: never let a hanging or crashing native
       // dialog take down the UI or hang forever.
-      selectedDirectory = await PlatformUtils.pickDirectory(
-        onWindowsNotice: (WindowsPathNotice notice) {
-          if (notice == WindowsPathNotice.dialogOpened) {
-            _logWindowsPathNotice(notice, null);
-          } else {
-            pendingNotices.add(notice);
-          }
-        },
-      ).timeout(
-        const Duration(minutes: 5),
-        onTimeout: () => null,
-      );
+      selectedDirectory =
+          await (directoryPickerOverride ?? PlatformUtils.pickDirectory)(
+            onWindowsNotice: (WindowsPathNotice notice) {
+              if (notice == WindowsPathNotice.dialogOpened) {
+                _logWindowsPathNotice(notice, null);
+              } else {
+                pendingNotices.add(notice);
+              }
+            },
+          ).timeout(const Duration(minutes: 5), onTimeout: () => null);
     } catch (error) {
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
-          _s.logCouldNotSelectDirectory(_safeErrorText(error)),
+          _pickErrorLog(error, _s.logCouldNotSelectDirectory),
         ],
       );
       return;
@@ -407,9 +480,19 @@ class TranslationDashboardController
       inputPath: state.inputPath,
       outputDirectory: state.outputDirectory,
     );
+    // Manual entry bypasses the picker dialogs: fire the Windows path
+    // observations here. Fire-and-forget: the observation never throws and
+    // only appends log lines.
+    unawaited(_observeWindowsPathIfNeeded(value));
   }
 
-  Future<bool> _acceptInputPath(String value, {required bool dropped}) async {
+  Future<bool> _acceptInputPath(
+    String value, {
+    required bool dropped,
+    // The picker dialogs already fired the bridge's path observations; the
+    // drag-drop and manual-entry paths did not, so they run them here.
+    bool skipWindowsNotices = false,
+  }) async {
     final String normalizedPath = value.trim();
     if (normalizedPath.isEmpty) {
       return false;
@@ -455,7 +538,36 @@ class TranslationDashboardController
       inputPath: normalizedPath,
       outputDirectory: outputDirectory,
     );
+    if (!skipWindowsNotices) {
+      await _observeWindowsPathIfNeeded(normalizedPath);
+    }
     return true;
+  }
+
+  /// Fires the Windows path observations (long-path-without-policy, OneDrive)
+  /// for a path that bypassed the picker dialogs (drag-drop / manual entry).
+  /// Best-effort: never throws, and never fires twice for picker flows (the
+  /// bridge already observed those via [skipWindowsNotices]).
+  Future<void> _observeWindowsPathIfNeeded(String path) async {
+    final Future<void> Function(String path)? observerOverride =
+        windowsPathObserverOverride;
+    if (observerOverride != null) {
+      // Test seam: exercised off Windows; the production filtering
+      // (dialogOpened / mounted) is irrelevant for the observation itself.
+      await observerOverride(path);
+      return;
+    }
+    if (!PlatformUtils.isWindows) {
+      return;
+    }
+    await NativePlatformBridge.observeWindowsPath(path, (
+      WindowsPathNotice notice,
+    ) {
+      if (!mounted || notice == WindowsPathNotice.dialogOpened) {
+        return;
+      }
+      _logWindowsPathNotice(notice, path);
+    });
   }
 
   void setOutputDirectory(String value) {
@@ -469,6 +581,9 @@ class TranslationDashboardController
       inputPath: state.inputPath,
       outputDirectory: state.outputDirectory,
     );
+    // Manual entry bypasses the picker dialog: fire the Windows path
+    // observations here (fire-and-forget; never throws).
+    unawaited(_observeWindowsPathIfNeeded(value));
   }
 
   void setTargetLanguage(String value) {
@@ -506,6 +621,7 @@ class TranslationDashboardController
       styleProfileEnabled: settingsConfig.styleProfileEnabled,
       textScale: settingsConfig.textScale,
       lockedGlossary: settingsConfig.lockedGlossary,
+      httpProxy: settingsConfig.httpProxy,
     );
     state = state.copyWith(
       config: nextConfig,
@@ -835,7 +951,7 @@ class TranslationDashboardController
           state.job?.copyWith(
             status: TranslationJobStatus.failed,
             phase: TranslationJobPhase.inspection,
-            currentChapter: 'Inspection failed',
+            currentChapter: _s.jobStatusInspectionFailed,
             errorMessage: safeError,
           ) ??
           TranslationJob(
@@ -845,7 +961,7 @@ class TranslationDashboardController
             status: TranslationJobStatus.failed,
             phase: TranslationJobPhase.inspection,
             progress: 0,
-            currentChapter: 'Inspection failed',
+            currentChapter: _s.jobStatusInspectionFailed,
             errorMessage: safeError,
           );
       state = state.copyWith(
@@ -957,7 +1073,7 @@ class TranslationDashboardController
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
           progress: 0,
-          currentChapter: 'Restoring cached translations',
+          currentChapter: _s.jobStatusRestoringCache,
           currentBlock: null,
           completedFiles: 0,
           totalFiles: selectedChapters.length,
@@ -981,7 +1097,7 @@ class TranslationDashboardController
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
           progress: 0,
-          currentChapter: 'Restoring cached translations',
+          currentChapter: _s.jobStatusRestoringCache,
           completedFiles: 0,
           totalFiles: selectedChapters.length,
           completedBlocks: 0,
@@ -1127,7 +1243,7 @@ class TranslationDashboardController
         state.job?.copyWith(
               status: TranslationJobStatus.failed,
               phase: TranslationJobPhase.translation,
-              currentChapter: 'Translation failed',
+              currentChapter: _s.jobStatusTranslationFailed,
               currentBlock: null,
               errorMessage: safeError,
             ) ??
@@ -1138,7 +1254,7 @@ class TranslationDashboardController
               status: TranslationJobStatus.failed,
               phase: TranslationJobPhase.translation,
               progress: 0,
-              currentChapter: 'Translation failed',
+              currentChapter: _s.jobStatusTranslationFailed,
               errorMessage: safeError,
             ),
       );
@@ -1194,8 +1310,23 @@ class TranslationDashboardController
         state.job?.id != activeJob.id) {
       return;
     }
+    // Style-profile generation runs against a terminal inspection job (the
+    // only "active" thing is isGeneratingStyleProfile); the profile
+    // coroutine observes _cancelRequested itself and clears
+    // isGeneratingStyleProfile. Marking the finished job
+    // 'Cancellation requested' would be a display glitch, so skip the job
+    // mutation here and just log.
+    final bool jobActivelyRunning =
+        activeJob.status == TranslationJobStatus.queued ||
+        activeJob.status == TranslationJobStatus.running;
+    if (!jobActivelyRunning) {
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logCancellationRequested],
+      );
+      return;
+    }
     final TranslationJob cancellingJob = activeJob.copyWith(
-      currentChapter: 'Cancellation requested',
+      currentChapter: _s.jobStatusCancellationRequested,
       currentBlock: null,
     );
     final int progressBlocks = _confirmedProgressBlocks(activeJob);
@@ -1291,6 +1422,13 @@ class TranslationDashboardController
           sourcePath: outputPath,
           displayName: displayName,
         );
+        if (!mounted) {
+          // The provider was disposed while the native save ran: assigning
+          // state now would throw, and the catch below would throw again on
+          // its own state assignment. Bail out quietly; finally still resets
+          // the saving flag under its own mounted guard.
+          return;
+        }
         // C-L4: the native return value is log-only and inconsistent across
         // OS versions — Android 10+ returns a display pseudo-path
         // "Downloads/<name>", Android 9 and below an absolute path. Never
@@ -1308,17 +1446,11 @@ class TranslationDashboardController
         if (_handlePermanentPermissionDenial(error)) {
           return;
         }
-        final String safeError = _safeErrorText(error);
+        if (!mounted) {
+          return;
+        }
         state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            // H3: the 5-minute Dart-side timeout only stops *waiting* — the
-            // native worker keeps running to completion in the background,
-            // so tell the user where to find the finished file.
-            safeError.contains('timed out')
-                ? _s.saveTimeoutContinuesBackground
-                : _s.logCouldNotSaveDownloads(safeError),
-          ],
+          logs: <String>[...state.logs, debugSaveErrorLogLine(error)],
         );
       }
     } finally {
@@ -1449,8 +1581,11 @@ class TranslationDashboardController
         job.styleProfileEnabled == state.config.styleProfileEnabled;
     final TranslationStyleProfile? preservedStyleProfile =
         job.styleProfileConfirmed && styleModeMatches ? job.styleProfile : null;
+    // The phase (not the display string) decides whether the failed job was
+    // a translation run: currentChapter is localized now and must not be
+    // matched on.
     final bool wasTranslationFailure =
-        (job.currentChapter ?? '').toLowerCase().contains('translation') ||
+        _isTranslationRunPhase(job.phase) ||
         job.totalBlocks > 0 ||
         job.completedBlocks > 0;
     _pendingResumeProgressHint = wasTranslationFailure && job.totalBlocks > 0
@@ -1499,18 +1634,68 @@ class TranslationDashboardController
     _pendingResumeProgressHint = null;
   }
 
-  void clearJobHistory() {
+  /// Clears the job history. Awaits the tombstone write so a user who closes
+  /// the app immediately afterwards cannot lose the clear: the old
+  /// fire-and-forget persist was dropped by the `!mounted` guard on dispose,
+  /// and the next launch resurrected the "cleared" history.
+  ///
+  /// Returns false when the clear did not happen (a run is active) or the
+  /// tombstone could not be persisted — the caller surfaces that to the user.
+  Future<bool> clearJobHistory() async {
     // A run in progress would re-insert its job on the next progress callback
     // and silently undo the clear.
     if (_logIfRunActive(_s.logRunAlreadyActiveGeneric)) {
-      return;
+      return false;
     }
     _historyClearRevision += 1;
+    // Our own clear is the newest tombstone by definition; keep it
+    // strictly monotonic so a same-millisecond double clear cannot tie.
+    final int nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs > _lastSeenHistoryClearedAt) {
+      _lastSeenHistoryClearedAt = nowMs;
+    }
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
       logs: <String>[...state.logs, _s.logClearedHistory],
     );
-    _persistJobHistory();
+    // Wait for the chained save to actually land the tombstone on disk.
+    // _pendingHistorySave swallows errors by design (it is a shared chain),
+    // so await the error-propagating future instead: on disk failure the
+    // "cleared" history would resurrect on next launch, and the user must
+    // be told the clear did not stick.
+    try {
+      await _persistJobHistoryWithError();
+    } catch (_) {
+      if (mounted) {
+        state = state.copyWith(
+          logs: <String>[...state.logs, _s.logClearHistoryFailed],
+        );
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /// Maps a save-to-Downloads failure to its log line.
+  ///
+  /// Extracted (and marked test-only) so the SAVE_NO_SPACE → localized
+  /// notice mapping stays covered by unit tests: the native bridge cannot
+  /// be driven on a desktop test host, but the mapping itself must never
+  /// regress to surfacing the raw English native text.
+  @visibleForTesting
+  String debugSaveErrorLogLine(Object error) {
+    // A7: no free space for the save — show the localized notice, not
+    // the raw English native text.
+    if (error is PlatformException && error.code == 'SAVE_NO_SPACE') {
+      return _s.logNotEnoughSpace;
+    }
+    final String safeError = _safeErrorText(error);
+    // H3: the 5-minute Dart-side timeout only stops *waiting* — the
+    // native worker keeps running to completion in the background,
+    // so tell the user where to find the finished file.
+    return safeError.contains('timed out')
+        ? _s.saveTimeoutContinuesBackground
+        : _s.logCouldNotSaveDownloads(safeError);
   }
 
   Future<String?> _completedOutputPath() async {
@@ -1587,6 +1772,23 @@ class TranslationDashboardController
     return redacted;
   }
 
+  /// Maps a file-picker failure to its log line. A path the WinForms dialog
+  /// itself cannot handle gets an actionable localized message instead of
+  /// a raw .NET stack trace; everything else keeps the generic wording.
+  String _pickErrorLog(Object error, String Function(String error) genericLog) {
+    if (error is WindowsLongPathException) {
+      AppLogger.warn(
+        'Windows dialog path too long: ${error.detail}',
+        tag: 'picker',
+      );
+      return _s.logWindowsDialogPathTooLong;
+    }
+    if (error is PlatformException && error.code == 'PICK_NO_SPACE') {
+      return _s.logNotEnoughSpace;
+    }
+    return genericLog(_safeErrorText(error));
+  }
+
   /// C-M6: surfaces a permanently-denied storage permission (native error
   /// code `PERMISSION_PERMANENTLY_DENIED`) as a log line plus a notice id
   /// the UI can listen on to show a Snackbar whose action opens the system
@@ -1612,11 +1814,51 @@ class TranslationDashboardController
     }
     _lastFgServicePercent = -1;
     _lastFgServiceChapter = null;
+    // Opaque run token so the native side only applies stashed
+    // notification updates to the run that produced them.
+    _fgServiceRunId = DateTime.now().microsecondsSinceEpoch.toString();
+    // The notification Stop action reaches back into Dart through this
+    // handler and cancels the run via the normal cancel path.
+    AndroidServiceBridge.setNotificationCancelHandler(requestCancel);
+    // Android 15+ may stop the service after ~6h in the background. The
+    // process then loses its foreground protection, so the run is wound
+    // down through the normal cancel path instead of burning API tokens
+    // in a process the system may kill at any moment. Block cache and
+    // checkpoints survive, so the user can resume after reopening.
+    AndroidServiceBridge.setForegroundServiceTimeoutHandler(() async {
+      if (!state.isRunActive) {
+        return;
+      }
+      // The native side may have persisted a timeout notice (notifications
+      // were disabled, so the final system notification was dropped);
+      // consume it now that the live callback arrived, so the next app
+      // start doesn't surface the same timeout in-app a second time.
+      unawaited(AndroidServiceBridge.consumePendingForegroundServiceTimeout());
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logForegroundServiceTimeout],
+      );
+      await requestCancel();
+    });
     unawaited(
       AndroidServiceBridge.startTranslationService(
         title: _s.foregroundServiceTitle,
         text: path.basename(state.inputPath),
-      ),
+        stopLabel: _s.foregroundServiceStopAction,
+        timeoutText: _s.foregroundServiceTimeoutText,
+        runId: _fgServiceRunId,
+      ).then((bool started) {
+        // Android 12+ can refuse the start when the app is in the
+        // background: the keep-alive is lost but the translation itself
+        // continues — warn instead of failing silently.
+        if (!started && mounted) {
+          state = state.copyWith(
+            logs: <String>[
+              ...state.logs,
+              _s.logForegroundServiceBackgroundDenied,
+            ],
+          );
+        }
+      }),
     );
   }
 
@@ -1638,6 +1880,7 @@ class TranslationDashboardController
       AndroidServiceBridge.updateTranslationNotification(
         progress: percent,
         text: _s.foregroundServiceText,
+        runId: _fgServiceRunId,
       ),
     );
   }
@@ -1648,6 +1891,8 @@ class TranslationDashboardController
     if (!PlatformUtils.isAndroid) {
       return;
     }
+    AndroidServiceBridge.setNotificationCancelHandler(null);
+    AndroidServiceBridge.setForegroundServiceTimeoutHandler(null);
     unawaited(AndroidServiceBridge.stopTranslationService());
   }
 
@@ -1663,7 +1908,7 @@ class TranslationDashboardController
     final TranslationJob cancelledJob = _translationHistoryJob(
       currentJob?.copyWith(
             status: TranslationJobStatus.cancelled,
-            currentChapter: 'Cancelled',
+            currentChapter: _s.jobStatusLabel(TranslationJobStatus.cancelled),
             currentBlock: null,
           ) ??
           TranslationJob(
@@ -1672,7 +1917,7 @@ class TranslationDashboardController
             outputPath: state.outputDirectory,
             status: TranslationJobStatus.cancelled,
             progress: 0,
-            currentChapter: 'Cancelled',
+            currentChapter: _s.jobStatusLabel(TranslationJobStatus.cancelled),
           ),
     );
     final bool translationRun = _isTranslationRunPhase(cancelledJob.phase);
@@ -1703,6 +1948,35 @@ class TranslationDashboardController
     _clearActiveTranslationHistory();
     _translationStopwatch?.stop();
     return true;
+  }
+
+  /// Surfaces a persisted foreground-service timeout notice on app start.
+  /// When Android 15+ stops the service for exceeding its background time
+  /// budget while notifications are disabled, the native side persists the
+  /// timeout instead of posting a notification that would be silently
+  /// dropped. If the live Dart callback never ran (the process died with
+  /// the service), the notice is still pending here: show it in-app once.
+  /// The live timeout handler consumes the notice itself, so a timeout
+  /// that already wound the run down never shows twice.
+  Future<void> _checkPendingForegroundServiceTimeout() async {
+    if (!PlatformUtils.isAndroid) {
+      return;
+    }
+    try {
+      if (await AndroidServiceBridge.consumePendingForegroundServiceTimeout()) {
+        if (!mounted) {
+          return;
+        }
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            _s.logForegroundServiceTimeoutRecovered,
+          ],
+        );
+      }
+    } catch (_) {
+      // Best effort: a missing notice must not fail startup.
+    }
   }
 
   Future<void> _loadSessionPaths() async {
@@ -1739,6 +2013,16 @@ class TranslationDashboardController
           _s.logRestoredOutput(paths.outputDirectory),
       ],
     );
+    // The picker/drag-drop/manual-entry flows run the Windows path
+    // observations; a restored session path used to bypass them and lost
+    // the early long-path/OneDrive warning. Fire-and-forget, like the
+    // manual-entry flow.
+    if (inputExists) {
+      unawaited(_observeWindowsPathIfNeeded(paths.inputPath));
+    }
+    if (paths.outputDirectory.isNotEmpty) {
+      unawaited(_observeWindowsPathIfNeeded(paths.outputDirectory));
+    }
   }
 
   void _persistSessionPaths({
@@ -1860,7 +2144,16 @@ class TranslationDashboardController
       return;
     }
     final int clearRevisionBeforeLoad = _historyClearRevision;
-    final List<TranslationJob> history = (await store.load())
+    final ({List<TranslationJob> jobs, int clearedAt}) loaded = await store
+        .loadWithTombstone();
+    // Never move the tombstone backwards: a clear that landed while this
+    // load was in flight already recorded a newer timestamp, and adopting
+    // the stale file value here would let a later persist overwrite a fresh
+    // tombstone with 0.
+    if (loaded.clearedAt > _lastSeenHistoryClearedAt) {
+      _lastSeenHistoryClearedAt = loaded.clearedAt;
+    }
+    final List<TranslationJob> history = loaded.jobs
         .map(_restoreInterruptedJob)
         .toList(growable: false);
     if (!mounted) {
@@ -1880,10 +2173,12 @@ class TranslationDashboardController
     return job.copyWith(
       status: TranslationJobStatus.cancelled,
       currentChapter: _isTranslationRunPhase(job.phase)
-          ? 'Translation interrupted'
-          : 'Inspection interrupted',
+          ? _s.jobStatusTranslationInterrupted
+          : _s.jobStatusInspectionInterrupted,
       currentBlock: null,
-      errorMessage: 'The application closed before this task finished.',
+      // Note: the retry heuristic reads `phase`, not this display string,
+      // so currentChapter is safe to localize.
+      errorMessage: _s.jobInterruptedOnRestart,
     );
   }
 
@@ -1900,22 +2195,58 @@ class TranslationDashboardController
   }
 
   void _persistJobHistory() {
+    unawaited(_persistJobHistoryWithError());
+  }
+
+  /// Persists the job history, returning a future that completes with an
+  /// error when the write fails (unlike the shared [_pendingHistorySave]
+  /// chain, which swallows errors by design so later passes are not
+  /// poisoned).
+  Future<void> _persistJobHistoryWithError() {
+    final JobHistoryStore? store = historyStore;
+    if (store == null) {
+      return Future<void>.value();
+    }
+    final Future<void> save = _pendingHistorySave.then<void>(
+      (_) => debugPersistJobHistoryNow(),
+      onError: (_) => debugPersistJobHistoryNow(),
+    );
+    _pendingHistorySave = save.catchError((_) {});
+    return save;
+  }
+
+  /// Test-only: runs a single history persistence pass, including the
+  /// cross-instance clear-tombstone guard.
+  @visibleForTesting
+  Future<void> debugPersistJobHistoryNow() async {
     final JobHistoryStore? store = historyStore;
     if (store == null) {
       return;
     }
-    Future<void> saveLatestHistory() async {
-      await _initialJobHistoryLoad;
-      if (!mounted) {
-        return;
-      }
-      await store.save(state.jobHistory);
+    await _initialJobHistoryLoad;
+    if (!mounted) {
+      return;
     }
-
-    final Future<void> save = _pendingHistorySave.then<void>(
-      (_) => saveLatestHistory(),
-      onError: (_) => saveLatestHistory(),
+    // Cross-instance guard: if another app instance cleared the history
+    // after our last read, its tombstone wins — skip this write instead of
+    // resurrecting the cleared entries.
+    final int fileClearedAt = (await store.loadWithTombstone()).clearedAt;
+    if (fileClearedAt > _lastSeenHistoryClearedAt) {
+      _lastSeenHistoryClearedAt = fileClearedAt;
+      // Our in-memory entries predate that clear, so they are stale: drop
+      // them now. Skipping just this one write is not enough — the next
+      // persistence pass (progress tick, run end) would write the stale
+      // entries back and resurrect the cleared history. The active run is
+      // unaffected: it is tracked via state.job and re-inserted into the
+      // history on completion.
+      if (state.jobHistory.isNotEmpty) {
+        state = state.copyWith(jobHistory: const <TranslationJob>[]);
+      }
+      return;
+    }
+    await store.save(
+      state.jobHistory,
+      clearedAtEpochMs: _lastSeenHistoryClearedAt,
     );
-    _pendingHistorySave = save.catchError((_) {});
   }
 }

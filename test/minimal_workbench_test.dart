@@ -35,10 +35,14 @@ class _MemorySettingsStore extends SettingsStore {
 
 class _MemoryJobHistoryStore extends JobHistoryStore {
   @override
-  Future<List<TranslationJob>> load() async => const <TranslationJob>[];
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {}
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
 }
 
 Widget _app() => ProviderScope(
@@ -336,6 +340,46 @@ void main() {
         ),
         findsNothing,
       );
+    });
+
+    testWidgets('corrupt-settings notice is shown once and then consumed', (
+      tester,
+    ) async {
+      _viewport(tester, const Size(800, 600));
+      final ProviderContainer container = ProviderContainer(
+        overrides: <Override>[
+          settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+          jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
+          settingsResetNoticeProvider.overrideWith(
+            (ref) => (id: 7, backupPath: '/tmp/settings.json.bad-1'),
+          ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const EpubTranslatorApp(),
+        ),
+      );
+      await tester.pump();
+
+      // The pre-existing notice (fired before AppShell subscribed) is
+      // picked up by the post-frame check and shown as a SnackBar.
+      expect(find.byType(SnackBar), findsOneWidget);
+      expect(find.textContaining('settings.json.bad-1'), findsOneWidget);
+      // Consume-once: the provider is cleared, so a later rebuild cannot
+      // pop the notice a second time.
+      expect(container.read(settingsResetNoticeProvider), isNull);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const EpubTranslatorApp(),
+        ),
+      );
+      await tester.pump();
+      expect(find.byType(SnackBar), findsOneWidget);
+      expect(tester.takeException(), isNull);
     });
   }
 }

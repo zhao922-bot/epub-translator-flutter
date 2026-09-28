@@ -12,7 +12,6 @@ class TranslationOverview extends StatelessWidget {
     super.key,
     required this.strings,
     required this.job,
-    required this.onTranslatePressed,
     required this.onExportPressed,
     required this.onSaveToDownloadsPressed,
     required this.canTranslate,
@@ -33,7 +32,6 @@ class TranslationOverview extends StatelessWidget {
 
   final AppStrings strings;
   final TranslationJob? job;
-  final VoidCallback onTranslatePressed;
   final VoidCallback onExportPressed;
   final VoidCallback onSaveToDownloadsPressed;
   final bool canTranslate;
@@ -201,8 +199,8 @@ class TranslationOverview extends StatelessWidget {
                   '${strings.blocksLabel}: ${job!.completedBlocks}/${job!.totalBlocks}',
                 ),
               if (estimate case final TranslationRunEstimate e
-                  when e.hasRuntimeData)
-                _MetaText('${strings.etaLabel}: ${e.remainingLabel}'),
+                  when e.hasRuntimeData && !canExport)
+                _MetaText('${strings.etaLabel}: ${e.remainingLabel(strings)}'),
               if (estimate case final TranslationRunEstimate e
                   when e.hasSelection && !canExport)
                 _MetaText(

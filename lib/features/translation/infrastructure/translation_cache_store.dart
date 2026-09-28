@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
 
@@ -124,11 +125,7 @@ class TranslationCacheStore {
         // `cleanStaleAtomicTempFiles` on write sweeps.
         if (!isAtomicTemp) {
           entries.add(
-            _CacheEntry(
-              file: entity,
-              size: stat.size,
-              modified: stat.modified,
-            ),
+            _CacheEntry(file: entity, size: stat.size, modified: stat.modified),
           );
         }
       } catch (_) {
@@ -176,6 +173,69 @@ class TranslationCacheStore {
       file,
       const JsonEncoder.withIndent('  ').convert(state.toJson()),
     );
+    await _pruneOldJobStates();
+  }
+
+  /// Maximum retained per-job checkpoints, aligned with the 20-entry job
+  /// history cap: a checkpoint whose job has scrolled out of history can no
+  /// longer be resumed through the UI, so keeping more would let `jobs/`
+  /// grow without bound.
+  static const int _maxJobCheckpoints = 20;
+
+  /// Deletes the oldest checkpoints beyond [_maxJobCheckpoints]. Best
+  /// effort: checkpoint maintenance must never break a translation run. The
+  /// checkpoint just written is always the newest, so it can never be pruned
+  /// by its own save.
+  Future<void> _pruneOldJobStates() async {
+    try {
+      final Directory root = await _cacheRoot();
+      await pruneJobCheckpointsForTest(
+        Directory(path.join(root.path, 'jobs')),
+        maxCheckpoints: _maxJobCheckpoints,
+      );
+    } catch (_) {
+      // Best effort; a locked file is left for the next pass.
+    }
+  }
+
+  /// Deletes the oldest checkpoint files in [jobsDir] beyond
+  /// [maxCheckpoints] (oldest first by modification time).
+  @visibleForTesting
+  Future<void> pruneJobCheckpointsForTest(
+    Directory jobsDir, {
+    int maxCheckpoints = _maxJobCheckpoints,
+  }) async {
+    if (!await jobsDir.exists()) {
+      return;
+    }
+    final List<({File file, DateTime modified})> entries =
+        <({File file, DateTime modified})>[];
+    await for (final FileSystemEntity entity in jobsDir.list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) {
+        continue;
+      }
+      try {
+        entries.add((file: entity, modified: (await entity.stat()).modified));
+      } catch (_) {
+        // A file that vanishes mid-scan is simply skipped.
+      }
+    }
+    if (entries.length <= maxCheckpoints) {
+      return;
+    }
+    entries.sort(
+      (
+        ({File file, DateTime modified}) a,
+        ({File file, DateTime modified}) b,
+      ) => a.modified.compareTo(b.modified),
+    );
+    for (int i = 0; i < entries.length - maxCheckpoints; i++) {
+      try {
+        await entries[i].file.delete();
+      } catch (_) {
+        // Best effort; a locked file is left for the next pass.
+      }
+    }
   }
 
   Future<void> clearJobState(String jobKey) async {

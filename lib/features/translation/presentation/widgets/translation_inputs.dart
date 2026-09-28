@@ -32,7 +32,13 @@ class TranslationInputs extends StatefulWidget {
   final String targetLanguage;
   final bool bilingual;
   final bool enabled;
+
+  /// Fired when the manual input path is committed (Enter or focus leaves
+  /// the field), not on every keystroke: the handler has destructive side
+  /// effects (it clears the current job and inspection state).
   final ValueChanged<String> onInputChanged;
+
+  /// Same commit semantics as [onInputChanged], for the output directory.
   final ValueChanged<String> onOutputChanged;
   final ValueChanged<String?> onTargetLanguageChanged;
   final ValueChanged<bool> onBilingualChanged;
@@ -50,6 +56,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
   bool _showAdvancedPaths = false;
   late final TextEditingController _inputPathController;
   late final TextEditingController _outputDirectoryController;
+  late final FocusNode _inputPathFocusNode;
+  late final FocusNode _outputDirectoryFocusNode;
 
   @override
   void initState() {
@@ -58,6 +66,40 @@ class _TranslationInputsState extends State<TranslationInputs> {
     _outputDirectoryController = TextEditingController(
       text: widget.outputDirectory,
     );
+    // Typing must not trigger the controller callbacks on every keystroke:
+    // those carry destructive side effects (clearing the current job and
+    // inspection state, disk writes, path watchers). Commit only on submit
+    // or when focus leaves the field.
+    _inputPathFocusNode = FocusNode()..addListener(_commitInputPathOnBlur);
+    _outputDirectoryFocusNode = FocusNode()
+      ..addListener(_commitOutputDirectoryOnBlur);
+  }
+
+  void _commitInputPathOnBlur() {
+    _commitInputPath();
+  }
+
+  void _commitOutputDirectoryOnBlur() {
+    _commitOutputDirectory();
+  }
+
+  /// Commits the pending path edits. [force] bypasses the focus check and is
+  /// used from [dispose] so uncommitted keystrokes are never silently dropped
+  /// when the widget goes away.
+  void _commitInputPath({bool force = false}) {
+    if ((force || !_inputPathFocusNode.hasFocus) &&
+        widget.enabled &&
+        _inputPathController.text != widget.inputPath) {
+      widget.onInputChanged(_inputPathController.text);
+    }
+  }
+
+  void _commitOutputDirectory({bool force = false}) {
+    if ((force || !_outputDirectoryFocusNode.hasFocus) &&
+        widget.enabled &&
+        _outputDirectoryController.text != widget.outputDirectory) {
+      widget.onOutputChanged(_outputDirectoryController.text);
+    }
   }
 
   @override
@@ -83,6 +125,17 @@ class _TranslationInputsState extends State<TranslationInputs> {
 
   @override
   void dispose() {
+    // Flush uncommitted keystrokes: navigating away with a focused field
+    // never triggers blur, so without this the last typed path would be
+    // silently dropped.
+    _commitInputPath(force: true);
+    _commitOutputDirectory(force: true);
+    _inputPathFocusNode
+      ..removeListener(_commitInputPathOnBlur)
+      ..dispose();
+    _outputDirectoryFocusNode
+      ..removeListener(_commitOutputDirectoryOnBlur)
+      ..dispose();
     _inputPathController.dispose();
     _outputDirectoryController.dispose();
     super.dispose();
@@ -134,7 +187,7 @@ class _TranslationInputsState extends State<TranslationInputs> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    hasFile ? 'EPUB' : fileName,
+                    hasFile ? widget.strings.epubFormatLabel : fileName,
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: scheme.onSurfaceVariant,
                     ),
@@ -287,8 +340,15 @@ class _TranslationInputsState extends State<TranslationInputs> {
             TextFormField(
               key: const ValueKey<String>('manual-input-path'),
               controller: _inputPathController,
+              focusNode: _inputPathFocusNode,
               enabled: widget.enabled,
-              onChanged: widget.enabled ? widget.onInputChanged : null,
+              onFieldSubmitted: widget.enabled
+                  ? (_) {
+                      if (_inputPathController.text != widget.inputPath) {
+                        widget.onInputChanged(_inputPathController.text);
+                      }
+                    }
+                  : null,
               decoration: InputDecoration(
                 labelText: widget.strings.inputEpub,
                 hintText: widget.strings.inputEpubHint,
@@ -299,8 +359,16 @@ class _TranslationInputsState extends State<TranslationInputs> {
             TextFormField(
               key: const ValueKey<String>('manual-output-directory'),
               controller: _outputDirectoryController,
+              focusNode: _outputDirectoryFocusNode,
               enabled: widget.enabled,
-              onChanged: widget.enabled ? widget.onOutputChanged : null,
+              onFieldSubmitted: widget.enabled
+                  ? (_) {
+                      if (_outputDirectoryController.text !=
+                          widget.outputDirectory) {
+                        widget.onOutputChanged(_outputDirectoryController.text);
+                      }
+                    }
+                  : null,
               decoration: InputDecoration(
                 labelText: widget.strings.outputDirectory,
                 hintText: widget.strings.outputDirectoryHint,

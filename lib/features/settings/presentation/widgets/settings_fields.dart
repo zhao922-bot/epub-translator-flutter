@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../translation/domain/models/translation_config.dart';
@@ -103,13 +105,56 @@ class SettingsTextField extends StatefulWidget {
 
 class SettingsTextFieldState extends State<SettingsTextField> {
   late final TextEditingController _controller;
+  late final FocusNode _focusNode;
   late bool _obscureText;
+
+  /// Every keystroke used to call `onChanged` directly, and each call
+  /// persisted the whole settings (all secret slots + settings.json — on
+  /// Windows every secret slot spawns a PowerShell process). Typing a 40
+  /// character API key therefore spawned ~80 PowerShell processes and made
+  /// typing stutter. Commits are now debounced; the in-memory text stays
+  /// fully responsive while the expensive persist runs once the user pauses.
+  static const Duration _commitDelay = Duration(milliseconds: 800);
+  Timer? _commitTimer;
+  String _lastCommitted = '';
 
   @override
   void initState() {
     super.initState();
     _controller = TextEditingController(text: widget.value);
+    _lastCommitted = widget.value;
     _obscureText = widget.obscureText;
+    _focusNode = FocusNode();
+    _focusNode.addListener(_onFocusChanged);
+  }
+
+  void _onFocusChanged() {
+    // Commit on blur so tabbing away never loses the last typed characters.
+    if (!_focusNode.hasFocus) {
+      _flushCommit();
+    }
+  }
+
+  void _scheduleCommit() {
+    _commitTimer?.cancel();
+    if (_controller.text == _lastCommitted) {
+      return;
+    }
+    _commitTimer = Timer(_commitDelay, _flushCommit);
+  }
+
+  void _flushCommit() {
+    _commitTimer?.cancel();
+    _commitTimer = null;
+    if (!mounted) {
+      return;
+    }
+    final String text = _controller.text;
+    if (text == _lastCommitted) {
+      return;
+    }
+    _lastCommitted = text;
+    widget.onChanged(text);
   }
 
   @override
@@ -119,15 +164,36 @@ class SettingsTextFieldState extends State<SettingsTextField> {
       _obscureText = widget.obscureText;
     }
     if (widget.value != oldWidget.value && widget.value != _controller.text) {
+      // An external value (e.g. a preset) supersedes any pending keystrokes.
+      _commitTimer?.cancel();
+      _commitTimer = null;
+      _lastCommitted = widget.value;
       _controller.value = TextEditingValue(
         text: widget.value,
         selection: TextSelection.collapsed(offset: widget.value.length),
       );
     }
+    if (oldWidget.enabled && !widget.enabled) {
+      // The run started and disabled the field: discard the half-typed,
+      // unconfirmed input instead of persisting it mid-run. Marking it as
+      // committed suppresses the timer, the blur commit that disabling
+      // triggers, and a later dispose flush.
+      _commitTimer?.cancel();
+      _commitTimer = null;
+      _lastCommitted = _controller.text;
+    }
   }
 
   @override
   void dispose() {
+    // Flush any pending debounced commit before tearing down: leaving the
+    // page within the debounce window must not silently drop the last typed
+    // characters. _flushCommit is safe here — mounted is still true during
+    // dispose, and it only forwards to widget.onChanged (memory + persist),
+    // the same path blur uses.
+    _flushCommit();
+    _focusNode.removeListener(_onFocusChanged);
+    _focusNode.dispose();
     _controller.dispose();
     super.dispose();
   }
@@ -158,11 +224,13 @@ class SettingsTextFieldState extends State<SettingsTextField> {
     return TextFormField(
       key: widget.fieldKey,
       controller: _controller,
+      focusNode: _focusNode,
       obscureText: widget.maxLines > 1 ? false : _obscureText,
       maxLines: widget.maxLines,
       minLines: widget.maxLines > 1 ? 3 : 1,
       enabled: widget.enabled,
-      onChanged: widget.enabled ? widget.onChanged : null,
+      onChanged: widget.enabled ? (_) => _scheduleCommit() : null,
+      onFieldSubmitted: widget.enabled ? (_) => _flushCommit() : null,
       decoration: decoration,
     );
   }

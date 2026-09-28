@@ -30,6 +30,18 @@ String decodeEpubText({
   required String filePath,
   bool strict = false,
 }) {
+  // NUL bytes are not valid in XML 1.0 documents at all and are the
+  // hallmark of UTF-16/UTF-32 payloads (every other byte is NUL for ASCII
+  // text). Declaration sniffing cannot help here: the declaration itself
+  // is unreadable in a 16-bit encoding, so fail loudly instead of
+  // producing U+FFFD confetti.
+  if (bytes.contains(0)) {
+    throw FormatException(
+      'Unsupported text encoding in $filePath: the file contains NUL '
+      'bytes (likely UTF-16/UTF-32). Only UTF-8 encoded EPUB content is '
+      'supported; convert the file to UTF-8 first.',
+    );
+  }
   final String? declared = _sniffDeclaredEncoding(bytes);
   if (declared != null && !_isUtf8Name(declared)) {
     throw FormatException(
@@ -37,19 +49,48 @@ String decodeEpubText({
       'only UTF-8 encoded EPUB content is supported.',
     );
   }
+  late final String decoded;
   try {
-    return strict
+    decoded = strict
         ? utf8.decode(bytes)
         : utf8.decode(bytes, allowMalformed: true);
   } on FormatException catch (error) {
     throw FormatException('Invalid UTF-8 in $filePath: ${error.message}');
   }
+  if (!strict) {
+    _throwIfMostlyUndecodable(decoded, filePath);
+  }
+  return decoded;
+}
+
+/// Heuristic safety net for bytes the declaration sniff cannot see: GBK
+/// without a declaration, or a declaration past the 8 KB scan window.
+/// Decoding such bytes with `allowMalformed` silently produces U+FFFD runs
+/// that would burn paid translation tokens on garbage, so reject loudly
+/// when the replacement-character ratio is too high to be stray bytes.
+void _throwIfMostlyUndecodable(String decoded, String filePath) {
+  int replacements = 0;
+  for (int i = 0; i < decoded.length; i++) {
+    if (decoded.codeUnitAt(i) == 0xFFFD) {
+      replacements++;
+    }
+  }
+  if (replacements >= 8 && replacements / decoded.length >= 0.01) {
+    throw FormatException(
+      'Could not decode $filePath as UTF-8 '
+      '($replacements undecodable sequences): the file is probably in a '
+      'legacy encoding such as GBK without a charset declaration. Only '
+      'UTF-8 encoded EPUB content is supported; convert the file to UTF-8 '
+      'first.',
+    );
+  }
 }
 
 bool _isUtf8Name(String declared) {
-  final String normalized = declared
-      .toLowerCase()
-      .replaceAll(RegExp(r'[^a-z0-9]'), '');
+  final String normalized = declared.toLowerCase().replaceAll(
+    RegExp(r'[^a-z0-9]'),
+    '',
+  );
   return normalized == 'utf8';
 }
 
@@ -65,31 +106,80 @@ String? _sniffDeclaredEncoding(List<int> bytes) {
   if (xmlMatch != null) {
     return xmlMatch.group(1)!.trim();
   }
-  final String htmlHead = _asciiHead(bytes, 8192);
-  for (final RegExpMatch tagMatch
-      in RegExp(r'<meta\b[^>]*>', caseSensitive: false).allMatches(htmlHead)) {
+  final String htmlHead = _stripIgnorableMarkup(_asciiHead(bytes, 8192));
+  final RegExp metaTagRegex = RegExp(r'<meta\b[^>]*>', caseSensitive: false);
+  final RegExp attrRegex = RegExp(
+    r'''([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)''',
+    caseSensitive: false,
+  );
+  final RegExp contentCharsetRegex = RegExp(
+    '\\bcharset\\s*=\\s*["\']?([A-Za-z0-9._-]+)',
+    caseSensitive: false,
+  );
+  for (final RegExpMatch tagMatch in metaTagRegex.allMatches(htmlHead)) {
     final String tagText = tagMatch.group(0)!;
-    final bool hasHttpEquiv = RegExp(
-      r'\bhttp-equiv\b',
-      caseSensitive: false,
-    ).hasMatch(tagText);
-    if (hasHttpEquiv &&
-        !RegExp(
-          '\\bhttp-equiv\\s*=\\s*["\']?content-type["\']?',
-          caseSensitive: false,
-        ).hasMatch(tagText)) {
-      continue;
+    String? httpEquiv;
+    String? contentValue;
+    // Match attributes by NAME, not by a bare `charset=` scan over the tag:
+    // a bare scan also fires inside quoted attribute values (e.g.
+    // `<meta name="desc" content="see charset=gbk">`), which would sniff the
+    // wrong encoding from unrelated text.
+    for (final RegExpMatch attr in attrRegex.allMatches(tagText)) {
+      final String name = attr.group(1)!.toLowerCase();
+      final String raw = attr.group(2)!;
+      final String value =
+          raw.length >= 2 &&
+              ((raw.startsWith('"') && raw.endsWith('"')) ||
+                  (raw.startsWith("'") && raw.endsWith("'")))
+          ? raw.substring(1, raw.length - 1)
+          : raw;
+      if (name == 'charset') {
+        final String charset = value.trim().split(';').first.trim();
+        if (charset.isNotEmpty) {
+          return charset;
+        }
+      } else if (name == 'http-equiv') {
+        httpEquiv = value.trim().toLowerCase();
+      } else if (name == 'content') {
+        contentValue = value;
+      }
     }
-    final RegExpMatch? charsetMatch =
-        RegExp(
-          '\\bcharset\\s*=\\s*["\']?([A-Za-z0-9_.:\\-;]+)',
-          caseSensitive: false,
-        ).firstMatch(tagText);
-    if (charsetMatch != null) {
-      return charsetMatch.group(1)!.trim().split(';').first.trim();
+    // `<meta http-equiv="Content-Type" content="text/html; charset=Big5">`:
+    // here the charset lives inside the content VALUE rather than in an
+    // attribute name. Only honor it for a content-type http-equiv, so
+    // unrelated text like `<meta name="desc" content="see charset=gbk">`
+    // is still ignored.
+    if (httpEquiv == 'content-type' && contentValue != null) {
+      final RegExpMatch? inContent = contentCharsetRegex.firstMatch(
+        contentValue,
+      );
+      if (inContent != null) {
+        return inContent.group(1)!;
+      }
     }
   }
   return null;
+}
+
+/// Removes HTML comments and script/style element *contents* from a scan
+/// window before charset sniffing: a `<meta charset="gbk">` inside a
+/// comment or a JS string is not a real declaration, and sniffing it would
+/// reject a perfectly good UTF-8 book.
+String _stripIgnorableMarkup(String head) {
+  String stripped = head.replaceAll(RegExp(r'<!--.*?-->', dotAll: true), ' ');
+  stripped = stripped.replaceAll(
+    RegExp(
+      r'<script\b[^>]*>.*?</script\s*>',
+      caseSensitive: false,
+      dotAll: true,
+    ),
+    ' ',
+  );
+  stripped = stripped.replaceAll(
+    RegExp(r'<style\b[^>]*>.*?</style\s*>', caseSensitive: false, dotAll: true),
+    ' ',
+  );
+  return stripped;
 }
 
 /// Maps every byte to its ASCII code point, replacing non-ASCII bytes with a

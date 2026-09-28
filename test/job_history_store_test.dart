@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
@@ -80,5 +81,79 @@ void main() {
 
     expect(loaded.single.status, TranslationJobStatus.completedWithWarnings);
     expect(loaded.single.degradedBlockCount, 2);
+  });
+
+  group('clear tombstone', () {
+    late Directory temp;
+    late File historyFile;
+    late JobHistoryStore store;
+
+    setUp(() async {
+      temp = await Directory.systemTemp.createTemp('job_history_tombstone_');
+      historyFile = File('${temp.path}/job-history.json');
+      store = JobHistoryStore(historyFileProvider: () async => historyFile);
+    });
+
+    tearDown(() async {
+      if (await temp.exists()) {
+        await temp.delete(recursive: true);
+      }
+    });
+
+    TranslationJob tombstoneJob(String id) => TranslationJob(
+      id: id,
+      inputPath: 'book.epub',
+      outputPath: 'book_translated.epub',
+      status: TranslationJobStatus.completed,
+      progress: 1,
+    );
+
+    test('tombstone round-trips through save and load', () async {
+      await store.save(<TranslationJob>[
+        tombstoneJob('job-1'),
+      ], clearedAtEpochMs: 123456789);
+
+      final ({List<TranslationJob> jobs, int clearedAt}) loaded = await store
+          .loadWithTombstone();
+
+      expect(loaded.clearedAt, 123456789);
+      expect(loaded.jobs, hasLength(1));
+      expect(loaded.jobs.single.id, 'job-1');
+      // load() keeps working and ignores the envelope.
+      expect((await store.load()).single.id, 'job-1');
+    });
+
+    test('legacy bare-list files load with a zero tombstone', () async {
+      await historyFile.writeAsString(
+        jsonEncode(<Object?>[tombstoneJob('legacy-job').toJson()]),
+      );
+
+      final loaded = await store.loadWithTombstone();
+
+      expect(loaded.clearedAt, 0);
+      expect(loaded.jobs.single.id, 'legacy-job');
+    });
+
+    test('a clear writes an empty job list with a fresh tombstone', () async {
+      await store.save(<TranslationJob>[
+        tombstoneJob('job-1'),
+      ], clearedAtEpochMs: 1000);
+      final int clearedAt = DateTime.now().millisecondsSinceEpoch;
+      await store.save(const <TranslationJob>[], clearedAtEpochMs: clearedAt);
+
+      final loaded = await store.loadWithTombstone();
+
+      expect(loaded.jobs, isEmpty);
+      expect(loaded.clearedAt, clearedAt);
+    });
+
+    test('malformed files still degrade to an empty history', () async {
+      await historyFile.writeAsString('{not-json');
+
+      final loaded = await store.loadWithTombstone();
+
+      expect(loaded.jobs, isEmpty);
+      expect(loaded.clearedAt, 0);
+    });
   });
 }

@@ -67,3 +67,69 @@ std::string Utf8FromUtf16(const wchar_t* utf16_string) {
   }
   return utf8_string;
 }
+
+namespace {
+
+// Converts a UTF-8 string to UTF-16. Returns an empty string on failure.
+std::wstring Utf16FromUtf8(const std::string& utf8_string) {
+  if (utf8_string.empty()) {
+    return std::wstring();
+  }
+  // -1: the input is null-terminated, so the returned size includes the
+  // terminator.
+  int target_length = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                            utf8_string.c_str(), -1, nullptr, 0);
+  if (target_length <= 0) {
+    return std::wstring();
+  }
+  std::wstring utf16_string(static_cast<size_t>(target_length), L'\0');
+  int written = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      utf8_string.c_str(), -1,
+                                      utf16_string.data(), target_length);
+  if (written <= 0) {
+    return std::wstring();
+  }
+  // Drop the embedded null terminator the -1 form wrote.
+  utf16_string.resize(static_cast<size_t>(written) - 1);
+  return utf16_string;
+}
+
+}  // namespace
+
+std::vector<std::string> ResolveRelativeFileArguments(
+    std::vector<std::string> arguments) {
+  for (std::string& arg : arguments) {
+    // Flags are never file paths.
+    if (arg.empty() || arg[0] == '-' || arg[0] == '/') {
+      continue;
+    }
+    std::wstring wide = Utf16FromUtf8(arg);
+    if (wide.empty()) {
+      continue;
+    }
+    // GetFullPathNameW resolves against the CURRENT directory, so the
+    // caller must run this before any SetCurrentDirectory.
+    DWORD needed = ::GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
+    if (needed == 0) {
+      continue;
+    }
+    std::wstring absolute(needed, L'\0');
+    DWORD written =
+        ::GetFullPathNameW(wide.c_str(), needed, absolute.data(), nullptr);
+    if (written == 0 || written >= needed) {
+      continue;
+    }
+    absolute.resize(written);
+    // Only rewrite arguments that point at an existing file or directory:
+    // a relative argument that doesn't exist is probably a flag value or a
+    // future output path, and absolutizing it could change its meaning.
+    if (::GetFileAttributesW(absolute.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      continue;
+    }
+    std::string utf8 = Utf8FromUtf16(absolute.c_str());
+    if (!utf8.empty()) {
+      arg = std::move(utf8);
+    }
+  }
+  return arguments;
+}

@@ -377,6 +377,7 @@ class EpubHtmlExtractor {
         }
       }
     }
+
     for (final dom.Node child in element.nodes) {
       visit(child);
     }

@@ -19,33 +19,35 @@ void main() {
       }
     });
 
-    test('keeps fresh temp files, deletes ones older than 30 minutes',
-        () async {
-      final File fresh = File(path.join(tempDir.path, 'a.html.tmp.1'));
-      final File old = File(path.join(tempDir.path, 'b.html.tmp.2'));
-      final File regular = File(path.join(tempDir.path, 'c.html'));
-      await fresh.writeAsString('fresh');
-      await old.writeAsString('old');
-      await regular.writeAsString('regular');
-      // Simulate an orphan from a process killed 31 minutes ago.
-      old.setLastModifiedSync(
-        DateTime.now().subtract(const Duration(minutes: 31)),
-      );
+    test(
+      'keeps fresh temp files, deletes ones older than 30 minutes',
+      () async {
+        final File fresh = File(path.join(tempDir.path, 'a.html.tmp.1'));
+        final File old = File(path.join(tempDir.path, 'b.html.tmp.2'));
+        final File regular = File(path.join(tempDir.path, 'c.html'));
+        await fresh.writeAsString('fresh');
+        await old.writeAsString('old');
+        await regular.writeAsString('regular');
+        // Simulate an orphan from a process killed 31 minutes ago.
+        old.setLastModifiedSync(
+          DateTime.now().subtract(const Duration(minutes: 31)),
+        );
 
-      await cleanStaleAtomicTempFiles(tempDir);
+        await cleanStaleAtomicTempFiles(tempDir);
 
-      expect(
-        await fresh.exists(),
-        isTrue,
-        reason: 'a temp file owned by a possibly live write must survive',
-      );
-      expect(
-        await old.exists(),
-        isFalse,
-        reason: 'a 31-minute-old orphan must be garbage-collected',
-      );
-      expect(await regular.exists(), isTrue);
-    });
+        expect(
+          await fresh.exists(),
+          isTrue,
+          reason: 'a temp file owned by a possibly live write must survive',
+        );
+        expect(
+          await old.exists(),
+          isFalse,
+          reason: 'a 31-minute-old orphan must be garbage-collected',
+        );
+        expect(await regular.exists(), isTrue);
+      },
+    );
 
     test('keeps a temp file just under the 30-minute threshold', () async {
       final File almostStale = File(path.join(tempDir.path, 'd.html.tmp.3'));
@@ -159,28 +161,32 @@ void main() {
       return file;
     }
 
-    test('never evicts jobs/ checkpoints, even when they are the oldest',
-        () async {
-      final File oldestBlock = await writeBlock('oldest.html', 120);
-      final File midBlock = await writeBlock('mid.html', 60);
-      final File newBlock = await writeBlock('new.html', 10);
-      final File checkpoint = await writeCheckpoint('job1.json', 180);
+    test(
+      'never evicts jobs/ checkpoints, even when they are the oldest',
+      () async {
+        final File oldestBlock = await writeBlock('oldest.html', 120);
+        final File midBlock = await writeBlock('mid.html', 60);
+        final File newBlock = await writeBlock('new.html', 10);
+        final File checkpoint = await writeCheckpoint('job1.json', 180);
 
-      // 3 blocks x 10 bytes = 30 > 25 cap; target is 22, so only the oldest
-      // block must go. The checkpoint is the oldest file overall but lives
-      // under jobs/ and must survive.
-      await TranslationCacheStore()
-          .pruneCacheDirectoryForTest(root, maxBytes: 25);
+        // 3 blocks x 10 bytes = 30 > 25 cap; target is 22, so only the oldest
+        // block must go. The checkpoint is the oldest file overall but lives
+        // under jobs/ and must survive.
+        await TranslationCacheStore().pruneCacheDirectoryForTest(
+          root,
+          maxBytes: 25,
+        );
 
-      expect(await oldestBlock.exists(), isFalse);
-      expect(await midBlock.exists(), isTrue);
-      expect(await newBlock.exists(), isTrue);
-      expect(
-        await checkpoint.exists(),
-        isTrue,
-        reason: 'a resume checkpoint must never be evicted',
-      );
-    });
+        expect(await oldestBlock.exists(), isFalse);
+        expect(await midBlock.exists(), isTrue);
+        expect(await newBlock.exists(), isTrue);
+        expect(
+          await checkpoint.exists(),
+          isTrue,
+          reason: 'a resume checkpoint must never be evicted',
+        );
+      },
+    );
 
     test('jobs/ bytes do not count toward the size cap', () async {
       final File block = await writeBlock('only.html', 5);
@@ -189,8 +195,10 @@ void main() {
 
       // blocks total = 10 bytes < 20 cap; the 1000-byte checkpoint must not
       // trigger any eviction.
-      await TranslationCacheStore()
-          .pruneCacheDirectoryForTest(root, maxBytes: 20);
+      await TranslationCacheStore().pruneCacheDirectoryForTest(
+        root,
+        maxBytes: 20,
+      );
 
       expect(await block.exists(), isTrue);
       expect(await checkpoint.exists(), isTrue);
@@ -200,11 +208,104 @@ void main() {
       final File block = await writeBlock('small.html', 5);
       final File checkpoint = await writeCheckpoint('job1.json', 5);
 
-      await TranslationCacheStore()
-          .pruneCacheDirectoryForTest(root, maxBytes: 1024);
+      await TranslationCacheStore().pruneCacheDirectoryForTest(
+        root,
+        maxBytes: 1024,
+      );
 
       expect(await block.exists(), isTrue);
       expect(await checkpoint.exists(), isTrue);
+    });
+  });
+  group('TranslationCacheStore.pruneJobCheckpointsForTest', () {
+    late Directory root;
+    late Directory jobsDir;
+
+    setUp(() async {
+      root = await Directory.systemTemp.createTemp('job_checkpoints_');
+      jobsDir = Directory(path.join(root.path, 'jobs'));
+      await jobsDir.create(recursive: true);
+    });
+
+    tearDown(() async {
+      if (await root.exists()) {
+        await root.delete(recursive: true);
+      }
+    });
+
+    Future<File> writeCheckpoint(String name, int ageMinutes) async {
+      final File file = File(path.join(jobsDir.path, name));
+      await file.writeAsString('{"job":"$name"}');
+      file.setLastModifiedSync(
+        DateTime.now().subtract(Duration(minutes: ageMinutes)),
+      );
+      return file;
+    }
+
+    test('prunes the oldest checkpoints beyond the cap', () async {
+      final List<File> files = <File>[];
+      for (int i = 0; i < 25; i++) {
+        files.add(await writeCheckpoint('job$i.json', 25 - i));
+      }
+
+      await TranslationCacheStore().pruneJobCheckpointsForTest(
+        jobsDir,
+        maxCheckpoints: 20,
+      );
+
+      for (int i = 0; i < 5; i++) {
+        expect(
+          await files[i].exists(),
+          isFalse,
+          reason: 'the oldest checkpoints must be pruned',
+        );
+      }
+      for (int i = 5; i < 25; i++) {
+        expect(
+          await files[i].exists(),
+          isTrue,
+          reason: 'the newest checkpoints must be kept',
+        );
+      }
+    });
+
+    test('does nothing when under the cap', () async {
+      final File checkpoint = await writeCheckpoint('a.json', 10);
+
+      await TranslationCacheStore().pruneJobCheckpointsForTest(
+        jobsDir,
+        maxCheckpoints: 20,
+      );
+
+      expect(await checkpoint.exists(), isTrue);
+    });
+
+    test('leaves non-json temp files alone', () async {
+      final File temp = File(path.join(jobsDir.path, 'x.json.tmp.1'));
+      await temp.writeAsString('tmp');
+      temp.setLastModifiedSync(
+        DateTime.now().subtract(const Duration(days: 1)),
+      );
+      for (int i = 0; i < 21; i++) {
+        await writeCheckpoint('job$i.json', 30 - i);
+      }
+
+      await TranslationCacheStore().pruneJobCheckpointsForTest(
+        jobsDir,
+        maxCheckpoints: 20,
+      );
+
+      expect(
+        await temp.exists(),
+        isTrue,
+        reason: 'atomic temp files are reclaimed by the temp sweeper, not here',
+      );
+    });
+
+    test('tolerates a missing directory', () async {
+      await TranslationCacheStore().pruneJobCheckpointsForTest(
+        Directory(path.join(jobsDir.path, 'does-not-exist')),
+      );
     });
   });
 }

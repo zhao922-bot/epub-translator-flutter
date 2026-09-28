@@ -11,6 +11,9 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/session_path_store.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
+import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _BlockingRepository implements TranslationRepository {
@@ -75,6 +78,23 @@ class _BlockingRepository implements TranslationRepository {
     TranslationCancellationCheck? isCancelled,
   }) {
     throw UnimplementedError();
+  }
+}
+
+/// A repository whose style-profile generation blocks on a completer, so a
+/// test can observe the `isGeneratingStyleProfile` window and cancel inside
+/// it.
+class _BlockingStyleProfileRepository extends _BlockingRepository {
+  final Completer<TranslationStyleProfile> profileCompleter =
+      Completer<TranslationStyleProfile>();
+
+  @override
+  Future<TranslationStyleProfile> generateStyleProfile({
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationCancellationCheck? isCancelled,
+  }) {
+    return profileCompleter.future;
   }
 }
 
@@ -603,10 +623,16 @@ class _ControlledHistoryStore extends JobHistoryStore {
   List<TranslationJob> saved = const <TranslationJob>[];
 
   @override
-  Future<List<TranslationJob>> load() => loadCompleter.future;
+  Future<({List<TranslationJob> jobs, int clearedAt})> loadWithTombstone() =>
+      loadCompleter.future.then(
+        (List<TranslationJob> jobs) => (jobs: jobs, clearedAt: 0),
+      );
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {
     saved = jobs;
   }
 }
@@ -629,6 +655,37 @@ class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+class _FailingHistoryStore extends JobHistoryStore {
+  _FailingHistoryStore({this.initial = const <TranslationJob>[]});
+
+  final List<TranslationJob> initial;
+
+  @override
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: initial, clearedAt: 0);
+
+  @override
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {
+    throw const FileSystemException('disk full');
+  }
+}
+
+class _FailingInspectionRepository extends _SuccessfulInspectionRepository {
+  @override
+  Future<InspectionResult> startJob({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    throw const FormatException('cannot decode chapter');
+  }
+}
+
 class _MemoryJobHistoryStore extends JobHistoryStore {
   _MemoryJobHistoryStore({this.initial = const <TranslationJob>[]});
 
@@ -636,15 +693,157 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
   List<TranslationJob> saved = const <TranslationJob>[];
 
   @override
-  Future<List<TranslationJob>> load() async => initial;
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: initial, clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {
     saved = jobs;
   }
 }
 
 void main() {
+  test(
+    'clearJobHistory reports failure when the tombstone cannot persist',
+    () async {
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: _FailingHistoryStore(
+              initial: const <TranslationJob>[
+                TranslationJob(
+                  id: 'old-job',
+                  inputPath: 'old.epub',
+                  outputPath: 'out',
+                  status: TranslationJobStatus.completed,
+                  progress: 1,
+                ),
+              ],
+            ),
+          );
+      await Future<void>.delayed(Duration.zero);
+      expect(controller.state.jobHistory, hasLength(1));
+
+      final bool cleared = await controller.clearJobHistory();
+
+      expect(cleared, isFalse);
+      expect(
+        controller.state.logs.last,
+        const AppStrings(UiLanguage.english).logClearHistoryFailed,
+      );
+      // The failed write must not poison the persist chain: a later save
+      // still goes through.
+      expect(controller.state.jobHistory, isEmpty);
+    },
+  );
+
+  test('inspection failure shows a localized progress title', () async {
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _FailingInspectionRepository(),
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(
+        uiLanguage: UiLanguage.chinese,
+        styleProfileEnabled: false,
+      ),
+    );
+    controller.setInputPath('book.epub');
+
+    await controller.startInspection();
+
+    expect(controller.state.job?.status, TranslationJobStatus.failed);
+    expect(
+      controller.state.job?.currentChapter,
+      const AppStrings(UiLanguage.chinese).jobStatusInspectionFailed,
+    );
+  });
+
+  test(
+    'retrying a failed translation-phase job does not depend on the English title',
+    () async {
+      final _SuccessfulInspectionRepository repository =
+          _SuccessfulInspectionRepository(blockCount: 2);
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(
+              initial: const <TranslationJob>[
+                TranslationJob(
+                  id: 'failed-cn',
+                  inputPath: 'book.epub',
+                  outputPath: 'out',
+                  status: TranslationJobStatus.failed,
+                  phase: TranslationJobPhase.translation,
+                  progress: 0,
+                  // Localized title: the old heuristic matched
+                  // currentChapter.contains('translation').
+                  currentChapter: '翻译失败',
+                  completedBlocks: 0,
+                  totalBlocks: 0,
+                  styleProfile: TranslationStyleProfile(
+                    primaryGenre: 'business nonfiction',
+                    tone: 'concise',
+                    confidence: TranslationStyleConfidence.high,
+                  ),
+                  styleProfileConfirmed: true,
+                ),
+              ],
+            ),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(
+          uiLanguage: UiLanguage.chinese,
+          styleProfileEnabled: false,
+        ),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      await controller.retryJob('failed-cn');
+
+      // The phase (not the display string) identifies the translation run,
+      // so retry continues into translation after re-inspection.
+      expect(repository.translateCount, 1);
+    },
+  );
+
+  test('save to downloads does not throw when disposed mid-flight', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'save-downloads',
+    );
+    final File epub = File('${temp.path}${Platform.pathSeparator}book.epub');
+    await epub.writeAsBytes(const <int>[0x50, 0x4B, 0x03, 0x04]);
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: _SuccessfulInspectionRepository(),
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(TranslationConfig.defaults());
+    controller.state = controller.state.copyWith(
+      job: TranslationJob(
+        id: 'done-job',
+        inputPath: 'book.epub',
+        outputPath: epub.path,
+        status: TranslationJobStatus.completed,
+        phase: TranslationJobPhase.translation,
+        progress: 1,
+      ),
+    );
+
+    // The native bridge has no handler in unit tests, so the awaited save
+    // fails; disposing mid-flight must not turn that into an unhandled
+    // StateError from the post-await state writes.
+    final Future<void> save = controller.saveTranslatedEpubToDownloads();
+    controller.dispose();
+    await save;
+
+    await temp.delete(recursive: true);
+  });
+
   test('committed translation result wins over a late cancellation', () async {
     final _BlockingTranslationRepository repository =
         _BlockingTranslationRepository(blockCount: 1);
@@ -776,6 +975,44 @@ void main() {
     await cancellation;
     expect(controller.state.job?.status, TranslationJobStatus.cancelled);
     expect(controller.state.isRunActive, isFalse);
+  });
+
+  test('cancellation shows a localized progress title', () async {
+    final _BlockingRepository repository = _BlockingRepository();
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(
+        uiLanguage: UiLanguage.chinese,
+        styleProfileEnabled: false,
+      ),
+    );
+    controller.setInputPath('C:\\\\Books\\\\book.epub');
+
+    final Future<void> run = controller.startInspection();
+    await Future<void>.delayed(Duration.zero);
+    final Future<void> cancellation = controller.requestCancel();
+    repository.inspectionCompleter.complete(
+      const InspectionResult(
+        job: TranslationJob(
+          id: 'running-job',
+          inputPath: 'C:\\\\Books\\\\book.epub',
+          outputPath: 'C:\\\\Books',
+          status: TranslationJobStatus.inspected,
+          progress: 1,
+        ),
+        chapters: <InspectedChapter>[],
+      ),
+    );
+    await run;
+    await cancellation;
+
+    expect(controller.state.job?.status, TranslationJobStatus.cancelled);
+    expect(controller.state.job?.currentChapter, '已取消');
+    expect(controller.state.logs.last, '任务已取消。');
   });
 
   test('old cancellation response cannot overwrite a retried run', () async {
@@ -1260,7 +1497,10 @@ void main() {
 
     final TranslationJob restored = controller.state.jobHistory.single;
     expect(restored.status, TranslationJobStatus.cancelled);
-    expect(restored.currentChapter, 'Translation interrupted');
+    expect(
+      restored.currentChapter,
+      const AppStrings(UiLanguage.english).jobStatusTranslationInterrupted,
+    );
     expect(restored.canResumeTranslation, isTrue);
   });
 
@@ -1404,8 +1644,9 @@ void main() {
           _SuccessfulInspectionRepository();
       // A non-empty generated profile stays unconfirmed, so the style gate
       // really blocks translation (an empty profile would auto-confirm).
-      repository.generatedStyleProfile =
-          const TranslationStyleProfile(primaryGenre: 'Literary fiction');
+      repository.generatedStyleProfile = const TranslationStyleProfile(
+        primaryGenre: 'Literary fiction',
+      );
       final TranslationDashboardController controller =
           TranslationDashboardController(
             repository: repository,
@@ -1579,20 +1820,21 @@ void main() {
     'accepts a dropped EPUB path and infers the output directory',
     testOn: 'windows',
     () async {
-    final TranslationDashboardController controller =
-        TranslationDashboardController(
-          repository: _SuccessfulInspectionRepository(),
-          historyStore: _MemoryJobHistoryStore(),
-        );
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: _MemoryJobHistoryStore(),
+          );
 
-    await controller.importDroppedEpubPath('C:\\Books\\dropped.epub');
+      await controller.importDroppedEpubPath('C:\\Books\\dropped.epub');
 
-    expect(controller.state.inputPath, 'C:\\Books\\dropped.epub');
-    expect(controller.state.outputDirectory, 'C:\\Books');
-    expect(controller.state.inspectedChapters, isEmpty);
-    expect(controller.state.job, isNull);
-    expect(controller.state.logs.last, contains('Dropped EPUB'));
-  });
+      expect(controller.state.inputPath, 'C:\\Books\\dropped.epub');
+      expect(controller.state.outputDirectory, 'C:\\Books');
+      expect(controller.state.inspectedChapters, isEmpty);
+      expect(controller.state.job, isNull);
+      expect(controller.state.logs.last, contains('Dropped EPUB'));
+    },
+  );
 
   test('EPUB import does not override a newer output directory edit', () async {
     final _RecordingSessionPathStore pathStore = _RecordingSessionPathStore();
@@ -1924,9 +2166,7 @@ void main() {
       'epub_translator_session_',
     );
     addTearDown(() => tempDir.delete(recursive: true));
-    final File book = File(
-      '${tempDir.path}${Platform.pathSeparator}book.epub',
-    );
+    final File book = File('${tempDir.path}${Platform.pathSeparator}book.epub');
     await book.writeAsString('fake epub');
 
     final _ControlledSessionPathStore pathStore = _ControlledSessionPathStore();
@@ -2043,7 +2283,10 @@ void main() {
           historyStore: historyStore,
         );
 
-    controller.clearJobHistory();
+    // clearJobHistory awaits the tombstone write, but the write is chained
+    // behind the still-pending startup load: complete the load first, then
+    // await the clear.
+    final Future<bool> clear = controller.clearJobHistory();
     historyStore.loadCompleter.complete(const <TranslationJob>[
       TranslationJob(
         id: 'old-job',
@@ -2053,10 +2296,421 @@ void main() {
         progress: 0,
       ),
     ]);
+    await clear;
     await Future<void>.delayed(Duration.zero);
     await Future<void>.delayed(Duration.zero);
 
     expect(controller.state.jobHistory, isEmpty);
     expect(historyStore.saved, isEmpty);
+  });
+
+  test(
+    'cancelling during style profile generation leaves the inspected job untouched',
+    () async {
+      // Regression test: requestCancel during style-profile generation used
+      // to stamp the finished inspection job's currentChapter with
+      // 'Cancellation requested'. The profile coroutine handles the cancel
+      // itself, so the job must be left alone.
+      final _BlockingStyleProfileRepository repository =
+          _BlockingStyleProfileRepository();
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(),
+          );
+      controller.setInputPath('C:\\\\Books\\\\book.epub');
+
+      // startInspection auto-starts style-profile generation (config default
+      // has styleProfileEnabled: true), which blocks on profileCompleter.
+      final Future<void> inspection = controller.startInspection();
+      repository.inspectionCompleter.complete(
+        const InspectionResult(
+          job: TranslationJob(
+            id: 'inspection-job',
+            inputPath: 'C:\\\\Books\\\\book.epub',
+            outputPath: 'C:\\\\Books',
+            status: TranslationJobStatus.inspected,
+            progress: 1,
+          ),
+          chapters: <InspectedChapter>[
+            InspectedChapter(
+              path: 'Text/ch1.xhtml',
+              title: 'Chapter 1',
+              body: 'body',
+              originalHtml: '<p>body</p>',
+              blocks: <ExtractedBlock>[],
+              category: ChapterCategory.content,
+              recommendedForTranslation: true,
+              includeInTranslation: true,
+            ),
+          ],
+        ),
+      );
+
+      // Wait until the profile coroutine has actually started.
+      for (
+        int i = 0;
+        i < 200 && !controller.state.isGeneratingStyleProfile;
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(controller.state.isGeneratingStyleProfile, isTrue);
+      expect(controller.state.job?.status, TranslationJobStatus.inspected);
+
+      await controller.requestCancel();
+      repository.profileCompleter.complete(TranslationStyleProfile.empty);
+      await inspection;
+
+      expect(controller.state.job?.status, TranslationJobStatus.inspected);
+      expect(
+        controller.state.job?.currentChapter,
+        isNot('Cancellation requested'),
+      );
+      expect(controller.state.isGeneratingStyleProfile, isFalse);
+      expect(repository.cancelCount, 1);
+    },
+  );
+
+  group('Windows path observations (drag-drop / manual entry)', () {
+    test('picker flow does not double-fire observations; drop and manual entry '
+        'do fire', () async {
+      final List<String> observed = <String>[];
+      int pickerCalls = 0;
+      // Explicit return type: an untyped closure would infer Future<String>
+      // here, and Future.timeout's onTimeout (() => null) then fails its
+      // runtime type check against T=String.
+      Future<String?> pickEpub({
+        void Function(WindowsPathNotice)? onWindowsNotice,
+      }) async {
+        pickerCalls += 1;
+        // Simulate the bridge firing the OneDrive notice while the
+        // dialog was open.
+        onWindowsNotice?.call(WindowsPathNotice.oneDrivePlaceholder);
+        return r'C:\Users\me\OneDrive\book.epub';
+      }
+
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _BlockingRepository(),
+            historyStore: _MemoryJobHistoryStore(),
+            epubPickerOverride: pickEpub,
+            windowsPathObserverOverride: (String path) async {
+              observed.add(path);
+            },
+          );
+
+      await controller.pickInputPath();
+      expect(pickerCalls, 1);
+      // The picker's own notice was logged exactly once; the redundant
+      // _acceptInputPath observation was skipped for the picker flow.
+      expect(observed, isEmpty);
+      const AppStrings strings = AppStrings(UiLanguage.english);
+      expect(
+        controller.state.logs
+            .where((String line) => line == strings.logOneDrivePlaceholderHint)
+            .length,
+        1,
+      );
+
+      // Drag-drop bypasses the dialog hook: the observation must fire.
+      final bool dropped = await controller.importDroppedEpubPath(
+        r'D:\drop\book.epub',
+      );
+      expect(dropped, isTrue);
+      expect(observed, <String>[r'D:\drop\book.epub']);
+
+      // Manual entry also bypasses the dialog hook (fire-and-forget).
+      controller.setInputPath(r'D:\manual\book.epub');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(observed, <String>[r'D:\drop\book.epub', r'D:\manual\book.epub']);
+    });
+
+    test('restored session paths run the Windows path observations', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'session_paths_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final File inputFile = File('${temp.path}/book.epub')
+        ..writeAsStringSync('fake-epub');
+      final File sessionFile = File('${temp.path}/session.json');
+      await sessionFile.writeAsString(
+        '{"inputPath": "${inputFile.path}", "outputDirectory": "${temp.path}/out"}',
+      );
+      final List<String> observed = <String>[];
+      TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+        historyStore: _MemoryJobHistoryStore(),
+        pathStore: SessionPathStore(fileProvider: () async => sessionFile),
+        windowsPathObserverOverride: (String path) async {
+          observed.add(path);
+        },
+      );
+      // _loadSessionPaths is fire-and-forget from the constructor.
+      for (int i = 0; i < 100 && observed.length < 2; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(observed, <String>[inputFile.path, '${temp.path}/out']);
+    });
+  });
+
+  group('picker re-entrancy guard', () {
+    test('rapid double taps open only one file picker dialog', () async {
+      final List<Completer<String?>> gates = <Completer<String?>>[];
+      int pickerCalls = 0;
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _BlockingRepository(),
+            historyStore: _MemoryJobHistoryStore(),
+            epubPickerOverride: ({onWindowsNotice}) {
+              pickerCalls += 1;
+              final Completer<String?> gate = Completer<String?>();
+              gates.add(gate);
+              return gate.future;
+            },
+          );
+
+      final Future<void> first = controller.pickInputPath();
+      await Future<void>.delayed(Duration.zero);
+      // Second tap while the first dialog is still open: ignored instead of
+      // stacking a second WinForms dialog behind the first.
+      await controller.pickInputPath();
+      expect(pickerCalls, 1);
+
+      gates.single.complete(r'C:\Books\book.epub');
+      await first;
+      expect(controller.state.inputPath, r'C:\Books\book.epub');
+
+      // The guard is cleared: a later pick works again.
+      final Future<void> second = controller.pickInputPath();
+      await Future<void>.delayed(Duration.zero);
+      expect(pickerCalls, 2);
+      gates.last.complete(null);
+      await second;
+    });
+
+    test('rapid double taps open only one directory picker dialog', () async {
+      final List<Completer<String?>> gates = <Completer<String?>>[];
+      int dirCalls = 0;
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _BlockingRepository(),
+            historyStore: _MemoryJobHistoryStore(),
+            directoryPickerOverride: ({onWindowsNotice}) {
+              dirCalls += 1;
+              final Completer<String?> gate = Completer<String?>();
+              gates.add(gate);
+              return gate.future;
+            },
+          );
+
+      final Future<void> first = controller.pickOutputDirectory();
+      await Future<void>.delayed(Duration.zero);
+      await controller.pickOutputDirectory();
+      expect(dirCalls, 1);
+
+      gates.single.complete(r'D:\out');
+      await first;
+      expect(controller.state.outputDirectory, r'D:\out');
+    });
+
+    test('file and directory pickers share the guard', () async {
+      // A file dialog open (possibly behind the app window) also blocks a
+      // directory dialog: the two pickers must never overlap.
+      final Completer<String?> fileGate = Completer<String?>();
+      int dirCalls = 0;
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _BlockingRepository(),
+            historyStore: _MemoryJobHistoryStore(),
+            epubPickerOverride: ({onWindowsNotice}) => fileGate.future,
+            directoryPickerOverride: ({onWindowsNotice}) async {
+              dirCalls += 1;
+              return null;
+            },
+          );
+
+      final Future<void> first = controller.pickInputPath();
+      await Future<void>.delayed(Duration.zero);
+      await controller.pickOutputDirectory();
+      expect(dirCalls, 0);
+
+      fileGate.complete(null);
+      await first;
+    });
+  });
+
+  test(
+    'restored interrupted jobs show a localized message but keep the English retry sentinel',
+    () async {
+      final _MemoryJobHistoryStore historyStore = _MemoryJobHistoryStore(
+        initial: const <TranslationJob>[
+          TranslationJob(
+            id: 'interrupted-job',
+            inputPath: 'book.epub',
+            outputPath: 'book_translated.epub',
+            status: TranslationJobStatus.running,
+            phase: TranslationJobPhase.translation,
+            progress: 0.4,
+          ),
+        ],
+      );
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: historyStore,
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(uiLanguage: UiLanguage.chinese),
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      final TranslationJob restored = controller.state.jobHistory.single;
+      expect(restored.status, TranslationJobStatus.cancelled);
+      expect(restored.errorMessage, '应用在上次任务完成前已关闭。');
+      expect(
+        restored.currentChapter,
+        const AppStrings(UiLanguage.chinese).jobStatusTranslationInterrupted,
+        reason:
+            'the interrupted title is localized; the retry heuristic '
+            'reads phase, not the display string',
+      );
+    },
+  );
+
+  test(
+    'a stale instance does not resurrect history cleared by another instance',
+    () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'history_tombstone_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final File historyFile = File('${temp.path}/job-history.json');
+      JobHistoryStore fileStore() =>
+          JobHistoryStore(historyFileProvider: () async => historyFile);
+
+      TranslationJob staleJob() => const TranslationJob(
+        id: 'stale-job',
+        inputPath: 'book.epub',
+        outputPath: 'book_translated.epub',
+        status: TranslationJobStatus.completed,
+        progress: 1,
+      );
+
+      // Instance B starts first with an empty history.
+      final TranslationDashboardController controllerB =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: fileStore(),
+          );
+      await Future<void>.delayed(Duration.zero);
+
+      // Instance A clears the history afterwards.
+      final TranslationDashboardController controllerA =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: fileStore(),
+          );
+      await Future<void>.delayed(Duration.zero);
+      await controllerA.clearJobHistory();
+
+      // Wait for A's chained save to land the tombstone.
+      int tombstone = 0;
+      for (int i = 0; i < 100 && tombstone == 0; i++) {
+        tombstone = (await fileStore().loadWithTombstone()).clearedAt;
+        if (tombstone == 0) {
+          await Future<void>.delayed(const Duration(milliseconds: 20));
+        }
+      }
+      expect(tombstone, greaterThan(0));
+
+      // B still holds a stale job in memory and tries to persist it.
+      controllerB.state = controllerB.state.copyWith(
+        jobHistory: <TranslationJob>[staleJob()],
+      );
+      await controllerB.debugPersistJobHistoryNow();
+
+      final after = await fileStore().loadWithTombstone();
+      expect(
+        after.jobs,
+        isEmpty,
+        reason: 'a stale instance must not resurrect cleared history',
+      );
+
+      // Regression: the old guard only skipped that one write, so the next
+      // persistence pass (progress tick, run end) wrote the stale entries
+      // back. Adopting the tombstone now drops them from B's memory, so a
+      // second persist must keep the file empty too.
+      await controllerB.debugPersistJobHistoryNow();
+      final afterSecond = await fileStore().loadWithTombstone();
+      expect(afterSecond.jobs, isEmpty);
+      expect(controllerB.state.jobHistory, isEmpty);
+
+      // A fresh instance that saw the tombstone can persist new history.
+      final TranslationDashboardController controllerC =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+            historyStore: fileStore(),
+          );
+      await Future<void>.delayed(Duration.zero);
+      controllerC.state = controllerC.state.copyWith(
+        jobHistory: <TranslationJob>[staleJob()],
+      );
+      await controllerC.debugPersistJobHistoryNow();
+
+      final resumed = await fileStore().loadWithTombstone();
+      expect(resumed.jobs.single.id, 'stale-job');
+    },
+  );
+
+  test('SAVE_NO_SPACE maps to the localized not-enough-space notice', () {
+    TranslationDashboardController controllerFor(UiLanguage language) {
+      final TranslationDashboardController controller =
+          TranslationDashboardController(
+            repository: _SuccessfulInspectionRepository(),
+          );
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(uiLanguage: language),
+      );
+      return controller;
+    }
+
+    // The raw English text the native side throws; the log line must be
+    // the localized notice, never this string.
+    final PlatformException noSpace = PlatformException(
+      code: 'SAVE_NO_SPACE',
+      message: 'Not enough free space to save this EPUB to Downloads.',
+    );
+
+    final TranslationDashboardController english = controllerFor(
+      UiLanguage.english,
+    );
+    expect(
+      english.debugSaveErrorLogLine(noSpace),
+      const AppStrings(UiLanguage.english).logNotEnoughSpace,
+    );
+    expect(
+      english.debugSaveErrorLogLine(noSpace),
+      isNot(contains('Not enough free space to save this EPUB')),
+    );
+
+    final TranslationDashboardController chinese = controllerFor(
+      UiLanguage.chinese,
+    );
+    expect(
+      chinese.debugSaveErrorLogLine(noSpace),
+      const AppStrings(UiLanguage.chinese).logNotEnoughSpace,
+    );
+
+    // The sibling branches stay intact: a generic error keeps its safe
+    // text, and a Dart-side timeout points at the background continuation.
+    expect(
+      english.debugSaveErrorLogLine(StateError('disk blew up')),
+      contains('disk blew up'),
+    );
+    expect(
+      english.debugSaveErrorLogLine(StateError('Save to Downloads timed out.')),
+      const AppStrings(UiLanguage.english).saveTimeoutContinuesBackground,
+    );
   });
 }

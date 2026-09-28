@@ -54,8 +54,7 @@ void main() {
               tagName: 'td',
               sourceHtml: '<td class="line"><p>Cell one</p></td>',
               sourceText: 'Cell one',
-              translatedHtml:
-                  '<td class="line"><p>单元格一</p></td>',
+              translatedHtml: '<td class="line"><p>单元格一</p></td>',
             ),
           ],
           category: ChapterCategory.content,

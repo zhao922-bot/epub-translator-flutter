@@ -35,7 +35,7 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       window_drop_channel_;
 
-  void SendDroppedFilePath(const std::wstring& file_path);
+  void SendDroppedFilePath(const std::wstring& file_path, UINT file_count);
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

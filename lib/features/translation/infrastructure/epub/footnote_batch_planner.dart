@@ -86,8 +86,11 @@ class FootnoteBatchPlanner {
     final bool hasFootnoteFileMarker = RegExp(
       r'(^|[-_.])fn(?:[-_.]|$)',
     ).hasMatch(filename);
-    final bool hasFootnotePath = _hasFootnoteWord(path);
-    if (hasFootnoteFileSuffix || hasFootnoteFileMarker || hasFootnotePath) {
+    // Only the filename is checked: matching parent directories too would
+    // misclassify a whole book that simply lives under a "notes/" folder
+    // (e.g. notes/chapter1.xhtml) as a footnote chapter.
+    final bool hasFootnoteName = _hasFootnoteWord(filename);
+    if (hasFootnoteFileSuffix || hasFootnoteFileMarker || hasFootnoteName) {
       return true;
     }
     return _hasFootnoteTitleWord(title) &&

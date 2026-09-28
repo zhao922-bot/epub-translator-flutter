@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as path;
+
 /// Leftover `.tmp.*` files are only garbage-collected once they are older
 /// than this: the cache store sweeps a directory lazily on its first write
 /// there, and the sweep's async listing yields to the event loop, so other
@@ -54,7 +56,10 @@ Future<void> writeFileAtomically(File file, String contents) async {
 Future<void> cleanStaleAtomicTempFiles(Directory directory) async {
   try {
     await for (final FileSystemEntity entity in directory.list()) {
-      if (entity is File && entity.path.contains('.tmp.')) {
+      // Match on the basename only: a parent directory containing ".tmp."
+      // (e.g. `/data/.tmp.backup/cache.json`) must not make every file in
+      // it eligible for deletion.
+      if (entity is File && path.basename(entity.path).contains('.tmp.')) {
         try {
           if (_isStaleTempFile(entity)) {
             await entity.delete();

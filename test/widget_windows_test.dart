@@ -1,5 +1,6 @@
 @TestOn('windows')
 library;
+
 // Windows-only UI tests: they assert Windows-specific copy ('Drop or choose
 // EPUB') and Windows file paths, so they only run on Windows.
 
@@ -34,14 +35,17 @@ class _WidgetSettingsStore extends SettingsStore {
 
 class _WidgetJobHistoryStore extends JobHistoryStore {
   @override
-  Future<List<TranslationJob>> load() async => const <TranslationJob>[];
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
 
   @override
-  Future<void> save(List<TranslationJob> jobs) async {}
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
 }
 
 void main() {
-
   Widget testApp({Completer<TranslationConfig>? loadCompleter}) {
     final Completer<TranslationConfig> completer =
         loadCompleter ??
@@ -183,5 +187,33 @@ void main() {
     await tester.tap(advancedPaths);
     await tester.pumpAndSettle();
     expect(find.text('C:\\Books\\dragged.epub'), findsOneWidget);
+  });
+
+  testWidgets('multi-file drop imports the first file and says the rest '
+      'were ignored', (tester) async {
+    await tester.pumpWidget(testApp());
+    await tester.pumpAndSettle();
+
+    const MethodCodec codec = StandardMethodCodec();
+    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+          'epub_translator/window_drop',
+          codec.encodeMethodCall(
+            const MethodCall('fileDropped', <String, Object>{
+              'path': 'C:\\Books\\first.epub',
+              'fileCount': 3,
+            }),
+          ),
+          (_) {},
+        );
+    await tester.pumpAndSettle();
+
+    // The first file is still imported.
+    expect(find.text('first.epub'), findsWidgets);
+    // ...but the user is told the other two were ignored.
+    expect(
+      find.textContaining('the first file was imported (3 dropped'),
+      findsOneWidget,
+    );
   });
 }

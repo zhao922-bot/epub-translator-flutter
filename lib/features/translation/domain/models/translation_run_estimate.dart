@@ -1,5 +1,6 @@
 import 'dart:math';
 
+import '../../../../shared/localization/app_strings.dart';
 import 'inspected_chapter.dart';
 import 'translation_job.dart';
 
@@ -25,12 +26,31 @@ class TranslationRunEstimate {
   /// Rough source character volume for cost/load hints.
   final int estimatedSourceChars;
 
-  /// Rough input-token estimate (~4 chars / token for Latin-ish mixed text).
+  /// Rough input-token estimate: ~4 chars/token for Latin-ish text, ~1.75
+  /// chars/token for CJK (Chinese/Japanese/Korean) text. Still a rough
+  /// estimate, but no longer systematically ~2x low for Chinese books.
   final int estimatedInputTokens;
 
   static const int _tinyBlockTextThreshold = 80;
   static const int _tinyBlockHtmlThreshold = 360;
   static const int _tinyBlockBudget = 48;
+
+  /// CJK Unified Ideographs (+ extensions), Hangul syllables, Hiragana,
+  /// Katakana, Bopomofo, CJK symbols/punctuation and fullwidth forms.
+  static final RegExp _cjkChar = RegExp(
+    r'[\u2e00-\u2fff\u3000-\u30ff\u3100-\u312f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]',
+  );
+
+  /// Rough token estimate for [text]: CJK characters count ~1.75
+  /// chars/token, everything else ~4 chars/token.
+  static int estimateInputTokens(String text) {
+    if (text.isEmpty) {
+      return 1;
+    }
+    final int cjkChars = _cjkChar.allMatches(text).length;
+    final int otherChars = text.length - cjkChars;
+    return max(1, (cjkChars / 1.75 + otherChars / 4).ceil());
+  }
 
   bool get hasSelection => selectedChapters > 0 && totalBlocks > 0;
 
@@ -44,20 +64,22 @@ class TranslationRunEstimate {
     return '${speed.toStringAsFixed(1)} blocks/min';
   }
 
-  String get remainingLabel {
+  String remainingLabel(AppStrings strings) {
     final Duration? remaining = estimatedRemaining;
     if (remaining == null) {
-      return 'Calculating';
+      return strings.etaCalculating;
     }
     if (remaining.inSeconds <= 0) {
-      return 'Less than 1 min';
+      return strings.etaLessThanOneMinute;
     }
     final int minutes = remaining.inMinutes;
     final int seconds = remaining.inSeconds.remainder(60);
     if (minutes <= 0) {
-      return '${max(1, seconds)} sec';
+      return strings.etaSeconds(max(1, seconds));
     }
-    return seconds == 0 ? '$minutes min' : '$minutes min $seconds sec';
+    return seconds == 0
+        ? strings.etaMinutes(minutes)
+        : strings.etaMinutesSeconds(minutes, seconds);
   }
 
   static TranslationRunEstimate fromChapters(
@@ -97,7 +119,19 @@ class TranslationRunEstimate {
                 blockSum + block.sourceText.length,
           ),
     );
-    final int inputTokens = max(1, (sourceChars / 4).ceil());
+    final int inputTokens = max(
+      1,
+      selected.fold<int>(
+        0,
+        (int sum, InspectedChapter chapter) =>
+            sum +
+            chapter.blocks.fold<int>(
+              0,
+              (int blockSum, ExtractedBlock block) =>
+                  blockSum + estimateInputTokens(block.sourceText),
+            ),
+      ),
+    );
 
     return TranslationRunEstimate(
       selectedChapters: selected.length,

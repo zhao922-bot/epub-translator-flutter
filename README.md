@@ -48,9 +48,17 @@
 
 ```powershell
 flutter pub get
-flutter build windows --release   # 输出 build\windows\x64\runner\Release\
+powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
+# 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
 flutter build apk --release       # 需配置 android/key.properties 签名
 ```
+
+> Windows 便携包说明：`flutter build windows` 的输出不含 VC++ 运行库（`msvcp140.dll` 等），
+> 在干净的 Win10/11 上会启动失败。`tool\package_windows.ps1` 会自动从本机查找并附带这些 DLL；
+> 若本机没有安装 Visual Studio / VC++ Redistributable，脚本会明确报错并给出下载链接。
+> 打包前请确认两点：① 用 64 位 PowerShell 运行脚本（32 位会直接报错并给出正确的重跑命令）；
+> ② 仓库路径不要太深（超过约 200 字符脚本会拒绝打包，请移到如 `C:\src\epub-translator-flutter` 的浅目录），
+> 否则 PowerShell 5.1 的 `Compress-Archive` 会因长路径莫名失败。
 
 ## 已知边界
 

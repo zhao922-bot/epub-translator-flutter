@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/platform/native_platform_bridge.dart';
+import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../widgets/settings_fields.dart';
 import '../widgets/settings_sections.dart';
 import '../../../translation/domain/models/api_provider_preset.dart';
 import '../../../translation/domain/models/translation_config.dart';
+import '../../../translation/infrastructure/epub/translation_api_client.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../application/settings_controller.dart';
 
@@ -25,13 +28,25 @@ class SettingsPage extends ConsumerWidget {
     final connectionTestState = ref.watch(connectionTestProvider);
     final connectionTestController = ref.read(connectionTestProvider.notifier);
     final strings = ref.watch(appStringsProvider);
+    final bool secretKeyRotated =
+        ref.watch(secretKeyRotatedNoticeProvider) != null;
 
     // Surface persistence failures (e.g. the secret store timing out): the
     // fields already show the new values, so warn instead of failing silently.
+    // Repeated failures with the same message are merged into one notice —
+    // without this a broken secret backend would fire a SnackBar per commit.
     ref.listen(settingsSaveErrorProvider, (previous, next) {
-      if (next != null && next.message != null && next.id != previous?.id) {
+      if (next != null &&
+          next.message != null &&
+          next.message != previous?.message) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(strings.settingsSaveFailed)),
+          SnackBar(
+            content: Text(
+              next.settingsFileLocked
+                  ? strings.settingsFileLocked(next.message ?? '')
+                  : strings.settingsSaveFailed,
+            ),
+          ),
         );
       }
     });
@@ -41,6 +56,24 @@ class SettingsPage extends ConsumerWidget {
       subtitle: strings.settingsSubtitle,
       child: Column(
         children: <Widget>[
+          // —— 安全提示 ——
+          // Android KeyStore 密钥被轮换（锁屏/生物识别变更）：已保存的密钥
+          // 已不可恢复，提醒用户重新输入。
+          if (secretKeyRotated)
+            _SettingsWarningBanner(text: strings.secretKeyRotatedWarning),
+          // Windows 提权运行：DPAPI 密钥与普通用户不互通，提醒用户。
+          if (PlatformUtils.isWindows)
+            FutureBuilder<bool>(
+              future: NativePlatformBridge.isWindowsElevated(),
+              builder: (BuildContext context, AsyncSnapshot<bool> snapshot) {
+                if (snapshot.data != true) {
+                  return const SizedBox.shrink();
+                }
+                return _SettingsWarningBanner(
+                  text: strings.windowsElevatedSecretWarning,
+                );
+              },
+            ),
           // —— API ——
           SettingsSection(
             title: strings.apiSection,
@@ -120,6 +153,33 @@ class SettingsPage extends ConsumerWidget {
                     labelText: strings.model,
                     prefixIcon: const Icon(Icons.memory_rounded),
                     isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SettingsTextField(
+                  strings: strings,
+                  fieldKey: const ValueKey<String>('settings-http-proxy'),
+                  value: config.httpProxy,
+                  onChanged: controller.setHttpProxy,
+                  enabled: !isRunActive,
+                  decoration: InputDecoration(
+                    labelText: strings.httpProxy,
+                    hintText: strings.httpProxyHint,
+                    prefixIcon: const Icon(Icons.vpn_lock_outlined),
+                    isDense: true,
+                    // Invalid values are treated as "no proxy" by the HTTP
+                    // client; surface that here instead of letting the user
+                    // discover it through a mysterious connection failure.
+                    errorText:
+                        switch (TranslationApiClient.validateProxySetting(
+                          config.httpProxy,
+                        )) {
+                          null => null,
+                          ProxySettingError.unsupportedScheme =>
+                            strings.httpProxyUnsupportedScheme,
+                          ProxySettingError.invalidFormat =>
+                            strings.httpProxyInvalidFormat,
+                        },
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -361,6 +421,45 @@ class SettingsPage extends ConsumerWidget {
           ),
           const SizedBox(height: 14),
         ],
+      ),
+    );
+  }
+}
+
+/// Warning banner shown at the top of the settings page for secret-store
+/// conditions the user must act on (Android KeyStore rotation, Windows
+/// elevation). Plain Card + icon so it fits both light and dark themes.
+class _SettingsWarningBanner extends StatelessWidget {
+  const _SettingsWarningBanner({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Card(
+        color: scheme.errorContainer,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Icon(Icons.warning_amber_rounded, color: scheme.onErrorContainer),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  text,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: scheme.onErrorContainer,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

@@ -13,7 +13,10 @@ List<int> _gbkChapterBytes(String declaredEncoding) {
       '<?xml version="1.0" encoding="$declaredEncoding"?>\n'
       '<html><head><title>T</title></head><body><p>',
     ),
-    0xD6, 0xD0, 0xCE, 0xC4,
+    0xD6,
+    0xD0,
+    0xCE,
+    0xC4,
     ...utf8.encode('</p></body></html>'),
   ];
 }
@@ -32,10 +35,7 @@ void main() {
           isA<FormatException>().having(
             (FormatException e) => e.message,
             'message',
-            allOf(
-              contains('OEBPS/chapter01.xhtml'),
-              contains('GBK'),
-            ),
+            allOf(contains('OEBPS/chapter01.xhtml'), contains('GBK')),
           ),
         ),
       );
@@ -83,10 +83,35 @@ void main() {
     test('UTF-8 without declaration decodes as before', () {
       const String text = '<html><body><p>中文 English</p></body></html>';
       expect(
-        decodeEpubText(
-          bytes: utf8.encode(text),
-          filePath: 'OEBPS/c4.xhtml',
-        ),
+        decodeEpubText(bytes: utf8.encode(text), filePath: 'OEBPS/c4.xhtml'),
+        text,
+      );
+    });
+
+    test('charset text inside an unrelated meta value is ignored', () {
+      // `charset=gbk` here is prose inside a description, not an encoding
+      // declaration: without http-equiv="Content-Type" it must not trigger
+      // the non-UTF-8 gate.
+      const String text =
+          '<html><head>'
+          '<meta name="desc" content="see charset=gbk for details">'
+          '</head><body><p>ok</p></body></html>';
+      expect(
+        decodeEpubText(bytes: utf8.encode(text), filePath: 'OEBPS/c4b.xhtml'),
+        text,
+      );
+    });
+
+    test('word-char-prefixed charset= inside content is not a declaration', () {
+      // `mycharset=gbk` has no word boundary before `charset`, so it must
+      // not be sniffed as an encoding declaration even with
+      // http-equiv="Content-Type" present.
+      const String text =
+          '<html><head>'
+          '<meta http-equiv="Content-Type" content="text/html; mycharset=gbk">'
+          '</head><body><p>ok</p></body></html>';
+      expect(
+        decodeEpubText(bytes: utf8.encode(text), filePath: 'OEBPS/c4c.xhtml'),
         text,
       );
     });
@@ -206,6 +231,81 @@ void main() {
       );
       expect(chapter.blocks, hasLength(1));
       expect(chapter.blocks.single.sourceText, 'Hello');
+    });
+
+    test('commented-out meta charset does not reject a UTF-8 book', () {
+      final String decoded = decodeEpubText(
+        bytes: utf8.encode(
+          '<html><head><!-- <meta charset="gbk"> legacy note -->'
+          '<title>T</title></head><body><p>纯中文内容</p></body></html>',
+        ),
+        filePath: 'OEBPS/comment.xhtml',
+      );
+      expect(decoded, contains('纯中文内容'));
+    });
+
+    test('meta charset inside script text does not reject a UTF-8 book', () {
+      final String decoded = decodeEpubText(
+        bytes: utf8.encode(
+          '<html><head><title>T</title></head><body>'
+          '<script>var s = "<meta charset=\\"gbk\\">";</script>'
+          '<p>纯中文内容</p></body></html>',
+        ),
+        filePath: 'OEBPS/script.xhtml',
+      );
+      expect(decoded, contains('纯中文内容'));
+    });
+
+    test('UTF-16LE bytes fail loud instead of decoding to confetti', () {
+      final List<int> bytes = <int>[];
+      for (final int unit in '<html><body><p>hi</p></body></html>'.codeUnits) {
+        bytes.addAll(<int>[unit, 0x00]);
+      }
+      expect(
+        () => decodeEpubText(bytes: bytes, filePath: 'OEBPS/utf16.xhtml'),
+        throwsA(
+          isA<FormatException>().having(
+            (FormatException e) => e.message,
+            'message',
+            allOf(contains('UTF-16'), contains('OEBPS/utf16.xhtml')),
+          ),
+        ),
+      );
+    });
+
+    test('undeclared GBK body fails loud instead of burning tokens', () {
+      // "中文" repeated 30 times in GBK, no declaration anywhere.
+      final List<int> body = <int>[];
+      for (int i = 0; i < 30; i++) {
+        body.addAll(<int>[0xD6, 0xD0, 0xCE, 0xC4]);
+      }
+      final List<int> bytes = <int>[
+        ...utf8.encode('<html><head><title>T</title></head><body><p>'),
+        ...body,
+        ...utf8.encode('</p></body></html>'),
+      ];
+      expect(
+        () => decodeEpubText(bytes: bytes, filePath: 'OEBPS/gbk.xhtml'),
+        throwsA(
+          isA<FormatException>().having(
+            (FormatException e) => e.message,
+            'message',
+            allOf(contains('GBK'), contains('OEBPS/gbk.xhtml')),
+          ),
+        ),
+      );
+    });
+
+    test('a few stray bytes do not trip the undecodable heuristic', () {
+      final String decoded = decodeEpubText(
+        bytes: <int>[
+          ...utf8.encode('<html><body><p>ok'),
+          0xFF, // single stray byte
+          ...utf8.encode('</p></body></html>'),
+        ],
+        filePath: 'OEBPS/stray.xhtml',
+      );
+      expect(decoded, contains('ok'));
     });
   });
 }

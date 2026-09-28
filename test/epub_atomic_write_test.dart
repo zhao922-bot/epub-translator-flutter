@@ -181,6 +181,157 @@ void main() {
         expect(leftovers, isEmpty);
       },
     );
+    test(
+      'reclaims a stale .bak backup left by an interrupted commit',
+      () async {
+        final File finalFile = File(path.join(tempDir.path, 'final.epub'));
+        final File tempFile = File(path.join(tempDir.path, 'final.epub.tmp.1'));
+        // Simulate a crash between moving the original aside and promoting
+        // the temp file: the final is missing but a .bak.* backup survived.
+        final File staleBackup = File('${finalFile.path}.bak.123456789');
+        await staleBackup.writeAsString('OLD_BACKUP_CONTENT', flush: true);
+        await tempFile.writeAsString('NEW_TEMP_CONTENT', flush: true);
+
+        final bool committed = await EpubIsolateWorker.commitTempFile(
+          tempFile,
+          finalFile,
+        );
+
+        expect(committed, isTrue);
+        // The backup was restored first, then the normal commit promoted
+        // the temp file over it.
+        expect(await finalFile.readAsString(), 'NEW_TEMP_CONTENT');
+        expect(await tempFile.exists(), isFalse);
+        final List<FileSystemEntity> bakLeftovers = tempDir
+            .listSync()
+            .where((FileSystemEntity entity) => entity.path.contains('.bak.'))
+            .toList();
+        expect(bakLeftovers, isEmpty);
+      },
+    );
+
+    test('failed stale-backup restore leaves the backup in place', () async {
+      // finalFile.path is an existing directory: File.exists() reports
+      // false for it, so _reclaimStaleBackups attempts a restore, but the
+      // rename onto a directory fails.
+      final Directory dirAsFinal = Directory(
+        path.join(tempDir.path, 'final.epub'),
+      );
+      await dirAsFinal.create();
+      final File finalFile = File(dirAsFinal.path);
+      final File olderBackup = File('${finalFile.path}.bak.111');
+      final File newestBackup = File('${finalFile.path}.bak.999');
+      await olderBackup.writeAsString('OLDER', flush: true);
+      await newestBackup.writeAsString('NEWEST', flush: true);
+      final File tempFile = File(path.join(tempDir.path, 'final.epub.tmp.1'));
+      await tempFile.writeAsString('NEW_TEMP_CONTENT', flush: true);
+
+      // The commit itself also fails (rename onto a directory), which is
+      // fine: this test only cares about backup preservation.
+      await expectLater(
+        EpubIsolateWorker.commitTempFile(tempFile, finalFile),
+        throwsA(isA<FileSystemException>()),
+      );
+
+      // The failed restore must not delete the only surviving copy.
+      expect(await newestBackup.exists(), isTrue);
+      expect(await newestBackup.readAsString(), 'NEWEST');
+      // Older stale backups are still cleaned up.
+      expect(await olderBackup.exists(), isFalse);
+    });
+
+    test(
+      'non-lock commit failure deletes the temp file and rethrows',
+      () async {
+        final Directory dirAsFinal = Directory(
+          path.join(tempDir.path, 'dir_as_final'),
+        );
+        await dirAsFinal.create();
+        final File tempFile = File(path.join(tempDir.path, 'final.epub.tmp.1'));
+        await tempFile.writeAsString('NEW_TEMP_CONTENT', flush: true);
+
+        // Renaming a file onto an existing directory throws
+        // FileSystemException (EISDIR on Linux) — a non-lock failure, so
+        // the old behavior (delete temp, rethrow as-is) must hold.
+        Object? caught;
+        try {
+          await EpubIsolateWorker.commitTempFile(
+            tempFile,
+            File(dirAsFinal.path),
+          );
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught, isA<FileSystemException>());
+        expect(caught is OutputFileLockedException, isFalse);
+        expect(await tempFile.exists(), isFalse);
+      },
+    );
+
+    test('isFileLockError recognizes Windows sharing violations', () {
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException('rename failed', 'a', OSError('x', 32)),
+        ),
+        isTrue,
+      );
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException('rename failed', 'a', OSError('x', 33)),
+        ),
+        isTrue,
+      );
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException(
+            'Cannot rename file to "b" (The process cannot access the file '
+                'because it is being used by another process.)',
+            'a',
+          ),
+        ),
+        isTrue,
+      );
+      // Other filesystem failures are not locks: access denied...
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException('rename failed', 'a', OSError('x', 5)),
+        ),
+        isFalse,
+      );
+      // ...and neither is a generic I/O error.
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException('No space left on device', 'a'),
+        ),
+        isFalse,
+      );
+      // A file whose own name contains the lock phrase must not be
+      // misclassified: the path is stripped before matching.
+      expect(
+        EpubIsolateWorker.isFileLockError(
+          FileSystemException(
+            'Cannot rename file to "C:\\out\\being used by another process.epub" (Access is denied.)',
+            'C:\\out\\being used by another process.epub',
+            OSError('x', 5),
+          ),
+        ),
+        isFalse,
+      );
+    });
+
+    test(
+      'OutputFileLockedException carries the localized message and temp path',
+      () {
+        const String message = '文件被占用';
+        const String tempPath = '/tmp/book.epub.tmp.1';
+        final OutputFileLockedException error = OutputFileLockedException(
+          message,
+          tempPath,
+        );
+        expect(error.toString(), message);
+        expect(error.tempFilePath, tempPath);
+      },
+    );
   });
 }
 

@@ -1,6 +1,21 @@
 import 'package:flutter/material.dart';
 import '../../../../shared/localization/app_strings.dart';
 
+/// Display label for a stored target-language key: each language in its own
+/// native name. Unknown/custom values fall back to the raw key.
+String _nativeLanguageName(String languageKey) {
+  return const <String, String>{
+        'Chinese': '中文',
+        'English': 'English',
+        'Japanese': '日本語',
+        'Korean': '한국어',
+        'French': 'Français',
+        'German': 'Deutsch',
+        'Spanish': 'Español',
+      }[languageKey] ??
+      languageKey;
+}
+
 class TranslationPreferences extends StatelessWidget {
   const TranslationPreferences({
     super.key,
@@ -21,6 +36,9 @@ class TranslationPreferences extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // The stored value stays the English key (config + cache keys depend on
+    // it); only the display label uses the language's own native name so the
+    // dropdown reads naturally in any UI language.
     final languages = <String>{
       'Chinese',
       'English',
@@ -46,7 +64,10 @@ class TranslationPreferences extends StatelessWidget {
           onChanged: enabled ? onTargetLanguageChanged : null,
           items: languages
               .map(
-                (value) => DropdownMenuItem(value: value, child: Text(value)),
+                (value) => DropdownMenuItem(
+                  value: value,
+                  child: Text(_nativeLanguageName(value)),
+                ),
               )
               .toList(),
           decoration: InputDecoration(

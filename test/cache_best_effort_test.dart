@@ -27,27 +27,34 @@ class _FailingCacheStore extends TranslationCacheStore {
 }
 
 void main() {
-  test('putBlockCacheErrorForTest returns null when the write succeeds', () async {
-    final _RecordingCacheStore store = _RecordingCacheStore();
-    final Object? error = await EpubChapterTranslator.putBlockCacheErrorForTest(
-      store,
-      'cache-key-1',
-      '<p>译文</p>',
-    );
-    // null means success: this is the signal the write counters use.
-    expect(error, isNull);
-    expect(store.writtenKeys, <String>['cache-key-1']);
-  });
+  test(
+    'putBlockCacheErrorForTest returns null when the write succeeds',
+    () async {
+      final _RecordingCacheStore store = _RecordingCacheStore();
+      final Object? error =
+          await EpubChapterTranslator.putBlockCacheErrorForTest(
+            store,
+            'cache-key-1',
+            '<p>译文</p>',
+          );
+      // null means success: this is the signal the write counters use.
+      expect(error, isNull);
+      expect(store.writtenKeys, <String>['cache-key-1']);
+    },
+  );
 
-  test('putBlockCacheErrorForTest swallows failures and returns the error',
-      () async {
-    final Object? error = await EpubChapterTranslator.putBlockCacheErrorForTest(
-      _FailingCacheStore(),
-      'cache-key-1',
-      '<p>译文</p>',
-    );
-    // A non-null result means the failure was swallowed: callers must not
-    // count this write as successful in the final report.
-    expect(error, isA<FileSystemException>());
-  });
+  test(
+    'putBlockCacheErrorForTest swallows failures and returns the error',
+    () async {
+      final Object? error =
+          await EpubChapterTranslator.putBlockCacheErrorForTest(
+            _FailingCacheStore(),
+            'cache-key-1',
+            '<p>译文</p>',
+          );
+      // A non-null result means the failure was swallowed: callers must not
+      // count this write as successful in the final report.
+      expect(error, isA<FileSystemException>());
+    },
+  );
 }

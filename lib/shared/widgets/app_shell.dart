@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../features/translation/application/translation_dashboard_controller.dart';
+import '../../features/settings/application/settings_controller.dart';
 import '../localization/app_strings.dart';
 import '../models/nav_item.dart';
 
@@ -34,6 +35,21 @@ class _AppShellState extends ConsumerState<AppShell> {
     super.initState();
     // Global handler so drop works on any shell route (Translate/Jobs/Preview/Settings).
     _windowDropChannel.setMethodCallHandler(_handleWindowDrop);
+    // The corrupt-settings reset can fire during provider initialization,
+    // before the first build subscribes the ref.listen below (which only
+    // fires on *changes*). Check post-frame so an already-posted notice is
+    // not silently lost. Consume-once: the notice is cleared after showing
+    // so it can never pop twice.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      final notice = ref.read(settingsResetNoticeProvider);
+      if (notice != null) {
+        ref.read(settingsResetNoticeProvider.notifier).state = null;
+        _showResetNotice(notice.backupPath);
+      }
+    });
   }
 
   @override
@@ -43,10 +59,25 @@ class _AppShellState extends ConsumerState<AppShell> {
   }
 
   Future<void> _handleWindowDrop(MethodCall call) async {
-    if (call.method != 'fileDropped' || call.arguments is! String) {
+    if (call.method != 'fileDropped') {
       return;
     }
-    final String droppedPath = call.arguments as String;
+    // Since 1.4.1 the native side sends a map {path, fileCount}; the legacy
+    // bare-string payload is still accepted.
+    final Object? args = call.arguments;
+    final String? droppedPath;
+    int fileCount = 1;
+    if (args is String) {
+      droppedPath = args;
+    } else if (args is Map) {
+      droppedPath = args['path'] as String?;
+      fileCount = (args['fileCount'] as num?)?.toInt() ?? 1;
+    } else {
+      return;
+    }
+    if (droppedPath == null || droppedPath.isEmpty) {
+      return;
+    }
     final bool accepted = await ref
         .read(translationDashboardProvider.notifier)
         .importDroppedEpubPath(droppedPath);
@@ -57,15 +88,27 @@ class _AppShellState extends ConsumerState<AppShell> {
     if (widget.currentLocation != '/') {
       context.go('/');
     }
+    final AppStrings strings = ref.read(appStringsProvider);
+    final ScaffoldMessengerState? messenger = ScaffoldMessenger.maybeOf(
+      context,
+    );
+    if (fileCount > 1) {
+      // Only the first file was imported; say so instead of silently
+      // ignoring the rest.
+      messenger?.showSnackBar(
+        SnackBar(
+          content: Text(strings.dropMultipleFilesNotice(fileCount)),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+      return;
+    }
     final String name = droppedPath
         .replaceAll('\\', '/')
         .split('/')
         .where((String part) => part.isNotEmpty)
         .last;
-    final AppStrings strings = ref.read(appStringsProvider);
-    final ScaffoldMessengerState? messenger = ScaffoldMessenger.maybeOf(
-      context,
-    );
     messenger?.showSnackBar(
       SnackBar(
         content: Text(strings.logDroppedEpub(name)),
@@ -75,10 +118,36 @@ class _AppShellState extends ConsumerState<AppShell> {
     );
   }
 
+  /// Shows the corrupt-settings reset notice once and consumes the event so
+  /// it can never pop twice (e.g. on rebuilds or hot reload).
+  void _showResetNotice(String? backupPath) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+      SnackBar(
+        content: Text(
+          ref.read(appStringsProvider).settingsCorruptResetNotice(backupPath),
+        ),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 8),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final ColorScheme scheme = Theme.of(context).colorScheme;
     final strings = ref.watch(appStringsProvider);
+
+    // A corrupt/unreadable settings.json resets to defaults at startup with
+    // only a log line otherwise: warn on every page, not just Settings.
+    // Consume-once (clear after showing): the id check alone cannot cover
+    // the case where the event fired before this listener subscribed — that
+    // is handled by the post-frame check in initState.
+    ref.listen(settingsResetNoticeProvider, (previous, next) {
+      if (next != null) {
+        ref.read(settingsResetNoticeProvider.notifier).state = null;
+        _showResetNotice(next.backupPath);
+      }
+    });
     final List<NavItem> items = <NavItem>[
       NavItem(
         label: strings.navTranslate,

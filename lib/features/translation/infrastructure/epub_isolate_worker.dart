@@ -1,14 +1,75 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
 
 import '../../../shared/logging/app_logger.dart';
 import 'epub/epub_text_decoder.dart';
+
+/// Thrown when the final output file is locked by another process at commit
+/// time (Windows: a reader holding it open without share access).
+///
+/// The fully-translated temp file is deliberately NOT deleted: the user can
+/// close the locking program and retry the translation (block cache makes the
+/// retry fast with no extra API cost), or rename [tempFilePath] manually.
+/// [message] is already localized by the caller via [EpubIsolateWorker.commitTempFile]'s
+/// `lockedMessage` callback.
+class OutputFileLockedException implements Exception {
+  OutputFileLockedException(this.message, this.tempFilePath);
+
+  final String message;
+  final String tempFilePath;
+
+  @override
+  String toString() => message;
+}
+
+/// Thrown when the SOURCE file is locked by another process at read time
+/// (Windows: a reader holding it open without share access), mirroring
+/// [OutputFileLockedException].
+///
+/// Unlike the output case there is no temp file to preserve: the read never
+/// started, and the block cache on disk is unaffected, so closing the locking
+/// program and retrying is cheap. Catchers build the user-facing message via
+/// `AppStrings.inputFileLocked`.
+class InputFileLockedException implements Exception {
+  InputFileLockedException(this.inputPath);
+
+  final String inputPath;
+
+  @override
+  String toString() => 'InputFileLockedException: $inputPath';
+}
+
+/// Thrown when a source EPUB trips the zip-bomb guards in
+/// [_decodeArchiveWithLimits]: the compressed file itself is implausibly
+/// large, the header-declared uncompressed total exceeds the cap, or the
+/// overall compression ratio is absurd. Rejected BEFORE any entry content is
+/// materialized, so a malicious archive cannot OOM the isolate.
+/// Catchers build the user-facing message via
+/// `AppStrings.epubDecompressionLimit`.
+class EpubDecompressionLimitException implements Exception {
+  EpubDecompressionLimitException({
+    required this.inputPath,
+    required this.compressedBytes,
+    required this.uncompressedBytes,
+    required this.limitBytes,
+  });
+
+  final String inputPath;
+  final int compressedBytes;
+  final int uncompressedBytes;
+  final int limitBytes;
+
+  @override
+  String toString() =>
+      'EpubDecompressionLimitException: $inputPath expands beyond the '
+      'decompression limit ($uncompressedBytes bytes vs $limitBytes allowed).';
+}
 
 /// Heavy ZIP work off the UI isolate (Windows/Android).
 class EpubIsolateWorker {
@@ -35,6 +96,10 @@ class EpubIsolateWorker {
   /// the temp file is deleted and the existing final output is left untouched.
   /// Returns `true` when the final file was committed, `false` when
   /// [shouldCommit] refused the commit (temp cleaned; final path untouched).
+  ///
+  /// [lockedMessage] builds the localized error for a locked output file; see
+  /// [OutputFileLockedException]. When omitted, a plain English message is
+  /// used.
   static Future<bool> writeTranslatedEpub({
     required String inputPath,
     required String outputFilePath,
@@ -42,6 +107,7 @@ class EpubIsolateWorker {
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
     bool Function()? shouldCommit,
+    String Function(String outputPath, String tempPath)? lockedMessage,
   }) async {
     final String tempPath = await Isolate.run(
       () => _writeTranslatedEpubToTempSync(
@@ -63,9 +129,15 @@ class EpubIsolateWorker {
         tempFile,
         File(outputFilePath),
         shouldCommit: shouldCommit,
+        lockedMessage: lockedMessage,
       );
     } catch (error) {
-      await _deleteQuietly(tempFile);
+      // A locked output keeps its temp file by design (see
+      // OutputFileLockedException): deleting it here would destroy the
+      // recovery path commitTempFile just preserved.
+      if (error is! OutputFileLockedException) {
+        await _deleteQuietly(tempFile);
+      }
       rethrow;
     }
   }
@@ -176,7 +248,14 @@ class EpubIsolateWorker {
       return replacements;
     }
     final String ncxPath = path.posix.normalize(
-      path.posix.join(path.posix.dirname(opfPath), ncxHref),
+      path.posix.join(
+        path.posix.dirname(opfPath),
+        // Manifest hrefs are URI-encoded while archive entry names are
+        // decoded; decode defensively (falling back to the raw href) so an
+        // encoded NCX file name still resolves, mirroring the `content src`
+        // handling via _decodeNcxSrc below.
+        _decodeNcxSrc(ncxHref),
+      ),
     );
     final List<int>? ncxBytes = archiveFiles[ncxPath];
     if (ncxBytes == null) {
@@ -275,10 +354,22 @@ class EpubIsolateWorker {
   /// [shouldCommit] is re-checked before each irreversible rename step so a
   /// cancel between awaits cannot leave a half-committed final file.
   /// Returns `false` when [shouldCommit] refuses (backup restored if needed).
+  ///
+  /// A lock probe before translation cannot close the TOCTOU window (the
+  /// user may open the output file mid-run), and probing with
+  /// `FileMode.append` only checks WRITE access while the commit rename
+  /// needs DELETE. So instead of a bigger probe, the failure path is made
+  /// recoverable: a locked target throws [OutputFileLockedException] with
+  /// the translated temp file preserved, instead of a raw
+  /// FileSystemException with the temp file deleted.
+  ///
+  /// [lockedMessage] builds the localized lock message from the output and
+  /// temp paths; when omitted a plain English message is used.
   static Future<bool> commitTempFile(
     File tempFile,
     File finalFile, {
     bool Function()? shouldCommit,
+    String Function(String outputPath, String tempPath)? lockedMessage,
   }) async {
     bool allowCommit() => shouldCommit == null || shouldCommit();
 
@@ -286,26 +377,29 @@ class EpubIsolateWorker {
     if (!await tempFile.exists()) {
       throw StateError('Temp EPUB file is missing: ${tempFile.path}');
     }
+    // A previous process may have died between moving the original aside
+    // and promoting the temp file, leaving `.bak.*` files behind.
+    await _reclaimStaleBackups(finalFile);
 
-    if (!await finalFile.exists()) {
-      if (!allowCommit()) {
-        await _deleteQuietly(tempFile);
-        return false;
-      }
-      await tempFile.rename(finalFile.path);
-      return true;
-    }
-
-    // Dart's File.rename on Windows uses MOVEFILE_REPLACE_EXISTING, so
-    // renaming over an existing file works fine; it only throws
-    // FileSystemException when the target is locked by another process.
-    // Still move final aside first: if promotion fails or commit is refused
-    // after the backup move, the backup can be restored instead of losing
-    // the original.
-    final File backupFile = File(
-      '${finalFile.path}.bak.${DateTime.now().microsecondsSinceEpoch}',
-    );
     try {
+      if (!await finalFile.exists()) {
+        if (!allowCommit()) {
+          await _deleteQuietly(tempFile);
+          return false;
+        }
+        await tempFile.rename(finalFile.path);
+        return true;
+      }
+
+      // Dart's File.rename on Windows uses MOVEFILE_REPLACE_EXISTING, so
+      // renaming over an existing file works fine; it only throws
+      // FileSystemException when the target is locked by another process.
+      // Still move final aside first: if promotion fails or commit is refused
+      // after the backup move, the backup can be restored instead of losing
+      // the original.
+      final File backupFile = File(
+        '${finalFile.path}.bak.${DateTime.now().microsecondsSinceEpoch}',
+      );
       if (!allowCommit()) {
         await _deleteQuietly(tempFile);
         return false;
@@ -328,9 +422,97 @@ class EpubIsolateWorker {
         }
         rethrow;
       }
+    } on FileSystemException catch (error) {
+      if (isFileLockError(error)) {
+        // The output file is locked (Windows sharing violation): keep the
+        // translated temp file and report a localized message. The user
+        // closes the locking program and retries — the block cache makes
+        // the retry fast with no extra API cost — or renames the temp file
+        // manually.
+        throw OutputFileLockedException(
+          lockedMessage?.call(finalFile.path, tempFile.path) ??
+              'The output file is locked by another program: ${finalFile.path}. '
+                  'The translated file was kept at: ${tempFile.path}',
+          tempFile.path,
+        );
+      }
+      await _deleteQuietly(tempFile);
+      rethrow;
     } catch (error) {
       await _deleteQuietly(tempFile);
       rethrow;
+    }
+  }
+
+  /// True when [error] looks like a Windows file-lock (sharing/lock
+  /// violation) rather than a different filesystem failure.
+  ///
+  /// Shared by the EPUB pipeline and the settings store: a sharing violation
+  /// (osError 32/33) can only be produced by a real Windows file lock, so the
+  /// classification is tested directly with synthetic exceptions.
+  static bool isFileLockError(FileSystemException error) {
+    // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION.
+    final int? code = error.osError?.errorCode;
+    if (code == 32 || code == 33) {
+      return true;
+    }
+    // Prefer the OS-provided message: Dart's FileSystemException.message
+    // embeds the file path, and a file literally named
+    // "...being used by another process.epub" must not be misclassified
+    // as a lock violation.
+    const String lockPhrase = 'being used by another process';
+    if ((error.osError?.message ?? '').toLowerCase().contains(lockPhrase)) {
+      return true;
+    }
+    // Fallback for exceptions without OSError details: strip the path
+    // before matching so a matching file name can't trigger a false
+    // positive. (Single-character paths are test artifacts, not real file
+    // paths; stripping those would mangle the message itself.)
+    String message = error.message.toLowerCase();
+    final String? path = error.path;
+    if (path != null && path.length > 1) {
+      message = message.replaceAll(path.toLowerCase(), '');
+    }
+    return message.contains(lockPhrase);
+  }
+
+  /// Recovers from a commit that died mid-rename: if the final file is
+  /// missing but a `.bak.*` backup survived, the newest backup is restored;
+  /// remaining stale backups are deleted. Best effort; never throws.
+  static Future<void> _reclaimStaleBackups(File finalFile) async {
+    try {
+      final String prefix = '${path.basename(finalFile.path)}.bak.';
+      final List<File> backups = <File>[];
+      await for (final FileSystemEntity entity in finalFile.parent.list()) {
+        if (entity is File && path.basename(entity.path).startsWith(prefix)) {
+          backups.add(entity);
+        }
+      }
+      if (backups.isEmpty) {
+        return;
+      }
+      // The timestamp suffix sorts chronologically; the newest is last.
+      backups.sort((File a, File b) => a.path.compareTo(b.path));
+      if (!await finalFile.exists()) {
+        final File newest = backups.removeLast();
+        try {
+          await newest.rename(finalFile.path);
+          AppLogger.warn(
+            'Restored ${finalFile.path} from stale backup ${newest.path} '
+            'left by an interrupted commit.',
+            tag: 'repack',
+          );
+        } catch (_) {
+          // Leave the backup file in place if the restore fails: it is the
+          // only surviving copy of the user's output. Older stale backups
+          // are still safe to delete below.
+        }
+      }
+      for (final File stale in backups) {
+        await _deleteQuietly(stale);
+      }
+    } catch (_) {
+      // Best effort: stale backups must never break a commit.
     }
   }
 
@@ -371,12 +553,15 @@ class EpubIsolateWorker {
   /// Reads and decodes the source EPUB in a tight scope so the raw download
   /// buffer has no live local reference once decoding returns.
   static Archive _decodeEpubArchive(String inputPath) {
-    final List<int> bytes = File(inputPath).readAsBytesSync();
-    return ZipDecoder().decodeBytes(bytes);
+    return _decodeArchiveWithLimits(
+      inputPath,
+      _readSourceBytesGuarded(inputPath),
+    );
   }
 
-  static Map<String, Uint8List> _loadArchiveFilesSync(String inputPath) {    final List<int> bytes = File(inputPath).readAsBytesSync();
-    final Archive archive = ZipDecoder().decodeBytes(bytes);
+  static Map<String, Uint8List> _loadArchiveFilesSync(String inputPath) {
+    final List<int> bytes = _readSourceBytesGuarded(inputPath);
+    final Archive archive = _decodeArchiveWithLimits(inputPath, bytes);
     final Map<String, Uint8List> files = <String, Uint8List>{};
     for (final ArchiveFile file in archive) {
       if (!file.isFile) {
@@ -385,6 +570,97 @@ class EpubIsolateWorker {
       files[file.name] = Uint8List.fromList(_fileBytes(file));
     }
     return files;
+  }
+
+  /// Zip-bomb guards for [_decodeArchiveWithLimits]. A legitimate EPUB is
+  /// tens of megabytes at most; these caps only trip on malicious or
+  /// degenerate archives.
+  ///
+  /// The compressed cap exists because `readAsBytesSync` materializes the
+  /// whole file first: without it, a multi-GB fake "EPUB" would OOM the
+  /// read itself before decoding even starts.
+  static const int _kMaxEpubCompressedBytes = 256 * 1024 * 1024;
+
+  /// Cap on the header-declared uncompressed total across all entries.
+  static const int _kMaxEpubUncompressedBytes = 512 * 1024 * 1024;
+
+  /// Cap on total-uncompressed / compressed-bytes. Real books sit far below
+  /// this (text compresses ~3-5x, images barely at all); a classic 42.zip
+  /// style bomb is many orders of magnitude above it.
+  static const int _kMaxCompressionRatio = 100;
+
+  /// Reads the source file with two guards: a cap on the compressed size
+  /// (see [_kMaxEpubCompressedBytes]) and Windows file-lock classification
+  /// that throws [InputFileLockedException] instead of a raw English
+  /// [FileSystemException].
+  static List<int> _readSourceBytesGuarded(String inputPath) {
+    final File file = File(inputPath);
+    final int compressedLength = file.lengthSync();
+    if (compressedLength > _kMaxEpubCompressedBytes) {
+      throw EpubDecompressionLimitException(
+        inputPath: inputPath,
+        compressedBytes: compressedLength,
+        uncompressedBytes: -1,
+        limitBytes: _kMaxEpubCompressedBytes,
+      );
+    }
+    try {
+      return file.readAsBytesSync();
+    } on FileSystemException catch (error) {
+      if (isFileLockError(error)) {
+        throw InputFileLockedException(inputPath);
+      }
+      rethrow;
+    }
+  }
+
+  /// Decodes ZIP bytes with zip-bomb guards. `archive` decodes lazily, so
+  /// the header-declared entry sizes are accumulated BEFORE any entry
+  /// content is touched: a malicious archive is rejected without ever
+  /// materializing its payload.
+  static Archive _decodeArchiveWithLimits(String inputPath, List<int> bytes) {
+    final Archive archive = ZipDecoder().decodeBytes(bytes);
+    checkArchiveLimitsForTest(
+      inputPath: inputPath,
+      archive: archive,
+      compressedBytes: bytes.length,
+    );
+    return archive;
+  }
+
+  /// Visible for testing: the pure limit check behind
+  /// [_decodeArchiveWithLimits]. Takes a decoded [archive] so tests can
+  /// feed synthetic entries with huge declared sizes without building a
+  /// real multi-hundred-megabyte file.
+  @visibleForTesting
+  static void checkArchiveLimitsForTest({
+    required String inputPath,
+    required Archive archive,
+    required int compressedBytes,
+  }) {
+    int totalUncompressed = 0;
+    for (final ArchiveFile entry in archive) {
+      if (!entry.isFile) {
+        continue;
+      }
+      totalUncompressed += entry.size;
+      if (totalUncompressed > _kMaxEpubUncompressedBytes) {
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: compressedBytes,
+          uncompressedBytes: totalUncompressed,
+          limitBytes: _kMaxEpubUncompressedBytes,
+        );
+      }
+    }
+    if (totalUncompressed > compressedBytes * _kMaxCompressionRatio) {
+      throw EpubDecompressionLimitException(
+        inputPath: inputPath,
+        compressedBytes: compressedBytes,
+        uncompressedBytes: totalUncompressed,
+        limitBytes: compressedBytes * _kMaxCompressionRatio,
+      );
+    }
   }
 
   /// Encodes the EPUB and writes only a same-directory temp file.
@@ -441,30 +717,38 @@ class EpubIsolateWorker {
       );
     }
 
+    // The EPUB spec requires the mimetype entry to exist, be first,
+    // uncompressed, and contain exactly "application/epub+zip". A missing
+    // entry is synthesized; an empty or whitespace-padded entry (some tools
+    // write "application/epub+zip\n") is normalized to the standard value
+    // instead of propagating the defect into the output.
+    const String standardMimetype = 'application/epub+zip';
     final ArchiveFile? mimetypeFile = sourceArchive.find('mimetype');
+    String declaredMimetype = '';
     if (mimetypeFile != null) {
-      final List<int> mimetypeBytes = _fileBytes(mimetypeFile);
-      repacked.add(
-        ArchiveFile.noCompress('mimetype', mimetypeBytes.length, mimetypeBytes)
-          ..lastModTime = mimetypeFile.lastModTime
-          ..mode = mimetypeFile.mode,
-      );
-    } else {
-      // The EPUB spec requires the mimetype entry to exist, be first, and be
-      // uncompressed. A source book missing it would otherwise produce an
-      // invalid EPUB; synthesize the standard entry instead of propagating
-      // the defect.
-      final List<int> defaultMimetypeBytes = utf8.encode(
-        'application/epub+zip',
-      );
-      repacked.add(
-        ArchiveFile.noCompress(
-          'mimetype',
-          defaultMimetypeBytes.length,
-          defaultMimetypeBytes,
-        ),
-      );
+      declaredMimetype = utf8
+          .decode(_fileBytes(mimetypeFile), allowMalformed: true)
+          .trim();
     }
+    final List<int> mimetypeBytes = utf8.encode(
+      declaredMimetype == standardMimetype
+          ? declaredMimetype
+          : standardMimetype,
+    );
+    final ArchiveFile repackedMimetype = ArchiveFile.noCompress(
+      'mimetype',
+      mimetypeBytes.length,
+      mimetypeBytes,
+    );
+    final int? sourceModTime = mimetypeFile?.lastModTime;
+    if (sourceModTime != null) {
+      repackedMimetype.lastModTime = sourceModTime;
+    }
+    final int? sourceMode = mimetypeFile?.mode;
+    if (sourceMode != null) {
+      repackedMimetype.mode = sourceMode;
+    }
+    repacked.add(repackedMimetype);
 
     for (final ArchiveFile sourceFile in sourceArchive) {
       if (sourceFile.name == 'mimetype') {

@@ -8,6 +8,53 @@ import '../widgets/job_row.dart';
 
 class JobsPage extends ConsumerWidget {
   const JobsPage({super.key});
+
+  /// Clearing history is destructive and cannot be undone; ask first instead
+  /// of wiping on a single tap.
+  Future<void> _confirmClearHistory(
+    BuildContext context,
+    WidgetRef ref,
+    AppStrings strings,
+    TranslationDashboardController controller,
+  ) async {
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: Text(strings.clearHistoryConfirmTitle),
+        content: Text(strings.clearHistoryConfirmBody),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(strings.dialogCancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(strings.dialogConfirm),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      final bool cleared = await controller.clearJobHistory();
+      if (!cleared && context.mounted) {
+        // The controller logs to the dashboard, which this page never shows:
+        // surface the reason here instead of leaving a silent no-op.
+        final bool runActive = ref
+            .read(translationDashboardProvider)
+            .isRunActive;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              runActive
+                  ? strings.clearBlockedByActiveRun
+                  : strings.logClearHistoryFailed,
+            ),
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final jobs = ref.watch(jobsProvider);
@@ -20,7 +67,8 @@ class JobsPage extends ConsumerWidget {
       actions: [
         if (jobs.isNotEmpty)
           TextButton.icon(
-            onPressed: controller.clearJobHistory,
+            onPressed: () =>
+                _confirmClearHistory(context, ref, strings, controller),
             icon: const Icon(Icons.clear_all_rounded, size: 18),
             label: Text(strings.clearHistory),
           ),

@@ -11,6 +11,7 @@ class JobSummary {
     required this.isActive,
     required this.canOpenOutput,
     required this.canRetry,
+    this.retryBlocked = false,
     this.canResume = false,
     this.phaseLabel = '',
     this.degradedBlockCount = 0,
@@ -25,6 +26,10 @@ class JobSummary {
   final bool isActive;
   final bool canOpenOutput;
   final bool canRetry;
+
+  /// True while another run is active: the retry button stays tappable but
+  /// explains via snackbar instead of silently no-op'ing in the controller.
+  final bool retryBlocked;
   final bool canResume;
   final String phaseLabel;
   final int degradedBlockCount;

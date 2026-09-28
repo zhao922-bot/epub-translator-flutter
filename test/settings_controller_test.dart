@@ -22,7 +22,6 @@ class _ControlledSettingsStore extends SettingsStore {
 
   @override
   Future<TranslationConfig> load() => loadCompleter.future;
-
   @override
   Future<void> save(
     TranslationConfig config, {
@@ -31,6 +30,15 @@ class _ControlledSettingsStore extends SettingsStore {
     saved.add(config);
     this.explicitSecretMutations.add(explicitSecretMutations);
   }
+}
+
+/// A store whose KeyStore key was invalidated and regenerated: reads return
+/// empty secrets and [secretKeyRotated] is true.
+class _RotatedKeySettingsStore extends _ControlledSettingsStore {
+  _RotatedKeySettingsStore(super.loadCompleter);
+
+  @override
+  bool get secretKeyRotated => true;
 }
 
 class _OutOfOrderSettingsStore extends SettingsStore {
@@ -305,4 +313,40 @@ void main() {
       });
     },
   );
+
+  test('notifies once when the KeyStore key was rotated', () async {
+    final Completer<TranslationConfig> loadCompleter =
+        Completer<TranslationConfig>();
+    final _RotatedKeySettingsStore store = _RotatedKeySettingsStore(
+      loadCompleter,
+    );
+    int notified = 0;
+    final SettingsController controller = SettingsController(
+      store,
+      onSecretKeyRotated: () => notified += 1,
+    );
+    loadCompleter.complete(TranslationConfig.defaults());
+
+    await controller.ready;
+
+    expect(notified, 1);
+  });
+
+  test('does not notify when the key was not rotated', () async {
+    final Completer<TranslationConfig> loadCompleter =
+        Completer<TranslationConfig>();
+    final _ControlledSettingsStore store = _ControlledSettingsStore(
+      loadCompleter,
+    );
+    int notified = 0;
+    final SettingsController controller = SettingsController(
+      store,
+      onSecretKeyRotated: () => notified += 1,
+    );
+    loadCompleter.complete(TranslationConfig.defaults());
+
+    await controller.ready;
+
+    expect(notified, 0);
+  });
 }

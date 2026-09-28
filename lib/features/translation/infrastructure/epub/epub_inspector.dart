@@ -2,10 +2,12 @@ import 'package:dio/dio.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
 
+import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
 import '../../domain/models/inspection_result.dart';
 import '../../domain/models/inspected_chapter.dart';
 import '../../domain/models/translation_job.dart';
+import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
@@ -13,10 +15,15 @@ import 'epub_text_decoder.dart';
 
 /// Loads an EPUB (via isolate) and extracts chapter/block inventory.
 class EpubInspector {
-  EpubInspector({EpubHtmlExtractor? extractor})
-    : _extractor = extractor ?? const EpubHtmlExtractor();
+  EpubInspector({EpubHtmlExtractor? extractor, AppStrings? strings})
+    : _extractor = extractor ?? const EpubHtmlExtractor(),
+      _strings = strings ?? const AppStrings(UiLanguage.english);
 
   final EpubHtmlExtractor _extractor;
+
+  /// Localizes the progress headers and log lines the dashboard shows while
+  /// inspecting. Defaults to English when the caller does not pass one.
+  final AppStrings _strings;
 
   Future<InspectionResult> inspect({
     required String inputPath,
@@ -24,7 +31,11 @@ class EpubInspector {
     required CancelToken cancelToken,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    AppStrings? strings,
   }) async {
+    // Per-call strings win over the constructor default so the repository
+    // can localize with the run's UI language.
+    final AppStrings s = strings ?? _strings;
     final Stopwatch inspectionStopwatch = Stopwatch()..start();
     final String jobId = DateTime.now().millisecondsSinceEpoch.toString();
     TranslationJob currentJob = TranslationJob(
@@ -34,7 +45,7 @@ class EpubInspector {
       status: TranslationJobStatus.running,
       phase: TranslationJobPhase.inspection,
       progress: 0,
-      currentChapter: 'Opening archive',
+      currentChapter: s.inspectProgressOpeningArchive,
       completedFiles: 0,
       totalFiles: 0,
       completedBlocks: 0,
@@ -55,7 +66,7 @@ class EpubInspector {
       }
     }
 
-    emit(currentJob, 'Opening EPUB: ${path.basename(inputPath)}');
+    emit(currentJob, s.inspectLogOpeningEpub(path.basename(inputPath)));
     throwIfCancelled();
 
     final Map<String, List<int>> files = await openArchiveFiles(inputPath);
@@ -99,21 +110,27 @@ class EpubInspector {
         progress: 0.1,
         currentChapter: path.basename(opfPath),
       ),
-      'Located package document: $opfPath',
+      s.inspectLogLocatedPackage(opfPath),
     );
 
-    final ({List<String> chapterPaths, List<String> unresolvedIdRefs})
-    spine = chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
+    final ({List<String> chapterPaths, List<String> unresolvedIdRefs}) spine =
+        chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
     final List<String> chapterPaths = spine.chapterPaths;
+
+    // The repack isolate strict-decodes the NCX while rendering navigation
+    // metadata. Sniff it here (decode only, no XML parse) so a non-UTF-8 NCX
+    // fails loudly during inspection — before any API spend — instead of
+    // killing the run after the whole translation was billed.
+    validateNavigationEncodings(files: files, opfPath: opfPath);
 
     if (chapterPaths.isEmpty) {
       emit(
         currentJob.copyWith(
           status: TranslationJobStatus.failed,
           progress: 1,
-          currentChapter: 'No chapters found',
+          currentChapter: s.inspectProgressNoChapters,
         ),
-        'No spine HTML/XHTML chapters were found in the EPUB.',
+        s.inspectLogNoChapters,
       );
       return InspectionResult(
         job: currentJob,
@@ -128,10 +145,10 @@ class EpubInspector {
     emit(
       currentJob.copyWith(
         progress: 0.2,
-        currentChapter: 'Spine ready',
+        currentChapter: s.inspectProgressSpineReady,
         totalFiles: chapterPaths.length,
       ),
-      'Found ${chapterPaths.length} chapters in the spine.',
+      s.inspectLogFoundChapters(chapterPaths.length),
     );
 
     final List<InspectedChapter> chapters = <InspectedChapter>[];
@@ -165,7 +182,7 @@ class EpubInspector {
       );
       emit(
         nextJob,
-        'Indexed chapter ${index + 1}/${chapterPaths.length}: $chapterPath',
+        s.inspectLogIndexedChapter(index + 1, chapterPaths.length, chapterPath),
       );
     }
 
@@ -178,16 +195,13 @@ class EpubInspector {
     final TranslationJob inspectedJob = currentJob.copyWith(
       status: TranslationJobStatus.inspected,
       progress: 1,
-      currentChapter: 'Ready for translation',
+      currentChapter: s.inspectProgressReady,
       completedFiles: chapterPaths.length,
       totalFiles: chapterPaths.length,
       totalBlocks: totalBlocks,
     );
     inspectionStopwatch.stop();
-    emit(
-      inspectedJob,
-      'EPUB inspection complete. Preview now shows ${chapters.length} real chapters with a basic translation filter.',
-    );
+    emit(inspectedJob, s.inspectLogComplete(chapters.length));
     if (warnings.isNotEmpty) {
       const int maxShown = 8;
       final String shown = warnings.take(maxShown).join(' ');
@@ -210,7 +224,11 @@ class EpubInspector {
     }
     emit(
       inspectedJob,
-      'Performance: EPUB inspection took ${_formatDuration(inspectionStopwatch.elapsed)} for ${chapters.length} chapters and $totalBlocks text blocks.',
+      s.inspectLogPerformance(
+        _formatDuration(inspectionStopwatch.elapsed),
+        chapters.length,
+        totalBlocks,
+      ),
     );
     return InspectionResult(
       job: inspectedJob,
@@ -228,6 +246,92 @@ class EpubInspector {
       for (final entry in loaded.entries)
         entry.key: List<int>.from(entry.value),
     };
+  }
+
+  /// Resolves the NCX path from OPF bytes the same way
+  /// `EpubIsolateWorker.renderNavigationMetadata` does (spine `toc`
+  /// attribute, falling back to the `application/x-dtbncx+xml` manifest
+  /// item). Returns null when the OPF declares no NCX.
+  ///
+  /// The lookup intentionally mirrors the worker exactly, including the
+  /// defensive URI decoding of the href: the inspect-phase sniff must see
+  /// precisely the entry the repack isolate will decode, otherwise a book
+  /// the worker handles fine could fail inspection spuriously.
+  ///
+  /// Public for reuse by the inspect-phase encoding sniff and by tests.
+  static String? ncxPathFromOpfBytes({
+    required Map<String, List<int>> files,
+    required String opfPath,
+  }) {
+    final List<int>? opfBytes = files[opfPath];
+    if (opfBytes == null) {
+      return null;
+    }
+    final XmlDocument opfDocument = XmlDocument.parse(
+      decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+    );
+    final XmlElement? spine = opfDocument.descendants
+        .whereType<XmlElement>()
+        .cast<XmlElement?>()
+        .firstWhere(
+          (XmlElement? element) => element?.name.local == 'spine',
+          orElse: () => null,
+        );
+    final String ncxId = spine?.getAttribute('toc') ?? '';
+    String ncxHref = '';
+    for (final XmlElement item
+        in opfDocument.descendants.whereType<XmlElement>()) {
+      if (item.name.local != 'item') {
+        continue;
+      }
+      if ((ncxId.isNotEmpty && item.getAttribute('id') == ncxId) ||
+          item.getAttribute('media-type') == 'application/x-dtbncx+xml') {
+        ncxHref = item.getAttribute('href') ?? '';
+        break;
+      }
+    }
+    if (ncxHref.isEmpty) {
+      return null;
+    }
+    // OPF manifest hrefs are URI-encoded while the archive entry names are
+    // decoded; decode defensively so an encoded NCX file name
+    // (`toc%E4%B8%AD.ncx`) resolves to the real entry. Mirrors
+    // `EpubIsolateWorker.renderNavigationMetadata`.
+    return path.posix.normalize(
+      path.posix.join(path.posix.dirname(opfPath), _decodeNcxHref(ncxHref)),
+    );
+  }
+
+  /// Percent-decodes an OPF manifest href, falling back to the raw value
+  /// when it is not validly encoded.
+  static String _decodeNcxHref(String raw) {
+    try {
+      return Uri.decodeFull(raw);
+    } catch (_) {
+      return raw;
+    }
+  }
+
+  /// Strict-decodes the NCX (when the OPF declares one) without parsing it.
+  ///
+  /// The repack isolate strict-decodes the NCX while rendering navigation
+  /// metadata; a non-UTF-8 NCX would otherwise fail the whole run AFTER
+  /// every API call was billed, with no EPUB produced. Sniffing here fails
+  /// loudly during inspection instead — before any paid work — and the
+  /// `Unsupported text encoding` message routes to the non-retryable
+  /// "convert to UTF-8 first" banner.
+  ///
+  /// Public for reuse and testing.
+  static void validateNavigationEncodings({
+    required Map<String, List<int>> files,
+    required String opfPath,
+  }) {
+    final String? ncxPath = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
+    final List<int>? ncxBytes = ncxPath == null ? null : files[ncxPath];
+    if (ncxBytes == null) {
+      return;
+    }
+    decodeEpubText(bytes: ncxBytes, filePath: ncxPath!, strict: true);
   }
 
   /// Resolves spine itemrefs to archive paths. Returns both the resolved

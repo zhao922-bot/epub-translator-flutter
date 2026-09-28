@@ -25,7 +25,6 @@ void main() {
                 phase: TranslationJobPhase.translation,
                 progress: 1,
               ),
-              onTranslatePressed: () {},
               onExportPressed: () {},
               onSaveToDownloadsPressed: () {},
               canTranslate: true,
@@ -70,7 +69,6 @@ void main() {
                 totalBlocks: 12,
                 degradedBlockCount: 2,
               ),
-              onTranslatePressed: () {},
               onExportPressed: () {},
               onSaveToDownloadsPressed: () {},
               canTranslate: true,
@@ -107,7 +105,6 @@ void main() {
                 progress: 1,
                 currentChapter: 'Ready for translation',
               ),
-              onTranslatePressed: () {},
               onExportPressed: () {},
               onSaveToDownloadsPressed: () {},
               canTranslate: true,
@@ -145,7 +142,6 @@ void main() {
                 cachedBlocks: 354,
                 resumedBlocks: 354,
               ),
-              onTranslatePressed: () {},
               onExportPressed: () {},
               onSaveToDownloadsPressed: () {},
               canTranslate: false,
@@ -188,5 +184,80 @@ void main() {
 
     expect(find.text('恢复缓存中'), findsOneWidget);
     expect(find.text('翻译中'), findsNothing);
+  });
+
+  testWidgets('hides the ETA once the output is ready', (tester) async {
+    const strings = AppStrings(UiLanguage.chinese);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: TranslationOverview(
+              strings: strings,
+              job: const TranslationJob(
+                id: 'job-1',
+                inputPath: 'book.epub',
+                outputPath: 'book_translated.epub',
+                status: TranslationJobStatus.completed,
+                phase: TranslationJobPhase.translation,
+                progress: 1,
+              ),
+              onExportPressed: () {},
+              onSaveToDownloadsPressed: () {},
+              canTranslate: true,
+              estimate: const TranslationRunEstimate(
+                selectedChapters: 2,
+                totalBlocks: 12,
+                estimatedApiBatches: 3,
+                completedBlocks: 12,
+                blocksPerMinute: 18,
+                estimatedRemaining: Duration.zero,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.textContaining('剩余'), findsNothing);
+    expect(find.textContaining('ETA'), findsNothing);
+  });
+
+  testWidgets('shows a localized ETA while the run is active', (tester) async {
+    const strings = AppStrings(UiLanguage.chinese);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SingleChildScrollView(
+            child: TranslationOverview(
+              strings: strings,
+              job: const TranslationJob(
+                id: 'job-1',
+                inputPath: 'book.epub',
+                outputPath: '',
+                status: TranslationJobStatus.running,
+                phase: TranslationJobPhase.translation,
+                progress: 0.4,
+              ),
+              onExportPressed: () {},
+              onSaveToDownloadsPressed: () {},
+              canTranslate: false,
+              canCancel: true,
+              onCancelPressed: () {},
+              estimate: const TranslationRunEstimate(
+                selectedChapters: 2,
+                totalBlocks: 12,
+                estimatedApiBatches: 3,
+                completedBlocks: 5,
+                blocksPerMinute: 18,
+                estimatedRemaining: Duration(minutes: 5),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('剩余: 5 分钟'), findsOneWidget);
   });
 }

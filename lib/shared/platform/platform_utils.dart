@@ -60,6 +60,13 @@ class PlatformUtils {
     return NativePlatformBridge.deleteSecret(name);
   }
 
+  /// Tells the Android native side which import files job history still
+  /// references so its stale-import sweep never deletes them. No-op off
+  /// Android.
+  static Future<void> setProtectedImportPaths(List<String> paths) {
+    return NativePlatformBridge.setProtectedImportPaths(paths);
+  }
+
   static Future<String> appDocumentsDirectory() async {
     final String? directory =
         await NativePlatformBridge.appDocumentsDirectory();

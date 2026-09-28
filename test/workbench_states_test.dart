@@ -100,8 +100,11 @@ void main() {
     );
     await tester.pump();
 
-    expect(controller.state.inputPath, 'NewBook.epub');
-    expect(controller.state.job, isNull);
+    // Typing alone must not commit: the destructive side effects of
+    // setInputPath (clearing the job and inspection state) must not fire
+    // per keystroke.
+    expect(controller.state.inputPath, 'Book.epub');
+    expect(controller.state.job, isNotNull);
     expect(field, findsOneWidget);
     final editable = find.descendant(
       of: field,
@@ -112,6 +115,15 @@ void main() {
       tester.widget<EditableText>(editable).controller.selection.baseOffset,
       3,
     );
+
+    // Committing with Enter applies the path and clears the job, while the
+    // manual field stays open.
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+
+    expect(controller.state.inputPath, 'NewBook.epub');
+    expect(controller.state.job, isNull);
+    expect(field, findsOneWidget);
   });
 
   testWidgets(

@@ -17,10 +17,35 @@ final settingsProvider =
     StateNotifierProvider<SettingsController, TranslationConfig>(
       (ref) => SettingsController(
         ref.watch(settingsStoreProvider),
-        onSaveError: (String? error) =>
-            ref.read(settingsSaveErrorProvider.notifier).state = (
+        onSaveError: (Object? error) {
+          final notifier = ref.read(settingsSaveErrorProvider.notifier);
+          if (error == null) {
+            // Successful persist: clear any previous failure notice.
+            notifier.state = (
               id: DateTime.now().microsecondsSinceEpoch,
-              message: error,
+              message: null,
+              settingsFileLocked: false,
+            );
+            return;
+          }
+          notifier.state = (
+            id: DateTime.now().microsecondsSinceEpoch,
+            // For a locked settings file the UI shows an actionable
+            // localized message; the record carries the file path for it.
+            message: error is SettingsFileLockedException
+                ? error.filePath
+                : '$error',
+            settingsFileLocked: error is SettingsFileLockedException,
+          );
+        },
+        onCorruptReset: (String? backupPath) =>
+            ref.read(settingsResetNoticeProvider.notifier).state = (
+              id: DateTime.now().microsecondsSinceEpoch,
+              backupPath: backupPath,
+            ),
+        onSecretKeyRotated: () =>
+            ref.read(secretKeyRotatedNoticeProvider.notifier).state = (
+              id: DateTime.now().microsecondsSinceEpoch,
             ),
       ),
     );
@@ -36,7 +61,31 @@ final settingsProvider =
 /// value, so two consecutive failures with identical text would otherwise only
 /// notify once and the second SnackBar would be swallowed.
 final settingsSaveErrorProvider =
-    StateProvider<({int id, String? message})?>((ref) => null);
+    StateProvider<({int id, String? message, bool settingsFileLocked})?>(
+      (ref) => null,
+    );
+
+/// Holds the latest "settings.json was unreadable/corrupt, defaults were
+/// restored" event, if any.
+///
+/// A corrupt (or transiently locked, on Windows) settings file used to reset
+/// a dozen user settings with only a log line to show for it. This surfaces
+/// the reset — and the backup location — so the UI can warn the user.
+///
+/// Same event-record pattern as [settingsSaveErrorProvider]: Riverpod
+/// suppresses state updates that equal the current value, so a plain string
+/// could swallow a second reset notice.
+final settingsResetNoticeProvider =
+    StateProvider<({int id, String? backupPath})?>((ref) => null);
+
+/// Holds the "Android KeyStore key was invalidated and regenerated" event,
+/// if any. The stored secrets are unrecoverable then, so the settings page
+/// shows a warning banner telling the user to re-enter their API keys.
+///
+/// Same event-record pattern as [settingsSaveErrorProvider].
+final secretKeyRotatedNoticeProvider = StateProvider<({int id})?>(
+  (ref) => null,
+);
 
 final connectionTestProvider =
     StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>(
@@ -44,16 +93,30 @@ final connectionTestProvider =
     );
 
 class SettingsController extends StateNotifier<TranslationConfig> {
-  SettingsController(this._store, {this.onSaveError})
-    : super(TranslationConfig.defaults()) {
+  SettingsController(
+    this._store, {
+    this.onSaveError,
+    this.onCorruptReset,
+    this.onSecretKeyRotated,
+  }) : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
 
   final SettingsStore _store;
 
-  /// Called with the failure message when persisting settings fails, or with
-  /// null after a successful persist (clears a previous error).
-  final void Function(String? error)? onSaveError;
+  /// Called with the failure when persisting settings fails, or with null
+  /// after a successful persist (clears a previous error).
+  final void Function(Object? error)? onSaveError;
+
+  /// Called with the backup path (null when the backup itself failed) when
+  /// settings.json was unreadable/corrupt at load and defaults were
+  /// restored. Not called on a first run with no settings file.
+  final void Function(String? backupPath)? onCorruptReset;
+
+  /// Called once after load when the Android KeyStore key was invalidated
+  /// (lock-screen/biometric change) and regenerated: the stored secrets
+  /// are unrecoverable, so the UI warns the user to re-enter them.
+  final void Function()? onSecretKeyRotated;
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
 
@@ -65,6 +128,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return;
     }
     state = loaded;
+    if (_store.didCorruptReset) {
+      onCorruptReset?.call(_store.lastCorruptBackupPath);
+    }
+    if (_store.secretKeyRotated) {
+      onSecretKeyRotated?.call();
+    }
   }
 
   Future<void> _persist(
@@ -103,7 +172,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       // The UI already shows the new value, so a silent failure would leave
       // it lying about what is actually persisted. Surface it instead of
       // letting the future go unhandled at the call site.
-      onSaveError?.call('$error');
+      onSaveError?.call(error);
     }
   }
 
@@ -193,6 +262,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setLockedGlossary(String value) =>
       _update((config) => config.copyWith(lockedGlossary: value));
+
+  Future<void> setHttpProxy(String value) =>
+      _update((config) => config.copyWith(httpProxy: value.trim()));
 
   Future<void> applyApiProviderPreset(ApiProviderPreset preset) =>
       _update(preset.applyTo);

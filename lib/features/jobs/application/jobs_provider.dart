@@ -7,15 +7,27 @@ import '../../translation/domain/models/translation_job.dart';
 import '../domain/models/job_summary.dart';
 
 final jobsProvider = Provider<List<JobSummary>>((ref) {
-  final TranslationDashboardState dashboard = ref.watch(
-    translationDashboardProvider,
+  // Only the fields the job list actually renders are selected: a plain
+  // watch of the whole dashboard state rebuilt this page on every log tick.
+  final (
+    :TranslationJob? job,
+    :List<TranslationJob> jobHistory,
+    :bool isRunActive,
+  ) = ref.watch(
+    translationDashboardProvider.select(
+      (TranslationDashboardState dashboard) => (
+        job: dashboard.job,
+        jobHistory: dashboard.jobHistory,
+        isRunActive: dashboard.isRunActive,
+      ),
+    ),
   );
   final AppStrings strings = ref.watch(appStringsProvider);
-  final TranslationJob? currentJob = dashboard.job;
+  final TranslationJob? currentJob = job;
   final Set<String> includedIds = <String>{};
   final List<TranslationJob> jobs = <TranslationJob>[
     ?currentJob,
-    ...dashboard.jobHistory.where((TranslationJob job) {
+    ...jobHistory.where((TranslationJob job) {
       if (currentJob != null && job.id == currentJob.id) {
         return false;
       }
@@ -40,6 +52,9 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
               job.status == TranslationJobStatus.failed ||
               job.status == TranslationJobStatus.cancelled ||
               job.status == TranslationJobStatus.completedWithWarnings,
+          // While a run is active the controller's _retryJob only appends a
+          // log line the Jobs page never shows; surface it here instead.
+          retryBlocked: isRunActive,
           canResume: job.canResumeTranslation,
           degradedBlockCount: job.degradedBlockCount,
         ),

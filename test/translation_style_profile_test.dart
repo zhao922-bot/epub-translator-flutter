@@ -26,7 +26,10 @@ void main() {
       expect(instruction, isNotEmpty);
       expect(instruction, contains('Genre: business nonfiction'));
       expect(instruction, contains('Preserve proper nouns exactly'));
-      expect(instruction, isNot(contains('Keep all embedded English quotations')));
+      expect(
+        instruction,
+        isNot(contains('Keep all embedded English quotations')),
+      );
       expect(instruction, isNot(contains('preserve the original English')));
       expect(instruction, isNot(contains('Keep dialogue in English')));
       expect(
@@ -60,21 +63,13 @@ void main() {
     });
 
     test('sanitizes stored constraints without rewriting the profile object', () {
-      final TranslationStyleProfile sanitized = profile.forTargetLanguage(
-        '中文',
-      );
+      final TranslationStyleProfile sanitized = profile.forTargetLanguage('中文');
 
-      expect(
-        sanitized.translationConstraints,
-        <String>[
-          'Quoted prose, dialogue, and epigraphs must be translated into 中文; keep only proper names, work titles, URLs, and short technical terms in the source language',
-          'Preserve proper nouns exactly',
-        ],
-      );
-      expect(
-        sanitized.avoid,
-        <String>['Avoid softening the polemical edge'],
-      );
+      expect(sanitized.translationConstraints, <String>[
+        'Quoted prose, dialogue, and epigraphs must be translated into 中文; keep only proper names, work titles, URLs, and short technical terms in the source language',
+        'Preserve proper nouns exactly',
+      ]);
+      expect(sanitized.avoid, <String>['Avoid softening the polemical edge']);
       expect(profile.translationConstraints, hasLength(3));
     });
   });

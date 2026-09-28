@@ -23,6 +23,15 @@ class TranslationParseException extends FormatException {
   const TranslationParseException(super.message);
 }
 
+/// Why a user-typed proxy setting cannot be used as an HTTP proxy.
+enum ProxySettingError {
+  /// The value is not shaped like `host:port` or `http(s)://host:port`.
+  invalidFormat,
+
+  /// An explicit scheme other than `http://`/`https://` (e.g. `socks5://`).
+  unsupportedScheme,
+}
+
 /// OpenAI-compatible chat client with retry / rate-limit handling.
 class TranslationApiClient {
   const TranslationApiClient();
@@ -50,11 +59,175 @@ class TranslationApiClient {
           ..idleTimeout = const Duration(seconds: 30)
           ..maxConnectionsPerHost = max(4, config.maxConcurrent * 2)
           ..userAgent = 'epub-translator-flutter/1.0';
+        // Dart's HttpClient only honors proxy *environment variables*;
+        // the Windows system proxy and the Android Wi-Fi proxy are invisible
+        // to it, so an explicit user-configured proxy wins here. Local and
+        // private destinations always bypass it (no_proxy semantics).
+        final String? proxy = proxyHostPort(config.httpProxy);
+        if (proxy != null) {
+          client.findProxy = (Uri uri) => proxyForUri(proxy, uri);
+        }
         return client;
       },
     );
 
     return dio;
+  }
+
+  /// Normalizes a user-typed proxy setting into `"host:port"`, or null when
+  /// it is empty or malformed. Accepts `host:port`, `http://host:port`, and
+  /// `https://host:port` (IPv6 literals need brackets: `[::1]:8080`).
+  /// Other schemes (e.g. `socks5://`) are rejected: Dart's HttpClient only
+  /// speaks HTTP proxies, so silently treating a SOCKS address as an HTTP
+  /// proxy would fail later with a confusing connection error. Use
+  /// [validateProxySetting] to tell the user why a value is invalid.
+  static String? proxyHostPort(String value) {
+    String trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    if (trimmed.contains('://')) {
+      final Uri? parsed = Uri.tryParse(trimmed);
+      if (parsed == null || parsed.host.isEmpty || !parsed.hasPort) {
+        return null;
+      }
+      final String scheme = parsed.scheme.toLowerCase();
+      if (scheme != 'http' && scheme != 'https') {
+        return null;
+      }
+      final String host = parsed.host;
+      return '$host:${parsed.port}';
+    }
+    final RegExpMatch? match = RegExp(
+      r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$',
+    ).firstMatch(trimmed);
+    if (match == null) {
+      return null;
+    }
+    final String host = (match.group(1) ?? match.group(2) ?? '').trim();
+    final int? port = int.tryParse(match.group(3)!);
+    if (host.isEmpty || port == null || port <= 0 || port > 65535) {
+      return null;
+    }
+    return '$host:$port';
+  }
+
+  /// Why a user-typed proxy setting is unusable, for inline error display.
+  ///
+  /// Returns null when the value is empty (proxy disabled) or valid.
+  /// Unlike [proxyHostPort], this distinguishes "wrong shape" from
+  /// "unsupported protocol" so the settings page can explain the problem
+  /// instead of saving a value that silently does nothing.
+  static ProxySettingError? validateProxySetting(String value) {
+    final String trimmed = value.trim();
+    if (trimmed.isEmpty) {
+      return null;
+    }
+    if (trimmed.contains('://')) {
+      final Uri? parsed = Uri.tryParse(trimmed);
+      if (parsed == null || parsed.host.isEmpty || !parsed.hasPort) {
+        return ProxySettingError.invalidFormat;
+      }
+      final String scheme = parsed.scheme.toLowerCase();
+      if (scheme != 'http' && scheme != 'https') {
+        return ProxySettingError.unsupportedScheme;
+      }
+      return null;
+    }
+    final RegExpMatch? match = RegExp(
+      r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$',
+    ).firstMatch(trimmed);
+    if (match == null) {
+      return ProxySettingError.invalidFormat;
+    }
+    final String host = (match.group(1) ?? match.group(2) ?? '').trim();
+    final int? port = int.tryParse(match.group(3)!);
+    if (host.isEmpty || port == null || port <= 0 || port > 65535) {
+      return ProxySettingError.invalidFormat;
+    }
+    return null;
+  }
+
+  /// PAC-style proxy selector for [hostPort] (`"host:port"`) with no_proxy
+  /// semantics: loopback, single-label, private-use and link-local
+  /// destinations bypass the proxy via `DIRECT`.
+  static String proxyForUri(String hostPort, Uri uri) {
+    return _isProxyBypassHost(uri.host) ? 'DIRECT' : 'PROXY $hostPort';
+  }
+
+  static bool _isProxyBypassHost(String host) {
+    final String name = host.trim().toLowerCase();
+    if (name.isEmpty || name == 'localhost' || name.endsWith('.localhost')) {
+      return true;
+    }
+    // Parse IP literals before the single-label rule: an unbracketed IPv6
+    // literal (Dart's Uri.host strips the brackets, e.g.
+    // "2001:4860:4860::8888") contains no '.' and must not be mistaken for
+    // a local intranet hostname.
+    final String literal = name.startsWith('[') && name.endsWith(']')
+        ? name.substring(1, name.length - 1)
+        : name;
+    final InternetAddress? address = InternetAddress.tryParse(literal);
+    if (address == null) {
+      // Single-label names (e.g. intranet hosts) are treated as local.
+      if (!name.contains('.')) {
+        return true;
+      }
+      return false;
+    }
+    final List<int> bytes = address.rawAddress;
+    if (address.type == InternetAddressType.IPv4) {
+      // 127/8 loopback, 10/8, 172.16/12, 192.168/16, 169.254/16 link-local.
+      if (bytes[0] == 127 || bytes[0] == 10) {
+        return true;
+      }
+      if (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) {
+        return true;
+      }
+      if (bytes[0] == 192 && bytes[1] == 168) {
+        return true;
+      }
+      if (bytes[0] == 169 && bytes[1] == 254) {
+        return true;
+      }
+      return false;
+    }
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) arrives as a 16-byte address: judge
+    // the embedded IPv4 octets with the IPv4 rules above instead of falling
+    // through to the IPv6 checks (where ::ffff:127.0.0.1 would miss the
+    // ::1 loopback test and be sent through the user's proxy).
+    if (bytes.length == 16 &&
+        bytes.sublist(0, 10).every((int b) => b == 0) &&
+        bytes[10] == 0xff &&
+        bytes[11] == 0xff) {
+      final int m0 = bytes[12];
+      if (m0 == 127 || m0 == 10) {
+        return true;
+      }
+      if (m0 == 172 && bytes[13] >= 16 && bytes[13] <= 31) {
+        return true;
+      }
+      if (m0 == 192 && bytes[13] == 168) {
+        return true;
+      }
+      if (m0 == 169 && bytes[13] == 254) {
+        return true;
+      }
+      return false;
+    }
+    // IPv6: ::1 loopback, fe80::/10 link-local, fc00::/7 unique-local.
+    if (bytes.length == 16 &&
+        bytes.sublist(0, 15).every((int b) => b == 0) &&
+        bytes[15] == 1) {
+      return true;
+    }
+    if (bytes.length == 16 && (bytes[0] & 0xfe) == 0xfc) {
+      return true;
+    }
+    if (bytes.length == 16 && bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80) {
+      return true;
+    }
+    return false;
   }
 
   Future<String> testConnection({required TranslationConfig config}) async {
@@ -63,6 +236,21 @@ class TranslationApiClient {
         config.model.trim().isEmpty) {
       throw const FormatException(
         'API base URL, API key, and model are required before testing the connection.',
+      );
+    }
+
+    // Fail fast on a proxy the client cannot use: without this the probe
+    // would die later with a generic connection error that says nothing
+    // about the misconfigured proxy field.
+    final ProxySettingError? proxyError = validateProxySetting(
+      config.httpProxy,
+    );
+    if (proxyError != null) {
+      final AppStrings strings = AppStrings(config.uiLanguage);
+      throw FormatException(
+        proxyError == ProxySettingError.unsupportedScheme
+            ? strings.httpProxyUnsupportedScheme
+            : strings.httpProxyInvalidFormat,
       );
     }
 
@@ -206,8 +394,29 @@ class TranslationApiClient {
         '(${responseData.runtimeType}).',
       );
     }
-    final dynamic rawContent =
-        responseData['choices']?[0]?['message']?['content'];
+    // Validate the choices envelope structurally before indexing: `[]?[0]`
+    // throws RangeError on an empty list and `?['message']` on a non-Map
+    // choice throws TypeError — both would bypass the TranslationParseException
+    // contract (deterministic, no retry) and burn maxRetries of paid retries
+    // before killing the whole run.
+    final dynamic rawChoices = responseData['choices'];
+    if (rawChoices is! List || rawChoices.isEmpty) {
+      throw TranslationParseException(
+        'Translation API response has no usable choices '
+        '(${rawChoices.runtimeType}).',
+      );
+    }
+    final dynamic firstChoice = rawChoices.first;
+    if (firstChoice is! Map<String, dynamic>) {
+      throw TranslationParseException(
+        'Translation API response choice is not a JSON object '
+        '(${firstChoice.runtimeType}).',
+      );
+    }
+    final dynamic rawMessage = firstChoice['message'];
+    final dynamic rawContent = rawMessage is Map<String, dynamic>
+        ? rawMessage['content']
+        : null;
     final String content = switch (rawContent) {
       String value => value.trim(),
       List<dynamic> value =>
@@ -405,6 +614,12 @@ class TranslationApiClient {
     return null;
   }
 
+  /// Normalizes a user-typed API base URL into `<scheme>://<host>[:port]<path>/v1`
+  /// form, preserving query parameters and userinfo. Handles `/V1`
+  /// (case-insensitive match, normalized to lowercase because a literal
+  /// `/V1` 404s on case-sensitive servers), trailing slashes, a pasted
+  /// `/chat/completions` suffix, and query strings such as `?key=xxx`
+  /// (which must not be treated as part of the path).
   String normalizedBaseUrl(String value) {
     String trimmed = value.trim();
     if (trimmed.isEmpty) {
@@ -413,19 +628,21 @@ class TranslationApiClient {
     if (!trimmed.contains('://')) {
       trimmed = 'https://$trimmed';
     }
-    trimmed = trimmed.replaceAll(RegExp(r'/+$'), '');
-
-    final String lower = trimmed.toLowerCase();
-    if (lower.endsWith('/chat/completions')) {
-      trimmed = trimmed.substring(
-        0,
-        trimmed.length - '/chat/completions'.length,
-      );
+    final Uri uri = Uri.parse(trimmed);
+    final List<String> segments = uri.pathSegments
+        .where((String segment) => segment.isNotEmpty)
+        .toList(growable: true);
+    if (segments.length >= 2 &&
+        segments[segments.length - 2].toLowerCase() == 'chat' &&
+        segments[segments.length - 1].toLowerCase() == 'completions') {
+      segments.removeRange(segments.length - 2, segments.length);
     }
-    if (trimmed.toLowerCase().endsWith('/v1')) {
-      return trimmed;
+    if (segments.isEmpty || segments.last.toLowerCase() != 'v1') {
+      segments.add('v1');
+    } else {
+      segments[segments.length - 1] = 'v1';
     }
-    return '$trimmed/v1';
+    return uri.replace(pathSegments: segments).toString();
   }
 
   String lockedGlossaryInstruction(TranslationConfig config) {
@@ -446,8 +663,7 @@ class TranslationApiClient {
   }
 
   static bool isSendTimeout(Object error) {
-    return error is DioException &&
-        error.type == DioExceptionType.sendTimeout;
+    return error is DioException && error.type == DioExceptionType.sendTimeout;
   }
 
   static bool isConnectionTimeout(Object error) {
@@ -473,10 +689,12 @@ class TranslationApiClient {
         error.type == DioExceptionType.sendTimeout;
   }
 
-  /// HTTP status codes that are deterministic configuration errors: a wrong
-  /// or inactive API key (401), a key without access to the model (403), or
-  /// a wrong Base URL / model name (404). Re-sending the same request cannot
-  /// fix them, so callers must fail fast instead of burning retry attempts.
+  /// HTTP status codes that are deterministic configuration errors: a
+  /// rejected request (400: context limit exceeded, content filter,
+  /// malformed payload), a wrong or inactive API key (401), a key without
+  /// access to the model (403), or a wrong Base URL / model name (404).
+  /// Re-sending the same request cannot fix them, so callers must fail
+  /// fast instead of burning retry attempts.
   ///
   /// A 403 is only deterministic when it is genuinely a permission problem:
   /// some gateways report rate limiting as 403 instead of 429. When the
@@ -487,7 +705,7 @@ class TranslationApiClient {
     final int? statusCode = error is DioException
         ? error.response?.statusCode
         : null;
-    if (statusCode == 401 || statusCode == 404) {
+    if (statusCode == 400 || statusCode == 401 || statusCode == 404) {
       return true;
     }
     return statusCode == 403 && !isRateLimitError(error);
@@ -506,6 +724,8 @@ class TranslationApiClient {
     final AppStrings strings = AppStrings(config.uiLanguage);
     final String host = _diagnosticHost(config);
     switch (statusCode) {
+      case 400:
+        return 'HTTP 400 from $host. The provider rejected the request itself (often a context limit or content filter); it will not succeed by retrying. Try a smaller chunk size or check the request content.';
       case 401:
         return strings.httpAuthError(host);
       case 403:
@@ -533,7 +753,7 @@ class TranslationApiClient {
     if (error is TranslationCancelledException || isCancelError(error)) {
       return false;
     }
-    // 401/403/404 are deterministic configuration errors (a 403 that looks
+    // 400/401/403/404 are deterministic errors (a 403 that looks
     // like rate limiting is already excluded by [isDeterministicHttpError]):
     // re-sending the whole batch would just bill the same doomed request
     // again.
@@ -580,6 +800,7 @@ class TranslationApiClient {
     return body.contains('rate limit') ||
         body.contains('rate-limit') ||
         body.contains('ratelimit') ||
+        body.contains('rate_limited') ||
         body.contains('quota') ||
         body.contains('too many requests');
   }
@@ -603,18 +824,50 @@ class TranslationApiClient {
   static Duration retryDelayForError(
     TranslationConfig config,
     Object error,
-    int attempt,
-  ) {
+    int attempt, {
+    Random? random,
+  }) {
     if (isRateLimitError(error)) {
       final Duration? retryAfter = retryAfterDelay(error);
       if (retryAfter != null) {
-        return clampRetryDelay(retryAfter);
+        // Honor an explicit server instruction exactly (no jitter on it),
+        // but refuse to stall a run for longer than [_maxServerCooldown]:
+        // fail loud with an actionable message instead.
+        if (retryAfter > _maxServerCooldown) {
+          final int minutes = (retryAfter.inSeconds / 60).ceil();
+          throw StateError(
+            AppStrings(
+              config.uiLanguage,
+            ).rateLimitCooldownTooLong(_diagnosticHost(config), minutes),
+          );
+        }
+        return retryAfter;
       }
       final int baseSeconds = max(5, config.retryDelaySeconds);
       final int multiplier = 1 << min(attempt - 1, 4);
-      return Duration(seconds: min(90, baseSeconds * multiplier));
+      // ±25% jitter: without it, maxConcurrent batches that hit a 429
+      // together retry in lockstep and re-trigger the limit as a herd.
+      return applyJitter(
+        Duration(seconds: min(90, baseSeconds * multiplier)),
+        random ?? Random(),
+      );
     }
     return Duration(seconds: max(1, config.retryDelaySeconds));
+  }
+
+  /// Longest server-requested cooldown this client will actually wait out.
+  /// Beyond this the run fails loud with an actionable message instead of
+  /// stalling (or burning the whole retry budget re-hitting the limit).
+  static const Duration _maxServerCooldown = Duration(minutes: 10);
+
+  /// Applies ±25% uniform jitter to [base]. Extracted so tests can pass a
+  /// seeded [Random] and assert the range instead of an exact value.
+  static Duration applyJitter(Duration base, Random random) {
+    if (base <= Duration.zero) {
+      return base;
+    }
+    final double factor = 0.75 + random.nextDouble() * 0.5;
+    return Duration(milliseconds: (base.inMilliseconds * factor).round());
   }
 
   static Duration? retryAfterDelay(Object error) {
@@ -628,24 +881,29 @@ class TranslationApiClient {
     }
     final int? seconds = int.tryParse(value);
     if (seconds != null) {
-      return Duration(seconds: seconds);
+      // A negative value is malformed (RFC 9110 delay-seconds is
+      // non-negative); treat it like an unparseable value so the caller
+      // falls back to exponential backoff instead of hammering the server
+      // with a zero-delay retry.
+      return seconds < 0 ? null : Duration(seconds: seconds);
     }
-    final DateTime? retryAt = DateTime.tryParse(value);
+    // RFC 9110 allows an HTTP-date as well as delay-seconds; Dart's
+    // DateTime.tryParse only understands an ISO-8601 subset, so parse the
+    // RFC 1123 form (e.g. "Wed, 21 Oct 2015 07:28:00 GMT") with
+    // HttpDate.parse first. An unparseable value falls back to the caller's
+    // exponential backoff — never to a zero delay that would hammer the
+    // server's cooldown.
+    DateTime? retryAt;
+    try {
+      retryAt = HttpDate.parse(value);
+    } on HttpException {
+      retryAt = DateTime.tryParse(value);
+    }
     if (retryAt == null) {
       return null;
     }
     final Duration delay = retryAt.toUtc().difference(DateTime.now().toUtc());
     return delay.isNegative ? Duration.zero : delay;
-  }
-
-  static Duration clampRetryDelay(Duration delay) {
-    if (delay < Duration.zero) {
-      return Duration.zero;
-    }
-    if (delay > const Duration(seconds: 120)) {
-      return const Duration(seconds: 120);
-    }
-    return delay;
   }
 
   /// Makes [suffix] safe as a Windows/macOS/Linux filename fragment.

@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
+import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _FakeSettingsSecretStore implements SettingsSecretStore {
@@ -11,18 +12,29 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
   String? deepSeekApiKey;
   String? customApiKey;
   bool failReads = false;
+
+  /// When true, reads throw [SecretKeyRotatedException], simulating an
+  /// Android KeyStore key invalidated by a lock-screen/biometric change.
+  bool rotateKeyOnReads = false;
   bool failWrites = false;
   bool failDeepSeekWrites = false;
+  bool failDeletes = false;
   int secretMutationCount = 0;
 
   @override
   Future<void> deleteApiKey() async {
     secretMutationCount += 1;
+    if (failDeletes) {
+      throw StateError('secret store unavailable');
+    }
     apiKey = null;
   }
 
   @override
   Future<String?> readApiKey() async {
+    if (rotateKeyOnReads) {
+      throw const SecretKeyRotatedException();
+    }
     if (failReads) {
       throw StateError('secret store unavailable');
     }
@@ -481,6 +493,9 @@ void main() {
       // The corrupt file was moved aside, so a later save cannot silently
       // overwrite it.
       expect(await settingsFile.exists(), isFalse);
+      // The controller surfaces these to the UI notice.
+      expect(store.didCorruptReset, isTrue);
+      expect(store.lastCorruptBackupPath, backups.single.path);
     },
   );
 
@@ -513,35 +528,29 @@ void main() {
     },
   );
 
-  test(
-    'does not back up settings.json when it parses cleanly',
-    () async {
-      final Directory temp = await Directory.systemTemp.createTemp(
-        'epub_valid_settings_test_',
-      );
-      addTearDown(() => temp.delete(recursive: true));
+  test('does not back up settings.json when it parses cleanly', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_valid_settings_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
 
-      final File settingsFile = File('${temp.path}/settings.json');
-      await settingsFile.writeAsString(
-        jsonEncode(
-          TranslationConfig.defaults().copyWith(outputSuffix: '_kept').toJson(),
-        ),
-      );
-      final SettingsStore store = SettingsStore(
-        settingsFileProvider: () async => settingsFile,
-        secretStore: _FakeSettingsSecretStore(),
-      );
+    final File settingsFile = File('${temp.path}/settings.json');
+    await settingsFile.writeAsString(
+      jsonEncode(
+        TranslationConfig.defaults().copyWith(outputSuffix: '_kept').toJson(),
+      ),
+    );
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: _FakeSettingsSecretStore(),
+    );
 
-      final TranslationConfig loaded = await store.load();
+    final TranslationConfig loaded = await store.load();
 
-      expect(loaded.outputSuffix, '_kept');
-      expect(
-        temp.listSync().where((e) => e.path.contains('.bad-')),
-        isEmpty,
-      );
-      expect(await settingsFile.exists(), isTrue);
-    },
-  );
+    expect(loaded.outputSuffix, '_kept');
+    expect(temp.listSync().where((e) => e.path.contains('.bad-')), isEmpty);
+    expect(await settingsFile.exists(), isTrue);
+  });
 
   test(
     'save without a prior load does not delete keys when reads fail',
@@ -593,9 +602,7 @@ void main() {
         secretStore: secrets,
       );
 
-      await store.save(
-        TranslationConfig.defaults().copyWith(apiKey: 'sk-new'),
-      );
+      await store.save(TranslationConfig.defaults().copyWith(apiKey: 'sk-new'));
 
       expect(secrets.apiKey, 'sk-new');
     },
@@ -627,6 +634,127 @@ void main() {
     expect(secrets.apiKey, 'sk-legacy');
     expect(secrets.deepSeekApiKey, 'sk-deepseek');
     expect(secrets.customApiKey, 'sk-custom');
+  });
+
+  test('still writes settings json when a secret delete fails', () async {
+    // Regression test: save() must not let a secret-store failure (e.g. the
+    // Windows DPAPI file being locked so deleteSecret throws StateError)
+    // skip _writeSettingsJson, or non-secret settings like
+    // apiProviderSelection silently diverge from memory after restart.
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_settings_store_json_on_secret_failure_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+      ..failDeletes = true;
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    final TranslationConfig config = TranslationConfig.defaults().copyWith(
+      // Non-secret JSON field...
+      apiProviderSelection: ApiProviderSelection.custom,
+      // ...and an empty key, which takes the delete() path that throws.
+      apiKey: '',
+    );
+
+    // The secret failure must still surface so the caller can report it...
+    await expectLater(store.save(config), throwsA(isA<StateError>()));
+    // ...but the non-secret settings must have been persisted anyway.
+    final Map<String, dynamic> persisted =
+        jsonDecode(await settingsFile.readAsString()) as Map<String, dynamic>;
+    expect(persisted['apiProviderSelection'], ApiProviderSelection.custom.name);
+  });
+
+  group('settings.json write-error classification', () {
+    FileSystemException lockError(int code) => FileSystemException(
+      'Cannot access the file because it is being used by another process',
+      '/settings.json',
+      OSError('The process cannot access the file', code),
+    );
+
+    test(
+      'Windows sharing violation (32) becomes SettingsFileLockedException',
+      () {
+        final Object mapped = SettingsStore.mapSettingsWriteError(
+          '/settings.json',
+          lockError(32),
+        );
+        expect(mapped, isA<SettingsFileLockedException>());
+        expect(
+          (mapped as SettingsFileLockedException).filePath,
+          '/settings.json',
+        );
+      },
+    );
+
+    test('Windows lock violation (33) becomes SettingsFileLockedException', () {
+      expect(
+        SettingsStore.mapSettingsWriteError('/settings.json', lockError(33)),
+        isA<SettingsFileLockedException>(),
+      );
+    });
+
+    test('non-lock failures pass through unchanged', () {
+      final FileSystemException denied = FileSystemException(
+        'Access is denied',
+        '/settings.json',
+        const OSError('Access is denied', 5),
+      );
+      expect(
+        SettingsStore.mapSettingsWriteError('/settings.json', denied),
+        same(denied),
+      );
+      final StateError other = StateError('boom');
+      expect(
+        SettingsStore.mapSettingsWriteError('/settings.json', other),
+        same(other),
+      );
+    });
+  });
+
+  test('flags secretKeyRotated when the KeyStore key was rotated', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_settings_store_rotation_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+      ..rotateKeyOnReads = true;
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    final TranslationConfig loaded = await store.load();
+
+    // The rotated key is reported distinctly from a generic read failure
+    // so the UI can tell the user to re-enter their keys.
+    expect(store.secretKeyRotated, isTrue);
+    expect(loaded.apiKey, isEmpty);
+  });
+
+  test('secretKeyRotated stays false on ordinary read failures', () async {
+    final Directory temp = await Directory.systemTemp.createTemp(
+      'epub_settings_store_rotation_test_',
+    );
+    addTearDown(() => temp.delete(recursive: true));
+
+    final File settingsFile = File('${temp.path}/settings.json');
+    final _FakeSettingsSecretStore secrets = _FakeSettingsSecretStore()
+      ..failReads = true;
+    final SettingsStore store = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+
+    await store.load();
+
+    expect(store.secretKeyRotated, isFalse);
   });
 }
 

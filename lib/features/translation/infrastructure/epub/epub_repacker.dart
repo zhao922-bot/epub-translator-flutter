@@ -9,6 +9,7 @@ import 'package:xml/xml.dart' as xml;
 import '../../domain/models/inspected_chapter.dart';
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
+import '../../../../shared/localization/app_strings.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
 import 'proper_name_normalizer.dart';
@@ -76,6 +77,16 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
   color: inherit !important;
   text-decoration: none !important;
   border-bottom: 0 !important;
+}
+/* Bilingual mode: translated paragraphs are appended right after the
+ * source text. Give them a subtle visual cue (a thin leading rule) so
+ * readers can tell translation apart from source without overriding the
+ * book's own typography. 双语模式：译文段落跟在原文后，用细竖线做低调区分，
+ * 不覆盖书籍原有排版。 */
+body.epub-translator-cjk [data-translation="true"] {
+  border-left: 0.18em solid #8a8a8a;
+  padding-left: 0.6em;
+  margin-top: 0.5em;
 }
 ''';
 
@@ -154,16 +165,37 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     };
     _validateXmlReplacements(translatedHtmlByPath);
     throwIfCancelled();
-    final bool committed = await EpubIsolateWorker.writeTranslatedEpub(
-      inputPath: inputPath,
-      outputFilePath: outputFilePath,
-      translatedHtmlByPath: translatedHtmlByPath,
-      navigationLabelsByPath: navigationLabelsByPath,
-      navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
-      // Isolate cannot be hard-interrupted; refuse final commit on cancel.
-      shouldCommit: () =>
-          !(cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)),
-    );
+    final bool committed;
+    try {
+      committed = await EpubIsolateWorker.writeTranslatedEpub(
+        inputPath: inputPath,
+        outputFilePath: outputFilePath,
+        translatedHtmlByPath: translatedHtmlByPath,
+        navigationLabelsByPath: navigationLabelsByPath,
+        navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
+        // Isolate cannot be hard-interrupted; refuse final commit on cancel.
+        shouldCommit: () =>
+            !(cancelToken?.isCancelled == true ||
+                (isCancelled?.call() ?? false)),
+        // A lock probe before translation cannot close the TOCTOU window, so
+        // the commit failure itself carries the localized message (with the
+        // preserved temp path) instead of a raw FileSystemException.
+        lockedMessage: (String outputPath, String tempPath) => AppStrings(
+          config.uiLanguage,
+        ).outputFileLockedAtCommit(outputPath, tempPath),
+      );
+    } on InputFileLockedException catch (error) {
+      // The user opened the source EPUB in a reader mid-run (Windows sharing
+      // violation): fail loudly with an actionable message instead of a raw
+      // English OS error. The block cache is intact, so the retry is cheap.
+      throw StateError(
+        AppStrings(config.uiLanguage).inputFileLocked(error.inputPath),
+      );
+    } on EpubDecompressionLimitException {
+      throw StateError(
+        AppStrings(config.uiLanguage).epubDecompressionLimit(inputPath),
+      );
+    }
     if (!committed) {
       throw const TranslationCancelledException();
     }
@@ -201,20 +233,33 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       );
       containsCjkTranslation =
           containsCjkTranslation || _containsCjk(normalizedTranslation);
-      var replacement = bilingual
-          ? '${target.outerHtml}\n${_sanitizeForBilingual(normalizedTranslation)}'
+      String translationPart = bilingual
+          ? _sanitizeForBilingual(
+              _safelyUnwrapReplacementForStructuralTag(
+                target,
+                normalizedTranslation,
+              ),
+              container: _replacementContainerFor(target),
+              languageTag: _languageTagForTarget(targetLanguage),
+            )
           : _safelyUnwrapReplacementForStructuralTag(
               target,
               normalizedTranslation,
             );
       if (nameMappings.isNotEmpty) {
-        replacement = ProperNameNormalizer.normalizeHtml(
-          replacement,
+        // The normalizer only ever sees the translation: in bilingual mode
+        // the source paragraphs must stay byte-identical, and the
+        // first-occurrence book state advances on translation hits alone.
+        translationPart = ProperNameNormalizer.normalizeHtml(
+          translationPart,
           nameMappings,
           targetLanguage: targetLanguage,
           state: properNameState,
         );
       }
+      var replacement = bilingual
+          ? '${target.outerHtml}\n$translationPart'
+          : translationPart;
       if (degradedBlockIds.contains(
         EpubRepacker.degradedKeyForBlock(
           chapterPath: chapter.path,
@@ -233,9 +278,24 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       _applyCjkReadingCompatibility(
         document,
         languageTag: _languageTagForTarget(targetLanguage),
+        bilingual: bilingual,
       );
     }
     return XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
+  }
+
+  /// The `parseFragment` container hint for a replacement: table cells need
+  /// the `tr` context to keep their `<td>`/`<th>` wrapper, but every other
+  /// target falls back to `body`. A non-cell target with a `tr` parent can
+  /// only come from invalid source nesting; parsing its replacement in row
+  /// context would trigger HTML5 foster parenting and displace the node,
+  /// so the honest `body` context keeps it in place.
+  String _replacementContainerFor(dom.Element target) {
+    final String tag = target.localName ?? '';
+    if (tag == 'td' || tag == 'th') {
+      return target.parent?.localName ?? 'body';
+    }
+    return 'body';
   }
 
   /// Table cells (`td` / `th`) must keep their wrapper element or the table
@@ -253,7 +313,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
     final dom.DocumentFragment fragment = html_parser.parseFragment(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
-      container: target.parent?.localName ?? 'body',
+      container: _replacementContainerFor(target),
     );
     final dom.Node? first = fragment.nodes.isEmpty
         ? null
@@ -287,7 +347,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
     final dom.DocumentFragment fragment = html_parser.parseFragment(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
-      container: target.parent?.localName ?? 'body',
+      container: _replacementContainerFor(target),
     );
     final List<dom.Node> replacementNodes = fragment.nodes.toList();
     if (replacementNodes.isEmpty) {
@@ -299,13 +359,34 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
   }
 
-  String _sanitizeForBilingual(String translatedHtml) {
+  /// Sanitizes a translation fragment for bilingual rendering: duplicate
+  /// `id`s are removed (the source block keeps its own) and every top-level
+  /// translation element is marked with `data-translation="true"` so styles
+  /// and reading systems can tell translation paragraphs apart from source
+  /// paragraphs. When [languageTag] is given, the mark also carries the
+  /// target language. [container] gives the HTML parser the table context
+  /// (`tr`) it needs to keep `<td>`/`<th>` wrappers instead of dropping
+  /// them as stray table cells.
+  String _sanitizeForBilingual(
+    String translatedHtml, {
+    String? container,
+    String? languageTag,
+  }) {
     final dom.DocumentFragment fragment = html_parser.parseFragment(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(translatedHtml),
+      container: container ?? 'body',
     );
     for (final dom.Element element in fragment.querySelectorAll('[id]')) {
       element.attributes.remove('id');
-      element.attributes['data-translation'] = 'true';
+    }
+    for (final dom.Node node in fragment.nodes) {
+      if (node is dom.Element) {
+        node.attributes['data-translation'] = 'true';
+        if (languageTag != null) {
+          node.attributes['lang'] = languageTag;
+          node.attributes['xml:lang'] = languageTag;
+        }
+      }
     }
     return fragment.outerHtml;
   }
@@ -421,6 +502,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
   void _applyCjkReadingCompatibility(
     dom.Document document, {
     required String? languageTag,
+    bool bilingual = false,
   }) {
     final dom.Element? body = document.body;
     if (body == null) {
@@ -428,7 +510,10 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
     body.classes.add('epub-translator-cjk');
     final dom.Element? root = document.documentElement;
-    if (root != null && languageTag != null) {
+    // In bilingual mode the source paragraphs keep their original language;
+    // only the translation blocks carry the target lang (set by
+    // _sanitizeForBilingual), so the root element must not be relabeled.
+    if (root != null && languageTag != null && !bilingual) {
       root.attributes['lang'] = languageTag;
       root.attributes['xml:lang'] = languageTag;
     }
@@ -459,6 +544,48 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     ).hasMatch(value);
   }
 
+  /// Filenames / title words that identify a table-of-contents document.
+  /// Matching is on whole stems and whole words on purpose: substring
+  /// matching (e.g. `contains('toc')`) misfires on ordinary words like
+  /// "Protocols" or "Stockholm" and would silently rewrite body-text
+  /// cross-references into chapter titles.
+  static const Set<String> _tocDocumentNames = <String>{
+    'toc',
+    'nav',
+    'contents',
+    'table-of-contents',
+    'tableofcontents',
+    'inhalt',
+    'sommaire',
+  };
+
+  static final RegExp _wordTokenPattern = RegExp(r'[a-z0-9]+');
+
+  bool _isTocLikeChapter(InspectedChapter chapter) {
+    // A real TOC stylesheet hook is precise; keep it as-is.
+    if (chapter.originalHtml.contains('class="toc')) {
+      return true;
+    }
+    // Whole filename-stem match: "toc.xhtml" hits, "protocols.xhtml" does
+    // not. ZIP entry names always use '/' separators.
+    final String fileName = chapter.path.toLowerCase().split('/').last;
+    final String stem = fileName.contains('.')
+        ? fileName.substring(0, fileName.lastIndexOf('.'))
+        : fileName;
+    if (_tocDocumentNames.contains(stem)) {
+      return true;
+    }
+    // Whole-word title match: "Table of Contents" hits, "Protocols" does not.
+    for (final RegExpMatch match in _wordTokenPattern.allMatches(
+      chapter.title.toLowerCase(),
+    )) {
+      if (_tocDocumentNames.contains(match.group(0))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void _synchronizeHtmlTocLabels(
     Map<String, String> renderedByPath,
     List<InspectedChapter> chapters,
@@ -472,12 +599,7 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
       return;
     }
     for (final InspectedChapter chapter in chapters) {
-      final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
-      final bool looksLikeToc =
-          token.contains('toc') ||
-          token.contains('contents') ||
-          chapter.originalHtml.contains('class="toc');
-      if (!looksLikeToc) {
+      if (!_isTocLikeChapter(chapter)) {
         continue;
       }
       final String? rendered = renderedByPath[chapter.path];
@@ -491,10 +613,13 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
         if (href.isEmpty || Uri.tryParse(href)?.hasScheme == true) {
           continue;
         }
+        // Decode percent-encoded hrefs the same way NCX `src` values are
+        // decoded, so `chapter%E4%B8%AD.xhtml` resolves against the decoded
+        // chapter paths in labelsByPath.
         final String targetPath = path.posix.normalize(
           path.posix.join(
             path.posix.dirname(chapter.path),
-            href.split('#').first,
+            _decodeTocHrefPath(href.split('#').first),
           ),
         );
         final String? label = labelsByPath[targetPath];
@@ -511,6 +636,18 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     }
   }
 
+  /// Percent-decodes an HTML TOC href path the same way NCX `src` values
+  /// are decoded (`EpubIsolateWorker` side), so `%E4%B8%AD`-style hrefs
+  /// resolve against the decoded chapter paths. Falls back to the raw
+  /// value on malformed input.
+  static String _decodeTocHrefPath(String raw) {
+    try {
+      return Uri.decodeFull(raw);
+    } catch (_) {
+      return raw;
+    }
+  }
+
   /// Replaces an anchor's direct text children with [label] while keeping
   /// nested elements (e.g. `<span class="pagenum">`) intact. `anchor.text =`
   /// would flatten those nested tags away.
@@ -518,9 +655,9 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
     dom.Element anchor,
     String label,
   ) {
-    final List<dom.Text> textNodes = anchor.nodes
-        .whereType<dom.Text>()
-        .toList(growable: false);
+    final List<dom.Text> textNodes = anchor.nodes.whereType<dom.Text>().toList(
+      growable: false,
+    );
     if (textNodes.isEmpty) {
       return;
     }

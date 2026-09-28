@@ -112,7 +112,12 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
         std::vector<wchar_t> file_path(path_length + 1);
         if (DragQueryFileW(drop_handle, 0, file_path.data(),
                            static_cast<UINT>(file_path.size())) > 0) {
-          SendDroppedFilePath(std::wstring(file_path.data()));
+          // Product semantics: the app imports exactly one book per drop —
+          // always the first file — and Dart uses fileCount to tell the
+          // user the rest were ignored instead of silently dropping them.
+          // This is deliberate (one translation run == one book), not a
+          // limitation to "fix" later by importing all files.
+          SendDroppedFilePath(std::wstring(file_path.data()), file_count);
         }
       }
       DragFinish(drop_handle);
@@ -123,12 +128,20 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
 }
 
-void FlutterWindow::SendDroppedFilePath(const std::wstring& file_path) {
+void FlutterWindow::SendDroppedFilePath(const std::wstring& file_path,
+                                       UINT file_count) {
   if (!window_drop_channel_) {
     return;
   }
 
+  // Map payload (not a bare string) so the Dart side can distinguish a
+  // multi-file drop from a single file. The legacy bare-string form is
+  // still accepted by Dart for forward/backward compatibility.
+  flutter::EncodableMap args;
+  args[flutter::EncodableValue("path")] =
+      flutter::EncodableValue(WideStringToUtf8(file_path));
+  args[flutter::EncodableValue("fileCount")] =
+      flutter::EncodableValue(static_cast<int32_t>(file_count));
   window_drop_channel_->InvokeMethod(
-      "fileDropped", std::make_unique<flutter::EncodableValue>(
-                         flutter::EncodableValue(WideStringToUtf8(file_path))));
+      "fileDropped", std::make_unique<flutter::EncodableValue>(args));
 }

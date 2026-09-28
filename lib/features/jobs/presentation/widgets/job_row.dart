@@ -69,8 +69,14 @@ class JobRow extends StatelessWidget {
           ),
         if (job.canRetry)
           IconButton(
-            tooltip: strings.retryJob,
-            onPressed: onRetry,
+            tooltip: job.retryBlocked
+                ? strings.retryBlockedByActiveRun
+                : strings.retryJob,
+            onPressed: job.retryBlocked
+                ? () => ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(strings.retryBlockedByActiveRun)),
+                  )
+                : onRetry,
             icon: const Icon(Icons.replay_rounded, size: 19),
           ),
       ],

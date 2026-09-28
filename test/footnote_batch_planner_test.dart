@@ -95,7 +95,6 @@ void main() {
       final List<InspectedChapter> chapters = <InspectedChapter>[
         _chapter(path: 'text/footnotes.xhtml', title: 'Chapter 1'),
         _chapter(path: 'text/endnotes.xhtml', title: 'Chapter 2'),
-        _chapter(path: 'notes/chapter-03.xhtml', title: 'Chapter 3'),
         _chapter(path: 'text/chapter-04-fn.xhtml', title: 'Chapter 4'),
       ];
 
@@ -105,6 +104,38 @@ void main() {
           isTrue,
         );
       }
+    });
+
+    test('does not mistake a notes directory for a footnote chapter', () {
+      // Regression: a book stored entirely under notes/ must not have its
+      // ordinary chapters classified as footnote chapters just because of
+      // the parent directory name. Only the file name itself is considered.
+      for (final String path in <String>[
+        'notes/chapter1.xhtml',
+        'notes/第1章.xhtml',
+        r'notes\chapter1.xhtml',
+      ]) {
+        expect(
+          FootnoteBatchPlanner.isStandaloneFootnoteChapter(
+            _chapter(path: path, title: 'Chapter 1'),
+          ),
+          isFalse,
+          reason: path,
+        );
+      }
+      // File-name hits still count, even under a notes/ directory.
+      expect(
+        FootnoteBatchPlanner.isStandaloneFootnoteChapter(
+          _chapter(path: 'notes/footnotes.xhtml', title: 'Notes'),
+        ),
+        isTrue,
+      );
+      expect(
+        FootnoteBatchPlanner.isStandaloneFootnoteChapter(
+          _chapter(path: 'notes/endnotes-1.xhtml', title: 'Notes'),
+        ),
+        isTrue,
+      );
     });
 
     test(

@@ -92,10 +92,9 @@ class TranslationStyleProfile {
     if (!shouldInject) {
       return '';
     }
-    return forTargetLanguage(targetLanguage)._buildInstruction(
-      targetLanguage: targetLanguage,
-      confirmed: false,
-    );
+    return forTargetLanguage(
+      targetLanguage,
+    )._buildInstruction(targetLanguage: targetLanguage, confirmed: false);
   }
 
   /// Prompt fragment for a user-confirmed/edited profile.
@@ -103,10 +102,9 @@ class TranslationStyleProfile {
     if (!shouldInjectWhenConfirmed) {
       return '';
     }
-    return forTargetLanguage(targetLanguage)._buildInstruction(
-      targetLanguage: targetLanguage,
-      confirmed: true,
-    );
+    return forTargetLanguage(
+      targetLanguage,
+    )._buildInstruction(targetLanguage: targetLanguage, confirmed: true);
   }
 
   /// Returns a profile safe to inject for [targetLanguage].
@@ -127,9 +125,8 @@ class TranslationStyleProfile {
         .where((String rule) => !_retainsSourceLanguageQuotedProse(rule))
         .toList(growable: false);
 
-    final bool needsQuoteTranslationRule = translationConstraints.any(
-          _retainsSourceLanguageQuotedProse,
-        ) ||
+    final bool needsQuoteTranslationRule =
+        translationConstraints.any(_retainsSourceLanguageQuotedProse) ||
         avoid.any(_retainsSourceLanguageQuotedProse);
     if (needsQuoteTranslationRule) {
       final String quoteRule =

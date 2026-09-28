@@ -65,6 +65,33 @@ class _RetryOnceBatchAdapter implements HttpClientAdapter {
   }
 }
 
+/// Every request answers with a non-JSON gateway error page: a proxy that
+/// returns HTML instead of the chat-completions object. Both the batch and
+/// the per-block request path must treat this as a deterministic parse
+/// failure (TranslationParseException), not a transport error.
+class _GatewayHtmlAdapter implements HttpClientAdapter {
+  int fetchCount = 0;
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    fetchCount += 1;
+    return ResponseBody.fromString(
+      '<html><body><h1>502 Bad Gateway</h1></body></html>',
+      200,
+      headers: <String, List<String>>{
+        Headers.contentTypeHeader: <String>['text/html'],
+      },
+    );
+  }
+}
+
 class _RateLimitThenSuccessBatchAdapter implements HttpClientAdapter {
   _RateLimitThenSuccessBatchAdapter({required this.rateLimitResponses});
 
@@ -1351,7 +1378,7 @@ void main() {
       expect(withGlossary, hasLength(64));
     });
 
-    test('ordinary block cache key remains compatible with v12', () {
+    test('ordinary block cache key includes the positional block id', () {
       final TranslationConfig config = TranslationConfig.defaults().copyWith(
         apiBaseUrl: 'https://api.example.test',
         model: 'example-model',
@@ -1362,7 +1389,12 @@ void main() {
         block: block,
         chapterPath: 'chapter-1.xhtml',
       );
-      final String legacyV12Key = sha256
+      // Block ids are positional within a chapter ("p-3"), so the id pins
+      // the key to the block's position: identical source HTML at two
+      // positions must not share a cache entry (the neighbor context fed
+      // into each prompt differs). Entries keyed without the id hash
+      // differently and are simply never hit again.
+      final String expectedKey = sha256
           .convert(
             utf8.encode(
               <Object>[
@@ -1371,17 +1403,22 @@ void main() {
                 config.model.trim(),
                 config.targetLanguage.trim(),
                 config.lockedGlossary.trim(),
+                // chunkSize joined the key afterwards: batch context changes
+                // with it, so cached translations must not be reused across
+                // sizes.
+                config.chunkSize,
                 config.residualQualityCheck,
                 config.styleProfileEnabled,
                 'none',
                 'chapter-1.xhtml',
+                block.id,
                 block.sourceHtml,
               ].join('|'),
             ),
           )
           .toString();
 
-      expect(currentKey, legacyV12Key);
+      expect(currentKey, expectedKey);
     });
 
     test('author signature block uses an isolated cache key', () {
@@ -1654,6 +1691,41 @@ void main() {
         expect(translated, <String>['<p>Translated after rate limit.</p>']);
       },
     );
+
+    test('an unparseable single-block reply degrades the block instead of '
+        'aborting the batch', () async {
+      final _GatewayHtmlAdapter adapter = _GatewayHtmlAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
+
+      // Every request (batch and per-block) gets a non-JSON gateway error
+      // page: TranslationParseException on every attempt. The block must
+      // keep its source HTML (and be reported as degraded) instead of
+      // throwing a StateError that aborts the whole book.
+      final List<String> translated = await EpubTranslationRepository()
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiBaseUrl: 'https://api.example.test',
+              apiKey: 'sk-test',
+              maxRetries: 2,
+              retryDelaySeconds: 1,
+            ),
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'block-1',
+                tagName: 'p',
+                sourceHtml: '<p>Source text.</p>',
+                sourceText: 'Source text.',
+              ),
+            ],
+          );
+
+      expect(translated, <String>['<p>Source text.</p>']);
+      // Batch attempt (parse fails) + single-block attempt (parse fails,
+      // deterministic so no blind retries of the same prompt).
+      expect(adapter.fetchCount, 2);
+    });
   });
 
   test(
@@ -2077,12 +2149,22 @@ void main() {
       );
 
       expect(adapter.strictRequestCount, 2);
-      expect(adapter.plainInputs, <String>[
-        'Read this sentence right now.',
-        'Translate this tail too.',
-        'Read this sentence right now.',
-        'Translate this tail too.',
-      ]);
+      expect(adapter.plainInputs, hasLength(4));
+      expect(adapter.plainInputs[0], 'Read this sentence right now.');
+      expect(adapter.plainInputs[1], 'Translate this tail too.');
+      // The retried whole round carries the previous failure reason into
+      // the prompt, so the model gets a concrete instruction instead of a
+      // blind re-send of the same rejected prompt.
+      expect(
+        adapter.plainInputs[2],
+        startsWith('Read this sentence right now.\n\n[RETRY]'),
+      );
+      expect(
+        adapter.plainInputs[3],
+        startsWith('Translate this tail too.\n\n[RETRY]'),
+      );
+      expect(adapter.plainInputs[2], contains('Possible untranslated'));
+      expect(adapter.plainInputs[3], contains('Possible untranslated'));
       expect(translated.single, contains('第一段已经翻译。'));
       expect(translated.single, contains('第二段已经翻译。'));
       expect(translated.single, contains('id="body"'));
@@ -2245,25 +2327,29 @@ void main() {
     final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
       ..httpClientAdapter = adapter;
 
-    await expectLater(
-      EpubChapterTranslator().translateBlockBatchForTest(
-        dio: dio,
-        config: TranslationConfig.defaults().copyWith(
-          apiKey: 'sk-test',
-          targetLanguage: 'Chinese',
-          maxRetries: 1,
-        ),
-        blocks: const <ExtractedBlock>[
-          ExtractedBlock(
-            id: 'protected-a',
-            tagName: 'p',
-            sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
-            sourceText: 'First [1]',
+    // The unsafe wrapper is rejected: the block keeps its source
+    // HTML and is reported as degraded instead of aborting the
+    // whole book.
+    final List<String> translated = await EpubChapterTranslator()
+        .translateBlockBatchForTest(
+          dio: dio,
+          config: TranslationConfig.defaults().copyWith(
+            apiKey: 'sk-test',
+            targetLanguage: 'Chinese',
+            maxRetries: 1,
           ),
-        ],
-      ),
-      throwsA(isA<FormatException>()),
-    );
+          blocks: const <ExtractedBlock>[
+            ExtractedBlock(
+              id: 'protected-a',
+              tagName: 'p',
+              sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
+              sourceText: 'First [1]',
+            ),
+          ],
+        );
+    expect(translated, <String>[
+      '<p>First <a href="#n1"><span>[1]</span></a></p>',
+    ]);
   });
 
   for (final MapEntry<String, String> wrapper in <String, String>{
@@ -2289,25 +2375,29 @@ void main() {
       final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
         ..httpClientAdapter = adapter;
 
-      await expectLater(
-        EpubChapterTranslator().translateBlockBatchForTest(
-          dio: dio,
-          config: TranslationConfig.defaults().copyWith(
-            apiKey: 'sk-test',
-            targetLanguage: 'Chinese',
-            maxRetries: 1,
-          ),
-          blocks: const <ExtractedBlock>[
-            ExtractedBlock(
-              id: 'protected-a',
-              tagName: 'p',
-              sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
-              sourceText: 'First [1]',
+      // The unsafe wrapper is rejected: the block keeps its source
+      // HTML and is reported as degraded instead of aborting the
+      // whole book.
+      final List<String> translated = await EpubChapterTranslator()
+          .translateBlockBatchForTest(
+            dio: dio,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              targetLanguage: 'Chinese',
+              maxRetries: 1,
             ),
-          ],
-        ),
-        throwsA(isA<FormatException>()),
-      );
+            blocks: const <ExtractedBlock>[
+              ExtractedBlock(
+                id: 'protected-a',
+                tagName: 'p',
+                sourceHtml: '<p>First <a href="#n1"><span>[1]</span></a></p>',
+                sourceText: 'First [1]',
+              ),
+            ],
+          );
+      expect(translated, <String>[
+        '<p>First <a href="#n1"><span>[1]</span></a></p>',
+      ]);
     });
   }
 
@@ -2764,43 +2854,64 @@ void main() {
             },
           ],
         }.entries) {
-      test('rejects slot response with ${malformed.key}', () async {
-        final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
-          malformed.value,
-        );
-        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
-          ..httpClientAdapter = adapter;
+      test(
+        'degrades slot response with ${malformed.key} instead of aborting',
+        () async {
+          final _FootnoteResponseAdapter adapter = _FootnoteResponseAdapter(
+            malformed.value,
+          );
+          final Dio dio = Dio(
+            BaseOptions(baseUrl: 'https://api.example.test/v1'),
+          )..httpClientAdapter = adapter;
+          final EpubChapterTranslator translator = EpubChapterTranslator();
 
-        final bool duplicateBlock = malformed.key == 'duplicate block id';
-        final bool duplicateSlot = malformed.key == 'duplicate slot id';
-        await expectLater(
-          EpubChapterTranslator().translateFootnoteBatchForTest(
-            dio: dio,
-            config: TranslationConfig.defaults().copyWith(
-              apiKey: 'sk-test',
-              targetLanguage: 'Chinese',
-              maxRetries: 1,
-            ),
-            references: <FootnoteBlockReference>[
-              _footnoteReference(
-                0,
-                duplicateSlot ? 'Before * after' : 'Footnote text. *',
-                sourceHtml: duplicateSlot
-                    ? '<p>Before <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> after</p>'
-                    : '<p>Footnote text. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
-              ),
-              if (duplicateBlock)
-                _footnoteReference(
-                  1,
-                  'Second footnote. *',
-                  sourceHtml:
-                      '<p>Second footnote. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>',
+          final bool duplicateBlock = malformed.key == 'duplicate block id';
+          final bool duplicateSlot = malformed.key == 'duplicate slot id';
+          const String firstSourceHtml =
+              '<p>Footnote text. <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a></p>';
+          const String beforeAfterSourceHtml =
+              '<p>Before <a href="chapter.xhtml#footnote_ref_1" role="doc-backlink"><span class="footnote_num">*</span></a> after</p>';
+          const String secondSourceHtml =
+              '<p>Second footnote. <a href="chapter.xhtml#footnote_ref_2" role="doc-backlink"><span class="footnote_num">*</span></a></p>';
+          // The malformed slot reply is rejected — its slot texts are
+          // never used and never cached — and each affected footnote keeps
+          // its source HTML and is reported as degraded instead of
+          // aborting the whole book, consistent with the normal block
+          // path.
+          final Map<String, String> translated = await translator
+              .translateFootnoteBatchForTest(
+                dio: dio,
+                config: TranslationConfig.defaults().copyWith(
+                  apiKey: 'sk-test',
+                  targetLanguage: 'Chinese',
+                  maxRetries: 1,
                 ),
-            ],
-          ),
-          throwsA(isA<FormatException>()),
-        );
-      });
+                references: <FootnoteBlockReference>[
+                  _footnoteReference(
+                    0,
+                    duplicateSlot ? 'Before * after' : 'Footnote text. *',
+                    sourceHtml: duplicateSlot
+                        ? beforeAfterSourceHtml
+                        : firstSourceHtml,
+                  ),
+                  if (duplicateBlock)
+                    _footnoteReference(
+                      1,
+                      'Second footnote. *',
+                      sourceHtml: secondSourceHtml,
+                    ),
+                ],
+              );
+
+          expect(translated, <String, String>{
+            'f0:p-1': duplicateSlot ? beforeAfterSourceHtml : firstSourceHtml,
+            if (duplicateBlock) 'f1:p-1': secondSourceHtml,
+          });
+          final Set<String> degraded = translator.getDegradedBlockIdsForTest();
+          expect(degraded, isNotEmpty);
+          expect(degraded, everyElement(endsWith('\u0000p-1')));
+        },
+      );
     }
 
     for (final MapEntry<String, _MalformedFootnoteCase> malformed

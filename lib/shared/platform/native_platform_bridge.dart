@@ -19,13 +19,29 @@ enum WindowsPathNotice {
   /// behind the app window.
   dialogOpened,
 
-  /// The chosen path exceeds MAX_PATH (260 chars) while the system
-  /// long-path policy (LongPathsEnabled) is off.
+  /// The chosen path is close enough to MAX_PATH (260 chars) that the
+  /// suffixes the app appends (`.tmp.*`, `.bak.*`, `\name.epub`) could push
+  /// the final write path over the limit, while the system long-path
+  /// policy (LongPathsEnabled) is off.
   longPathWithoutPolicy,
 
   /// The chosen path is under OneDrive; on-demand placeholder files may
   /// need to download before import can proceed.
   oneDrivePlaceholder,
+}
+
+/// Thrown when the Android KeyStore key was invalidated (the user changed
+/// their lock-screen credential or biometric enrollment) and the native side
+/// had to regenerate it: anything encrypted with the old key is
+/// unrecoverable. Callers should tell the user to re-enter their keys
+/// rather than reporting a transient read failure.
+class SecretKeyRotatedException implements Exception {
+  const SecretKeyRotatedException();
+
+  @override
+  String toString() =>
+      'SecretKeyRotatedException: device key was rotated; '
+      'stored secrets can no longer be decrypted.';
 }
 
 class NativePlatformBridge {
@@ -34,6 +50,37 @@ class NativePlatformBridge {
   static const MethodChannel _androidChannel = MethodChannel(
     'epub_translator_flutter/android_export',
   );
+
+  /// Timeout for Android KeyStore secret operations. The native side runs
+  /// them on a single-thread executor, so a wedged keystore daemon would
+  /// otherwise hang the settings page forever; the file operations already
+  /// use the same 5-minute budget.
+  @visibleForTesting
+  static Duration androidSecretTimeout = const Duration(minutes: 5);
+
+  /// Runs an Android KeyStore secret operation with [androidSecretTimeout].
+  /// Public (not private) so tests can drive the timeout without an
+  /// Android device; the production callers below use it too.
+  ///
+  /// A `SECRET_KEY_ROTATED` platform error (the Android KeyStore key was
+  /// invalidated and regenerated) is translated into
+  /// [SecretKeyRotatedException] so callers can tell the user to re-enter
+  /// their keys instead of reporting a generic read failure.
+  static Future<T?> invokeAndroidSecret<T>(
+    String method,
+    Map<String, Object?> args,
+  ) async {
+    try {
+      return await _androidChannel
+          .invokeMethod<T>(method, args)
+          .timeout(androidSecretTimeout);
+    } on PlatformException catch (error) {
+      if (error.code == 'SECRET_KEY_ROTATED') {
+        throw const SecretKeyRotatedException();
+      }
+      rethrow;
+    }
+  }
 
   /// Service grouping for desktop secret helpers: `secret-tool` attributes
   /// on Linux and the keychain service on macOS. Keeps the three API-key
@@ -69,6 +116,35 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     }
 
     return null;
+  }
+
+  /// Tells the Android native side which import files are referenced by job
+  /// history so its 7-day stale-import sweep never deletes them (retrying a
+  /// weeks-old history entry must find its source file). No-op off Android.
+  /// Callers pass the current history's input paths; the native side keeps
+  /// only the distinct non-blank entries (see [protectedImportPathsFromJobs]).
+  static Future<void> setProtectedImportPaths(List<String> paths) async {
+    if (kIsWeb || !Platform.isAndroid) {
+      return;
+    }
+    await _androidChannel.invokeMethod<void>(
+      'setProtectedImportPaths',
+      <String, Object?>{'paths': protectedImportPathsFromJobs(paths)},
+    );
+  }
+
+  /// Normalizes the raw input-path list for [setProtectedImportPaths]:
+  /// drops blanks and de-duplicates, preserving first-seen order. Pure so
+  /// it can be unit tested off Android.
+  @visibleForTesting
+  static List<String> protectedImportPathsFromJobs(Iterable<String> paths) {
+    final List<String> distinct = <String>[];
+    for (final String path in paths) {
+      if (path.isNotEmpty && !distinct.contains(path)) {
+        distinct.add(path);
+      }
+    }
+    return distinct;
   }
 
   static Future<String?> appDocumentsDirectory() async {
@@ -162,7 +238,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 
   static Future<String?> readSecret(String name) async {
     if (!kIsWeb && Platform.isAndroid) {
-      return _androidChannel.invokeMethod<String>('readSecret', {'name': name});
+      return invokeAndroidSecret<String>('readSecret', {'name': name});
     }
 
     if (!kIsWeb && Platform.isWindows) {
@@ -210,7 +286,7 @@ $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $nu
 
   static Future<void> writeSecret(String name, String value) async {
     if (!kIsWeb && Platform.isAndroid) {
-      await _androidChannel.invokeMethod<void>('writeSecret', {
+      await invokeAndroidSecret<void>('writeSecret', {
         'name': name,
         'value': value,
       });
@@ -253,16 +329,34 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
 
   static Future<void> deleteSecret(String name) async {
     if (!kIsWeb && Platform.isAndroid) {
-      await _androidChannel.invokeMethod<void>('deleteSecret', {'name': name});
+      await invokeAndroidSecret<void>('deleteSecret', {'name': name});
       return;
     }
 
     if (!kIsWeb && Platform.isWindows) {
+      // A transient antivirus/indexer lock must not fail the delete, but a
+      // file that survives deletion must not be reported as deleted either:
+      // _saveSecret marks the slot "missing" unconditionally, so a silent
+      // failure would leave the old key readable while the UI claims it is
+      // gone. Retry once, then verify and throw honestly.
       final File file = await _windowsSecretFile(name);
-      if (await file.exists()) {
-        await file.delete();
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          if (await file.exists()) {
+            await file.delete();
+          }
+        } catch (_) {
+          // Best effort per attempt; the verification below decides.
+        }
+        if (!await file.exists()) {
+          return;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
       }
-      return;
+      throw StateError(
+        'Could not delete the stored secret file '
+        '(still present after retry): ${file.path}',
+      );
     }
 
     if (!kIsWeb && Platform.isLinux) {
@@ -300,27 +394,13 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   /// stdout; a missing item yields empty output.
   @visibleForTesting
   static List<String> linuxSecretLookupArgs(String service, String name) {
-    return <String>[
-      'secret-tool',
-      'lookup',
-      'service',
-      service,
-      'name',
-      name,
-    ];
+    return <String>['secret-tool', 'lookup', 'service', service, 'name', name];
   }
 
   /// Builds the argv for `secret-tool clear`.
   @visibleForTesting
   static List<String> linuxSecretClearArgs(String service, String name) {
-    return <String>[
-      'secret-tool',
-      'clear',
-      'service',
-      service,
-      'name',
-      name,
-    ];
+    return <String>['secret-tool', 'clear', 'service', service, 'name', name];
   }
 
   static Future<String?> _readLinuxSecret(String name) async {
@@ -581,6 +661,11 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     // open, so kill PowerShell instead of leaving it lingering.
     final Process process = await Process.start('powershell', <String>[
       '-NoProfile',
+      // Harmless safety net for enterprise machines with a Restricted
+      // execution policy; -Command is not policy-gated, but this costs
+      // nothing if some wrapper re-interprets the invocation.
+      '-ExecutionPolicy',
+      'Bypass',
       '-STA',
       '-Command',
       script,
@@ -590,7 +675,15 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
         process,
       ).timeout(const Duration(minutes: 5));
       if (result.exitCode != 0) {
-        final String stderr = _decodeWindowsDialogBytes(result.stderr).trim();
+        final String stderr = decodeWindowsDialogBytes(result.stderr).trim();
+        // The PowerShell host (powershell.exe 5.1) is not covered by the
+        // app's longPathAware manifest entry, so over-long paths fail
+        // inside the WinForms dialog even when the system policy is on.
+        // Surface that as a dedicated, actionable error instead of a raw
+        // .NET stack trace.
+        if (looksLikeLongPathFailure(stderr)) {
+          throw WindowsLongPathException(stderr);
+        }
         throw StateError(
           stderr.isNotEmpty ? stderr : 'Windows file dialog failed.',
         );
@@ -601,6 +694,15 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       process.kill();
       return null;
     }
+  }
+
+  /// True when PowerShell stderr looks like a .NET path-too-long failure
+  /// from the WinForms file dialog.
+  @visibleForTesting
+  static bool looksLikeLongPathFailure(String stderr) {
+    final String lower = stderr.toLowerCase();
+    return lower.contains('pathtoolongexception') ||
+        lower.contains('less than 260 characters');
   }
 
   /// Collects a [ProcessResult] from an already-started process, keeping
@@ -642,7 +744,12 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       return;
     }
     try {
-      if (selectedPath.length > 260) {
+      // Warn with headroom: the app appends its own suffixes after
+      // selection (`.tmp.<16 digits>` = 22 chars, `.bak.<13 digits>` = 18,
+      // plus `\name.epub` on output dirs), and MAX_PATH counts the
+      // terminating NUL. A path that merely fits today can overflow at
+      // commit time — after the translation has already been paid for.
+      if (isLongPathWarningCandidate(selectedPath)) {
         final bool? enabled = await _windowsLongPathsEnabled();
         // null = registry read failed: stay silent rather than nagging.
         if (enabled == false) {
@@ -657,30 +764,105 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     }
   }
 
+  /// Headroom reserved in the long-path warning for suffixes the app
+  /// appends after selection: `.tmp.<16 digits>` (22), `.bak.<13 digits>`
+  /// (18), plus a path separator and `.epub` on output directories.
+  static const int _windowsPathSuffixHeadroom = 48;
+
+  /// Public read of the Windows long-path policy
+  /// (HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled).
+  /// Returns null when the policy could not be determined; callers must fail
+  /// open on null (stay silent rather than blocking on a guess). Cached per
+  /// process: spawning PowerShell is slow.
+  static Future<bool?> windowsLongPathsEnabled() {
+    return _windowsLongPathsEnabled();
+  }
+
+  /// Fires [WindowsPathNotice]s for a path that did not come from one of the
+  /// picker dialogs (drag-drop or manual entry), which bypass the observation
+  /// hook inside [pickEpubFile]/[pickDirectory]. Best-effort: never throws.
+  /// Callers must skip [WindowsPathNotice.dialogOpened] (only the dialogs
+  /// produce it) and should only call this on Windows.
+  static Future<void> observeWindowsPath(
+    String? selectedPath,
+    void Function(WindowsPathNotice notice)? onWindowsNotice,
+  ) {
+    return _notifyWindowsPathObservations(selectedPath, onWindowsNotice);
+  }
+
+  /// True when [selectedPath] is close enough to MAX_PATH (260) that the
+  /// suffixes the app appends after selection could push the final write
+  /// path over the limit.
+  ///
+  /// Visible for testing.
+  @visibleForTesting
+  static bool isLongPathWarningCandidate(String selectedPath) {
+    return selectedPath.length > 260 - _windowsPathSuffixHeadroom;
+  }
+
   /// Best-effort read of the Windows long-path policy
   /// (HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled).
   /// Returns null when the query fails; a missing value counts as disabled.
-  /// Cached per process: spawning PowerShell is slow.
+  /// Cached per process (including failures): spawning PowerShell is slow,
+  /// and a broken registry read must not respawn it on every selection.
   static bool? _windowsLongPathsEnabledCache;
+  static bool _windowsLongPathsQueried = false;
 
   static Future<bool?> _windowsLongPathsEnabled() async {
-    if (_windowsLongPathsEnabledCache != null) {
+    if (_windowsLongPathsQueried) {
       return _windowsLongPathsEnabledCache;
     }
     try {
-      final ProcessResult result =
-          await Process.run('powershell', <String>[
-            '-NoProfile',
-            '-Command',
-            r"(Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled",
-          ]).timeout(const Duration(seconds: 30));
-      _windowsLongPathsEnabledCache = parseLongPathsEnabledOutput(
-        result.stdout.toString(),
-      );
+      // Process.start (not Process.run) so a 30s timeout kills the child:
+      // Process.run's timeout only stops *waiting* and leaves the
+      // PowerShell behind.
+      final Process process = await Process.start('powershell', <String>[
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        r"(Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled",
+      ]);
+      try {
+        final ProcessResult result = await _collectProcessResult(
+          process,
+        ).timeout(const Duration(seconds: 30));
+        _windowsLongPathsEnabledCache = resolveLongPathsPolicy(
+          exitCode: result.exitCode,
+          stdout: decodeWindowsDialogBytes(result.stdout),
+        );
+      } on TimeoutException {
+        process.kill();
+        _windowsLongPathsEnabledCache = null;
+      }
     } catch (_) {
       _windowsLongPathsEnabledCache = null;
     }
+    // Cache the outcome even when the query failed: without this a
+    // persistently failing registry read would spawn a PowerShell (and
+    // block up to 30s) on every long-path selection.
+    _windowsLongPathsQueried = true;
     return _windowsLongPathsEnabledCache;
+  }
+
+  /// Decides the long-path policy from a finished PowerShell query.
+  /// A non-zero exit code (GPO execution policy, broken PowerShell, …)
+  /// means the query itself failed: return null (unknown, fail open)
+  /// instead of misreporting "disabled". An empty stdout with exit code 0
+  /// means the registry value is missing, which counts as disabled.
+  ///
+  /// Visible for testing.
+  @visibleForTesting
+  static bool? resolveLongPathsPolicy({
+    required int exitCode,
+    required String stdout,
+  }) {
+    if (exitCode != 0) {
+      return null;
+    }
+    // Exit 0 with empty stdout = the registry value is missing, which
+    // counts as disabled (see [parseLongPathsEnabledOutput]).
+    return parseLongPathsEnabledOutput(stdout);
   }
 
   /// Parses the LongPathsEnabled registry value as printed by PowerShell:
@@ -701,20 +883,17 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     List<String> args, {
     String? stdinInput,
   }) {
-    return _runDesktopSecretHelper(
-      executable,
-      args,
-      stdinInput: stdinInput,
-    );
+    return _runDesktopSecretHelper(executable, args, stdinInput: stdinInput);
   }
 
   @visibleForTesting
   static String? decodeWindowsDialogSelection(Object? stdout) {
-    final String selected = _decodeWindowsDialogBytes(stdout).trim();
+    final String selected = decodeWindowsDialogBytes(stdout).trim();
     return selected.isEmpty ? null : path.normalize(selected);
   }
 
-  static String _decodeWindowsDialogBytes(Object? output) {
+  @visibleForTesting
+  static String decodeWindowsDialogBytes(Object? output) {
     if (output is List<int>) {
       // Never let one malformed byte turn into a FormatException that masks
       // the real dialog error.
@@ -741,12 +920,102 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     return File(path.join(secretsDir.path, '$safeName.dpapi'));
   }
 
+  /// Test seam: replaces the real [Process.start] for Windows secret
+  /// scripts so the [ProcessException]-to-[StateError] mapping can be
+  /// tested off Windows.
+  @visibleForTesting
+  static Future<Process> Function(String executable, List<String> arguments)?
+  debugWindowsProcessStarter;
+
+  /// Whether this process runs elevated (UAC administrator) on Windows.
+  /// DPAPI-encrypted secrets are tied to the user *and* the logon session
+  /// type: keys saved while elevated are not decryptable from a
+  /// non-elevated process and vice versa. The settings page warns when
+  /// elevated so the user isn't confused by "missing" keys. The check runs
+  /// once per process; off Windows it always returns false.
+  static Future<bool> isWindowsElevated() {
+    return _windowsElevatedFuture ??= _checkWindowsElevated();
+  }
+
+  static Future<bool>? _windowsElevatedFuture;
+
+  static Future<bool> _checkWindowsElevated() async {
+    if (!Platform.isWindows) {
+      return false;
+    }
+    // Query the current process token directly instead of parsing
+    // `whoami /groups`: the group listing's "deny only" marker text is
+    // localized on non-English Windows and easy to misparse, while this
+    // prints a culture-invariant True/False.
+    const String script =
+        r'$p = New-Object Security.Principal.WindowsPrincipal('
+        r'[Security.Principal.WindowsIdentity]::GetCurrent());'
+        r'$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)';
+    try {
+      final Process process = await startWindowsSecretProcess(<String>[
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        script,
+      ]);
+      final String output = await process.stdout
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 10));
+      unawaited(process.stderr.drain());
+      await process.exitCode.timeout(const Duration(seconds: 10));
+      return parseWindowsElevationResult(output);
+    } catch (_) {
+      // PowerShell missing or hanging: fail closed (not elevated).
+      return false;
+    }
+  }
+
+  /// Parses the elevation check output: the script prints a single
+  /// culture-invariant `True`/`False`. Anything unrecognized fails closed.
+  @visibleForTesting
+  static bool parseWindowsElevationResult(String output) {
+    final String normalized = output.trim().toLowerCase();
+    if (normalized == 'true') {
+      return true;
+    }
+    if (normalized == 'false') {
+      return false;
+    }
+    // Tolerate PowerShell wrapping the boolean in extra whitespace or a
+    // trailing newline variant; anything else fails closed.
+    if (normalized.contains('true') && !normalized.contains('false')) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Starts the PowerShell child process for Windows secret operations.
+  /// A missing/unlaunchable powershell.exe (broken PATH, broken execution
+  /// host) surfaces as a [StateError] the settings UI already knows how to
+  /// report, instead of a raw [ProcessException] escaping to the caller.
+  @visibleForTesting
+  static Future<Process> startWindowsSecretProcess(
+    List<String> arguments,
+  ) async {
+    final Future<Process> Function(String, List<String>) starter =
+        debugWindowsProcessStarter ?? Process.start;
+    try {
+      return await starter('powershell', arguments);
+    } on ProcessException catch (error) {
+      throw StateError('无法启动 PowerShell 子进程：${error.message}');
+    }
+  }
+
   static Future<String> _runWindowsSecretScript(
     String script,
     String input,
   ) async {
-    final Process process = await Process.start('powershell', <String>[
+    final Process process = await startWindowsSecretProcess(<String>[
       '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
       '-Command',
       script,
     ]);
@@ -799,4 +1068,17 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     }
     return stdoutText;
   }
+}
+
+/// Thrown when a Windows file dialog fails because a path exceeds MAX_PATH.
+/// Carries the raw PowerShell stderr for logging; callers map this type to
+/// a localized AppStrings message (the bridge cannot localize itself
+/// without creating an import cycle).
+class WindowsLongPathException implements Exception {
+  WindowsLongPathException(this.detail);
+
+  final String detail;
+
+  @override
+  String toString() => 'WindowsLongPathException: $detail';
 }

@@ -90,3 +90,6 @@ package-lock.json
 
 # Test coverage
 coverage/
+
+# 测试跑出来的本地缓存产物
+/translation_cache/
