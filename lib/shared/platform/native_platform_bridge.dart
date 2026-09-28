@@ -9,6 +9,7 @@ import 'package:path/path.dart' as path;
 
 import '../io/atomic_file_writer.dart';
 import '../logging/app_logger.dart';
+import 'windows_elevation_check.dart';
 
 /// Windows-only observations about file selection that the UI may want to
 /// surface as log lines. The bridge cannot localize these itself (importing
@@ -931,17 +932,19 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   /// DPAPI-encrypted secrets are tied to the user *and* the logon session
   /// type: keys saved while elevated are not decryptable from a
   /// non-elevated process and vice versa. The settings page warns when
-  /// elevated so the user isn't confused by "missing" keys. The check runs
-  /// once per process; off Windows it always returns false.
+  /// elevated so the user isn't confused by "missing" keys. Successful results
+  /// are cached for the process; off Windows it always returns false.
   static Future<bool> isWindowsElevated() {
-    return _windowsElevatedFuture ??= _checkWindowsElevated();
+    return startWindowsElevationCheck().result;
   }
 
-  static Future<bool>? _windowsElevatedFuture;
+  static bool? _windowsElevatedResult;
 
-  static Future<bool> _checkWindowsElevated() async {
-    if (!Platform.isWindows) {
-      return false;
+  /// The settings widget owns this handle and cancels it on disposal. Only
+  /// completed probes are cached, so timeouts can be retried on the next visit.
+  static WindowsElevationCheck startWindowsElevationCheck() {
+    if (!Platform.isWindows || _windowsElevatedResult != null) {
+      return WindowsElevationCheck.completed(_windowsElevatedResult ?? false);
     }
     // Query the current process token directly instead of parsing
     // `whoami /groups`: the group listing's "deny only" marker text is
@@ -951,29 +954,17 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
         r'$p = New-Object Security.Principal.WindowsPrincipal('
         r'[Security.Principal.WindowsIdentity]::GetCurrent());'
         r'$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)';
-    try {
-      final Process process = await startWindowsSecretProcess(<String>[
+    return WindowsElevationCheck(
+      start: () => startWindowsSecretProcess(<String>[
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
         '-Command',
         script,
-      ]);
-      // NOTE: no `.timeout()` here on purpose. This future is cached
-      // process-wide ([isWindowsElevated]) and subscribed from a FutureBuilder:
-      // a timeout timer created inside the future would outlive the widget
-      // tree in widget tests ("A Timer is still pending even after the widget
-      // tree was disposed"). The settings page owns the timeout instead: it
-      // starts its own 10s timer and fails closed when it fires, cancelling
-      // the timer in dispose.
-      final String output = await process.stdout.transform(utf8.decoder).join();
-      unawaited(process.stderr.drain());
-      await process.exitCode;
-      return parseWindowsElevationResult(output);
-    } catch (_) {
-      // PowerShell missing or hanging: fail closed (not elevated).
-      return false;
-    }
+      ]),
+      parseOutput: parseWindowsElevationResult,
+      onSuccess: (bool value) => _windowsElevatedResult = value,
+    );
   }
 
   /// Parses the elevation check output: the script prints a single

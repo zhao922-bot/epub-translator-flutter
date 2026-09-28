@@ -12,6 +12,7 @@ import '../../domain/repositories/translation_repository.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'epub_navigation.dart';
 import 'proper_name_normalizer.dart';
 import 'protected_anchor_text_slots.dart';
 import 'xhtml_html_compatibility.dart';
@@ -95,11 +96,7 @@ body.epub-translator-cjk [data-translation="true"] {
     required List<InspectedChapter> chapters,
     required String targetLanguage,
   }) {
-    final Map<String, String> labelsByPath = <String, String>{
-      for (final InspectedChapter chapter in chapters)
-        if (_navigationLabelForChapter(chapter) case final String label)
-          path.posix.normalize(chapter.path): label,
-    };
+    final labelsByPath = _navigationLabels(chapters);
     return EpubIsolateWorker.renderNavigationMetadata(
       archiveFiles: archiveFiles,
       labelsByPath: labelsByPath,
@@ -158,11 +155,7 @@ body.epub-translator-cjk [data-translation="true"] {
     // Navigation metadata (OPF language + translated NCX labels) is rendered
     // inside the isolate from the same decoded archive, so the whole book is
     // never loaded into the main isolate just to read three small XML files.
-    final Map<String, String> navigationLabelsByPath = <String, String>{
-      for (final InspectedChapter chapter in chapters)
-        if (_navigationLabelForChapter(chapter) case final String label)
-          path.posix.normalize(chapter.path): label,
-    };
+    final navigationLabelsByPath = _navigationLabels(chapters);
     _validateXmlReplacements(translatedHtmlByPath);
     throwIfCancelled();
     final bool committed;
@@ -220,7 +213,9 @@ body.epub-translator-cjk [data-translation="true"] {
     final List<dom.Element> targets = _extractor
         .extractTranslatableTextElements(document);
     final int count = min(targets.length, chapter.blocks.length);
+    final languageTag = _languageTagForTarget(targetLanguage);
     bool containsCjkTranslation = false;
+    bool hasTranslation = false;
     for (int index = 0; index < count; index += 1) {
       final dom.Element target = targets[index];
       final ExtractedBlock block = chapter.blocks[index];
@@ -228,8 +223,10 @@ body.epub-translator-cjk [data-translation="true"] {
       if (translatedHtml.isEmpty) {
         continue;
       }
+      hasTranslation = true;
       final String normalizedTranslation = _normalizeCjkInitialTypography(
         translatedHtml,
+        container: _replacementContainerFor(target),
       );
       containsCjkTranslation =
           containsCjkTranslation || _containsCjk(normalizedTranslation);
@@ -257,8 +254,20 @@ body.epub-translator-cjk [data-translation="true"] {
           state: properNameState,
         );
       }
+      if (languageTag != null &&
+          !degradedBlockIds.contains(
+            degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
+          )) {
+        translationPart = _labelTranslationLanguage(
+          translationPart,
+          target,
+          languageTag,
+        );
+      }
       var replacement = bilingual
-          ? '${target.outerHtml}\n$translationPart'
+          ? (const {'li', 'td', 'th'}.contains(target.localName)
+                ? _bilingualStructuralItem(target, translationPart)
+                : '${target.outerHtml}\n$translationPart')
           : translationPart;
       if (degradedBlockIds.contains(
         EpubRepacker.degradedKeyForBlock(
@@ -274,14 +283,83 @@ body.epub-translator-cjk [data-translation="true"] {
       }
       _replaceNodeWithHtml(target, replacement);
     }
+    if (hasTranslation && !bilingual && languageTag != null) {
+      // Keep the original inherited language for unselected / degraded text.
+      // Each translated block carries its own target-language override.
+      final body = document.body;
+      final originalLanguage =
+          document.documentElement?.attributes['xml:lang'] ??
+          document.documentElement?.attributes['lang'];
+      if (body != null &&
+          originalLanguage != null &&
+          !body.attributes.containsKey('lang') &&
+          !body.attributes.containsKey('xml:lang')) {
+        body.attributes['lang'] = originalLanguage;
+        body.attributes['xml:lang'] = originalLanguage;
+      }
+      document.documentElement?.attributes['lang'] = languageTag;
+      document.documentElement?.attributes['xml:lang'] = languageTag;
+    }
     if (containsCjkTranslation) {
-      _applyCjkReadingCompatibility(
-        document,
-        languageTag: _languageTagForTarget(targetLanguage),
-        bilingual: bilingual,
-      );
+      _applyCjkReadingCompatibility(document);
     }
     return XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
+  }
+
+  /// Preserve list numbering and the table grid (including row/col spans).
+  /// Translations are content inside the original structural element.
+  String _bilingualStructuralItem(dom.Element source, String translationHtml) {
+    final dom.Element item = source.clone(true);
+    final dom.DocumentFragment fragment = html_parser.parseFragment(
+      translationHtml,
+      container: _replacementContainerFor(source),
+    );
+    for (final dom.Node node in fragment.nodes.toList()) {
+      if (node is dom.Element && node.localName == source.localName) {
+        final dom.Element translation = dom.Element.tag('div');
+        translation.attributes.addAll(node.attributes);
+        translation.attributes.remove('value');
+        translation.attributes.remove('rowspan');
+        translation.attributes.remove('colspan');
+        translation.attributes.remove('headers');
+        translation.attributes.remove('scope');
+        translation.nodes.addAll(node.nodes.toList());
+        item.append(translation);
+      } else {
+        item.nodes.add(node);
+      }
+    }
+    return item.outerHtml;
+  }
+
+  String _labelTranslationLanguage(
+    String markup,
+    dom.Element target,
+    String languageTag,
+  ) {
+    final fragment = html_parser.parseFragment(
+      markup,
+      container: _replacementContainerFor(target),
+    );
+    // A bare-text API response also needs a local language boundary.
+    for (final node in fragment.nodes.toList()) {
+      if (node is dom.Text && node.data.trim().isNotEmpty) {
+        final wrapper = dom.Element.tag('span');
+        final index = fragment.nodes.indexOf(node);
+        node.remove();
+        wrapper.nodes.add(node);
+        fragment.nodes.insert(index, wrapper);
+      }
+    }
+    for (final element in fragment.querySelectorAll('*')) {
+      if (element.parentNode == fragment ||
+          element.attributes.containsKey('lang') ||
+          element.attributes.containsKey('xml:lang')) {
+        element.attributes['lang'] = languageTag;
+        element.attributes['xml:lang'] = languageTag;
+      }
+    }
+    return fragment.outerHtml;
   }
 
   /// The `parseFragment` container hint for a replacement: table cells need
@@ -391,11 +469,17 @@ body.epub-translator-cjk [data-translation="true"] {
     return fragment.outerHtml;
   }
 
-  String _normalizeCjkInitialTypography(String translatedHtml) {
+  String _normalizeCjkInitialTypography(
+    String translatedHtml, {
+    String container = 'body',
+  }) {
     final String parserSafe = XhtmlHtmlCompatibility.normalizeForHtmlParser(
       translatedHtml,
     );
-    final dom.DocumentFragment fragment = html_parser.parseFragment(parserSafe);
+    final dom.DocumentFragment fragment = html_parser.parseFragment(
+      parserSafe,
+      container: container,
+    );
     if (!_containsCjk(fragment.text ?? '')) {
       return parserSafe;
     }
@@ -499,24 +583,12 @@ body.epub-translator-cjk [data-translation="true"] {
     }
   }
 
-  void _applyCjkReadingCompatibility(
-    dom.Document document, {
-    required String? languageTag,
-    bool bilingual = false,
-  }) {
+  void _applyCjkReadingCompatibility(dom.Document document) {
     final dom.Element? body = document.body;
     if (body == null) {
       return;
     }
     body.classes.add('epub-translator-cjk');
-    final dom.Element? root = document.documentElement;
-    // In bilingual mode the source paragraphs keep their original language;
-    // only the translation blocks carry the target lang (set by
-    // _sanitizeForBilingual), so the root element must not be relabeled.
-    if (root != null && languageTag != null && !bilingual) {
-      root.attributes['lang'] = languageTag;
-      root.attributes['xml:lang'] = languageTag;
-    }
     for (final dom.Element anchor in body.querySelectorAll('a:not([href])')) {
       anchor.classes.add('epub-translator-anchor-marker');
     }
@@ -590,11 +662,7 @@ body.epub-translator-cjk [data-translation="true"] {
     Map<String, String> renderedByPath,
     List<InspectedChapter> chapters,
   ) {
-    final Map<String, String> labelsByPath = <String, String>{
-      for (final InspectedChapter chapter in chapters)
-        if (_navigationLabelForChapter(chapter) case final String label)
-          path.posix.normalize(chapter.path): label,
-    };
+    final labelsByPath = _navigationLabels(chapters);
     if (labelsByPath.isEmpty) {
       return;
     }
@@ -607,21 +675,18 @@ body.epub-translator-cjk [data-translation="true"] {
         continue;
       }
       final dom.Document document = html_parser.parse(rendered);
+      // EPUB 3 nav documents are handled from the manifest in the isolate.
+      // Applying this legacy heuristic would also overwrite page-list labels.
+      if (document.querySelectorAll('nav').any(isEpubTocElement)) {
+        continue;
+      }
       bool changed = false;
       for (final dom.Element anchor in document.querySelectorAll('a[href]')) {
         final String href = anchor.attributes['href'] ?? '';
         if (href.isEmpty || Uri.tryParse(href)?.hasScheme == true) {
           continue;
         }
-        // Decode percent-encoded hrefs the same way NCX `src` values are
-        // decoded, so `chapter%E4%B8%AD.xhtml` resolves against the decoded
-        // chapter paths in labelsByPath.
-        final String targetPath = path.posix.normalize(
-          path.posix.join(
-            path.posix.dirname(chapter.path),
-            _decodeTocHrefPath(href.split('#').first),
-          ),
-        );
+        final targetPath = navigationTargetKey(chapter.path, href);
         final String? label = labelsByPath[targetPath];
         if (label == null || anchor.text.trim().isEmpty) {
           continue;
@@ -636,28 +701,74 @@ body.epub-translator-cjk [data-translation="true"] {
     }
   }
 
-  /// Percent-decodes an HTML TOC href path the same way NCX `src` values
-  /// are decoded (`EpubIsolateWorker` side), so `%E4%B8%AD`-style hrefs
-  /// resolve against the decoded chapter paths. Falls back to the raw
-  /// value on malformed input.
-  static String _decodeTocHrefPath(String raw) {
-    try {
-      return Uri.decodeFull(raw);
-    } catch (_) {
-      return raw;
+  Map<String, String> _navigationLabels(List<InspectedChapter> chapters) {
+    final labels = <String, String>{};
+    for (final chapter in chapters) {
+      if (!chapter.includeInTranslation) continue;
+      final chapterPath = path.posix.normalize(chapter.path);
+      final chapterLabel = _navigationLabelForChapter(chapter);
+      if (chapterLabel != null) labels[chapterPath] = chapterLabel;
+      // Translation releases sourceHtml after caching. Recreate the same
+      // extraction boundaries from the retained chapter document for export.
+      final originalDocument = html_parser.parse(
+        XhtmlHtmlCompatibility.normalizeForHtmlParser(chapter.originalHtml),
+      );
+      final originalBlocks = _extractor.extractBlocks(
+        originalDocument,
+        chapterPath: chapter.path,
+      );
+      final sourcesById = {for (final block in originalBlocks) block.id: block};
+      for (final block in chapter.blocks) {
+        if (block.translatedHtml?.trim().isNotEmpty != true) continue;
+        final source = html_parser.parseFragment(
+          XhtmlHtmlCompatibility.normalizeForHtmlParser(
+            sourcesById[block.id]?.sourceHtml ?? block.sourceHtml,
+          ),
+        );
+        final translated = html_parser.parseFragment(block.translatedHtml!);
+        final headings = source.querySelectorAll('h1,h2,h3,h4,h5,h6');
+        final translatedHeadings = translated.querySelectorAll(
+          'h1,h2,h3,h4,h5,h6',
+        );
+        // Only pair structurally matching headings; preserve unknown labels.
+        if (headings.length != translatedHeadings.length) continue;
+        for (var i = 0; i < headings.length; i++) {
+          final label = translatedHeadings[i].text
+              .replaceAll(RegExp(r'\s+'), ' ')
+              .trim();
+          if (label.isEmpty) continue;
+          for (final element in [
+            headings[i],
+            ...headings[i].querySelectorAll('[id], a[name]'),
+          ]) {
+            final id = element.attributes['id'] ?? element.attributes['name'];
+            if (id != null && id.isNotEmpty) labels['$chapterPath#$id'] = label;
+          }
+        }
+      }
     }
+    return labels;
   }
 
-  /// Replaces an anchor's direct text children with [label] while keeping
-  /// nested elements (e.g. `<span class="pagenum">`) intact. `anchor.text =`
-  /// would flatten those nested tags away.
+  /// Replace label text even when wrapped in formatting spans. Keep the
+  /// nested elements and page-number text intact instead of flattening them.
   void _setAnchorLabelPreservingNestedElements(
     dom.Element anchor,
     String label,
   ) {
-    final List<dom.Text> textNodes = anchor.nodes.whereType<dom.Text>().toList(
-      growable: false,
-    );
+    final textNodes = <dom.Text>[];
+    void collect(dom.Node node) {
+      if (node is dom.Text && node.data.trim().isNotEmpty) textNodes.add(node);
+      if (node is dom.Element &&
+          !node.classes.contains('pagenum') &&
+          node.attributes['role'] != 'doc-pagebreak') {
+        for (final child in node.nodes) {
+          collect(child);
+        }
+      }
+    }
+
+    collect(anchor);
     if (textNodes.isEmpty) {
       return;
     }
@@ -698,17 +809,7 @@ body.epub-translator-cjk [data-translation="true"] {
 
   void _validateXmlReplacements(Map<String, String> replacements) {
     for (final MapEntry<String, String> replacement in replacements.entries) {
-      final String extension = path.posix
-          .extension(replacement.key)
-          .toLowerCase();
-      if (extension != '.htm' &&
-          extension != '.html' &&
-          extension != '.xhtml' &&
-          extension != '.opf' &&
-          extension != '.ncx' &&
-          extension != '.xml') {
-        continue;
-      }
+      // Every replacement here is an XHTML chapter, regardless of its suffix.
       try {
         xml.XmlDocument.parse(replacement.value);
       } on xml.XmlParserException catch (error) {

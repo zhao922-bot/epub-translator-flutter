@@ -776,6 +776,7 @@ void main() {
               initial: const <TranslationJob>[
                 TranslationJob(
                   id: 'failed-cn',
+                  selectedChapterPaths: ['chapter.xhtml'],
                   inputPath: 'book.epub',
                   outputPath: 'out',
                   status: TranslationJobStatus.failed,
@@ -1207,6 +1208,7 @@ void main() {
         initial: const <TranslationJob>[
           TranslationJob(
             id: 'failed-job',
+            selectedChapterPaths: ['chapter.xhtml'],
             inputPath: 'C:\\Books\\failed.epub',
             outputPath: 'C:\\Translated',
             status: TranslationJobStatus.failed,
@@ -1270,6 +1272,7 @@ void main() {
               initial: const <TranslationJob>[
                 TranslationJob(
                   id: 'failed-605',
+                  selectedChapterPaths: ['chapter.xhtml'],
                   inputPath: r'C:\Books\book.epub',
                   outputPath: r'C:\Books',
                   status: TranslationJobStatus.failed,
@@ -1349,6 +1352,7 @@ void main() {
             initial: const <TranslationJob>[
               TranslationJob(
                 id: 'failed-cache',
+                selectedChapterPaths: ['chapter.xhtml'],
                 inputPath: r'C:\Books\book.epub',
                 outputPath: r'C:\Books',
                 status: TranslationJobStatus.failed,
@@ -1608,6 +1612,7 @@ void main() {
             initial: const <TranslationJob>[
               TranslationJob(
                 id: 'warning-job',
+                selectedChapterPaths: ['chapter.xhtml'],
                 inputPath: 'C:\\Books\\partial.epub',
                 outputPath: 'C:\\Translated\\partial_translated.epub',
                 status: TranslationJobStatus.completedWithWarnings,
@@ -1655,6 +1660,7 @@ void main() {
               initial: const <TranslationJob>[
                 TranslationJob(
                   id: 'failed-unconfirmed-style',
+                  selectedChapterPaths: ['chapter.xhtml'],
                   inputPath: 'unconfirmed.epub',
                   outputPath: 'unconfirmed-out',
                   status: TranslationJobStatus.failed,
@@ -2045,6 +2051,7 @@ void main() {
         initial: const <TranslationJob>[
           TranslationJob(
             id: 'style-disabled-job',
+            selectedChapterPaths: ['chapter.xhtml'],
             inputPath: 'C:\\Books\\book.epub',
             outputPath: 'C:\\Books',
             status: TranslationJobStatus.failed,
@@ -2099,6 +2106,7 @@ void main() {
             initial: const <TranslationJob>[
               TranslationJob(
                 id: 'retry-old-job',
+                selectedChapterPaths: ['chapter.xhtml'],
                 inputPath: 'C:\\Books\\retry.epub',
                 outputPath: 'C:\\RetryOutput',
                 status: TranslationJobStatus.failed,

@@ -115,7 +115,7 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion = 'v12-protected-anchor-text-slots';
+  static const String _cacheSchemaVersion = 'v14-complete-text-blocks';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -163,12 +163,14 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required ExtractedBlock block,
     required String chapterPath,
+    String inputFingerprint = 'test-book',
     TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return EpubChapterTranslator()._blockCacheKey(
       config,
       block,
       chapterPath: chapterPath,
+      inputFingerprint: inputFingerprint,
       confirmedStyleProfile: confirmedStyleProfile,
     );
   }
@@ -992,6 +994,7 @@ class EpubChapterTranslator {
                   config,
                   block,
                   chapterPath: chapter.path,
+                  inputFingerprint: inputFingerprint,
                   confirmedStyleProfile: userStyleProfile,
                 ),
             throwIfCancelled: throwIfCancelled,
@@ -1328,6 +1331,7 @@ class EpubChapterTranslator {
                   config,
                   reference.block,
                   chapterPath: reference.chapter.path,
+                  inputFingerprint: inputFingerprint,
                   confirmedStyleProfile: userStyleProfile,
                 ),
                 translated,
@@ -1651,6 +1655,7 @@ class EpubChapterTranslator {
                                 config,
                                 batch.blocks[index],
                                 chapterPath: chapter.path,
+                                inputFingerprint: inputFingerprint,
                                 confirmedStyleProfile: userStyleProfile,
                               ),
                               translated[index],
@@ -4831,7 +4836,11 @@ class EpubChapterTranslator {
   }
 
   Future<String> _inputFingerprint(String inputPath) async {
-    final FileStat stat = await File(inputPath).stat();
+    // Read as a stream: context changes elsewhere in the book must invalidate
+    // block translations even when the file size and timestamp are unchanged.
+    final Digest contentHash = await sha256
+        .bind(File(inputPath).openRead())
+        .first;
     final String normalizedPath = _normalizeInputPathForCache(inputPath);
     return sha256
         .convert(
@@ -4839,8 +4848,7 @@ class EpubChapterTranslator {
             <Object>[
               _cacheSchemaVersion,
               normalizedPath,
-              stat.size,
-              stat.modified.millisecondsSinceEpoch,
+              contentHash.toString(),
             ].join('|'),
           ),
         )
@@ -4880,6 +4888,7 @@ class EpubChapterTranslator {
     TranslationConfig config,
     ExtractedBlock block, {
     required String chapterPath,
+    required String inputFingerprint,
     TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return sha256
@@ -4895,6 +4904,7 @@ class EpubChapterTranslator {
               config.residualQualityCheck,
               config.styleProfileEnabled,
               _styleProfileCacheValue(confirmedStyleProfile),
+              inputFingerprint,
               chapterPath,
               // Block ids are positional within a chapter (e.g. "p-3"), so
               // two blocks with identical source HTML at different positions

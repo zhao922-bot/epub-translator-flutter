@@ -46,6 +46,7 @@ class TranslationJob {
     this.styleProfile = TranslationStyleProfile.empty,
     this.styleProfileConfirmed = false,
     this.styleProfileEnabled,
+    this.selectedChapterPaths,
   });
 
   final String id;
@@ -72,6 +73,9 @@ class TranslationJob {
 
   /// Null for legacy history entries that predate style-mode persistence.
   final bool? styleProfileEnabled;
+
+  /// Exact translation scope. Null means legacy/unknown, never "all chapters".
+  final List<String>? selectedChapterPaths;
 
   /// True when this job represents a finished translation with an EPUB output.
   bool get hasExportableEpub {
@@ -129,6 +133,7 @@ class TranslationJob {
       styleProfile: _readStyleProfile(json['styleProfile']),
       styleProfileConfirmed: json['styleProfileConfirmed'] as bool? ?? false,
       styleProfileEnabled: json['styleProfileEnabled'] as bool?,
+      selectedChapterPaths: _readChapterPaths(json['selectedChapterPaths']),
     );
   }
 
@@ -155,6 +160,7 @@ class TranslationJob {
     TranslationStyleProfile? styleProfile,
     bool? styleProfileConfirmed,
     Object? styleProfileEnabled = _unset,
+    Object? selectedChapterPaths = _unset,
   }) {
     return TranslationJob(
       id: id ?? this.id,
@@ -190,6 +196,9 @@ class TranslationJob {
       styleProfileEnabled: identical(styleProfileEnabled, _unset)
           ? this.styleProfileEnabled
           : styleProfileEnabled as bool?,
+      selectedChapterPaths: identical(selectedChapterPaths, _unset)
+          ? this.selectedChapterPaths
+          : selectedChapterPaths as List<String>?,
     );
   }
 
@@ -218,8 +227,17 @@ class TranslationJob {
       'styleProfileConfirmed': styleProfileConfirmed,
       if (styleProfileEnabled != null)
         'styleProfileEnabled': styleProfileEnabled,
+      if (selectedChapterPaths != null)
+        'selectedChapterPaths': selectedChapterPaths,
     };
   }
+}
+
+List<String>? _readChapterPaths(Object? value) {
+  if (value is! List || value.any((item) => item is! String || item.isEmpty)) {
+    return null;
+  }
+  return List<String>.unmodifiable(value.cast<String>().toSet());
 }
 
 TranslationStyleProfile _readStyleProfile(Object? value) {

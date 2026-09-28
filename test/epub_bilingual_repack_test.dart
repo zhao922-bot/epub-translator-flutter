@@ -51,16 +51,16 @@ void main() {
       expect(rows, hasLength(1));
       final dom.Element row = rows.first;
       // No bare translation text directly under <tr>: the translation must
-      // live inside its own <td>, not as a text node child of the row.
+      // live inside the original <td>, preserving the table grid.
       final Iterable<dom.Text> bareText = row.nodes.whereType<dom.Text>().where(
         (dom.Text node) => node.text.trim().isNotEmpty,
       );
       expect(bareText, isEmpty);
       final List<dom.Element> cells = row.querySelectorAll('td');
-      expect(cells, hasLength(2));
+      expect(cells, hasLength(1));
       expect(cells[0].text, contains('Cell one'));
-      expect(cells[1].text, contains('单元格一'));
-      expect(cells[1].attributes['data-translation'], 'true');
+      final translation = cells[0].querySelector('[data-translation="true"]')!;
+      expect(translation.text, contains('单元格一'));
     });
 
     test('table cell translation keeps td when the model returns one', () {
@@ -87,8 +87,11 @@ void main() {
       );
       final dom.Document document = html_parser.parse(output);
       final List<dom.Element> cells = document.querySelectorAll('tr td');
-      expect(cells, hasLength(2));
-      expect(cells[1].attributes['data-translation'], 'true');
+      expect(cells, hasLength(1));
+      expect(
+        cells.single.querySelector('[data-translation="true"]')!.text,
+        contains('单元格一'),
+      );
     });
 
     test('translation paragraphs are marked and visually distinguished', () {

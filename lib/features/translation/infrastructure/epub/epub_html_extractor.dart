@@ -341,6 +341,8 @@ class EpubHtmlExtractor {
   }
 
   List<dom.Element> extractTranslatableElements(dom.Document document) {
+    final body = document.body;
+    if (body != null) _wrapUnclaimedText(body);
     return document
         .querySelectorAll(translatableTags.join(', '))
         .where(
@@ -350,6 +352,75 @@ class EpubHtmlExtractor {
               !isStandaloneProtectedMarkerElement(element),
         )
         .toList();
+  }
+
+  /// Give otherwise unclaimed inline text a stable block boundary. Inspection
+  /// and repacking both run this normalization on their own parsed document.
+  /// Existing blocks are never merged, and skipped content is never visited.
+  void _wrapUnclaimedText(dom.Element container) {
+    if (translatableTags.contains(container.localName) ||
+        nonTextAncestors.contains(container.localName)) {
+      return;
+    }
+    const inlineTags = <String>{
+      'span',
+      'a',
+      'em',
+      'strong',
+      'b',
+      'i',
+      'u',
+      's',
+      'small',
+      'sub',
+      'sup',
+      'abbr',
+      'cite',
+      'q',
+      'time',
+      'mark',
+      'bdi',
+      'bdo',
+      'ruby',
+      'rt',
+      'rp',
+      'br',
+      'wbr',
+      'img',
+    };
+    bool hasUnclaimedText(dom.Node node) {
+      if (node is dom.Text) return node.data.trim().isNotEmpty;
+      if (node is! dom.Element ||
+          translatableTags.contains(node.localName) ||
+          nonTextAncestors.contains(node.localName)) {
+        return false;
+      }
+      return node.nodes.any(hasUnclaimedText);
+    }
+
+    final run = <dom.Node>[];
+    void flush() {
+      if (run.any(hasUnclaimedText)) {
+        final wrapper = dom.Element.tag('span');
+        final index = container.nodes.indexOf(run.first);
+        for (final node in run) {
+          node.remove();
+          wrapper.nodes.add(node);
+        }
+        container.nodes.insert(index, wrapper);
+      }
+      run.clear();
+    }
+
+    for (final node in container.nodes.toList()) {
+      if (node is! dom.Element || inlineTags.contains(node.localName)) {
+        run.add(node);
+      } else {
+        flush();
+        _wrapUnclaimedText(node);
+      }
+    }
+    flush();
   }
 
   List<dom.Element> extractTranslatableTextElements(dom.Document document) {

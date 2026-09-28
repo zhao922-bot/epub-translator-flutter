@@ -796,6 +796,12 @@ class AppStrings {
   String get logRetryContinueTranslate => isChinese
       ? '检查完成，继续翻译重试。'
       : 'Inspection ready. Continuing with translation for the retry.';
+  String get logRetrySelectionUnknown => isChinese
+      ? '该历史任务未保存章节范围。请重新选择章节后开始翻译。'
+      : 'This history item has no saved chapter selection. Select chapters before starting translation.';
+  String get logRetrySelectionChanged => isChinese
+      ? '原选章节已缺失或范围为空。请检查章节选择后再开始翻译。'
+      : 'Previously selected chapters are missing or the selection is empty. Review the selection before starting translation.';
   String get logClearedHistory =>
       isChinese ? '已清空任务历史。' : 'Cleared job history.';
   String get logClearHistoryFailed => isChinese

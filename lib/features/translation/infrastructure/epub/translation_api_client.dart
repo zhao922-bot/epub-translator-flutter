@@ -273,8 +273,8 @@ class TranslationApiClient {
           },
         ],
       };
-      final Response<dynamic> response = await dio.post<dynamic>(
-        '/chat/completions',
+      final Response<dynamic> response = await postChatCompletions(
+        dio: dio,
         data: requestData,
       );
       final String content = extractMessageContent(response.data);
@@ -308,8 +308,15 @@ class TranslationApiClient {
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
   }) {
+    // Dio concatenates baseUrl and a relative path as strings. Construct the
+    // absolute endpoint first so a base query/fragment cannot absorb the path.
+    final Uri base = Uri.parse(dio.options.baseUrl);
+    final Uri endpoint = base.replace(
+      path: '${base.path.replaceAll(RegExp(r'/+$'), '')}/chat/completions',
+      fragment: '',
+    );
     return dio.post<dynamic>(
-      '/chat/completions',
+      endpoint.toString(),
       data: data,
       cancelToken: cancelToken,
     );

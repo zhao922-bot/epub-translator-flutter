@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:epub_translator_flutter/app/app.dart';
 import 'package:epub_translator_flutter/app/theme/app_theme.dart';
 import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
@@ -7,6 +10,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:epub_translator_flutter/shared/widgets/app_shell.dart';
+import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:epub_translator_flutter/shared/widgets/page_scaffold.dart';
 import 'package:epub_translator_flutter/shared/widgets/section_card.dart';
 import 'package:flutter/material.dart';
@@ -31,6 +35,21 @@ class _MemorySettingsStore extends SettingsStore {
     TranslationConfig config, {
     Set<SettingsSecretSlot>? explicitSecretMutations,
   }) async {}
+}
+
+// Layout tests must not spawn real PowerShell under Flutter's fake clock.
+// Process timeout/cancellation is exercised in windows_elevation_check_test.
+class _UnelevatedProcess implements Process {
+  @override
+  Stream<List<int>> get stdout => Stream.value(utf8.encode('False'));
+  @override
+  Stream<List<int>> get stderr => const Stream.empty();
+  @override
+  Future<int> get exitCode async => 0;
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => true;
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
 class _MemoryJobHistoryStore extends JobHistoryStore {
@@ -61,6 +80,14 @@ void _viewport(WidgetTester tester, Size size) {
 }
 
 void main() {
+  setUp(() {
+    NativePlatformBridge.debugWindowsProcessStarter =
+        (executable, arguments) async => _UnelevatedProcess();
+  });
+  tearDown(() {
+    NativePlatformBridge.debugWindowsProcessStarter = null;
+  });
+
   testWidgets(
     'confirmed style collapses while pending style remains editable',
     (tester) async {

@@ -295,6 +295,7 @@ class TranslationDashboardController
   int _lastSeenHistoryClearedAt = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
+  List<String>? _activeTranslationChapterPaths;
   DateTime? _lastProgressHistoryPersistAt;
 
   AppStrings get _s => AppStrings(state.config.uiLanguage);
@@ -846,6 +847,8 @@ class TranslationDashboardController
 
   Future<void> startInspection({
     TranslationStyleProfile? preservedStyleProfile,
+    List<String>? chapterSelection,
+    bool generateStyle = true,
   }) async {
     if (!await _waitForSettingsReady()) {
       return;
@@ -925,20 +928,42 @@ class TranslationDashboardController
         _handleCancellation(const TranslationCancelledException());
         return;
       }
+      final inspectedChapters = chapterSelection == null
+          ? result.chapters
+          : result.chapters
+                .map(
+                  (chapter) => chapter.copyWith(
+                    includeInTranslation: chapterSelection.contains(
+                      chapter.path,
+                    ),
+                  ),
+                )
+                .toList();
       state = state.copyWith(
         job: result.job.copyWith(phase: TranslationJobPhase.inspection),
         jobHistory: _jobHistoryWith(
           result.job.copyWith(phase: TranslationJobPhase.inspection),
         ),
-        runEstimate: _buildEstimate(chapters: result.chapters, job: result.job),
-        inspectedChapters: result.chapters,
+        runEstimate: _buildEstimate(
+          chapters: inspectedChapters,
+          job: result.job,
+        ),
+        inspectedChapters: inspectedChapters,
         styleProfile: preservedStyleProfile ?? TranslationStyleProfile.empty,
         styleProfileConfirmed:
             preservedStyleProfile != null || !state.config.styleProfileEnabled,
         isGeneratingStyleProfile: false,
         actionableError: null,
       );
-      if (state.config.styleProfileEnabled && preservedStyleProfile == null) {
+      if (generateStyle &&
+          state.config.styleProfileEnabled &&
+          preservedStyleProfile == null &&
+          (chapterSelection == null ||
+              chapterSelection.every(
+                (selected) => inspectedChapters.any(
+                  (chapter) => chapter.path == selected,
+                ),
+              ))) {
         await generateStyleProfile();
       }
     } catch (error) {
@@ -1065,11 +1090,15 @@ class TranslationDashboardController
       0,
       selectedBlocks,
     );
+    final selectedPaths = List<String>.unmodifiable(
+      selectedChapters.map((chapter) => chapter.path),
+    );
     // The checkpoint is unverified until the cache scan runs: the progress
     // bar and block counters start at zero while `resumeCheckpointBlocks`
     // keeps the pending figure (the UI labels it as "to verify").
     final TranslationJob queuedJob =
         state.job?.copyWith(
+          selectedChapterPaths: selectedPaths,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
           progress: 0,
@@ -1096,6 +1125,7 @@ class TranslationDashboardController
           outputPath: state.outputDirectory,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
+          selectedChapterPaths: selectedPaths,
           progress: 0,
           currentChapter: _s.jobStatusRestoringCache,
           completedFiles: 0,
@@ -1110,6 +1140,7 @@ class TranslationDashboardController
           styleProfileEnabled: state.config.styleProfileEnabled,
         );
     _activeTranslationHistoryJobId = queuedJob.id;
+    _activeTranslationChapterPaths = selectedPaths;
     _lastProgressHistoryPersistAt = null;
     final TranslationRunEstimate? estimate = _buildEstimate(job: queuedJob);
     state = state.copyWith(
@@ -1610,12 +1641,43 @@ class TranslationDashboardController
         _s.logRetrying(path.basename(job.inputPath)),
       ],
     );
-    await startInspection(preservedStyleProfile: preservedStyleProfile);
+    await startInspection(
+      preservedStyleProfile: preservedStyleProfile,
+      chapterSelection: wasTranslationFailure
+          ? job.selectedChapterPaths ?? const <String>[]
+          : null,
+      generateStyle:
+          !wasTranslationFailure ||
+          job.selectedChapterPaths?.isNotEmpty == true,
+    );
     if (!mounted) {
       return;
     }
     if (!wasTranslationFailure) {
       _pendingResumeProgressHint = null;
+      return;
+    }
+    if (state.job?.status != TranslationJobStatus.inspected) {
+      _pendingResumeProgressHint = null;
+      return;
+    }
+    final selection = job.selectedChapterPaths;
+    if (selection == null ||
+        selection.isEmpty ||
+        selection.any(
+          (selected) => !state.inspectedChapters.any(
+            (chapter) => chapter.path == selected,
+          ),
+        )) {
+      _pendingResumeProgressHint = null;
+      state = state.copyWith(
+        logs: <String>[
+          ...state.logs,
+          selection == null
+              ? _s.logRetrySelectionUnknown
+              : _s.logRetrySelectionChanged,
+        ],
+      );
       return;
     }
     final bool readyToTranslate = state.inspectedChapters.any(
@@ -2062,11 +2124,17 @@ class TranslationDashboardController
 
   TranslationJob _translationHistoryJob(TranslationJob job) {
     final String? historyJobId = _activeTranslationHistoryJobId;
-    return historyJobId == null ? job : job.copyWith(id: historyJobId);
+    return historyJobId == null
+        ? job
+        : job.copyWith(
+            id: historyJobId,
+            selectedChapterPaths: _activeTranslationChapterPaths,
+          );
   }
 
   void _clearActiveTranslationHistory() {
     _activeTranslationHistoryJobId = null;
+    _activeTranslationChapterPaths = null;
     _lastProgressHistoryPersistAt = null;
   }
 

@@ -1398,7 +1398,7 @@ void main() {
           .convert(
             utf8.encode(
               <Object>[
-                'v12-protected-anchor-text-slots',
+                'v14-complete-text-blocks',
                 'https://api.example.test/v1',
                 config.model.trim(),
                 config.targetLanguage.trim(),
@@ -1410,6 +1410,7 @@ void main() {
                 config.residualQualityCheck,
                 config.styleProfileEnabled,
                 'none',
+                'test-book',
                 'chapter-1.xhtml',
                 block.id,
                 block.sourceHtml,

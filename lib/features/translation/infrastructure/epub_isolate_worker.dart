@@ -9,6 +9,7 @@ import 'package:xml/xml.dart' as xml;
 
 import '../../../shared/logging/app_logger.dart';
 import 'epub/epub_text_decoder.dart';
+import 'epub/epub_navigation.dart';
 
 /// Thrown when the final output file is locked by another process at commit
 /// time (Windows: a reader holding it open without share access).
@@ -168,6 +169,7 @@ class EpubIsolateWorker {
     required Map<String, List<int>> archiveFiles,
     required Map<String, String> labelsByPath,
     required String? languageTag,
+    Map<String, String> renderedHtmlByPath = const <String, String>{},
   }) {
     if (languageTag == null) {
       // The target language is unknown: OPF/NCX navigation metadata is left
@@ -227,6 +229,34 @@ class EpubIsolateWorker {
     final Map<String, String> replacements = <String, String>{
       opfPath: opf.toXmlString(),
     };
+    for (final item in opf.descendants.whereType<xml.XmlElement>().where(
+      (element) =>
+          element.name.local == 'item' &&
+          (element.getAttribute('properties') ?? '')
+              .split(RegExp(r'\s+'))
+              .contains('nav'),
+    )) {
+      final href = item.getAttribute('href') ?? '';
+      final uri = Uri.tryParse(href);
+      if (href.isEmpty || uri == null || uri.hasScheme || uri.hasAuthority) {
+        continue;
+      }
+      final navPath = navigationTargetKey(opfPath, href);
+      final bytes = archiveFiles[navPath];
+      if (bytes == null) continue;
+      // Use rendered content when navigation is also a translated chapter,
+      // preserving translated prose outside its toc rather than restoring it.
+      final markup =
+          renderedHtmlByPath[navPath] ??
+          decodeEpubText(bytes: bytes, filePath: navPath, strict: true);
+      replacements[navPath] = synchronizeEpub3Navigation(
+        markup: markup,
+        documentPath: navPath,
+        labelsByPath: labelsByPath,
+        languageTag: languageTag,
+      );
+      xml.XmlDocument.parse(replacements[navPath]!);
+    }
     final xml.XmlElement? spine = opf.descendants
         .whereType<xml.XmlElement>()
         .where((xml.XmlElement element) => element.name.local == 'spine')
@@ -270,7 +300,7 @@ class EpubIsolateWorker {
         in ncx.descendants.whereType<xml.XmlElement>().where(
           (xml.XmlElement element) => element.name.local == 'navPoint',
         )) {
-      final xml.XmlElement? content = navPoint.descendants
+      final xml.XmlElement? content = navPoint.children
           .whereType<xml.XmlElement>()
           .where((xml.XmlElement element) => element.name.local == 'content')
           .firstOrNull;
@@ -278,17 +308,16 @@ class EpubIsolateWorker {
       if (source.isEmpty) {
         continue;
       }
-      final String chapterPath = path.posix.normalize(
-        path.posix.join(
-          path.posix.dirname(ncxPath),
-          _decodeNcxSrc(source.split('#').first),
-        ),
-      );
+      final chapterPath = navigationTargetKey(ncxPath, source);
       final String? label = labelsByPath[chapterPath];
       if (label == null) {
         continue;
       }
-      final xml.XmlElement? text = navPoint.descendants
+      final navLabel = navPoint.children
+          .whereType<xml.XmlElement>()
+          .where((element) => element.name.local == 'navLabel')
+          .firstOrNull;
+      final xml.XmlElement? text = navLabel?.descendants
           .whereType<xml.XmlElement>()
           .where((xml.XmlElement element) => element.name.local == 'text')
           .firstOrNull;
@@ -713,6 +742,7 @@ class EpubIsolateWorker {
           archiveFiles: archiveView,
           labelsByPath: navigationLabelsByPath,
           languageTag: navigationLanguageTag,
+          renderedHtmlByPath: translatedHtmlByPath,
         ),
       );
     }

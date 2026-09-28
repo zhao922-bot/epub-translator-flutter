@@ -328,10 +328,33 @@ class EpubInspector {
   }) {
     final String? ncxPath = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
     final List<int>? ncxBytes = ncxPath == null ? null : files[ncxPath];
-    if (ncxBytes == null) {
-      return;
+    if (ncxBytes != null) {
+      decodeEpubText(bytes: ncxBytes, filePath: ncxPath!, strict: true);
     }
-    decodeEpubText(bytes: ncxBytes, filePath: ncxPath!, strict: true);
+    // EPUB 3 navigation is now rewritten at export too. Validate it before
+    // any paid requests, including when it is absent from the spine.
+    final opfBytes = files[opfPath];
+    if (opfBytes == null) return;
+    final opf = XmlDocument.parse(
+      decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+    );
+    for (final item in opf.descendants.whereType<XmlElement>().where(
+      (element) =>
+          element.name.local == 'item' &&
+          (element.getAttribute('properties') ?? '')
+              .split(RegExp(r'\s+'))
+              .contains('nav'),
+    )) {
+      final href = item.getAttribute('href');
+      if (href == null) continue;
+      final navPath = _resolveManifestHref(path.posix.dirname(opfPath), href);
+      final bytes = files[navPath];
+      if (bytes != null) {
+        XmlDocument.parse(
+          decodeEpubText(bytes: bytes, filePath: navPath, strict: true),
+        );
+      }
+    }
   }
 
   /// Resolves spine itemrefs to archive paths. Returns both the resolved
@@ -356,6 +379,7 @@ class EpubInspector {
     final String opfDirectory = path.posix.dirname(opfPath);
 
     final Map<String, String> manifest = <String, String>{};
+    final Map<String, String> mediaTypes = <String, String>{};
     for (final XmlElement item
         in opfDocument.descendants.whereType<XmlElement>()) {
       if (item.name.local != 'item') {
@@ -367,6 +391,8 @@ class EpubInspector {
         continue;
       }
       manifest[id] = _resolveManifestHref(opfDirectory, href);
+      mediaTypes[id] =
+          item.getAttribute('media-type')?.trim().toLowerCase() ?? '';
     }
 
     final List<String> chapterPaths = <String>[];
@@ -384,7 +410,9 @@ class EpubInspector {
         }
         continue;
       }
-      if (_isHtmlDocument(chapterPath)) {
+      final mediaType = mediaTypes[idRef] ?? '';
+      if (mediaType == 'application/xhtml+xml' ||
+          (mediaType.isEmpty && _isHtmlDocument(chapterPath))) {
         chapterPaths.add(chapterPath);
       }
     }

@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/platform/native_platform_bridge.dart';
+import '../../../../shared/platform/windows_elevation_check.dart';
 import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../widgets/settings_fields.dart';
@@ -420,11 +421,8 @@ class SettingsPage extends ConsumerWidget {
 /// Shows the Windows-elevation secret warning once the (cached, process-wide)
 /// elevation check reports the process is elevated.
 ///
-/// The 10s fail-closed timeout is owned by this widget — not by the check
-/// future itself. A timeout timer created inside the cached future would
-/// outlive the widget tree in widget tests ("A Timer is still pending even
-/// after the widget tree was disposed"); here the timer is cancelled in
-/// [dispose], so tests stay green on Windows.
+/// The widget owns a cancellable probe. Disposing it releases the timeout and
+/// the child process, while a timeout settles the result and ignores late data.
 class _WindowsElevatedWarning extends ConsumerStatefulWidget {
   const _WindowsElevatedWarning();
 
@@ -435,22 +433,15 @@ class _WindowsElevatedWarning extends ConsumerStatefulWidget {
 
 class _WindowsElevatedWarningState
     extends ConsumerState<_WindowsElevatedWarning> {
-  static const Duration _checkTimeout = Duration(seconds: 10);
-
   bool _elevated = false;
-  Timer? _timeoutTimer;
+  late final WindowsElevationCheck _check;
 
   @override
   void initState() {
     super.initState();
-    _timeoutTimer = Timer(_checkTimeout, () {
-      // Fail closed: a hanging check means "not elevated" for the banner.
-      _timeoutTimer = null;
-    });
+    _check = NativePlatformBridge.startWindowsElevationCheck();
     unawaited(
-      NativePlatformBridge.isWindowsElevated().then((bool elevated) {
-        _timeoutTimer?.cancel();
-        _timeoutTimer = null;
+      _check.result.then((bool elevated) {
         if (mounted) {
           setState(() {
             _elevated = elevated;
@@ -462,8 +453,7 @@ class _WindowsElevatedWarningState
 
   @override
   void dispose() {
-    _timeoutTimer?.cancel();
-    _timeoutTimer = null;
+    _check.cancel();
     super.dispose();
   }
 

@@ -1,6 +1,7 @@
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:html/parser.dart' as html;
 
 void main() {
   group('repack keeps table cell wrappers', () {
@@ -32,8 +33,10 @@ void main() {
         bilingual: false,
         targetLanguage: 'Chinese',
       );
-      expect(output, contains('<td class="line"><p>单元格一</p></td>'));
-      expect(output, isNot(contains('<td><p>单元格一</p></td>')));
+      final cell = html.parse(output).querySelectorAll('td').single;
+      expect(cell.attributes['class'], 'line');
+      expect(cell.querySelector('p')!.text, '单元格一');
+      expect(cell.attributes['lang'], 'zh-CN');
     });
 
     test('keeps td when the model returns a full td already', () {
@@ -64,7 +67,10 @@ void main() {
         bilingual: false,
         targetLanguage: 'Chinese',
       );
-      expect(output, contains('<td class="line"><p>单元格一</p></td>'));
+      final cell = html.parse(output).querySelectorAll('td').single;
+      expect(cell.attributes['class'], 'line');
+      expect(cell.querySelector('p')!.text, '单元格一');
+      expect(cell.attributes['lang'], 'zh-CN');
     });
 
     test('wraps th cell output without duplicating the wrapper', () {
@@ -93,7 +99,9 @@ void main() {
         bilingual: false,
         targetLanguage: 'Chinese',
       );
-      expect(output, contains('<th>表头</th>'));
+      final cell = html.parse(output).querySelectorAll('th').single;
+      expect(cell.text, '表头');
+      expect(cell.attributes['lang'], 'zh-CN');
     });
   });
 }
