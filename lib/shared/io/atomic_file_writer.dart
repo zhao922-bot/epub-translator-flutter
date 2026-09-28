@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as path;
@@ -30,9 +31,47 @@ String tempPathForAtomicWrite(File file) {
 /// can therefore never leave a truncated [file] behind: readers either see
 /// the old content or the new content, never a half-written one.
 ///
+/// Concurrent writes to the *same* target are serialized through a
+/// per-path gate. Hammering one path with concurrent renames keeps the file
+/// hot under antivirus/indexer locks on Windows (rename → "Access is
+/// denied", errno 5, no matter how long you back off); chaining same-target
+/// writes removes that self-inflicted contention. Writes to different paths
+/// still run in parallel.
+///
 /// Any leftover temporary file from an interrupted write is deleted on a
 /// best-effort basis before throwing.
-Future<void> writeFileAtomically(File file, String contents) async {
+Future<void> writeFileAtomically(File file, String contents) {
+  final String key = _atomicWriteKey(file);
+  final Future<void> previous = _atomicWriteGates[key] ?? Future<void>.value();
+  final Completer<void> gate = Completer<void>();
+  _atomicWriteGates[key] = gate.future;
+  return previous.then((_) async {
+    try {
+      await _writeFileAtomicallyNow(file, contents);
+    } finally {
+      gate.complete();
+      // Only remove our own gate: a newer write may have chained behind us
+      // already, and its gate must stay registered.
+      if (identical(_atomicWriteGates[key], gate.future)) {
+        _atomicWriteGates.remove(key);
+      }
+    }
+  });
+}
+
+/// Chains concurrent writes to the same target path. Gate futures always
+/// complete normally (completion happens in `finally`), so a failed write
+/// never blocks the writes queued behind it.
+final Map<String, Future<void>> _atomicWriteGates = <String, Future<void>>{};
+
+String _atomicWriteKey(File file) {
+  final String absolute = File(file.path).absolute.path;
+  // Windows paths are case-insensitive: `C:\A\f` and `c:\a\F` are the same
+  // file and must share one gate.
+  return Platform.isWindows ? absolute.toLowerCase() : absolute;
+}
+
+Future<void> _writeFileAtomicallyNow(File file, String contents) async {
   final File tmp = File(tempPathForAtomicWrite(file));
   try {
     await tmp.writeAsString(contents, flush: true);
