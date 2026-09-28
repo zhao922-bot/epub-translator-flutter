@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
@@ -2434,8 +2435,14 @@ void main() {
       final File inputFile = File('${temp.path}/book.epub')
         ..writeAsStringSync('fake-epub');
       final File sessionFile = File('${temp.path}/session.json');
+      // jsonEncode, not string interpolation: on Windows the paths contain
+      // backslashes, which are invalid unescaped inside a JSON string and
+      // would make SessionPathStore.load() silently return empty paths.
       await sessionFile.writeAsString(
-        '{"inputPath": "${inputFile.path}", "outputDirectory": "${temp.path}/out"}',
+        jsonEncode(<String, String>{
+          'inputPath': inputFile.path,
+          'outputDirectory': '${temp.path}/out',
+        }),
       );
       final List<String> observed = <String>[];
       TranslationDashboardController(

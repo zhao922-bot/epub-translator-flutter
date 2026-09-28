@@ -305,8 +305,13 @@ class SettingsStore {
   /// Returns the backup path, or null when the backup itself failed.
   Future<String?> _backupCorruptSettingsFile(File file) async {
     try {
-      final String backupPath =
-          '${file.path}.bad-${DateTime.now().microsecondsSinceEpoch}';
+      // Build with path.join (not string interpolation on file.path): the
+      // File may have been constructed with '/' separators while the
+      // platform listing (and callers comparing paths) use '\' on Windows.
+      final String backupPath = path.join(
+        file.parent.path,
+        '${path.basename(file.path)}.bad-${DateTime.now().microsecondsSinceEpoch}',
+      );
       await file.rename(backupPath);
       await _pruneCorruptBackups(
         file.parent,

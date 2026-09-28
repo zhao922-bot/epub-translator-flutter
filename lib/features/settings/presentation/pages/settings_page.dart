@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -62,18 +64,7 @@ class SettingsPage extends ConsumerWidget {
           if (secretKeyRotated)
             _SettingsWarningBanner(text: strings.secretKeyRotatedWarning),
           // Windows 提权运行：DPAPI 密钥与普通用户不互通，提醒用户。
-          if (PlatformUtils.isWindows)
-            FutureBuilder<bool>(
-              future: NativePlatformBridge.isWindowsElevated(),
-              builder: (BuildContext context, AsyncSnapshot<bool> snapshot) {
-                if (snapshot.data != true) {
-                  return const SizedBox.shrink();
-                }
-                return _SettingsWarningBanner(
-                  text: strings.windowsElevatedSecretWarning,
-                );
-              },
-            ),
+          if (PlatformUtils.isWindows) const _WindowsElevatedWarning(),
           // —— API ——
           SettingsSection(
             title: strings.apiSection,
@@ -423,6 +414,66 @@ class SettingsPage extends ConsumerWidget {
         ],
       ),
     );
+  }
+}
+
+/// Shows the Windows-elevation secret warning once the (cached, process-wide)
+/// elevation check reports the process is elevated.
+///
+/// The 10s fail-closed timeout is owned by this widget — not by the check
+/// future itself. A timeout timer created inside the cached future would
+/// outlive the widget tree in widget tests ("A Timer is still pending even
+/// after the widget tree was disposed"); here the timer is cancelled in
+/// [dispose], so tests stay green on Windows.
+class _WindowsElevatedWarning extends ConsumerStatefulWidget {
+  const _WindowsElevatedWarning();
+
+  @override
+  ConsumerState<_WindowsElevatedWarning> createState() =>
+      _WindowsElevatedWarningState();
+}
+
+class _WindowsElevatedWarningState
+    extends ConsumerState<_WindowsElevatedWarning> {
+  static const Duration _checkTimeout = Duration(seconds: 10);
+
+  bool _elevated = false;
+  Timer? _timeoutTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _timeoutTimer = Timer(_checkTimeout, () {
+      // Fail closed: a hanging check means "not elevated" for the banner.
+      _timeoutTimer = null;
+    });
+    unawaited(
+      NativePlatformBridge.isWindowsElevated().then((bool elevated) {
+        _timeoutTimer?.cancel();
+        _timeoutTimer = null;
+        if (mounted) {
+          setState(() {
+            _elevated = elevated;
+          });
+        }
+      }),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timeoutTimer?.cancel();
+    _timeoutTimer = null;
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_elevated) {
+      return const SizedBox.shrink();
+    }
+    final AppStrings strings = ref.watch(appStringsProvider);
+    return _SettingsWarningBanner(text: strings.windowsElevatedSecretWarning);
   }
 }
 

@@ -36,7 +36,7 @@ Future<void> writeFileAtomically(File file, String contents) async {
   final File tmp = File(tempPathForAtomicWrite(file));
   try {
     await tmp.writeAsString(contents, flush: true);
-    await tmp.rename(file.path);
+    await _renameOverTargetWithRetry(tmp, file.path);
   } catch (_) {
     try {
       if (await tmp.exists()) {
@@ -46,6 +46,28 @@ Future<void> writeFileAtomically(File file, String contents) async {
       // Best effort: a stale .tmp file is harmless (readers ignore it).
     }
     rethrow;
+  }
+}
+
+/// Renames [tmp] over [targetPath], retrying transient failures.
+///
+/// On Windows, antivirus / file-indexer / OneDrive can hold a brief lock on
+/// the target, making the rename throw "Access is denied" (errno 5) even
+/// though a retry milliseconds later succeeds. This flaked Windows CI on
+/// concurrent writes and can also bite production back-to-back saves, so
+/// absorb a few transient failures before giving up.
+Future<void> _renameOverTargetWithRetry(File tmp, String targetPath) async {
+  const int maxAttempts = 6;
+  for (int attempt = 1; ; attempt++) {
+    try {
+      await tmp.rename(targetPath);
+      return;
+    } on FileSystemException {
+      if (attempt >= maxAttempts) {
+        rethrow;
+      }
+      await Future<void>.delayed(Duration(milliseconds: 25 * attempt));
+    }
   }
 }
 

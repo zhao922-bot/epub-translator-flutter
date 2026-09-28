@@ -959,12 +959,16 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
         '-Command',
         script,
       ]);
-      final String output = await process.stdout
-          .transform(utf8.decoder)
-          .join()
-          .timeout(const Duration(seconds: 10));
+      // NOTE: no `.timeout()` here on purpose. This future is cached
+      // process-wide ([isWindowsElevated]) and subscribed from a FutureBuilder:
+      // a timeout timer created inside the future would outlive the widget
+      // tree in widget tests ("A Timer is still pending even after the widget
+      // tree was disposed"). The settings page owns the timeout instead: it
+      // starts its own 10s timer and fails closed when it fires, cancelling
+      // the timer in dispose.
+      final String output = await process.stdout.transform(utf8.decoder).join();
       unawaited(process.stderr.drain());
-      await process.exitCode.timeout(const Duration(seconds: 10));
+      await process.exitCode;
       return parseWindowsElevationResult(output);
     } catch (_) {
       // PowerShell missing or hanging: fail closed (not elevated).
