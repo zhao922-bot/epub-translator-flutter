@@ -88,6 +88,28 @@ class TranslationRunEstimate {
     TranslationJob? job,
     Duration? elapsed,
   }) {
+    final TranslationRunEstimate base = staticPart(
+      chapters,
+      chunkSize: chunkSize,
+    );
+    return base.withProgress(
+      completedBlocks: job?.completedBlocks ?? 0,
+      totalBlocks: job?.totalBlocks ?? base.totalBlocks,
+      elapsed: elapsed,
+    );
+  }
+
+  /// The expensive, run-invariant part of the estimate: everything derived
+  /// from the source text (per-block CJK token estimates, batch packing,
+  /// source volume). The source text never changes during a run, so the
+  /// controller computes this once per run/selection and refreshes only the
+  /// progress fields via [withProgress] on every progress callback —
+  /// otherwise each callback re-runs the CJK regex over the whole book on
+  /// the UI isolate (tens to hundreds of ms per batch on big books).
+  static TranslationRunEstimate staticPart(
+    List<InspectedChapter> chapters, {
+    required int chunkSize,
+  }) {
     final List<InspectedChapter> selected = chapters
         .where(
           (InspectedChapter chapter) =>
@@ -98,17 +120,6 @@ class TranslationRunEstimate {
       0,
       (int sum, InspectedChapter chapter) => sum + chapter.blocks.length,
     );
-    final int completedBlocks = min(
-      job?.completedBlocks ?? 0,
-      job?.totalBlocks ?? totalBlocks,
-    );
-    final double? speed = _blocksPerMinute(completedBlocks, elapsed);
-    final Duration? remaining = _remainingDuration(
-      totalBlocks: job?.totalBlocks ?? totalBlocks,
-      completedBlocks: completedBlocks,
-      blocksPerMinute: speed,
-    );
-
     final int sourceChars = selected.fold<int>(
       0,
       (int sum, InspectedChapter chapter) =>
@@ -137,11 +148,34 @@ class TranslationRunEstimate {
       selectedChapters: selected.length,
       totalBlocks: totalBlocks,
       estimatedApiBatches: _estimateBatchCount(selected, chunkSize),
-      completedBlocks: completedBlocks,
-      blocksPerMinute: speed,
-      estimatedRemaining: remaining,
       estimatedSourceChars: sourceChars,
       estimatedInputTokens: inputTokens,
+    );
+  }
+
+  /// Cheap per-progress-tick refresh: keeps the static fields from [staticPart]
+  /// and recomputes only the speed/ETA from [completedBlocks] and [elapsed].
+  /// O(1) — safe to call on every progress callback.
+  TranslationRunEstimate withProgress({
+    required int completedBlocks,
+    required int totalBlocks,
+    Duration? elapsed,
+  }) {
+    final int safeCompleted = min(completedBlocks, totalBlocks);
+    final double? speed = _blocksPerMinute(safeCompleted, elapsed);
+    return TranslationRunEstimate(
+      selectedChapters: selectedChapters,
+      totalBlocks: totalBlocks,
+      estimatedApiBatches: estimatedApiBatches,
+      completedBlocks: safeCompleted,
+      blocksPerMinute: speed,
+      estimatedRemaining: _remainingDuration(
+        totalBlocks: totalBlocks,
+        completedBlocks: safeCompleted,
+        blocksPerMinute: speed,
+      ),
+      estimatedSourceChars: estimatedSourceChars,
+      estimatedInputTokens: estimatedInputTokens,
     );
   }
 

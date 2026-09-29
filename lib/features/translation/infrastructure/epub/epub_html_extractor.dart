@@ -504,10 +504,13 @@ class EpubHtmlExtractor {
     final String titleToken = title.toLowerCase();
     // Title matching uses word boundaries so generic substrings don't misfire
     // ("advert" inside "advertisement", "notes" inside "footnotes"). Path
-    // matching intentionally stays substring-based: EPUB filenames are
-    // conventional markers like `book_cvi_r1.htm`, not prose.
+    // matching requires a left token boundary for plain words: EPUB
+    // filenames are conventional markers like `cover.xhtml` or
+    // `book_cvi_r1.htm`, but bare substring matching misfires on ordinary
+    // prose words — `discover.xhtml` contains `cover`, `attack.xhtml` and
+    // `back.xhtml` contain `ack`, `subtitle.xhtml` contains `title`.
     bool matches(List<String> needles) =>
-        _matchesAny(pathToken, needles) ||
+        _matchesPathToken(pathToken, needles) ||
         _matchesTitleWord(titleToken, needles);
 
     if (matches(const <String>[
@@ -604,8 +607,23 @@ class EpubHtmlExtractor {
         RegExp(r'^page\d{1,4}$', caseSensitive: false).hasMatch(compact);
   }
 
-  bool _matchesAny(String source, List<String> needles) {
-    return needles.any(source.contains);
+  /// Matches [needles] against a lowercased chapter path. Plain words must
+  /// start at a token boundary (start of string or a non-alphanumeric):
+  /// `cover` matches `cover.xhtml` but not `discover.xhtml`; `ack` matches
+  /// `acknowledgments.xhtml` but not `attack.xhtml`. Stem needles keep
+  /// working (`endnote` in `endnotes.xhtml`, `advert` in
+  /// `advertisement.xhtml`) because only the left edge is anchored.
+  /// Delimiter-style markers (`ad_`, `_cvi_`, `z-lib`) already carry their
+  /// own delimiters and keep plain substring matching.
+  bool _matchesPathToken(String pathToken, List<String> needles) {
+    return needles.any((String needle) {
+      if (RegExp(r'[^a-z0-9]').hasMatch(needle)) {
+        return pathToken.contains(needle);
+      }
+      return RegExp(
+        '(?:^|[^a-z0-9])${RegExp.escape(needle)}',
+      ).hasMatch(pathToken);
+    });
   }
 
   bool _matchesTitleWord(String title, List<String> needles) {

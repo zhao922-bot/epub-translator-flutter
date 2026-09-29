@@ -450,6 +450,14 @@ class SeedHistory extends JobHistoryStore {
     List<TranslationJob> jobs, {
     int clearedAtEpochMs = 0,
   }) async {}
+
+  @override
+  Future<({bool written, int fileClearedAt})> saveMerged({
+    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
+    required int clearedAtEpochMs,
+  }) async {
+    return (written: true, fileClearedAt: 0);
+  }
 }
 
 class RetryProbeRepository extends EpubTranslationRepository {

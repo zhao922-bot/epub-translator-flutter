@@ -14,6 +14,9 @@ const Duration _staleTempAge = Duration(minutes: 30);
 /// writes to the same target can land in the same microsecond; without a
 /// unique suffix they would share one temp path, interleave bytes, and the
 /// torn mix would be renamed over the target — silent data corruption.
+/// [pid] separates writers in *different processes* (two app instances
+/// saving the same history file); the counter separates rapid writes within
+/// one process.
 int _tempCounter = 0;
 
 /// Returns the sibling temp path used for an atomic write to [file]. Public
@@ -21,7 +24,7 @@ int _tempCounter = 0;
 /// the cleanup logic recognizing these files.
 String tempPathForAtomicWrite(File file) {
   return '${file.path}.tmp.'
-      '${DateTime.now().microsecondsSinceEpoch}_${_tempCounter++}';
+      '${DateTime.now().microsecondsSinceEpoch}_${pid}_${_tempCounter++}';
 }
 
 /// Writes [contents] to [file] atomically.

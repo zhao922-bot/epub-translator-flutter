@@ -9,6 +9,7 @@ import '../../../shared/logging/app_logger.dart';
 import '../../../shared/platform/native_platform_bridge.dart';
 import '../../../shared/platform/platform_utils.dart';
 import '../../../shared/io/atomic_file_writer.dart';
+import '../../../shared/io/strip_bom.dart';
 import '../../translation/domain/models/translation_config.dart';
 import '../../translation/infrastructure/epub_isolate_worker.dart';
 
@@ -293,7 +294,10 @@ class SettingsStore {
 
   Future<TranslationConfig> _readConfigFile(File file) async {
     final String raw = await file.readAsString();
-    final Object? decoded = jsonDecode(raw);
+    // Windows Notepad writes UTF-8 with BOM; without stripping, a
+    // hand-edited settings.json is misclassified as corrupt and the user's
+    // settings get reset to defaults.
+    final Object? decoded = jsonDecode(stripLeadingBom(raw));
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('settings.json is not a JSON object');
     }

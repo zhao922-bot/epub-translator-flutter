@@ -247,7 +247,9 @@ class ProperNameNormalizer {
       }
       output
         ..write(html.substring(cursor, match.start))
-        ..write('${mapping.target}（${_cleanLooseHtmlTokens(raw)}）');
+        ..write(
+          '${mapping.target}（${_cleanLooseHtmlTokens(raw, mapping.source)}）',
+        );
       state?.countedNames.add(mapping.source);
       cursor = match.end;
     }
@@ -410,9 +412,13 @@ class ProperNameNormalizer {
   /// returned translation), so `Pierre Van Den <span…></span>Berghe` still
   /// matches the locked `Van Den Berghe`.
   static RegExp _tolerantNamePattern(String source) {
-    final String escaped = RegExp.escape(source);
+    // The empty-tag mask character (\uE003) is transparent inside words too:
+    // anchors emitted at fixed character intervals (`Ad\uE003…am`) must not
+    // break the match; the gloss text is re-spaced by _cleanLooseHtmlTokens.
+    String wordPattern(String word) =>
+        word.split('').map(RegExp.escape).join(r'(?:\uE003+)?');
     if (!RegExp(r'\s').hasMatch(source)) {
-      return RegExp(escaped, caseSensitive: false);
+      return RegExp(wordPattern(source), caseSensitive: false);
     }
     final String emptyTagPair = r'<[^>]+>\s*</[^>]+>';
     // The empty-tag mask character (\uE003) is transparent to the matcher,
@@ -422,7 +428,7 @@ class ProperNameNormalizer {
         r'[\s\u00A0\uE003]*(?:' + emptyTagPair + r')?[\s\u00A0\uE003]*';
     final String pattern = source
         .split(RegExp(r'\s+'))
-        .map(RegExp.escape)
+        .map(wordPattern)
         .join(gap);
     return RegExp(pattern, caseSensitive: false);
   }
@@ -430,13 +436,38 @@ class ProperNameNormalizer {
   /// Strips any empty inline tag pairs / bare tags that the tolerant matcher
   /// may have travelled through so the parenthetical keeps a clean Latin
   /// name (a pagebreak anchor is meaningless inside a gloss).
-  static String _cleanLooseHtmlTokens(String value) {
-    return value
-        .replaceAll(RegExp(r'<[^>]+>\s*</[^>]+>'), '')
+  ///
+  /// [raw] is matched against the markup-masked HTML, so empty tags show up
+  /// as `\\uE003` runs. They are transparent separators: an empty tag between
+  /// words (`Adam\\uE003…Smith`) must keep a space, while one inside a word
+  /// (`Ad\\uE003…am Smith`, from anchors emitted at fixed character
+  /// intervals) must not gain one. The word boundaries are therefore
+  /// re-aligned to [source]: when the de-spaced cleaned text equals the
+  /// de-spaced source, spaces are re-inserted at the source's word
+  /// boundaries (keeping the text's own letter casing).
+  static String _cleanLooseHtmlTokens(String value, String source) {
+    final String cleaned = value
+        .replaceAll(RegExp(r'<[^>]+>\s*</[^>]+>'), ' ')
         .replaceAll(RegExp(r'<[^>]+>'), '')
-        .replaceAll(RegExp(r'[\uE002\uE003]'), '')
+        .replaceAll('\uE003', ' ')
+        .replaceAll(RegExp(r'[\uE002]+'), '')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
+    final List<String> sourceWords = source.split(RegExp(r'\s+'));
+    final String cleanedCompact = cleaned.replaceAll(' ', '');
+    if (sourceWords.length > 1 &&
+        cleanedCompact.toLowerCase() == sourceWords.join().toLowerCase()) {
+      final StringBuffer out = StringBuffer();
+      int pos = 0;
+      for (int i = 0; i < sourceWords.length; i++) {
+        if (i > 0) out.write(' ');
+        final int len = sourceWords[i].length;
+        out.write(cleanedCompact.substring(pos, pos + len));
+        pos += len;
+      }
+      return out.toString();
+    }
+    return cleaned;
   }
 
   /// Whether [match] spans an English name that is embedded inside an

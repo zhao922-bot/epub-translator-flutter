@@ -59,6 +59,14 @@ class _TranslationInputsState extends State<TranslationInputs> {
   late final FocusNode _inputPathFocusNode;
   late final FocusNode _outputDirectoryFocusNode;
 
+  /// Last value synced (or noted) from the widget into each field. Tracks
+  /// whether the controller text is genuine user typing vs. stale content:
+  /// without this, an external value arriving while the field is focused
+  /// would be "reverted" by the blur commit because the untouched controller
+  /// still holds the older text.
+  late String _syncedInputPath;
+  late String _syncedOutputDirectory;
+
   @override
   void initState() {
     super.initState();
@@ -66,6 +74,8 @@ class _TranslationInputsState extends State<TranslationInputs> {
     _outputDirectoryController = TextEditingController(
       text: widget.outputDirectory,
     );
+    _syncedInputPath = widget.inputPath;
+    _syncedOutputDirectory = widget.outputDirectory;
     // Typing must not trigger the controller callbacks on every keystroke:
     // those carry destructive side effects (clearing the current job and
     // inspection state, disk writes, path watchers). Commit only on submit
@@ -85,41 +95,70 @@ class _TranslationInputsState extends State<TranslationInputs> {
 
   /// Commits the pending path edits. [force] bypasses the focus check and is
   /// used from [dispose] so uncommitted keystrokes are never silently dropped
-  /// when the widget goes away.
+  /// when the widget goes away. Only fires when the text is genuine user
+  /// typing (differs from the last synced external value): an external value
+  /// that arrived while the field was focused must not be reverted by the
+  /// blur commit of an untouched field.
   void _commitInputPath({bool force = false}) {
+    final String typed = _inputPathController.text;
     if ((force || !_inputPathFocusNode.hasFocus) &&
         widget.enabled &&
-        _inputPathController.text != widget.inputPath) {
-      widget.onInputChanged(_inputPathController.text);
+        typed != _syncedInputPath &&
+        typed != widget.inputPath) {
+      widget.onInputChanged(typed);
     }
   }
 
   void _commitOutputDirectory({bool force = false}) {
+    final String typed = _outputDirectoryController.text;
     if ((force || !_outputDirectoryFocusNode.hasFocus) &&
         widget.enabled &&
-        _outputDirectoryController.text != widget.outputDirectory) {
-      widget.onOutputChanged(_outputDirectoryController.text);
+        typed != _syncedOutputDirectory &&
+        typed != widget.outputDirectory) {
+      widget.onOutputChanged(typed);
     }
   }
 
   @override
   void didUpdateWidget(covariant TranslationInputs oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.inputPath != oldWidget.inputPath &&
-        widget.inputPath != _inputPathController.text) {
-      _inputPathController.value = TextEditingValue(
-        text: widget.inputPath,
-        selection: TextSelection.collapsed(offset: widget.inputPath.length),
-      );
+    // Never clobber keystrokes being typed: an external value arriving while
+    // the user is actively typing (cold-start session restore, dropped
+    // EPUB, …) must wait for blur/submit, where _commit* decides what to do
+    // with the uncommitted text. Without the focus guard the typed path is
+    // silently replaced, and the later blur commit becomes a no-op because
+    // the controller now matches widget.inputPath.
+    //
+    // But a field that merely *has focus* without any typing is safe to
+    // sync: the controller still shows the old external value, so replacing
+    // it cannot destroy keystrokes. Skipping the sync in that case would be
+    // worse — the blur commit would see the stale text differ from
+    // _syncedInputPath and re-submit it, reverting the external update.
+    if (widget.inputPath != oldWidget.inputPath) {
+      _syncedInputPath = widget.inputPath;
+      if (_inputPathController.text == oldWidget.inputPath ||
+          !_inputPathFocusNode.hasFocus) {
+        if (widget.inputPath != _inputPathController.text) {
+          _inputPathController.value = TextEditingValue(
+            text: widget.inputPath,
+            selection: TextSelection.collapsed(offset: widget.inputPath.length),
+          );
+        }
+      }
     }
-    if (widget.outputDirectory != oldWidget.outputDirectory &&
-        widget.outputDirectory != _outputDirectoryController.text) {
-      _outputDirectoryController.value = TextEditingValue(
-        text: widget.outputDirectory,
-        selection: TextSelection.collapsed(
-          offset: widget.outputDirectory.length,
-        ),
-      );
+    if (widget.outputDirectory != oldWidget.outputDirectory) {
+      _syncedOutputDirectory = widget.outputDirectory;
+      if (_outputDirectoryController.text == oldWidget.outputDirectory ||
+          !_outputDirectoryFocusNode.hasFocus) {
+        if (widget.outputDirectory != _outputDirectoryController.text) {
+          _outputDirectoryController.value = TextEditingValue(
+            text: widget.outputDirectory,
+            selection: TextSelection.collapsed(
+              offset: widget.outputDirectory.length,
+            ),
+          );
+        }
+      }
     }
   }
 

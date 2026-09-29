@@ -660,6 +660,15 @@ class _ControlledHistoryStore extends JobHistoryStore {
   }) async {
     saved = jobs;
   }
+
+  @override
+  Future<({bool written, int fileClearedAt})> saveMerged({
+    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
+    required int clearedAtEpochMs,
+  }) async {
+    saved = merge(const <TranslationJob>[], 0);
+    return (written: true, fileClearedAt: 0);
+  }
 }
 
 class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
@@ -696,6 +705,14 @@ class _FailingHistoryStore extends JobHistoryStore {
   }) async {
     throw const FileSystemException('disk full');
   }
+
+  @override
+  Future<({bool written, int fileClearedAt})> saveMerged({
+    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
+    required int clearedAtEpochMs,
+  }) async {
+    throw const FileSystemException('disk full');
+  }
 }
 
 class _FailingInspectionRepository extends _SuccessfulInspectionRepository {
@@ -727,6 +744,15 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
     int clearedAtEpochMs = 0,
   }) async {
     saved = jobs;
+  }
+
+  @override
+  Future<({bool written, int fileClearedAt})> saveMerged({
+    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
+    required int clearedAtEpochMs,
+  }) async {
+    saved = merge(initial, 0);
+    return (written: true, fileClearedAt: 0);
   }
 }
 

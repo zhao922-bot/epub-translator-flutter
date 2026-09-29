@@ -60,6 +60,9 @@ class _TranslationStyleProfileCardState
   late final FocusNode _constraintsFocusNode;
   late final FocusNode _avoidFocusNode;
 
+  /// Removers for the blur re-sync listeners added in [initState].
+  final List<VoidCallback> _blurResyncRemovers = <VoidCallback>[];
+
   static String _lines(List<String> values) =>
       values.join(String.fromCharCode(10));
 
@@ -86,6 +89,57 @@ class _TranslationStyleProfileCardState
     _sentenceFocusNode = FocusNode();
     _constraintsFocusNode = FocusNode();
     _avoidFocusNode = FocusNode();
+    // If a profile change arrived while a field was focused and the user
+    // had already typed (so the sync was skipped), the field can be left
+    // showing text that no longer matches the model. Re-sync on blur.
+    _addBlurResync(
+      focusNode: _genreFocusNode,
+      controller: _genreController,
+      valueOf: () => widget.profile.primaryGenre,
+    );
+    _addBlurResync(
+      focusNode: _secondaryFocusNode,
+      controller: _secondaryController,
+      valueOf: () => widget.profile.secondaryGenres.join(', '),
+    );
+    _addBlurResync(
+      focusNode: _toneFocusNode,
+      controller: _toneController,
+      valueOf: () => widget.profile.tone,
+    );
+    _addBlurResync(
+      focusNode: _sentenceFocusNode,
+      controller: _sentenceController,
+      valueOf: () => widget.profile.sentenceStyle,
+    );
+    _addBlurResync(
+      focusNode: _constraintsFocusNode,
+      controller: _constraintsController,
+      valueOf: () => _lines(widget.profile.translationConstraints),
+    );
+    _addBlurResync(
+      focusNode: _avoidFocusNode,
+      controller: _avoidController,
+      valueOf: () => _lines(widget.profile.avoid),
+    );
+  }
+
+  /// Re-syncs [controller] to [valueOf] when [focusNode] loses focus, so a
+  /// field whose sync was skipped mid-edit cannot display stale text
+  /// forever. The remover is kept for [dispose].
+  void _addBlurResync({
+    required FocusNode focusNode,
+    required TextEditingController controller,
+    required String Function() valueOf,
+  }) {
+    void listener() {
+      if (!focusNode.hasFocus) {
+        _syncController(controller, valueOf(), focusNode: focusNode);
+      }
+    }
+
+    focusNode.addListener(listener);
+    _blurResyncRemovers.add(() => focusNode.removeListener(listener));
   }
 
   @override
@@ -96,31 +150,37 @@ class _TranslationStyleProfileCardState
       _syncController(
         _genreController,
         widget.profile.primaryGenre,
+        unchangedSince: oldWidget.profile.primaryGenre,
         focusNode: _genreFocusNode,
       );
       _syncController(
         _secondaryController,
         widget.profile.secondaryGenres.join(', '),
+        unchangedSince: oldWidget.profile.secondaryGenres.join(', '),
         focusNode: _secondaryFocusNode,
       );
       _syncController(
         _toneController,
         widget.profile.tone,
+        unchangedSince: oldWidget.profile.tone,
         focusNode: _toneFocusNode,
       );
       _syncController(
         _sentenceController,
         widget.profile.sentenceStyle,
+        unchangedSince: oldWidget.profile.sentenceStyle,
         focusNode: _sentenceFocusNode,
       );
       _syncController(
         _constraintsController,
         _lines(widget.profile.translationConstraints),
+        unchangedSince: _lines(oldWidget.profile.translationConstraints),
         focusNode: _constraintsFocusNode,
       );
       _syncController(
         _avoidController,
         _lines(widget.profile.avoid),
+        unchangedSince: _lines(oldWidget.profile.avoid),
         focusNode: _avoidFocusNode,
       );
     }
@@ -130,16 +190,21 @@ class _TranslationStyleProfileCardState
     TextEditingController controller,
     String value, {
     required FocusNode focusNode,
+    String? unchangedSince,
   }) {
     if (controller.text == value) {
       return;
     }
-    // Never rewrite the field the user is actively editing: replacing the
+    // Never rewrite a field the user is actively editing: replacing the
     // text on every keystroke yanks the cursor to the end and makes
-    // mid-text editing impossible. The model already holds the parsed
-    // value; the field is re-synced once it loses focus and the profile
-    // changes again.
-    if (focusNode.hasFocus) {
+    // mid-text editing impossible. Exception: the field still shows the
+    // pre-change text ([unchangedSince], e.g. the book was switched while
+    // the field was focused and the user hasn't typed since) — replacing it
+    // is safe, and skipping it would let the stale text leak into the new
+    // profile on the next keystroke. A blur listener (see initState) covers
+    // the remaining case: text edited mid-focus is re-synced on focus loss.
+    if (focusNode.hasFocus &&
+        (unchangedSince == null || controller.text != unchangedSince)) {
       return;
     }
     controller.value = TextEditingValue(
@@ -150,6 +215,10 @@ class _TranslationStyleProfileCardState
 
   @override
   void dispose() {
+    for (final VoidCallback remove in _blurResyncRemovers) {
+      remove();
+    }
+    _blurResyncRemovers.clear();
     _genreController.dispose();
     _secondaryController.dispose();
     _toneController.dispose();

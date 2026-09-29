@@ -264,6 +264,11 @@ class TranslationDashboardController
   // a rapid double-tap cannot start two overlapping async flows.
   bool _styleProfileInFlight = false;
   bool _isRetrying = false;
+  // Style-profile field names the user edited while a generation was in
+  // flight. Generation completing must not silently discard those edits
+  // (the completion copyWith would otherwise overwrite the whole profile),
+  // so the edited fields are merged back over the generated result.
+  final Set<String> _styleFieldsEditedDuringGeneration = <String>{};
   // WinForms dialogs have no owner window and may open behind the app, so a
   // user who thinks nothing happened can double-tap the picker buttons.
   // Without this guard two PowerShell + two modal dialogs stack up and the
@@ -301,6 +306,13 @@ class TranslationDashboardController
   // seen. Guards against a second app instance resurrecting cleared history
   // entries through its periodic persistence (see _persistJobHistory).
   int _lastSeenHistoryClearedAt = 0;
+  // Tombstone of our own in-flight [clearJobHistory]. While set, the file
+  // may still hold pre-clear entries (our clear's save hasn't landed yet),
+  // so [debugPersistJobHistoryNow] saves verbatim instead of merging — a
+  // merge would resurrect exactly what we just cleared. Set synchronously
+  // before the first await in [clearJobHistory], reset once the clear's
+  // save has landed.
+  int _ownClearTombstoneMs = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
   List<String>? _activeTranslationChapterPaths;
@@ -722,6 +734,7 @@ class TranslationDashboardController
 
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
+    _styleFieldsEditedDuringGeneration.clear();
     state = state.copyWith(
       isGeneratingStyleProfile: true,
       styleProfileConfirmed: false,
@@ -740,16 +753,44 @@ class TranslationDashboardController
         state = state.copyWith(isGeneratingStyleProfile: false);
         return;
       }
+      // The user may have hand-edited fields while the generation was in
+      // flight (the card stays editable). Keep those edits: take the
+      // generated profile as the base and overlay the user-touched fields
+      // from the pre-completion profile, which holds the live edits.
+      final TranslationStyleProfile userEdited = state.styleProfile;
+      final Set<String> edited = _styleFieldsEditedDuringGeneration;
+      final TranslationStyleProfile merged = edited.isEmpty
+          ? profile
+          : profile.copyWith(
+              primaryGenre: edited.contains('primaryGenre')
+                  ? userEdited.primaryGenre
+                  : null,
+              secondaryGenres: edited.contains('secondaryGenres')
+                  ? userEdited.secondaryGenres
+                  : null,
+              tone: edited.contains('tone') ? userEdited.tone : null,
+              sentenceStyle: edited.contains('sentenceStyle')
+                  ? userEdited.sentenceStyle
+                  : null,
+              translationConstraints: edited.contains('translationConstraints')
+                  ? userEdited.translationConstraints
+                  : null,
+              avoid: edited.contains('avoid') ? userEdited.avoid : null,
+              confidence: edited.contains('confidence')
+                  ? userEdited.confidence
+                  : null,
+            );
+      _styleFieldsEditedDuringGeneration.clear();
       state = state.copyWith(
-        styleProfile: profile,
+        styleProfile: merged,
         // Empty means generic style; keep unconfirmed only when there is content to review.
-        styleProfileConfirmed: profile.isEmpty,
+        styleProfileConfirmed: merged.isEmpty,
         isGeneratingStyleProfile: false,
         logs: <String>[
           ...state.logs,
-          profile.isEmpty
+          merged.isEmpty
               ? _s.logStyleProfileEmpty
-              : _s.logStyleProfileReady(profile.summaryLabel),
+              : _s.logStyleProfileReady(merged.summaryLabel),
         ],
       );
     } catch (error) {
@@ -775,6 +816,20 @@ class TranslationDashboardController
     if (state.isRunActive && !state.isGeneratingStyleProfile) {
       return;
     }
+    // A whole-profile replacement during generation is a manual edit too:
+    // mark every field so the in-flight generation result cannot clobber it
+    // on completion (see _generateStyleProfile).
+    if (state.isGeneratingStyleProfile) {
+      _styleFieldsEditedDuringGeneration.addAll(const <String>{
+        'primaryGenre',
+        'secondaryGenres',
+        'tone',
+        'sentenceStyle',
+        'translationConstraints',
+        'avoid',
+        'confidence',
+      });
+    }
     state = state.copyWith(styleProfile: profile, styleProfileConfirmed: false);
   }
 
@@ -789,6 +844,28 @@ class TranslationDashboardController
   }) {
     if (state.isRunActive && !state.isGeneratingStyleProfile) {
       return;
+    }
+    // Manual edits are allowed while a generation is in flight; remember
+    // which fields were touched so the generation result doesn't silently
+    // discard them on completion (see _generateStyleProfile).
+    if (state.isGeneratingStyleProfile) {
+      if (primaryGenre != null) {
+        _styleFieldsEditedDuringGeneration.add('primaryGenre');
+      }
+      if (secondaryGenresCsv != null) {
+        _styleFieldsEditedDuringGeneration.add('secondaryGenres');
+      }
+      if (tone != null) _styleFieldsEditedDuringGeneration.add('tone');
+      if (sentenceStyle != null) {
+        _styleFieldsEditedDuringGeneration.add('sentenceStyle');
+      }
+      if (constraintsText != null) {
+        _styleFieldsEditedDuringGeneration.add('translationConstraints');
+      }
+      if (avoidText != null) _styleFieldsEditedDuringGeneration.add('avoid');
+      if (confidence != null) {
+        _styleFieldsEditedDuringGeneration.add('confidence');
+      }
     }
     final TranslationStyleProfile current = state.styleProfile;
     final List<String> secondary = secondaryGenresCsv == null
@@ -857,6 +934,12 @@ class TranslationDashboardController
     TranslationStyleProfile? preservedStyleProfile,
     List<String>? chapterSelection,
     bool generateStyle = true,
+    // True when called from _retryJob: the retry flow manages
+    // _pendingResumeProgressHint itself. A manual (re-)inspection abandons
+    // any pending retry-resume context — the retried job's checkpoint must
+    // not linger and surface as a phantom resume point once the user
+    // translates the freshly inspected selection.
+    bool preserveResumeHint = false,
   }) async {
     if (!await _waitForSettingsReady()) {
       return;
@@ -890,6 +973,9 @@ class TranslationDashboardController
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
 
+    if (!preserveResumeHint) {
+      _pendingResumeProgressHint = null;
+    }
     state = state.copyWith(
       outputDirectory: outputDirectory,
       actionableError: null,
@@ -1657,6 +1743,7 @@ class TranslationDashboardController
       generateStyle:
           !wasTranslationFailure ||
           job.selectedChapterPaths?.isNotEmpty == true,
+      preserveResumeHint: true,
     );
     if (!mounted) {
       return;
@@ -1724,6 +1811,12 @@ class TranslationDashboardController
     if (nowMs > _lastSeenHistoryClearedAt) {
       _lastSeenHistoryClearedAt = nowMs;
     }
+    // Set synchronously, before any await: a persist that read the file
+    // before this clear must save verbatim (not merge) so it cannot
+    // resurrect the entries being cleared. Reset once our clear's save has
+    // landed — afterwards the file carries our tombstone and the merge path
+    // is safe again.
+    _ownClearTombstoneMs = _lastSeenHistoryClearedAt;
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
       logs: <String>[...state.logs, _s.logClearedHistory],
@@ -1742,6 +1835,8 @@ class TranslationDashboardController
         );
       }
       return false;
+    } finally {
+      _ownClearTombstoneMs = 0;
     }
     return true;
   }
@@ -2183,6 +2278,23 @@ class TranslationDashboardController
     return history;
   }
 
+  // Memoized inputs for the static (source-text-derived) part of the run
+  // estimate. The per-block CJK token estimation is O(book size) and the
+  // source text never changes during a run, so it is computed once per
+  // chapter-list/config and reused across progress callbacks; only the
+  // cheap progress fields (speed, ETA) are refreshed per tick. Identity
+  // comparison is enough: state updates reuse the same list instance via
+  // copyWith unless the chapters actually changed.
+  List<InspectedChapter>? _estimateStaticChaptersKey;
+  int _estimateStaticChunkSizeKey = -1;
+  TranslationRunEstimate? _estimateStaticCache;
+
+  /// Test-only: the memoized static estimate. Regression tests assert that
+  /// progress ticks reuse the same instance (no re-scan of the book) while
+  /// chapter or chunk-size changes invalidate it.
+  @visibleForTesting
+  TranslationRunEstimate? get debugStaticEstimateCache => _estimateStaticCache;
+
   TranslationRunEstimate? _buildEstimate({
     List<InspectedChapter>? chapters,
     TranslationConfig? config,
@@ -2193,10 +2305,23 @@ class TranslationDashboardController
     if (sourceChapters.isEmpty) {
       return null;
     }
-    return TranslationRunEstimate.fromChapters(
-      sourceChapters,
-      chunkSize: (config ?? state.config).chunkSize,
-      job: job ?? state.job,
+    final int chunkSize = (config ?? state.config).chunkSize;
+    TranslationRunEstimate? staticPart = _estimateStaticCache;
+    if (!identical(sourceChapters, _estimateStaticChaptersKey) ||
+        chunkSize != _estimateStaticChunkSizeKey ||
+        staticPart == null) {
+      staticPart = TranslationRunEstimate.staticPart(
+        sourceChapters,
+        chunkSize: chunkSize,
+      );
+      _estimateStaticChaptersKey = sourceChapters;
+      _estimateStaticChunkSizeKey = chunkSize;
+      _estimateStaticCache = staticPart;
+    }
+    final TranslationJob? currentJob = job ?? state.job;
+    return staticPart.withProgress(
+      completedBlocks: currentJob?.completedBlocks ?? 0,
+      totalBlocks: currentJob?.totalBlocks ?? staticPart.totalBlocks,
       elapsed: _translationStopwatch?.elapsed,
     );
   }
@@ -2313,26 +2438,48 @@ class TranslationDashboardController
     if (!mounted) {
       return;
     }
-    // Cross-instance guard: if another app instance cleared the history
-    // after our last read, its tombstone wins — skip this write instead of
-    // resurrecting the cleared entries.
-    final int fileClearedAt = (await store.loadWithTombstone()).clearedAt;
-    if (fileClearedAt > _lastSeenHistoryClearedAt) {
-      _lastSeenHistoryClearedAt = fileClearedAt;
-      // Our in-memory entries predate that clear, so they are stale: drop
-      // them now. Skipping just this one write is not enough — the next
-      // persistence pass (progress tick, run end) would write the stale
-      // entries back and resurrect the cleared history. The active run is
-      // unaffected: it is tracked via state.job and re-inserted into the
-      // history on completion.
+    // Snapshot what the merge needs: the merge callback runs inside the
+    // store's cross-process lock, so it must be synchronous and cannot read
+    // fresh state.
+    final List<TranslationJob> memoryJobs = state.jobHistory;
+    final int ownClearMs = _ownClearTombstoneMs;
+    final int lastSeen = _lastSeenHistoryClearedAt;
+    final ({bool written, int fileClearedAt}) result = await store.saveMerged(
+      clearedAtEpochMs: lastSeen,
+      merge: (List<TranslationJob> fileJobs, int fileClearedAt) {
+        // Our own in-flight clear: the file still predates it, so its
+        // entries are exactly what we just cleared — save verbatim so the
+        // merge cannot resurrect them.
+        if (ownClearMs > 0 && fileClearedAt < ownClearMs) {
+          return memoryJobs;
+        }
+        // Cross-instance append guard (Windows has no single-instance
+        // lock): another instance may have added jobs after our last read.
+        // The read and the write are serialized by the store's lock, so the
+        // merge sees the other instance's latest write instead of
+        // discarding it. Our entries first (our active job's copy is the
+        // freshest), then file entries we don't already have, capped at 20
+        // (the same union _loadJobHistory uses).
+        final Set<String> included = <String>{};
+        return <TranslationJob>[...memoryJobs, ...fileJobs]
+            .where((TranslationJob job) => included.add(job.id))
+            .take(20)
+            .toList(growable: false);
+      },
+    );
+    if (result.fileClearedAt > _lastSeenHistoryClearedAt) {
+      _lastSeenHistoryClearedAt = result.fileClearedAt;
+    }
+    if (!result.written) {
+      // Another instance cleared after our last read; the write was refused
+      // so the cleared entries stay cleared. Our in-memory entries predate
+      // that clear, so they are stale: drop them now — the next persist
+      // pass would otherwise write them back and resurrect the cleared
+      // history. The active run is unaffected: it is tracked via state.job
+      // and re-inserted into the history on completion.
       if (state.jobHistory.isNotEmpty) {
         state = state.copyWith(jobHistory: const <TranslationJob>[]);
       }
-      return;
     }
-    await store.save(
-      state.jobHistory,
-      clearedAtEpochMs: _lastSeenHistoryClearedAt,
-    );
   }
 }

@@ -56,7 +56,18 @@ class EpubInspector {
 
     void emit(TranslationJob job, String logLine) {
       currentJob = job;
-      onProgress?.call(job, logLine);
+      try {
+        onProgress?.call(job, logLine);
+      } catch (error) {
+        // A UI-side progress listener must never abort an inspection (e.g.
+        // the dashboard was disposed mid-inspection and its callback throws
+        // StateError on `state = …`). Log and keep going, like the
+        // translator's emit does.
+        AppLogger.warn(
+          'Progress callback failed (${error.runtimeType}); continuing.',
+          tag: 'inspect',
+        );
+      }
       AppLogger.debug(logLine, tag: 'inspect');
     }
 

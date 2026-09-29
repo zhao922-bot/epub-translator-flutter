@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
@@ -725,6 +726,14 @@ body.epub-translator-cjk [data-translation="true"] {
     }
   }
 
+  /// Test-only: exposes the translated navigation labels
+  /// (`chapterPath` / `chapterPath#fragment` → label) so the fragment-id
+  /// registration (heading ids, ancestor ids, EPUB2 empty anchors) is
+  /// directly covered by regression tests.
+  @visibleForTesting
+  Map<String, String> debugNavigationLabels(List<InspectedChapter> chapters) =>
+      _navigationLabels(chapters);
+
   Map<String, String> _navigationLabels(List<InspectedChapter> chapters) {
     final labels = <String, String>{};
     for (final chapter in chapters) {
@@ -742,6 +751,23 @@ body.epub-translator-cjk [data-translation="true"] {
         chapterPath: chapter.path,
       );
       final sourcesById = {for (final block in originalBlocks) block.id: block};
+      // The block fragments above lose document context: block splitting
+      // keeps only the heading element's own outerHtml, so ancestor ids
+      // (`<section id="…"><h1>`) and preceding empty anchors
+      // (`<a id="…"></a><h1>`) never appear in the fragment. Keep the
+      // source elements from the same extraction (identical order and id
+      // scheme) to resolve those against the full chapter document.
+      final sourceElements = _extractor.extractTranslatableTextElements(
+        originalDocument,
+      );
+      final elementsById = <String, dom.Element>{};
+      for (
+        var k = 0;
+        k < originalBlocks.length && k < sourceElements.length;
+        k++
+      ) {
+        elementsById[originalBlocks[k].id] = sourceElements[k];
+      }
       for (final block in chapter.blocks) {
         if (block.translatedHtml?.trim().isNotEmpty != true) continue;
         final source = html_parser.parseFragment(
@@ -761,17 +787,91 @@ body.epub-translator-cjk [data-translation="true"] {
               .replaceAll(RegExp(r'\s+'), ' ')
               .trim();
           if (label.isEmpty) continue;
+          final dom.Element heading = headings[i];
           for (final element in [
-            headings[i],
-            ...headings[i].querySelectorAll('[id], a[name]'),
+            heading,
+            ...heading.querySelectorAll('[id], a[name]'),
           ]) {
             final id = element.attributes['id'] ?? element.attributes['name'];
             if (id != null && id.isNotEmpty) labels['$chapterPath#$id'] = label;
+          }
+          // Ancestor ids address the same location as the heading: EPUB3
+          // `<section id="chapter1"><h1>…` with a nav link to
+          // `ch1.xhtml#chapter1` must resolve to this heading's label,
+          // otherwise the TOC entry stays in the source language. The
+          // first heading claims a shared ancestor (putIfAbsent).
+          //
+          // Resolved against the full chapter document: the block fragment
+          // above contains only the heading element itself, so ancestors
+          // and preceding siblings are invisible there.
+          final dom.Element contextHeading =
+              _documentHeadingFor(elementsById[block.id], i) ?? heading;
+          dom.Node? ancestor = contextHeading.parent;
+          while (ancestor is dom.Element &&
+              ancestor.localName != 'body' &&
+              ancestor.localName != 'html') {
+            final String? ancestorId = ancestor.attributes['id'];
+            if (ancestorId != null && ancestorId.isNotEmpty) {
+              labels.putIfAbsent('$chapterPath#$ancestorId', () => label);
+            }
+            ancestor = ancestor.parent;
+          }
+          // EPUB2-style empty anchors placed immediately before the heading
+          // (`<a id="…"></a><h1>…`) mark the same location. Whitespace text
+          // and comments between them don't break the run; anything else
+          // does (e.g. a footnote anchor belongs to previous content).
+          final dom.Node? headingParent = contextHeading.parent;
+          if (headingParent is dom.Element) {
+            final List<dom.Node> siblings = headingParent.nodes;
+            int index = siblings.indexOf(contextHeading);
+            while (index > 0) {
+              final dom.Node candidate = siblings[index - 1];
+              if (candidate is dom.Text || candidate is dom.Comment) {
+                if (candidate is dom.Text && candidate.text.trim().isNotEmpty) {
+                  break;
+                }
+                index -= 1;
+                continue;
+              }
+              if (candidate is! dom.Element ||
+                  candidate.localName != 'a' ||
+                  candidate.text.trim().isNotEmpty) {
+                break;
+              }
+              final String? anchorId =
+                  candidate.attributes['id'] ?? candidate.attributes['name'];
+              if (anchorId != null && anchorId.isNotEmpty) {
+                labels['$chapterPath#$anchorId'] = label;
+              }
+              index -= 1;
+            }
           }
         }
       }
     }
     return labels;
+  }
+
+  /// The i-th heading inside a block's source element in the full chapter
+  /// document, mirroring the fragment pairing above (same subtree order).
+  /// The block element itself can be the heading (block splitting isolates
+  /// `<h1>` into its own block), so it is included in the candidates.
+  dom.Element? _documentHeadingFor(dom.Element? sourceElement, int index) {
+    if (sourceElement == null) return null;
+    final List<dom.Element> headings = <dom.Element>[
+      if (_isHeadingElement(sourceElement)) sourceElement,
+      ...sourceElement.querySelectorAll('h1,h2,h3,h4,h5,h6'),
+    ];
+    return index < headings.length ? headings[index] : null;
+  }
+
+  bool _isHeadingElement(dom.Element element) {
+    final String? tag = element.localName;
+    return tag != null &&
+        tag.length == 2 &&
+        tag.codeUnitAt(0) == 0x68 && // 'h'
+        tag.codeUnitAt(1) >= 0x31 && // '1'
+        tag.codeUnitAt(1) <= 0x36; // '6'
   }
 
   /// Replace label text even when wrapped in formatting spans. Keep the
