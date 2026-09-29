@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
+import 'package:dio/dio.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as path;
 
@@ -205,10 +206,17 @@ class TranslationDashboardState {
 
 class _ResumeProgressHint {
   const _ResumeProgressHint({
+    required this.inputPath,
     required this.completedBlocks,
     required this.totalBlocks,
   });
 
+  /// The book this hint belongs to. A hint must never apply to a different
+  /// book: after `_retryJob` is stopped by the style-profile confirmation
+  /// gate, a stale hint would otherwise linger and surface as a phantom
+  /// resume point once the user inspects a new book whose selected block
+  /// count happens to match [totalBlocks].
+  final String inputPath;
   final int completedBlocks;
   final int totalBlocks;
 }
@@ -1075,6 +1083,7 @@ class TranslationDashboardController
         currentJob.totalBlocks > 0;
     final _ResumeProgressHint? currentJobHint = currentJobIsResumable
         ? _ResumeProgressHint(
+            inputPath: currentJob.inputPath,
             completedBlocks: currentJob.completedBlocks,
             totalBlocks: currentJob.totalBlocks,
           )
@@ -1082,7 +1091,8 @@ class TranslationDashboardController
     final _ResumeProgressHint? candidateResumeHint =
         _pendingResumeProgressHint ?? currentJobHint;
     final _ResumeProgressHint? resumeHint =
-        candidateResumeHint?.totalBlocks == selectedBlocks
+        candidateResumeHint?.totalBlocks == selectedBlocks &&
+            candidateResumeHint?.inputPath == state.inputPath
         ? candidateResumeHint
         : null;
     _pendingResumeProgressHint = null;
@@ -1618,6 +1628,7 @@ class TranslationDashboardController
     final bool wasTranslationFailure = _isTranslationRunPhase(job.phase);
     _pendingResumeProgressHint = wasTranslationFailure && job.totalBlocks > 0
         ? _ResumeProgressHint(
+            inputPath: job.inputPath,
             completedBlocks: job.completedBlocks,
             totalBlocks: job.totalBlocks,
           )
@@ -1960,7 +1971,17 @@ class TranslationDashboardController
   }
 
   bool _handleCancellation(Object error) {
-    if (!_cancelRequested && error is! TranslationCancelledException) {
+    // Cancellation is recognized by its signals only: the cooperative
+    // TranslationCancelledException checkpoints, and Dio's cancel-type
+    // error from the CancelToken that cancelJob() trips for an in-flight
+    // request. A genuine failure (bad API key, timeout, quality-gate
+    // FormatException, …) is never downgraded to "cancelled" — even when
+    // the user hit cancel at the same moment — or the real diagnosis is
+    // lost and a retry blindly hits the same wall.
+    final bool isCancellationSignal =
+        error is TranslationCancelledException ||
+        (error is DioException && error.type == DioExceptionType.cancel);
+    if (!isCancellationSignal) {
       return false;
     }
     final TranslationJob? currentJob = state.job;

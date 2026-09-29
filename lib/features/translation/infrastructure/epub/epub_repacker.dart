@@ -639,10 +639,27 @@ body.epub-translator-cjk [data-translation="true"] {
   };
 
   static final RegExp _wordTokenPattern = RegExp(r'[a-z0-9]+');
+  static final RegExp _classAttributePattern = RegExp(r'class="([^"]*)"');
+  static final RegExp _whitespaceRunPattern = RegExp(r'\s+');
+
+  /// True when the HTML carries `toc` as a whole whitespace-separated class
+  /// token. A bare prefix test (`class="toc…`) misfires on ordinary
+  /// body-text hooks like `class="toc-entry"` / `class="toclevel1"`,
+  /// misclassifying a body chapter as a TOC document — its cross-reference
+  /// anchor texts would then be rewritten into chapter titles.
+  bool _hasTocClassToken(String html) {
+    for (final RegExpMatch match in _classAttributePattern.allMatches(html)) {
+      if (match.group(1)!.split(_whitespaceRunPattern).contains('toc')) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   bool _isTocLikeChapter(InspectedChapter chapter) {
-    // A real TOC stylesheet hook is precise; keep it as-is.
-    if (chapter.originalHtml.contains('class="toc')) {
+    // A real TOC stylesheet hook is a whole `toc` class token; keep the
+    // check token-precise so body-text hooks like `toc-entry` do not hit.
+    if (_hasTocClassToken(chapter.originalHtml)) {
       return true;
     }
     // Whole filename-stem match: "toc.xhtml" hits, "protocols.xhtml" does

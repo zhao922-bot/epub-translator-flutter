@@ -256,4 +256,71 @@ void main() {
       expect(marked.map((dom.Element e) => e.text).join(), contains('单元格一'));
     });
   });
+
+  group('TOC label synchronization heuristic', () {
+    InspectedChapter translatedChapter() {
+      return _chapter(
+        path: 'text/ch2.xhtml',
+        originalHtml:
+            '<html><body><h2>Experiment</h2><p>Body.</p></body></html>',
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'h2-1',
+            tagName: 'h2',
+            sourceHtml: '<h2>Experiment</h2>',
+            sourceText: 'Experiment',
+            translatedHtml: '<h2>实验</h2>',
+          ),
+        ],
+      );
+    }
+
+    test('toc-prefixed class hook does not mark a body chapter as a TOC', () {
+      // Regression: `class="toc-entry"` / `class="toclevel1"` used to match
+      // the `class="toc` prefix check, so intentional cross-reference prose
+      // ("see the experiment section") was rewritten into the chapter title.
+      const String ch1Html =
+          '<html><body>'
+          '<p class="toc-entry">See '
+          '<a href="ch2.xhtml">the experiment section</a> for details.</p>'
+          '</body></html>';
+      final String output = EpubRepacker().synchronizeHtmlTocForTest(
+        tocPath: 'text/ch1.xhtml',
+        tocHtml: ch1Html,
+        chapters: <InspectedChapter>[
+          _chapter(
+            path: 'text/ch1.xhtml',
+            originalHtml: ch1Html,
+            blocks: const <ExtractedBlock>[],
+          ),
+          translatedChapter(),
+        ],
+      );
+      expect(output, contains('the experiment section'));
+      expect(output, isNot(contains('>实验</a>')));
+    });
+
+    test('whole toc class token still synchronizes labels', () {
+      // The legitimate signal — a whole `toc` class token — must keep
+      // working: TOC documents get their anchor labels synchronized.
+      const String tocHtml =
+          '<html><body>'
+          '<div class="toc"><a href="ch2.xhtml">old label</a></div>'
+          '</body></html>';
+      final String output = EpubRepacker().synchronizeHtmlTocForTest(
+        tocPath: 'text/toc.xhtml',
+        tocHtml: tocHtml,
+        chapters: <InspectedChapter>[
+          _chapter(
+            path: 'text/toc.xhtml',
+            originalHtml: tocHtml,
+            blocks: const <ExtractedBlock>[],
+          ),
+          translatedChapter(),
+        ],
+      );
+      expect(output, contains('>实验</a>'));
+      expect(output, isNot(contains('old label')));
+    });
+  });
 }

@@ -53,6 +53,12 @@ class _TranslationStyleProfileCardState
   late final TextEditingController _sentenceController;
   late final TextEditingController _constraintsController;
   late final TextEditingController _avoidController;
+  late final FocusNode _genreFocusNode;
+  late final FocusNode _secondaryFocusNode;
+  late final FocusNode _toneFocusNode;
+  late final FocusNode _sentenceFocusNode;
+  late final FocusNode _constraintsFocusNode;
+  late final FocusNode _avoidFocusNode;
 
   static String _lines(List<String> values) =>
       values.join(String.fromCharCode(10));
@@ -74,6 +80,12 @@ class _TranslationStyleProfileCardState
     _avoidController = TextEditingController(
       text: _lines(widget.profile.avoid),
     );
+    _genreFocusNode = FocusNode();
+    _secondaryFocusNode = FocusNode();
+    _toneFocusNode = FocusNode();
+    _sentenceFocusNode = FocusNode();
+    _constraintsFocusNode = FocusNode();
+    _avoidFocusNode = FocusNode();
   }
 
   @override
@@ -81,23 +93,53 @@ class _TranslationStyleProfileCardState
     super.didUpdateWidget(oldWidget);
     if (oldWidget.confirmed != widget.confirmed) _showConfirmedDetails = false;
     if (!oldWidget.profile.sameContentAs(widget.profile)) {
-      _syncController(_genreController, widget.profile.primaryGenre);
+      _syncController(
+        _genreController,
+        widget.profile.primaryGenre,
+        focusNode: _genreFocusNode,
+      );
       _syncController(
         _secondaryController,
         widget.profile.secondaryGenres.join(', '),
+        focusNode: _secondaryFocusNode,
       );
-      _syncController(_toneController, widget.profile.tone);
-      _syncController(_sentenceController, widget.profile.sentenceStyle);
+      _syncController(
+        _toneController,
+        widget.profile.tone,
+        focusNode: _toneFocusNode,
+      );
+      _syncController(
+        _sentenceController,
+        widget.profile.sentenceStyle,
+        focusNode: _sentenceFocusNode,
+      );
       _syncController(
         _constraintsController,
         _lines(widget.profile.translationConstraints),
+        focusNode: _constraintsFocusNode,
       );
-      _syncController(_avoidController, _lines(widget.profile.avoid));
+      _syncController(
+        _avoidController,
+        _lines(widget.profile.avoid),
+        focusNode: _avoidFocusNode,
+      );
     }
   }
 
-  void _syncController(TextEditingController controller, String value) {
+  void _syncController(
+    TextEditingController controller,
+    String value, {
+    required FocusNode focusNode,
+  }) {
     if (controller.text == value) {
+      return;
+    }
+    // Never rewrite the field the user is actively editing: replacing the
+    // text on every keystroke yanks the cursor to the end and makes
+    // mid-text editing impossible. The model already holds the parsed
+    // value; the field is re-synced once it loses focus and the profile
+    // changes again.
+    if (focusNode.hasFocus) {
       return;
     }
     controller.value = TextEditingValue(
@@ -114,6 +156,12 @@ class _TranslationStyleProfileCardState
     _sentenceController.dispose();
     _constraintsController.dispose();
     _avoidController.dispose();
+    _genreFocusNode.dispose();
+    _secondaryFocusNode.dispose();
+    _toneFocusNode.dispose();
+    _sentenceFocusNode.dispose();
+    _constraintsFocusNode.dispose();
+    _avoidFocusNode.dispose();
     super.dispose();
   }
 
@@ -223,27 +271,32 @@ class _TranslationStyleProfileCardState
           const SizedBox(height: 14),
           _field(
             controller: _genreController,
+            focusNode: _genreFocusNode,
             label: widget.strings.styleProfilePrimaryGenre,
             onChanged: (String value) => widget.onChanged(primaryGenre: value),
           ),
           _field(
             controller: _secondaryController,
+            focusNode: _secondaryFocusNode,
             label: widget.strings.styleProfileSecondaryGenres,
             onChanged: (String value) =>
                 widget.onChanged(secondaryGenresCsv: value),
           ),
           _field(
             controller: _toneController,
+            focusNode: _toneFocusNode,
             label: widget.strings.styleProfileTone,
             onChanged: (String value) => widget.onChanged(tone: value),
           ),
           _field(
             controller: _sentenceController,
+            focusNode: _sentenceFocusNode,
             label: widget.strings.styleProfileSentenceStyle,
             onChanged: (String value) => widget.onChanged(sentenceStyle: value),
           ),
           _field(
             controller: _constraintsController,
+            focusNode: _constraintsFocusNode,
             label: widget.strings.styleProfileConstraints,
             maxLines: 3,
             onChanged: (String value) =>
@@ -251,6 +304,7 @@ class _TranslationStyleProfileCardState
           ),
           _field(
             controller: _avoidController,
+            focusNode: _avoidFocusNode,
             label: widget.strings.styleProfileAvoid,
             maxLines: 3,
             onChanged: (String value) => widget.onChanged(avoidText: value),
@@ -293,6 +347,7 @@ class _TranslationStyleProfileCardState
 
   Widget _field({
     required TextEditingController controller,
+    required FocusNode focusNode,
     required String label,
     required ValueChanged<String> onChanged,
     int maxLines = 1,
@@ -301,6 +356,7 @@ class _TranslationStyleProfileCardState
       padding: const EdgeInsets.only(bottom: 10),
       child: TextField(
         controller: controller,
+        focusNode: focusNode,
         maxLines: maxLines,
         enabled: !widget.isGenerating && widget.editable,
         decoration: InputDecoration(labelText: label, isDense: true),

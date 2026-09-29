@@ -284,6 +284,30 @@ class _BlockingTranslationRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+/// A repository whose translation run throws a genuine failure (not a
+/// cancellation signal) once released, so tests can race it against a
+/// concurrent cancel request.
+class _ErrorTranslationRepository extends _SuccessfulInspectionRepository {
+  _ErrorTranslationRepository({super.blockCount = 1});
+
+  final Completer<void> translationStarted = Completer<void>();
+  final Completer<Object> releaseTranslation = Completer<Object>();
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    translationStarted.complete();
+    throw await releaseTranslation.future;
+  }
+}
+
 class _WarningTranslationRepository extends _SuccessfulInspectionRepository {
   _WarningTranslationRepository() : super(blockCount: 2);
 
@@ -871,6 +895,34 @@ void main() {
       controller.state.jobHistory.first.status,
       TranslationJobStatus.completed,
     );
+  });
+
+  test('genuine failure during cancellation is reported as failed', () async {
+    // Regression: when the user hit cancel at the same moment a real error
+    // surfaced, the error was downgraded to "cancelled" and the diagnosis
+    // (bad key, timeout, …) was lost.
+    final _ErrorTranslationRepository repository = _ErrorTranslationRepository(
+      blockCount: 1,
+    );
+    final TranslationDashboardController controller =
+        TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+    controller.syncSettings(
+      TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+    );
+    controller.setInputPath('C:\\Books\\book.epub');
+    await controller.startInspection();
+
+    final Future<void> translation = controller.startTranslation();
+    await repository.translationStarted.future;
+    await controller.requestCancel();
+    repository.releaseTranslation.complete(Exception('401 Unauthorized'));
+    await translation;
+
+    expect(controller.state.job?.status, TranslationJobStatus.failed);
+    expect(controller.state.job?.errorMessage, contains('401'));
   });
 
   test('ignores duplicate inspection requests while a run is active', () async {
