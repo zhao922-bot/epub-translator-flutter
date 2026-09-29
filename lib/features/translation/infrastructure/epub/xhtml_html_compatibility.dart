@@ -1,3 +1,6 @@
+import 'package:html/dom.dart' as dom;
+import 'package:html/parser.dart' as html_parser;
+
 /// Adapts XHTML syntax that an HTML5 parser would otherwise reinterpret.
 ///
 /// EPUB 2 books commonly use self-closing, non-void elements such as
@@ -7,6 +10,23 @@
 /// using package:html preserves their intended empty-marker semantics.
 class XhtmlHtmlCompatibility {
   const XhtmlHtmlCompatibility._();
+
+  /// Table cells and captions disappear in the default body context. Keep
+  /// their source-owned wrapper for structure locking and protected slots.
+  static dom.DocumentFragment parseFragment(String source) {
+    final root = RegExp(
+      r'^\s*(?:<!--[\s\S]*?-->\s*)*<(td|th|caption)(?=[\s/>])',
+      caseSensitive: false,
+    ).firstMatch(source)?.group(1)?.toLowerCase();
+    return html_parser.parseFragment(
+      normalizeForHtmlParser(source),
+      container: root == 'caption'
+          ? 'table'
+          : root != null
+          ? 'tr'
+          : 'body',
+    );
+  }
 
   static const Set<String> _htmlVoidTags = <String>{
     'area',
@@ -28,6 +48,10 @@ class XhtmlHtmlCompatibility {
   };
 
   static String normalizeForHtmlParser(String source) {
+    return _mapMarkup(source, _normalizeHtmlMarkup, cdataAsText: true);
+  }
+
+  static String _normalizeHtmlMarkup(String source) {
     if (!source.contains('/>')) {
       return source;
     }
@@ -114,6 +138,10 @@ class XhtmlHtmlCompatibility {
   /// HTML-only `&nbsp;` named entity. EPUB 2 content documents are XHTML, so
   /// strict readers require `<meta />` / `<br />` and an XML-safe entity.
   static String normalizeForXhtmlOutput(String source) {
+    return _mapMarkup(source, _normalizeXhtmlMarkup);
+  }
+
+  static String _normalizeXhtmlMarkup(String source) {
     final String xmlEntitySafe = source.replaceAll('&nbsp;', '&#160;');
     final StringBuffer output = StringBuffer();
     int copyFrom = 0;
@@ -187,7 +215,103 @@ class XhtmlHtmlCompatibility {
     return output.toString();
   }
 
+  /// Only rewrite markup. CDATA, comments, processing instructions and raw
+  /// script/style content may contain tag-shaped strings or literal entities.
+  static String _mapMarkup(
+    String source,
+    String Function(String) transform, {
+    bool cdataAsText = false,
+  }) {
+    final output = StringBuffer();
+    var start = 0;
+    var cursor = 0;
+    while (cursor < source.length) {
+      if (source.codeUnitAt(cursor) != _lessThan) {
+        cursor++;
+        continue;
+      }
+      String? terminator;
+      var prefixLength = 0;
+      if (source.startsWith('<!--', cursor)) {
+        terminator = '-->';
+        prefixLength = 4;
+      } else if (source.startsWith('<![CDATA[', cursor)) {
+        terminator = ']]>';
+        prefixLength = 9;
+      } else if (source.startsWith('<?', cursor)) {
+        terminator = '?>';
+        prefixLength = 2;
+      }
+      if (terminator != null) {
+        final end = source.indexOf(terminator, cursor + prefixLength);
+        final next = end < 0 ? source.length : end + terminator.length;
+        output.write(transform(source.substring(start, cursor)));
+        if (cdataAsText && terminator == ']]>' && end >= 0) {
+          // HTML treats CDATA in ordinary elements as a bogus comment.
+          // Entity encoding preserves its character data in HTML and foreign
+          // content alike. Raw script/style regions are skipped below.
+          output.write(
+            source
+                .substring(cursor + prefixLength, end)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;'),
+          );
+        } else {
+          output.write(source.substring(cursor, next));
+        }
+        start = cursor = next;
+        continue;
+      }
+      final name = _openingTag.matchAsPrefix(source, cursor);
+      if (name == null) {
+        cursor++;
+        continue;
+      }
+      var end = name.end;
+      int? quote;
+      for (; end < source.length; end++) {
+        final character = source.codeUnitAt(end);
+        if (quote != null) {
+          if (character == quote) quote = null;
+        } else if (character == _singleQuote || character == _doubleQuote) {
+          quote = character;
+        } else if (character == _greaterThan) {
+          break;
+        }
+      }
+      if (end >= source.length) break;
+      final tag = name.group(1)!;
+      final selfClosing = source
+          .substring(cursor, end)
+          .trimRight()
+          .endsWith('/');
+      cursor = end + 1;
+      if (!selfClosing &&
+          const {
+            'script',
+            'style',
+            'xmp',
+            'iframe',
+            'noembed',
+            'noframes',
+          }.contains(tag.toLowerCase())) {
+        final matches = RegExp(
+          '</${RegExp.escape(tag)}\\s*>',
+          caseSensitive: false,
+        ).allMatches(source, cursor).iterator;
+        final next = matches.moveNext() ? matches.current.start : source.length;
+        output.write(transform(source.substring(start, cursor)));
+        output.write(source.substring(cursor, next));
+        start = cursor = next;
+      }
+    }
+    output.write(transform(source.substring(start)));
+    return output.toString();
+  }
+
   static const int _lessThan = 0x3C;
+  static final RegExp _openingTag = RegExp(r'<([A-Za-z][\w:.-]*)(?=[\s/>])');
   static const int _greaterThan = 0x3E;
   static const int _slash = 0x2F;
   static const int _singleQuote = 0x27;

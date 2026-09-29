@@ -13,6 +13,7 @@ import '../../../../shared/localization/app_strings.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
 import 'epub_navigation.dart';
+import 'epub_source_guard.dart';
 import 'proper_name_normalizer.dart';
 import 'protected_anchor_text_slots.dart';
 import 'xhtml_html_compatibility.dart';
@@ -166,6 +167,8 @@ body.epub-translator-cjk [data-translation="true"] {
         translatedHtmlByPath: translatedHtmlByPath,
         navigationLabelsByPath: navigationLabelsByPath,
         navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
+        bilingual: config.bilingual,
+        expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
         // Isolate cannot be hard-interrupted; refuse final commit on cancel.
         shouldCommit: () =>
             !(cancelToken?.isCancelled == true ||
@@ -224,6 +227,9 @@ body.epub-translator-cjk [data-translation="true"] {
         continue;
       }
       hasTranslation = true;
+      final isDegraded = degradedBlockIds.contains(
+        degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
+      );
       final String normalizedTranslation = _normalizeCjkInitialTypography(
         translatedHtml,
         container: _replacementContainerFor(target),
@@ -237,7 +243,7 @@ body.epub-translator-cjk [data-translation="true"] {
                 normalizedTranslation,
               ),
               container: _replacementContainerFor(target),
-              languageTag: _languageTagForTarget(targetLanguage),
+              languageTag: isDegraded ? null : languageTag,
             )
           : _safelyUnwrapReplacementForStructuralTag(
               target,
@@ -254,10 +260,7 @@ body.epub-translator-cjk [data-translation="true"] {
           state: properNameState,
         );
       }
-      if (languageTag != null &&
-          !degradedBlockIds.contains(
-            degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
-          )) {
+      if (languageTag != null && !isDegraded) {
         translationPart = _labelTranslationLanguage(
           translationPart,
           target,
@@ -265,16 +268,11 @@ body.epub-translator-cjk [data-translation="true"] {
         );
       }
       var replacement = bilingual
-          ? (const {'li', 'td', 'th'}.contains(target.localName)
+          ? (const {'li', 'td', 'th', 'caption'}.contains(target.localName)
                 ? _bilingualStructuralItem(target, translationPart)
                 : '${target.outerHtml}\n$translationPart')
           : translationPart;
-      if (degradedBlockIds.contains(
-        EpubRepacker.degradedKeyForBlock(
-          chapterPath: chapter.path,
-          blockId: block.id,
-        ),
-      )) {
+      if (isDegraded) {
         // This block fell back to source/partial content. Leave an HTML
         // comment so the untranslated paragraph can be located in the EPUB
         // source. It trails the replacement so node-replacement mechanics
@@ -364,19 +362,20 @@ body.epub-translator-cjk [data-translation="true"] {
 
   /// The `parseFragment` container hint for a replacement: table cells need
   /// the `tr` context to keep their `<td>`/`<th>` wrapper, but every other
-  /// target falls back to `body`. A non-cell target with a `tr` parent can
+  /// caption needs `table`; other targets fall back to `body`. A non-cell target with a `tr` parent can
   /// only come from invalid source nesting; parsing its replacement in row
   /// context would trigger HTML5 foster parenting and displace the node,
   /// so the honest `body` context keeps it in place.
   String _replacementContainerFor(dom.Element target) {
     final String tag = target.localName ?? '';
+    if (tag == 'caption') return 'table';
     if (tag == 'td' || tag == 'th') {
       return target.parent?.localName ?? 'body';
     }
     return 'body';
   }
 
-  /// Table cells (`td` / `th`) must keep their wrapper element or the table
+  /// Table cells and captions must keep their wrapper element or the table
   /// layout collapses. The model is allowed to return the inner content
   /// without the cell wrapper (`<p>…</p>` instead of `<td>…</td>`), so if the
   /// first node of the replacement is not the same structural tag, we wrap it
@@ -386,7 +385,7 @@ body.epub-translator-cjk [data-translation="true"] {
     String replacementHtml,
   ) {
     final String tag = target.localName ?? '';
-    if (tag != 'td' && tag != 'th') {
+    if (tag != 'td' && tag != 'th' && tag != 'caption') {
       return replacementHtml;
     }
     final dom.DocumentFragment fragment = html_parser.parseFragment(
@@ -397,7 +396,12 @@ body.epub-translator-cjk [data-translation="true"] {
         ? null
         : fragment.nodes.first;
     if (first is dom.Element && first.localName == tag) {
-      return replacementHtml;
+      // The model supplies text, not table layout or anchor identities.
+      // Restore source attributes even when it returned a full cell wrapper.
+      first.attributes
+        ..clear()
+        ..addAll(target.attributes);
+      return fragment.outerHtml;
     }
     final StringBuffer attrs = StringBuffer();
     for (final MapEntry<Object, String> entry in target.attributes.entries) {
@@ -456,6 +460,9 @@ body.epub-translator-cjk [data-translation="true"] {
     );
     for (final dom.Element element in fragment.querySelectorAll('[id]')) {
       element.attributes.remove('id');
+    }
+    for (final anchor in fragment.querySelectorAll('a[name]')) {
+      anchor.attributes.remove('name');
     }
     for (final dom.Node node in fragment.nodes) {
       if (node is dom.Element) {

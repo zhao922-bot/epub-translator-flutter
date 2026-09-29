@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
@@ -10,6 +11,7 @@ import 'package:xml/xml.dart' as xml;
 import '../../../shared/logging/app_logger.dart';
 import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
+import 'epub/epub_source_guard.dart';
 
 /// Thrown when the final output file is locked by another process at commit
 /// time (Windows: a reader holding it open without share access).
@@ -78,7 +80,14 @@ class EpubIsolateWorker {
 
   /// Reads and decodes an EPUB into a name -> bytes map on a background isolate.
   static Future<Map<String, Uint8List>> loadArchiveFiles(String inputPath) {
-    return Isolate.run(() => _loadArchiveFilesSync(inputPath));
+    return Isolate.run(() => _loadArchiveSnapshotSync(inputPath).files);
+  }
+
+  /// Hash and decoded entries come from the same read, so an external save
+  /// cannot associate an old inspection with a newer file's hash.
+  static Future<({Map<String, Uint8List> files, String fingerprint})>
+  loadArchiveSnapshot(String inputPath) {
+    return Isolate.run(() => _loadArchiveSnapshotSync(inputPath));
   }
 
   /// Repacks an EPUB, replacing selected XHTML payloads, on a background isolate.
@@ -107,8 +116,10 @@ class EpubIsolateWorker {
     required Map<String, String> translatedHtmlByPath,
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
+    bool bilingual = false,
     bool Function()? shouldCommit,
     String Function(String outputPath, String tempPath)? lockedMessage,
+    String? expectedSourceFingerprint,
   }) async {
     final String tempPath = await Isolate.run(
       () => _writeTranslatedEpubToTempSync(
@@ -117,6 +128,8 @@ class EpubIsolateWorker {
         translatedHtmlByPath: translatedHtmlByPath,
         navigationLabelsByPath: navigationLabelsByPath,
         navigationLanguageTag: navigationLanguageTag,
+        bilingual: bilingual,
+        expectedSourceFingerprint: expectedSourceFingerprint,
       ),
     );
 
@@ -150,6 +163,7 @@ class EpubIsolateWorker {
     required Map<String, String> translatedHtmlByPath,
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
+    bool bilingual = false,
   }) {
     return Isolate.run(
       () => _writeTranslatedEpubToTempSync(
@@ -158,6 +172,7 @@ class EpubIsolateWorker {
         translatedHtmlByPath: translatedHtmlByPath,
         navigationLabelsByPath: navigationLabelsByPath,
         navigationLanguageTag: navigationLanguageTag,
+        bilingual: bilingual,
       ),
     );
   }
@@ -169,6 +184,7 @@ class EpubIsolateWorker {
     required Map<String, List<int>> archiveFiles,
     required Map<String, String> labelsByPath,
     required String? languageTag,
+    bool bilingual = false,
     Map<String, String> renderedHtmlByPath = const <String, String>{},
   }) {
     if (languageTag == null) {
@@ -210,7 +226,22 @@ class EpubIsolateWorker {
         .whereType<xml.XmlElement>()
         .where((xml.XmlElement element) => element.name.local == 'language')
         .toList(growable: false);
-    if (languages.isEmpty) {
+    if (bilingual && languages.isNotEmpty) {
+      final seen = <String>{};
+      for (final language in languages) {
+        final value = language.innerText.trim().toLowerCase();
+        if (value.isEmpty || !seen.add(value)) {
+          language.parent?.children.remove(language);
+        }
+      }
+      if (!seen.contains(languageTag.toLowerCase())) {
+        final metadata = opf.descendants
+            .whereType<xml.XmlElement>()
+            .where((element) => element.name.local == 'metadata')
+            .firstOrNull;
+        metadata?.children.add(_dcLanguageElement(opf, languageTag));
+      }
+    } else if (languages.isEmpty) {
       // No dc:language present: append one instead of skipping, so the
       // finished book still carries the target language.
       final xml.XmlElement? metadata = opf.descendants
@@ -581,14 +612,22 @@ class EpubIsolateWorker {
 
   /// Reads and decodes the source EPUB in a tight scope so the raw download
   /// buffer has no live local reference once decoding returns.
-  static Archive _decodeEpubArchive(String inputPath) {
-    return _decodeArchiveWithLimits(
-      inputPath,
-      _readSourceBytesGuarded(inputPath),
-    );
+  static Archive _decodeEpubArchive(
+    String inputPath,
+    String? expectedFingerprint,
+  ) {
+    final bytes = _readSourceBytesGuarded(inputPath);
+    if (expectedFingerprint != null) {
+      checkEpubSourceHash(
+        sha256.convert(bytes).toString(),
+        expectedFingerprint,
+      );
+    }
+    return _decodeArchiveWithLimits(inputPath, bytes);
   }
 
-  static Map<String, Uint8List> _loadArchiveFilesSync(String inputPath) {
+  static ({Map<String, Uint8List> files, String fingerprint})
+  _loadArchiveSnapshotSync(String inputPath) {
     final List<int> bytes = _readSourceBytesGuarded(inputPath);
     final Archive archive = _decodeArchiveWithLimits(inputPath, bytes);
     final Map<String, Uint8List> files = <String, Uint8List>{};
@@ -598,7 +637,7 @@ class EpubIsolateWorker {
       }
       files[file.name] = Uint8List.fromList(_fileBytes(file));
     }
-    return files;
+    return (files: files, fingerprint: sha256.convert(bytes).toString());
   }
 
   /// Zip-bomb guards for [_decodeArchiveWithLimits]. A legitimate EPUB is
@@ -700,6 +739,8 @@ class EpubIsolateWorker {
     required Map<String, String> translatedHtmlByPath,
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
+    bool bilingual = false,
+    String? expectedSourceFingerprint,
   }) {
     // Memory layout note: at peak this function holds the decoded source
     // archive (decompressed payloads), the repacked archive (mostly shared
@@ -715,7 +756,10 @@ class EpubIsolateWorker {
     //     slots are cleared. Repacked entries already hold their own
     //     references to the payload buffers (shared Uint8List views), so
     //     only the original download buffer becomes collectable here.
-    final Archive sourceArchive = _decodeEpubArchive(inputPath);
+    final Archive sourceArchive = _decodeEpubArchive(
+      inputPath,
+      expectedSourceFingerprint,
+    );
     final Archive repacked = Archive();
 
     // Navigation metadata (OPF language + translated NCX labels) is rendered
@@ -742,6 +786,7 @@ class EpubIsolateWorker {
           archiveFiles: archiveView,
           labelsByPath: navigationLabelsByPath,
           languageTag: navigationLanguageTag,
+          bilingual: bilingual,
           renderedHtmlByPath: translatedHtmlByPath,
         ),
       );

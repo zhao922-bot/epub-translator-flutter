@@ -65,12 +65,26 @@ String synchronizeEpub3Navigation({
 
       collect(anchor);
       if (textNodes.isEmpty) continue;
-      textNodes.first.text = label;
+      final labelNode = textNodes.first;
+      labelNode.text = label;
+      // Mark the actual replacement text. A nested span's explicit language
+      // overrides the anchor, while adjacent page numbers must keep theirs.
+      final labelParent = labelNode.parentNode;
+      if (labelParent is dom.Element && labelParent.nodes.length == 1) {
+        labelParent.attributes['lang'] = languageTag;
+        labelParent.attributes['xml:lang'] = languageTag;
+      } else if (labelParent != null) {
+        final index = labelParent.nodes.indexOf(labelNode);
+        final translatedLabel = dom.Element.tag('span')
+          ..attributes['lang'] = languageTag
+          ..attributes['xml:lang'] = languageTag;
+        labelNode.remove();
+        translatedLabel.nodes.add(labelNode);
+        labelParent.nodes.insert(index, translatedLabel);
+      }
       for (final extra in textNodes.skip(1)) {
         extra.remove();
       }
-      anchor.attributes['lang'] = languageTag;
-      anchor.attributes['xml:lang'] = languageTag;
       changed = true;
     }
   }

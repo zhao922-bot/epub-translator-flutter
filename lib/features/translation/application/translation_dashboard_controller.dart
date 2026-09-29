@@ -1615,10 +1615,7 @@ class TranslationDashboardController
     // The phase (not the display string) decides whether the failed job was
     // a translation run: currentChapter is localized now and must not be
     // matched on.
-    final bool wasTranslationFailure =
-        _isTranslationRunPhase(job.phase) ||
-        job.totalBlocks > 0 ||
-        job.completedBlocks > 0;
+    final bool wasTranslationFailure = _isTranslationRunPhase(job.phase);
     _pendingResumeProgressHint = wasTranslationFailure && job.totalBlocks > 0
         ? _ResumeProgressHint(
             completedBlocks: job.completedBlocks,

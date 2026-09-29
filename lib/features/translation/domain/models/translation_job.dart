@@ -111,7 +111,12 @@ class TranslationJob {
       inputPath: _readString(json['inputPath']),
       outputPath: _readString(json['outputPath']),
       status: _readStatus(json['status']),
-      phase: _readPhase(json['phase'], status: _readStatus(json['status'])),
+      phase: _readPhase(
+        json['phase'],
+        status: _readStatus(json['status']),
+        totalBlocks: _readNonNegativeInt(json['totalBlocks']),
+        completedBlocks: _readNonNegativeInt(json['completedBlocks']),
+      ),
       progress: _readProgress(json['progress']),
       currentChapter: _readNullableString(json['currentChapter']),
       currentBlock: _readNullableString(json['currentBlock']),
@@ -295,6 +300,8 @@ TranslationJobStatus _readStatus(Object? value) {
 TranslationJobPhase _readPhase(
   Object? value, {
   required TranslationJobStatus status,
+  required int totalBlocks,
+  required int completedBlocks,
 }) {
   if (value is String) {
     for (final TranslationJobPhase phase in TranslationJobPhase.values) {
@@ -310,6 +317,11 @@ TranslationJobPhase _readPhase(
   }
   if (status == TranslationJobStatus.inspected) {
     return TranslationJobPhase.inspection;
+  }
+  // Only legacy records without a recognized phase need this heuristic.
+  // A known inspection phase can also have indexed blocks and must win.
+  if (totalBlocks > 0 || completedBlocks > 0) {
+    return TranslationJobPhase.translation;
   }
   return TranslationJobPhase.inspection;
 }

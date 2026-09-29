@@ -439,6 +439,7 @@ class EpubHtmlExtractor {
       if (node is dom.Text) {
         buffer.write(node.data);
       } else if (node is dom.Element) {
+        if (nonTextAncestors.contains(node.localName)) return;
         if (node.localName == 'br') {
           buffer.write(' ');
         } else {

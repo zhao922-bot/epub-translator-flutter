@@ -1,5 +1,6 @@
 import 'package:html/dom.dart';
 import 'package:html/parser.dart' as html_parser;
+import 'epub/epub_html_extractor.dart';
 
 enum TranslationResidualKind { longSourceText, cjkAdjacentLowercaseWord }
 
@@ -153,6 +154,20 @@ class TranslationQuality {
     }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
+    // Source-owned code/formula text is intentionally retained. Exempt only
+    // identical subtrees, so newly introduced code wrappers cannot hide prose.
+    final selector = EpubHtmlExtractor.nonTextAncestors.join(',');
+    final sourceNonProse = sourceDocument.querySelectorAll(selector);
+    final translatedNonProse = translatedDocument.querySelectorAll(selector);
+    if (sourceNonProse.length == translatedNonProse.length) {
+      for (var index = sourceNonProse.length - 1; index >= 0; index--) {
+        if (sourceNonProse[index].outerHtml ==
+            translatedNonProse[index].outerHtml) {
+          sourceNonProse[index].nodes.clear();
+          translatedNonProse[index].nodes.clear();
+        }
+      }
+    }
     // Capture source inline work titles BEFORE any clearing below empties the
     // `<i>/<em>/<cite>` nodes, so retained work titles can be recognised later
     // even when the source copy was scrubbed by term/name handling.

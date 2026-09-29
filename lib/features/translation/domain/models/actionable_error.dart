@@ -43,6 +43,10 @@ class ActionableErrorFactory {
     if (_isEncodingUnsupported(message)) {
       return _encodingUnsupported(isChinese);
     }
+    if (message.toLowerCase().contains('source epub has changed') ||
+        message.contains('EPUB 源文件在检查后发生变化')) {
+      return _forKind(ActionableErrorKind.retryInspection, message, isChinese);
+    }
 
     final ActionableErrorKind kind =
         preferredKind ?? _classify(message) ?? ActionableErrorKind.dismiss;

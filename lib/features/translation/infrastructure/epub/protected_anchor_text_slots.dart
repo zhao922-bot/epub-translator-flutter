@@ -1,7 +1,8 @@
 import 'dart:collection';
 
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html_parser;
+import 'xhtml_html_compatibility.dart';
+import 'epub_html_extractor.dart';
 
 /// A source-owned HTML skeleton with translatable text slots.
 ///
@@ -16,7 +17,9 @@ class ProtectedAnchorTextSlots {
   ) : slotTexts = UnmodifiableListView<String>(slotTexts);
 
   factory ProtectedAnchorTextSlots.parse(String sourceHtml) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      sourceHtml,
+    );
     final List<dom.Node> roots = fragment.nodes
         .where(
           (dom.Node node) => node is! dom.Text || node.data.trim().isNotEmpty,
@@ -43,7 +46,9 @@ class ProtectedAnchorTextSlots {
   /// Detects protected anchors without imposing [parse]'s single-root
   /// requirement on ordinary HTML blocks.
   static bool containsProtectedAnchors(String sourceHtml) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      sourceHtml,
+    );
     for (final dom.Node node in fragment.nodes) {
       if (node is! dom.Element) {
         continue;
@@ -105,7 +110,10 @@ class ProtectedAnchorTextSlots {
       }
 
       final bool childProtected =
-          protected || _isRawTextElement(node) || _isProtectedAnchor(node);
+          protected ||
+          EpubHtmlExtractor.nonTextAncestors.contains(node.localName) ||
+          _isRawTextElement(node) ||
+          _isProtectedAnchor(node);
       for (final dom.Node child in node.nodes) {
         visit(child, protected: childProtected);
       }

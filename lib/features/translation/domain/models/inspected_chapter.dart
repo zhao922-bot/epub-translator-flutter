@@ -1,5 +1,13 @@
 enum ChapterCategory { content, frontMatter, backMatter, reference, ancillary }
 
+/// Identity of the exact archive bytes used to inspect a chapter.
+class EpubSourceIdentity {
+  const EpubSourceIdentity({required this.inputPath, required this.sha256});
+
+  final String inputPath;
+  final String sha256;
+}
+
 class InspectedChapter {
   const InspectedChapter({
     required this.path,
@@ -10,6 +18,7 @@ class InspectedChapter {
     required this.category,
     required this.recommendedForTranslation,
     required this.includeInTranslation,
+    this.sourceIdentity,
   });
 
   final String path;
@@ -20,6 +29,7 @@ class InspectedChapter {
   final ChapterCategory category;
   final bool recommendedForTranslation;
   final bool includeInTranslation;
+  final EpubSourceIdentity? sourceIdentity;
 
   int get translatedBlockCount => blocks
       .where((ExtractedBlock block) => block.translatedHtml != null)
@@ -34,6 +44,7 @@ class InspectedChapter {
     ChapterCategory? category,
     bool? recommendedForTranslation,
     bool? includeInTranslation,
+    EpubSourceIdentity? sourceIdentity,
   }) {
     return InspectedChapter(
       path: path ?? this.path,
@@ -45,6 +56,7 @@ class InspectedChapter {
       recommendedForTranslation:
           recommendedForTranslation ?? this.recommendedForTranslation,
       includeInTranslation: includeInTranslation ?? this.includeInTranslation,
+      sourceIdentity: sourceIdentity ?? this.sourceIdentity,
     );
   }
 

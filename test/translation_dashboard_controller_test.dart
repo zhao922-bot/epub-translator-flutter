@@ -1208,6 +1208,7 @@ void main() {
         initial: const <TranslationJob>[
           TranslationJob(
             id: 'failed-job',
+            phase: TranslationJobPhase.translation,
             selectedChapterPaths: ['chapter.xhtml'],
             inputPath: 'C:\\Books\\failed.epub',
             outputPath: 'C:\\Translated',

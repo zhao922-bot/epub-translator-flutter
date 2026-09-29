@@ -36,6 +36,9 @@ enum ProxySettingError {
 class TranslationApiClient {
   const TranslationApiClient();
 
+  static bool _isValidProxyPort(int? port) =>
+      port != null && port >= 1 && port <= 65535;
+
   Dio buildDio(TranslationConfig config) {
     final Dio dio = Dio(
       BaseOptions(
@@ -88,7 +91,10 @@ class TranslationApiClient {
     }
     if (trimmed.contains('://')) {
       final Uri? parsed = Uri.tryParse(trimmed);
-      if (parsed == null || parsed.host.isEmpty || !parsed.hasPort) {
+      if (parsed == null ||
+          parsed.host.isEmpty ||
+          !parsed.hasPort ||
+          !_isValidProxyPort(parsed.port)) {
         return null;
       }
       final String scheme = parsed.scheme.toLowerCase();
@@ -106,7 +112,7 @@ class TranslationApiClient {
     }
     final String host = (match.group(1) ?? match.group(2) ?? '').trim();
     final int? port = int.tryParse(match.group(3)!);
-    if (host.isEmpty || port == null || port <= 0 || port > 65535) {
+    if (host.isEmpty || !_isValidProxyPort(port)) {
       return null;
     }
     return '$host:$port';
@@ -125,7 +131,10 @@ class TranslationApiClient {
     }
     if (trimmed.contains('://')) {
       final Uri? parsed = Uri.tryParse(trimmed);
-      if (parsed == null || parsed.host.isEmpty || !parsed.hasPort) {
+      if (parsed == null ||
+          parsed.host.isEmpty ||
+          !parsed.hasPort ||
+          !_isValidProxyPort(parsed.port)) {
         return ProxySettingError.invalidFormat;
       }
       final String scheme = parsed.scheme.toLowerCase();
@@ -142,7 +151,7 @@ class TranslationApiClient {
     }
     final String host = (match.group(1) ?? match.group(2) ?? '').trim();
     final int? port = int.tryParse(match.group(3)!);
-    if (host.isEmpty || port == null || port <= 0 || port > 65535) {
+    if (host.isEmpty || !_isValidProxyPort(port)) {
       return ProxySettingError.invalidFormat;
     }
     return null;

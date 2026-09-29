@@ -9,10 +9,14 @@
 
 ## 下载安装
 
+当前源码版本：**1.4.4+8**。本次更新包含翻译恢复、源文件一致性、表格、CDATA、代码保护和双语导出修复，详见 [更新日志](CHANGELOG.md)。
+
+以下为目前已发布的安装包；**尚未发布 v1.4.4 安装包**，体验本次修复请从源码构建。
+
 | 平台 | 下载 | 说明 |
 |------|------|------|
-| Windows x64 | [v1.4.0 便携包](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.0) | 解压后运行 `epub_translator_flutter_clean.exe`（需同目录 DLL 与 `data` 文件夹）；v1.4.1 的 Windows 包待补充 |
-| Android | [v1.4.1 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) | 正式签名，可覆盖升级 |
+| Windows x64 | [v1.4.0 便携包](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.0) | 解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [v1.4.2 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.2) | 下载该版本发布页中的 APK 安装 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -21,9 +25,11 @@
 - **整书工作流**：章节选择、工作量预估、按块批量翻译，上下文与术语锁定保证前后连贯
 - **风格档案**：翻译前采样分析文体语气，展示置信度供你确认修改，AI 误判不会扩散到全书
 - **质量校验**：漏翻、源语言残留、异常输出自动检测重试；失败块可保留原文，输出可用译本
-- **断点续传**：中断后从缓存继续；Android 有前台服务，灭屏或切后台翻译不中断
+- **断点续传**：中断后复用有效缓存；重试保留章节选择。Android 使用前台服务维持后台任务，仍可能受系统省电策略限制
 - **EPUB 兼容**：保留图片、目录、章节顺序与排版，输出前校验 XML，降低损坏概率
-- **隐私**：Windows 下 API Key 系统级加密存储，日志自动脱敏；不内置、不上传任何密钥
+- **内容保护**：保留表格单元格和标题属性、正文 CDATA、代码与公式；术语替换跳过受保护内容，双语导出避免重复锚点并保留源语言元数据
+- **源文件校验**：检查后若 EPUB 内容发生变化，翻译或导出会提示重新检查，避免混用旧章节与新文件
+- **隐私**：Windows 下 API Key 系统级加密存储，日志自动脱敏；API Key 用于向你配置的服务商认证，不内置服务商密钥
 
 ## 使用流程
 
@@ -64,6 +70,17 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 - 不支持 DRM 保护的 EPUB；极少数自定义脚本、字体或复杂 CSS 在不同阅读器表现可能不同
 - 翻译质量、速度、费用取决于模型与服务商；建议保留原始 EPUB，先用短章节验证
+- v1.4.4 更新了表格单元格、表格标题和含代码/公式等受保护内容的缓存键；对应旧缓存可能需要重新翻译，其他未受影响的块仍可复用
+
+## 开发验证
+
+v1.4.4 修复集本地验证：**1026 项测试通过、19 项依赖环境的测试跳过**，静态分析无问题。测试覆盖模拟 API 和真实 EPUB 打包，未调用收费接口；不等同于所有设备与阅读器的兼容性认证。
+
+```powershell
+$env:LIVE_TRANSLATION_E2E='0'
+flutter analyze --no-pub
+flutter test --no-pub
+```
 
 ## 更多
 

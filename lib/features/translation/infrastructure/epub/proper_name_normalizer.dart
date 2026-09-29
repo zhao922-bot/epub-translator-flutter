@@ -1,3 +1,5 @@
+import 'epub_html_extractor.dart';
+
 /// Deterministic post-processing layer that converts every configuration-
 /// locked proper name to the canonical display form across the whole book.
 ///
@@ -68,7 +70,8 @@ class ProperNameNormalizer {
     if (mappings.isEmpty || !_isCjkTarget(targetLanguage)) {
       return html;
     }
-    if (!_containsCjk(html)) {
+    final prose = _maskNonProse(html);
+    if (!_containsCjk(prose)) {
       return html;
     }
 
@@ -76,7 +79,7 @@ class ProperNameNormalizer {
     // (Chinese（English） first, Chinese after) only applies to translated
     // prose. Entries are conventionally rendered with the source-language
     // author name intact.
-    if (_isBibliographicOrIndexEntry(html)) {
+    if (_isBibliographicOrIndexEntry(prose)) {
       return html;
     }
 
@@ -307,6 +310,7 @@ class ProperNameNormalizer {
   /// The mask is length-preserving, so match offsets stay valid for
   /// splicing the original HTML back together.
   static String _maskHtmlMarkup(String html) {
+    html = _maskNonProse(html);
     final StringBuffer out = StringBuffer();
     int cursor = 0;
     final RegExp markup = RegExp(
@@ -324,6 +328,53 @@ class ProperNameNormalizer {
       cursor = match.end;
     }
     out.write(html.substring(cursor));
+    return out.toString();
+  }
+
+  /// Keep source-owned subtrees opaque to every glossary rewrite, without
+  /// serializing the DOM or changing offsets in the original HTML.
+  static String _maskNonProse(String html) {
+    final tokens = RegExp(
+      r'''<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<(/?)([A-Za-z][\w:.-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>''',
+    );
+    final out = StringBuffer();
+    var cursor = 0;
+    String? root;
+    var depth = 0;
+    var start = 0;
+    for (final token in tokens.allMatches(html)) {
+      final tag = token.group(2)?.toLowerCase();
+      if (tag == null) continue;
+      final closing = token.group(1) == '/';
+      final selfClosing = token.group(0)!.endsWith('/>');
+      if (root == null) {
+        if (closing || !EpubHtmlExtractor.nonTextAncestors.contains(tag)) {
+          continue;
+        }
+        out.write(html.substring(cursor, token.start));
+        start = token.start;
+        root = tag;
+        depth = 1;
+      } else if (tag == root) {
+        if (closing) {
+          depth--;
+        } else if (!selfClosing && root != 'script' && root != 'style') {
+          depth++;
+        }
+      }
+      if (depth == 0 ||
+          (start == token.start &&
+              (selfClosing || const {'img', 'link', 'meta'}.contains(tag)))) {
+        out.write('\uE002' * (token.end - start));
+        cursor = token.end;
+        root = null;
+      }
+    }
+    if (root != null) {
+      out.write('\uE002' * (html.length - start));
+    } else {
+      out.write(html.substring(cursor));
+    }
     return out.toString();
   }
 

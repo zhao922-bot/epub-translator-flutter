@@ -69,7 +69,12 @@ class EpubInspector {
     emit(currentJob, s.inspectLogOpeningEpub(path.basename(inputPath)));
     throwIfCancelled();
 
-    final Map<String, List<int>> files = await openArchiveFiles(inputPath);
+    final snapshot = await EpubIsolateWorker.loadArchiveSnapshot(inputPath);
+    final Map<String, List<int>> files = snapshot.files;
+    final sourceIdentity = EpubSourceIdentity(
+      inputPath: path.absolute(inputPath),
+      sha256: snapshot.fingerprint,
+    );
     throwIfCancelled();
 
     final List<int>? containerBytes = files['META-INF/container.xml'];
@@ -118,7 +123,7 @@ class EpubInspector {
     final List<String> chapterPaths = spine.chapterPaths;
 
     // The repack isolate strict-decodes the NCX while rendering navigation
-    // metadata. Sniff it here (decode only, no XML parse) so a non-UTF-8 NCX
+    // metadata. Validate its encoding and XML here so a malformed NCX
     // fails loudly during inspection — before any API spend — instead of
     // killing the run after the whole translation was billed.
     validateNavigationEncodings(files: files, opfPath: opfPath);
@@ -165,10 +170,9 @@ class EpubInspector {
         missingChapterFiles.add(chapterPath);
         continue;
       }
-      final InspectedChapter chapter = _extractor.inspectChapterBytes(
-        chapterPath: chapterPath,
-        bytes: chapterBytes,
-      );
+      final InspectedChapter chapter = _extractor
+          .inspectChapterBytes(chapterPath: chapterPath, bytes: chapterBytes)
+          .copyWith(sourceIdentity: sourceIdentity);
       chapters.add(chapter);
       totalBlocks += chapter.blocks.length;
       final double progress = (index + 1) / chapterPaths.length;
@@ -312,7 +316,7 @@ class EpubInspector {
     }
   }
 
-  /// Strict-decodes the NCX (when the OPF declares one) without parsing it.
+  /// Validates NCX and EPUB 3 navigation encoding and XML before translation.
   ///
   /// The repack isolate strict-decodes the NCX while rendering navigation
   /// metadata; a non-UTF-8 NCX would otherwise fail the whole run AFTER
@@ -329,7 +333,9 @@ class EpubInspector {
     final String? ncxPath = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
     final List<int>? ncxBytes = ncxPath == null ? null : files[ncxPath];
     if (ncxBytes != null) {
-      decodeEpubText(bytes: ncxBytes, filePath: ncxPath!, strict: true);
+      XmlDocument.parse(
+        decodeEpubText(bytes: ncxBytes, filePath: ncxPath!, strict: true),
+      );
     }
     // EPUB 3 navigation is now rewritten at export too. Validate it before
     // any paid requests, including when it is absent from the spine.

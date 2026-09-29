@@ -6,7 +6,6 @@ import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
@@ -25,6 +24,9 @@ import '../translation_quality.dart';
 import '../cache_restoration_scanner.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_repacker.dart';
+import 'epub_html_extractor.dart';
+import 'epub_source_guard.dart';
+import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
 import 'translation_api_client.dart';
@@ -333,6 +335,7 @@ class EpubChapterTranslator {
     if (!config.styleProfileEnabled) {
       return TranslationStyleProfile.empty;
     }
+    await validateInspectedSource(chapters);
     final Dio dio = _apiClient.buildDio(config);
     try {
       return await _generateStyleProfile(
@@ -771,6 +774,7 @@ class EpubChapterTranslator {
         await throwIfOutputPathTooLongForWindows(outputFilePath);
       }
       if (totalBlocks == 0) {
+        await validateInspectedSource(chapters, inputPath: inputPath);
         return await _repackZeroBlockSelection(
           jobId: jobId,
           inputPath: inputPath,
@@ -812,7 +816,10 @@ class EpubChapterTranslator {
           confirmedProfile == null || confirmedProfile.isEmpty
           ? null
           : confirmedProfile;
-      final String inputFingerprint = await _inputFingerprint(inputPath);
+      final String inputFingerprint = await _inputFingerprint(
+        inputPath,
+        expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
+      );
       final String jobKey = _jobKey(
         inputFingerprint: inputFingerprint,
         config: config,
@@ -2521,7 +2528,7 @@ class EpubChapterTranslator {
   }
 
   static String _plainTextFromHtmlFragment(String value) {
-    return html_parser.parseFragment(value).text ?? '';
+    return XhtmlHtmlCompatibility.parseFragment(value).text ?? '';
   }
 
   /// Drops the per-block source HTML/text of a finished chapter to release
@@ -2855,7 +2862,8 @@ class EpubChapterTranslator {
     }
 
     final String sourceMarker = source.text.trim();
-    if (_isProtectedTextElement(source) &&
+    if (!EpubHtmlExtractor.nonTextAncestors.contains(source.localName) &&
+        _isProtectedTextElement(source) &&
         _isProtectedMarkerText(sourceMarker)) {
       _normalizeProtectedAnchor(
         source: source,
@@ -3140,7 +3148,7 @@ class EpubChapterTranslator {
   }
 
   static dom.Element? _singleRootElement(String fragmentHtml) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
       fragmentHtml,
     );
     final List<dom.Node> nodes = fragment.nodes
@@ -3210,7 +3218,9 @@ class EpubChapterTranslator {
   }
 
   static List<_HtmlTextSlot> _textSlotsInFragment(String html) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(html);
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      html,
+    );
     final List<_HtmlTextSlot> slots = <_HtmlTextSlot>[];
     for (final dom.Node node in fragment.nodes) {
       _collectTextSlots(node, slots, protected: false);
@@ -3246,6 +3256,7 @@ class EpubChapterTranslator {
 
   static bool _isProtectedTextElement(dom.Element element) {
     final String tag = element.localName ?? '';
+    if (EpubHtmlExtractor.nonTextAncestors.contains(tag)) return true;
     final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
     final bool protectedMarkerText = _isProtectedMarkerText(element.text);
@@ -4835,12 +4846,16 @@ class EpubChapterTranslator {
     return normalized;
   }
 
-  Future<String> _inputFingerprint(String inputPath) async {
+  Future<String> _inputFingerprint(
+    String inputPath, {
+    String? expectedSourceFingerprint,
+  }) async {
     // Read as a stream: context changes elsewhere in the book must invalidate
     // block translations even when the file size and timestamp are unchanged.
     final Digest contentHash = await sha256
         .bind(File(inputPath).openRead())
         .first;
+    checkEpubSourceHash(contentHash.toString(), expectedSourceFingerprint);
     final String normalizedPath = _normalizeInputPathForCache(inputPath);
     return sha256
         .convert(
@@ -4915,6 +4930,16 @@ class EpubChapterTranslator {
               // never hit again.
               block.id,
               block.sourceHtml,
+              // Old cell caches may contain model-owned layout or links.
+              // Invalidate just these blocks, retaining ordinary paid text.
+              if (block.tagName == 'td' || block.tagName == 'th')
+                'table-cell-structure-v2',
+              if (block.tagName == 'caption') 'table-caption-structure-v2',
+              if (RegExp(
+                r'<(?:pre|code|var|kbd|samp|svg|math|script|style)(?=[\s/>])',
+                caseSensitive: false,
+              ).hasMatch(block.sourceHtml))
+                'non-prose-text-v2',
               if (block.isAuthorSignature) 'author-signature-v1',
             ].join('|'),
           ),
@@ -4960,7 +4985,9 @@ class EpubChapterTranslator {
         (!sourceHtml.contains('dropcap') && !sourceHtml.contains('small'))) {
       return sourceHtml;
     }
-    final dom.DocumentFragment fragment = html_parser.parseFragment(sourceHtml);
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      sourceHtml,
+    );
     bool changed = false;
     final List<dom.Element> spans = fragment
         .querySelectorAll('span[class]')
@@ -5081,7 +5108,9 @@ class EpubChapterTranslator {
     if (html == null || html.trim().isEmpty) {
       return null;
     }
-    final dom.DocumentFragment fragment = html_parser.parseFragment(html);
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      html,
+    );
     return (fragment.text ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
