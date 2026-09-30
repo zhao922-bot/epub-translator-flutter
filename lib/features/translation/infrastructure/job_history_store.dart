@@ -28,6 +28,52 @@ class HistoryWriteConflict implements Exception {
       'after this instance last read it';
 }
 
+/// Thrown by [JobHistoryStore.saveMerged] when the cross-process history
+/// lock cannot be acquired within [_historyLockTimeout]: another app
+/// instance is holding it without making progress (debugger-paused, wedged
+/// event loop). The write is abandoned, not retried forever — the caller's
+/// next persist will try again, and `clearJobHistory` surfaces the failure
+/// instead of hanging the UI.
+class HistoryLockTimeout implements Exception {
+  HistoryLockTimeout(this.timeout);
+
+  final Duration timeout;
+
+  @override
+  String toString() =>
+      'HistoryLockTimeout: history lock not acquired within $timeout';
+}
+
+/// How long `saveMerged` waits for the cross-process history lock before
+/// giving up with [HistoryLockTimeout].
+const Duration _historyLockTimeout = Duration(seconds: 10);
+
+/// Acquires an exclusive lock on [lockHandle], failing fast instead of
+/// blocking forever: a non-blocking attempt throws [FileSystemException]
+/// immediately when another *process* holds the lock, so retry every 100ms
+/// until [timeout] and then throw [HistoryLockTimeout].
+///
+/// (Same-process handles never contend on POSIX — verified by test — which
+/// is why the in-process mutex in `saveMerged` serializes same-isolate
+/// callers separately.)
+Future<void> _lockWithTimeout(
+  RandomAccessFile lockHandle, {
+  Duration timeout = _historyLockTimeout,
+}) async {
+  final DateTime deadline = DateTime.now().add(timeout);
+  for (;;) {
+    try {
+      await lockHandle.lock(FileLock.exclusive);
+      return;
+    } on FileSystemException {
+      if (!DateTime.now().isBefore(deadline)) {
+        throw HistoryLockTimeout(timeout);
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+}
+
 class JobHistoryStore {
   JobHistoryStore({this.historyFileProvider});
 
@@ -63,6 +109,18 @@ class JobHistoryStore {
           ? _readClearedAt(decoded)
           : 0;
       return (jobs: _parseJobs(jobsNode), clearedAt: clearedAt);
+    } on FileSystemException catch (error) {
+      // Transient IO failure (an antivirus/indexer lock on Windows, a
+      // disappearing network drive): the file is not corrupt, only
+      // unreadable right now. Do NOT rename it aside — the next load will
+      // retry and the history is preserved.
+      AppLogger.error(
+        'Failed to read job-history.json (transient IO error); '
+        'will retry on next load.',
+        tag: 'history',
+        error: error,
+      );
+      return (jobs: const <TranslationJob>[], clearedAt: 0);
     } catch (error) {
       // A genuinely unparseable history file would otherwise be silently
       // overwritten by the next persist with no recovery path; rename it
@@ -88,8 +146,41 @@ class JobHistoryStore {
         'job-history.json.bad-${DateTime.now().microsecondsSinceEpoch}',
       );
       await file.rename(backupPath);
+      await _pruneCorruptBackups(file.parent);
     } catch (_) {
       // Best effort only: a failed backup must not break startup.
+    }
+  }
+
+  /// How many corrupt-history backups to keep. Every genuinely corrupt file
+  /// leaves one `job-history.json.bad-<microseconds>` behind; without a
+  /// bound they accumulate forever.
+  static const int _maxCorruptBackups = 5;
+
+  /// Deletes `job-history.json.bad-*` backups beyond [_maxCorruptBackups],
+  /// oldest first (the microseconds-since-epoch suffix sorts
+  /// chronologically).
+  Future<void> _pruneCorruptBackups(Directory directory) async {
+    try {
+      final List<File> backups = await directory
+          .list()
+          .where(
+            (FileSystemEntity entity) =>
+                entity is File &&
+                path.basename(entity.path).startsWith('job-history.json.bad-'),
+          )
+          .cast<File>()
+          .toList();
+      backups.sort((File a, File b) => a.path.compareTo(b.path));
+      for (int i = 0; i + _maxCorruptBackups < backups.length; i++) {
+        try {
+          await backups[i].delete();
+        } catch (_) {
+          // Best effort: leave whatever cannot be deleted.
+        }
+      }
+    } catch (_) {
+      // Best effort: a listing failure must not break startup.
     }
   }
 
@@ -201,10 +292,12 @@ class JobHistoryStore {
         mode: FileMode.write,
       );
       try {
-        // Blocking exclusive: the second instance waits here instead of
-        // racing. Mandatory on Windows, advisory (flock) on Linux/Android —
-        // both instances use this same path, so either is sufficient.
-        await lockHandle.lock(FileLock.blockingExclusive);
+        // Timed exclusive: the second instance retries here instead of
+        // racing, but gives up after [_historyLockTimeout] rather than
+        // blocking forever when the peer is wedged. Mandatory on Windows,
+        // advisory (flock) on Linux/Android — both instances use this same
+        // path, so either is sufficient.
+        await _lockWithTimeout(lockHandle);
         int fileClearedAt = 0;
         List<TranslationJob> fileJobs = const <TranslationJob>[];
         if (await file.exists()) {
@@ -252,6 +345,16 @@ class JobHistoryStore {
           // Best effort: the close below releases the lock anyway.
         }
         await lockHandle.close();
+        // Best effort: the lock file is only needed while a save is in
+        // flight; delete it so it does not linger forever. Deleting after
+        // unlock+close cannot break mutual exclusion: any contender either
+        // shared this file's identity (and blocked properly) or arrives
+        // after the critical section and reads fresh data.
+        try {
+          await lockFile.delete();
+        } catch (_) {
+          // Another instance may still have it open (Windows); harmless.
+        }
       }
     });
   }

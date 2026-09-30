@@ -478,15 +478,21 @@ class MainActivity : FlutterActivity() {
         // armed to close the stream at the deadline (see pickEpubFile). It
         // is a no-op once its attempt is answered, never touches a newer
         // attempt, and only fails the result when nobody else will answer
-        // it (see the watchdog in pickEpubFile).
+        // it (see the watchdog in pickEpubFile). The user-cancelled branch
+        // below is the exception: with no copy task submitted, it answers
+        // via replyToImport(), which drops the watchdog.
 
         val attempt = pendingPick ?: return
         pendingPick = null
         val result = attempt.result
 
         if (resultCode != Activity.RESULT_OK || data?.data == null) {
-            attempt.done.set(true)
-            result.success(null)
+            // Cancelled by the user (or an empty result): no copy task was
+            // submitted on this path, so the watchdog has nothing to guard.
+            // Answer through the shared funnel so it is dropped from the
+            // main queue (see replyToImport). The RESULT_OK path below must
+            // NOT do this: the watchdog doubles as the copy watchdog there.
+            replyToImport(attempt) { result.success(null) }
             return
         }
 
@@ -630,6 +636,16 @@ class MainActivity : FlutterActivity() {
      */
     private fun replyToImport(attempt: ImportAttempt, reply: () -> Unit) {
         if (attempt.done.compareAndSet(false, true)) {
+            // Normal completion (success, user cancel, copy failure): the
+            // watchdog is no longer needed — drop it from the main queue
+            // instead of letting it linger for the full 5 minutes holding
+            // the Activity/Result/ImportAttempt references. Only when it
+            // still belongs to this attempt: a newer pick may already have
+            // registered its own watchdog (the stale one then no-ops via
+            // its lastImportAttempt guard and must be left alone).
+            if (lastImportAttempt.get() === attempt) {
+                cancelPickTimeout()
+            }
             replyOnUiThread(attempt.result, reply)
         }
     }

@@ -351,15 +351,65 @@ body.epub-translator-cjk [data-translation="true"] {
       }
     }
     for (final element in fragment.querySelectorAll('*')) {
-      if (element.parentNode == fragment ||
-          element.attributes.containsKey('lang') ||
-          element.attributes.containsKey('xml:lang')) {
+      final String? markedLanguage =
+          element.attributes['lang'] ?? element.attributes['xml:lang'];
+      final bool isStaleEcho =
+          markedLanguage != null &&
+          _isStaleLanguageEcho(target, element, markedLanguage);
+      if (markedLanguage != null && !isStaleEcho) {
+        // The model deliberately marked a foreign-language passage the
+        // source did not mark (m6: a kept English quote inside Chinese
+        // text): respect it, never overwrite with the target language.
+        continue;
+      }
+      if (element.parentNode == fragment || isStaleEcho) {
         element.attributes['lang'] = languageTag;
         element.attributes['xml:lang'] = languageTag;
       }
     }
     return fragment.outerHtml;
   }
+
+  /// True when the model's language marking on [fragmentElement] merely
+  /// echoes a marking the source [target] subtree already carried, while the
+  /// text itself was translated (round2: `<em lang="en">Hello.</em>` →
+  /// `<em xml:lang="en">Bonjour.</em>`): the marking is stale and the
+  /// translated text takes the target language.
+  ///
+  /// A marking the source never had — or one whose text the model preserved
+  /// verbatim (a genuine foreign-language quote) — is deliberate and must
+  /// survive untouched.
+  bool _isStaleLanguageEcho(
+    dom.Element target,
+    dom.Element fragmentElement,
+    String markedLanguage,
+  ) {
+    final String fragmentText = _collapsedText(fragmentElement.text);
+    bool sawSameMarking = false;
+    for (final dom.Element sourceElement in <dom.Element>[
+      target,
+      ...target.querySelectorAll('*'),
+    ]) {
+      final String? sourceLanguage =
+          sourceElement.attributes['lang'] ??
+          sourceElement.attributes['xml:lang'];
+      if (sourceLanguage != markedLanguage ||
+          sourceElement.localName != fragmentElement.localName) {
+        continue;
+      }
+      sawSameMarking = true;
+      if (_collapsedText(sourceElement.text) == fragmentText) {
+        // The model preserved this passage verbatim: the marking is a
+        // genuine foreign-language quote, not a stale echo — even when a
+        // *different* same-tag element nearby was translated.
+        return false;
+      }
+    }
+    return sawSameMarking;
+  }
+
+  String _collapsedText(String text) =>
+      text.replaceAll(RegExp(r'\s+'), ' ').trim();
 
   /// The `parseFragment` container hint for a replacement: table cells need
   /// the `tr` context to keep their `<td>`/`<th>` wrapper, but every other
@@ -507,9 +557,21 @@ body.epub-translator-cjk [data-translation="true"] {
       final dom.Element? followingElement = _nextNonWhitespaceElement(dropCap);
       final String dropCapText = dropCap.text.trim();
       if (RegExp(r'^[A-Za-z]$').hasMatch(dropCapText)) {
-        // The translated sentence already contains its CJK opening word.
-        // Keeping the original decorative initial leaves a stray Latin letter.
-        dropCap.remove();
+        // A single Latin letter is only a stray decorative initial when the
+        // translated sentence already opens with its CJK word. If the letter
+        // heads a preserved English word (e.g. a proper name the model kept
+        // in Latin: `<span class="dropcap">A</span>dam Smith 说`), deleting
+        // it corrupts the word — keep the letter and only drop the class.
+        // When nothing follows, stay conservative and keep the letter too.
+        final String? nextChar = _firstContentCharAfter(dropCap);
+        if (nextChar != null && _containsCjk(nextChar)) {
+          dropCap.remove();
+        } else {
+          _removeClassesWhere(
+            dropCap,
+            (String className) => className.toLowerCase().startsWith('dropcap'),
+          );
+        }
       } else {
         _removeClassesWhere(
           dropCap,
@@ -569,6 +631,41 @@ body.epub-translator-cjk [data-translation="true"] {
       }
       if (sibling is dom.Text && sibling.data.trim().isNotEmpty) {
         return null;
+      }
+    }
+    return null;
+  }
+
+  /// The first non-whitespace character immediately following [element]
+  /// among its next siblings: whitespace-only text nodes are skipped, then
+  /// the first character of the first non-empty text node (or of the first
+  /// element's text) is returned. Null when nothing follows — callers must
+  /// treat that as "cannot judge" and keep content rather than delete it.
+  String? _firstContentCharAfter(dom.Element element) {
+    final dom.Node? parent = element.parentNode;
+    if (parent == null) {
+      return null;
+    }
+    final int elementIndex = parent.nodes.indexOf(element);
+    if (elementIndex < 0) {
+      return null;
+    }
+    for (
+      int index = elementIndex + 1;
+      index < parent.nodes.length;
+      index += 1
+    ) {
+      final dom.Node sibling = parent.nodes[index];
+      if (sibling is dom.Text) {
+        final Match? hit = RegExp(r'\S').firstMatch(sibling.data);
+        if (hit != null) {
+          return hit.group(0);
+        }
+      } else if (sibling is dom.Element) {
+        final Match? hit = RegExp(r'\S').firstMatch(sibling.text);
+        if (hit != null) {
+          return hit.group(0);
+        }
       }
     }
     return null;
@@ -640,7 +737,11 @@ body.epub-translator-cjk [data-translation="true"] {
   };
 
   static final RegExp _wordTokenPattern = RegExp(r'[a-z0-9]+');
-  static final RegExp _classAttributePattern = RegExp(r'class="([^"]*)"');
+  // Matches both `class="…"` and `class='…'` (older EPUBs use single
+  // quotes); group 2 is the class value, group 1 the quote character.
+  static final RegExp _classAttributePattern = RegExp(
+    'class=(["\'])([\\s\\S]*?)\\1',
+  );
   static final RegExp _whitespaceRunPattern = RegExp(r'\s+');
 
   /// True when the HTML carries `toc` as a whole whitespace-separated class
@@ -650,7 +751,7 @@ body.epub-translator-cjk [data-translation="true"] {
   /// anchor texts would then be rewritten into chapter titles.
   bool _hasTocClassToken(String html) {
     for (final RegExpMatch match in _classAttributePattern.allMatches(html)) {
-      if (match.group(1)!.split(_whitespaceRunPattern).contains('toc')) {
+      if (match.group(2)!.split(_whitespaceRunPattern).contains('toc')) {
         return true;
       }
     }

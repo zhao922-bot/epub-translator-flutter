@@ -548,16 +548,23 @@ void main() {
       expect(seen.length, greaterThan(1));
     });
 
-    test('honors a server Retry-After under the cap exactly', () {
+    test('honors a server Retry-After as a minimum with positive jitter', () {
       final TranslationConfig config = TranslationConfig.defaults();
-      expect(
-        TranslationApiClient.retryDelayForError(
+      final Set<int> seen = <int>{};
+      for (int seed = 0; seed < 10; seed++) {
+        final Duration delay = TranslationApiClient.retryDelayForError(
           config,
           rateLimitError(retryAfter: '300'),
           1,
-        ),
-        const Duration(seconds: 300),
-      );
+          random: Random(seed),
+        );
+        // Server said 300s: never shorter, at most +25% on top.
+        expect(delay.inMilliseconds, greaterThanOrEqualTo(300000));
+        expect(delay.inMilliseconds, lessThanOrEqualTo(375000));
+        seen.add(delay.inMilliseconds);
+      }
+      // With jitter, distinct seeds must not all collapse to one value.
+      expect(seen.length, greaterThan(1));
     });
 
     test('fails loud when Retry-After exceeds the 10 minute cap', () {

@@ -846,9 +846,12 @@ class TranslationApiClient {
     if (isRateLimitError(error)) {
       final Duration? retryAfter = retryAfterDelay(error);
       if (retryAfter != null) {
-        // Honor an explicit server instruction exactly (no jitter on it),
-        // but refuse to stall a run for longer than [_maxServerCooldown]:
-        // fail loud with an actionable message instead.
+        // The server's Retry-After stays a hard minimum (never shortened),
+        // but a small positive-only jitter desynchronizes batches that were
+        // limited together so they don't wake in lockstep and re-trigger
+        // the limit as a herd. Still refuses to stall a run past
+        // [_maxServerCooldown]: fail loud with an actionable message
+        // instead.
         if (retryAfter > _maxServerCooldown) {
           final int minutes = (retryAfter.inSeconds / 60).ceil();
           throw StateError(
@@ -857,7 +860,11 @@ class TranslationApiClient {
             ).rateLimitCooldownTooLong(_diagnosticHost(config), minutes),
           );
         }
-        return retryAfter;
+        final Duration jittered = addPositiveJitter(
+          retryAfter,
+          random ?? Random(),
+        );
+        return jittered > _maxServerCooldown ? _maxServerCooldown : jittered;
       }
       final int baseSeconds = max(5, config.retryDelaySeconds);
       final int multiplier = 1 << min(attempt - 1, 4);
@@ -868,7 +875,16 @@ class TranslationApiClient {
         random ?? Random(),
       );
     }
-    return Duration(seconds: max(1, config.retryDelaySeconds));
+    // Exponential backoff with jitter for every other retryable failure
+    // (transient 5xx, connection blips): without it, maxConcurrent batches
+    // that fail together retry in lockstep and hammer the endpoint as a
+    // herd. Same 90s cap as the rate-limit path.
+    final int baseSeconds = max(1, config.retryDelaySeconds);
+    final int multiplier = 1 << min(attempt - 1, 4);
+    return applyJitter(
+      Duration(seconds: min(90, baseSeconds * multiplier)),
+      random ?? Random(),
+    );
   }
 
   /// Longest server-requested cooldown this client will actually wait out.
@@ -883,6 +899,19 @@ class TranslationApiClient {
       return base;
     }
     final double factor = 0.75 + random.nextDouble() * 0.5;
+    return Duration(milliseconds: (base.inMilliseconds * factor).round());
+  }
+
+  /// Adds 0–25% extra delay on top of [base], never shortening it. Used for
+  /// server-directed Retry-After values, where the server's instruction
+  /// must stay a hard minimum while batches limited together stop waking
+  /// in lockstep. Extracted so tests can pass a seeded [Random] and assert
+  /// the range instead of an exact value.
+  static Duration addPositiveJitter(Duration base, Random random) {
+    if (base <= Duration.zero) {
+      return base;
+    }
+    final double factor = 1.0 + random.nextDouble() * 0.25;
     return Duration(milliseconds: (base.inMilliseconds * factor).round());
   }
 

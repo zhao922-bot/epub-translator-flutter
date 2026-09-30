@@ -2626,17 +2626,30 @@ class EpubChapterTranslator {
     final List<_HtmlTextSlot> translatedSlots = _textSlotsInFragment(
       trimmedTranslation,
     );
-    final List<String> translatedTexts = translatedSlots
-        .map((_HtmlTextSlot slot) => slot.text)
-        .where((String text) => text.isNotEmpty)
+    // Positional mapping must pair unprotected slots with unprotected
+    // slots: protected slots (footnote markers, page breaks, code) keep
+    // their source text, so consuming translation texts across the
+    // protected boundary would silently drop real translation text and
+    // duplicate marker text whenever the model moves a marker to another
+    // position. Fall back to the plain-text path when the protected counts
+    // do not line up either.
+    final List<_HtmlTextSlot> writableSourceSlots = sourceSlots
+        .where((_HtmlTextSlot slot) => !slot.protected)
         .toList(growable: false);
+    final List<String> writableTranslatedTexts = translatedSlots
+        .where((_HtmlTextSlot slot) => !slot.protected && slot.text.isNotEmpty)
+        .map((_HtmlTextSlot slot) => slot.text)
+        .toList(growable: false);
+    final int protectedSourceCount =
+        sourceSlots.length - writableSourceSlots.length;
+    final int protectedTranslatedCount = translatedSlots
+        .where((_HtmlTextSlot slot) => slot.protected && slot.text.isNotEmpty)
+        .length;
 
-    if (translatedTexts.length == sourceSlots.length) {
-      for (int index = 0; index < sourceSlots.length; index += 1) {
-        if (sourceSlots[index].protected) {
-          continue;
-        }
-        sourceSlots[index].text = translatedTexts[index];
+    if (writableTranslatedTexts.length == writableSourceSlots.length &&
+        protectedTranslatedCount == protectedSourceCount) {
+      for (int index = 0; index < writableSourceSlots.length; index += 1) {
+        writableSourceSlots[index].text = writableTranslatedTexts[index];
       }
       return rebuiltRoot.outerHtml;
     }

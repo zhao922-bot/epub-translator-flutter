@@ -13,6 +13,14 @@ import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
 import 'epub/epub_source_guard.dart';
 
+/// A `.tmp.*` file counts as a stale orphan only when older than this. The
+/// temp file of a live commit is always seconds old; orphans from a dead
+/// previous process or session are far older. An age gate (instead of
+/// "older than this process started") is robust against filesystem
+/// timestamp granularity (FAT32/exFAT: 2s) and clock skew, and also
+/// protects the temp files of a second concurrently running app instance.
+const Duration _kStaleTempAge = Duration(minutes: 30);
+
 /// Thrown when the final output file is locked by another process at commit
 /// time (Windows: a reader holding it open without share access).
 ///
@@ -50,8 +58,9 @@ class InputFileLockedException implements Exception {
 
 /// Thrown when a source EPUB trips the zip-bomb guards in
 /// [_decodeArchiveWithLimits]: the compressed file itself is implausibly
-/// large, the header-declared uncompressed total exceeds the cap, or the
-/// overall compression ratio is absurd. Rejected BEFORE any entry content is
+/// large, the header-declared uncompressed total exceeds the cap, the
+/// overall compression ratio is absurd, or the entry count exceeds the cap
+/// (millions of near-empty entries). Rejected BEFORE any entry content is
 /// materialized, so a malicious archive cannot OOM the isolate.
 /// Catchers build the user-facing message via
 /// `AppStrings.epubDecompressionLimit`.
@@ -272,7 +281,18 @@ class EpubIsolateWorker {
       if (href.isEmpty || uri == null || uri.hasScheme || uri.hasAuthority) {
         continue;
       }
-      final navPath = navigationTargetKey(opfPath, href);
+      // Manifest hrefs may carry a "#fragment" (seen in the wild, though
+      // unusual); archive keys never contain it. Strip it from the raw href
+      // before lookup — mirroring EpubInspector.validateNavigationEncodings
+      // — so the nav document is not silently skipped. (Stripping the raw
+      // href, not the decoded key, keeps a literal %23 in filenames intact.)
+      // A bare "#fragment" with no path cannot resolve to a content
+      // document; skip it instead of matching the OPF itself.
+      final String hrefPath = href.split('#').first;
+      if (hrefPath.isEmpty) {
+        continue;
+      }
+      final navPath = navigationTargetKey(opfPath, hrefPath);
       final bytes = archiveFiles[navPath];
       if (bytes == null) continue;
       // Use rendered content when navigation is also a translated chapter,
@@ -440,6 +460,10 @@ class EpubIsolateWorker {
     // A previous process may have died between moving the original aside
     // and promoting the temp file, leaving `.bak.*` files behind.
     await _reclaimStaleBackups(finalFile);
+    // A previous process may also have died between the isolate returning
+    // the temp path and the commit running, leaving `.tmp.*` orphans
+    // behind (unlike `.bak.*` files, nothing reclaimed these until now).
+    await _reclaimStaleTempFiles(finalFile, tempFile);
 
     try {
       if (!await finalFile.exists()) {
@@ -576,6 +600,36 @@ class EpubIsolateWorker {
     }
   }
 
+  /// Deletes `.tmp.*` orphans left by a previous process that died after
+  /// the isolate wrote the temp EPUB but before [commitTempFile] promoted
+  /// it. Only files older than [_kStaleTempAge] are touched, and the temp
+  /// file this commit is about to promote is always excluded — so a live
+  /// commit (or a temp deliberately kept by an [OutputFileLockedException]
+  /// recovery, or a second app instance's temp) can never be deleted.
+  /// Best effort; never throws.
+  static Future<void> _reclaimStaleTempFiles(
+    File finalFile,
+    File tempFile,
+  ) async {
+    try {
+      final String prefix = '${path.basename(finalFile.path)}.tmp.';
+      final DateTime cutoff = DateTime.now().subtract(_kStaleTempAge);
+      await for (final FileSystemEntity entity in finalFile.parent.list()) {
+        if (entity is! File || !path.basename(entity.path).startsWith(prefix)) {
+          continue;
+        }
+        if (entity.path == tempFile.path) {
+          continue;
+        }
+        if ((await entity.lastModified()).isBefore(cutoff)) {
+          await _deleteQuietly(entity);
+        }
+      }
+    } catch (_) {
+      // Best effort: stale temps must never break a commit.
+    }
+  }
+
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
     finalFile.parent.createSync(recursive: true);
@@ -657,6 +711,13 @@ class EpubIsolateWorker {
   /// style bomb is many orders of magnitude above it.
   static const int _kMaxCompressionRatio = 100;
 
+  /// Cap on the number of entries in the archive. Real books carry hundreds
+  /// to low thousands of entries; tens of thousands is already implausible.
+  /// Without this, a bomb of millions of near-empty entries sails under the
+  /// size/ratio guards above while every entry still costs a decoded header
+  /// object and per-entry processing downstream.
+  static const int _kMaxEpubEntryCount = 50000;
+
   /// Reads the source file with two guards: a cap on the compressed size
   /// (see [_kMaxEpubCompressedBytes]) and Windows file-lock classification
   /// that throws [InputFileLockedException] instead of a raw English
@@ -706,8 +767,21 @@ class EpubIsolateWorker {
     required Archive archive,
     required int compressedBytes,
   }) {
+    int entryCount = 0;
     int totalUncompressed = 0;
     for (final ArchiveFile entry in archive) {
+      // Count every entry (files and directories): each one costs a decoded
+      // header object, so millions of near-empty entries are a DoS vector
+      // even when their declared sizes stay under the byte caps below.
+      entryCount += 1;
+      if (entryCount > _kMaxEpubEntryCount) {
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: compressedBytes,
+          uncompressedBytes: entryCount,
+          limitBytes: _kMaxEpubEntryCount,
+        );
+      }
       if (!entry.isFile) {
         continue;
       }
@@ -825,7 +899,18 @@ class EpubIsolateWorker {
     }
     repacked.add(repackedMimetype);
 
+    // The read path (_loadArchiveSnapshotSync) keys entries by name in a Map,
+    // so duplicate entry names resolve last-wins there. The copy loop used
+    // to emit every copy — including an untranslated first copy of a
+    // replaced chapter, which some readers prefer. Dedupe to last-wins so
+    // both sides agree on which copy survives. Insertion order (first-seen
+    // position) is preserved, so entry ordering is unchanged.
+    final Map<String, ArchiveFile> dedupedSource = <String, ArchiveFile>{};
     for (final ArchiveFile sourceFile in sourceArchive) {
+      dedupedSource[sourceFile.name] = sourceFile;
+    }
+
+    for (final ArchiveFile sourceFile in dedupedSource.values) {
       if (sourceFile.name == 'mimetype') {
         continue;
       }

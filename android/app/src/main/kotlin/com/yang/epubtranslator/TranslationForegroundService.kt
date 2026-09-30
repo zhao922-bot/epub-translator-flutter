@@ -66,15 +66,18 @@ class TranslationForegroundService : Service() {
             @Suppress("DEPRECATION")
             stopForeground(false)
         }
-        if (NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+        if (NotificationManagerCompat.from(this).areNotificationsEnabled() &&
+            isProgressChannelEnabled()
+        ) {
             NotificationManagerCompat.from(this)
                 .notify(NOTIFICATION_ID, buildNotification(ongoing = false))
         } else {
-            // The user disabled notifications: the final notification would
-            // be posted into the void and the timeout would go completely
-            // unnoticed. Persist it instead so the next app start can
-            // surface it in-app; Dart consumes (and clears) the flag via
-            // MainActivity's "consumePendingForegroundServiceTimeout".
+            // The user disabled notifications (or just this channel): the
+            // final notification would be posted into the void and the
+            // timeout would go completely unnoticed. Persist it instead so
+            // the next app start can surface it in-app; Dart consumes (and
+            // clears) the flag via MainActivity's
+            // "consumePendingForegroundServiceTimeout".
             getSharedPreferences(TIMEOUT_PENDING_PREFS, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(KEY_TIMEOUT_PENDING, true)
@@ -211,6 +214,23 @@ class TranslationForegroundService : Service() {
             NotificationManager.IMPORTANCE_LOW
         )
         manager.createNotificationChannel(channel)
+    }
+
+    /**
+     * Whether the `translation_progress` channel can actually deliver: the
+     * app-level `areNotificationsEnabled()` check is not enough, because the
+     * user may disable this channel alone in system settings, in which case
+     * posting is silently dropped. A deleted channel also counts as
+     * undeliverable — the timeout must then take the persisted-flag path so
+     * the next app start can surface it in-app.
+     */
+    private fun isProgressChannelEnabled(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return true
+        val manager = getSystemService(NotificationManager::class.java)
+            ?: return false
+        val channel = manager.getNotificationChannel(CHANNEL_ID)
+        return channel != null &&
+            channel.importance != NotificationManager.IMPORTANCE_NONE
     }
 
     companion object {

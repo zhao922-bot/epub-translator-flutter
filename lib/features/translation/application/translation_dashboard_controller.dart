@@ -485,8 +485,17 @@ class TranslationDashboardController
       state = state.copyWith(logs: <String>[...state.logs, _s.logInputLocked]);
       return;
     }
+    // NOTE: no extension validation here — this receives intermediate values
+    // while the user is still typing (see 'rapid manual edits coalesce queued
+    // session writes'); rejecting them would break incremental entry and
+    // fight the widget's blur-commit tracking. Validation happens at the
+    // action boundary in startInspection.
     _sessionPathRevision += 1;
     _inputPathRevision += 1;
+    // A new input abandons any in-flight style generation and its profile:
+    // drop the edit markers too, or the next merge would overlay fields from
+    // the discarded profile.
+    _styleFieldsEditedDuringGeneration.clear();
     state = state.copyWith(
       inputPath: value,
       job: null,
@@ -540,6 +549,9 @@ class TranslationDashboardController
         ? inferredOutput
         : state.outputDirectory;
     final String base = path.basename(normalizedPath);
+    // Same as setInputPath: a newly picked/dropped book discards the profile
+    // and any in-flight generation, so the edit markers go too.
+    _styleFieldsEditedDuringGeneration.clear();
     state = state.copyWith(
       inputPath: normalizedPath,
       outputDirectory: outputDirectory,
@@ -734,7 +746,11 @@ class TranslationDashboardController
 
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
-    _styleFieldsEditedDuringGeneration.clear();
+    // Do NOT clear _styleFieldsEditedDuringGeneration here: edits made during
+    // a previous generation that was cancelled/failed are still live in
+    // state.styleProfile and must survive into the next generation's merge.
+    // The set is cleared after a successful merge, and at every wholesale
+    // profile reset (new input path, new inspection, retry).
     state = state.copyWith(
       isGeneratingStyleProfile: true,
       styleProfileConfirmed: false,
@@ -953,6 +969,15 @@ class TranslationDashboardController
       );
       return;
     }
+    // Safety net: the input path can also arrive via session restore or
+    // older flows that bypass setInputPath's validation — never let a
+    // non-EPUB path reach the repository layer.
+    if (path.extension(state.inputPath.trim()).toLowerCase() != '.epub') {
+      state = state.copyWith(
+        logs: <String>[...state.logs, _s.logChooseEpubFile],
+      );
+      return;
+    }
 
     final String inputPath = state.inputPath;
     final int inputPathRevision = _inputPathRevision;
@@ -976,6 +1001,10 @@ class TranslationDashboardController
     if (!preserveResumeHint) {
       _pendingResumeProgressHint = null;
     }
+    // A fresh inspection replaces the profile wholesale (confirmed retry
+    // profile or empty): any in-flight edit markers from a previous
+    // generation no longer describe this profile.
+    _styleFieldsEditedDuringGeneration.clear();
     state = state.copyWith(
       outputDirectory: outputDirectory,
       actionableError: null,
@@ -1059,6 +1088,12 @@ class TranslationDashboardController
                 ),
               ))) {
         await generateStyleProfile();
+        // NOTE: no _cancelRequested recheck here on purpose. Cancelling
+        // during style-profile generation is handled inside
+        // _generateStyleProfile (the inspected job is deliberately left
+        // untouched — see 'cancelling during style profile generation leaves
+        // the inspected job untouched'). Callers that must not proceed after
+        // a cancel (_retryJob) recheck _cancelRequested themselves.
       }
     } catch (error) {
       if (_handleCancellation(error)) {
@@ -1170,7 +1205,11 @@ class TranslationDashboardController
     final _ResumeProgressHint? currentJobHint = currentJobIsResumable
         ? _ResumeProgressHint(
             inputPath: currentJob.inputPath,
-            completedBlocks: currentJob.completedBlocks,
+            // A job cancelled during cacheRestoration carries its verified
+            // progress in cachedBlocks (completedBlocks is the stale,
+            // unverified checkpoint); _confirmedProgressBlocks picks the
+            // truthful figure per phase.
+            completedBlocks: _confirmedProgressBlocks(currentJob),
             totalBlocks: currentJob.totalBlocks,
           )
         : null;
@@ -1492,6 +1531,12 @@ class TranslationDashboardController
             // `chooserTitle` parameter to the Dart share method).
             chooserTitle: _s.shareChooserTitle,
           );
+          if (!mounted) {
+            // The provider was disposed while the share sheet was open:
+            // assigning state now would throw; finally still resets the
+            // sharing flag under its own mounted guard.
+            return;
+          }
           state = state.copyWith(
             logs: <String>[
               ...state.logs,
@@ -1502,6 +1547,9 @@ class TranslationDashboardController
         }
 
         final OpenResult result = await OpenFilex.open(outputPath);
+        if (!mounted) {
+          return;
+        }
         state = state.copyWith(
           logs: <String>[
             ...state.logs,
@@ -1513,6 +1561,9 @@ class TranslationDashboardController
       } catch (error) {
         // C-M6: permanently-denied storage permission gets its own notice.
         if (_handlePermanentPermissionDenial(error)) {
+          return;
+        }
+        if (!mounted) {
           return;
         }
         state = state.copyWith(
@@ -1624,6 +1675,12 @@ class TranslationDashboardController
             // `chooserTitle` parameter to the Dart share method).
             chooserTitle: _s.shareChooserTitle,
           );
+          if (!mounted) {
+            // The provider was disposed while the share sheet was open:
+            // assigning state now would throw; finally still resets the
+            // sharing flag under its own mounted guard.
+            return;
+          }
           state = state.copyWith(
             logs: <String>[
               ...state.logs,
@@ -1633,6 +1690,9 @@ class TranslationDashboardController
           return;
         }
         final OpenResult result = await OpenFilex.open(outputPath);
+        if (!mounted) {
+          return;
+        }
         state = state.copyWith(
           logs: <String>[
             ...state.logs,
@@ -1644,6 +1704,9 @@ class TranslationDashboardController
       } catch (error) {
         // C-M6: permanently-denied storage permission gets its own notice.
         if (_handlePermanentPermissionDenial(error)) {
+          return;
+        }
+        if (!mounted) {
           return;
         }
         state = state.copyWith(
@@ -1715,12 +1778,18 @@ class TranslationDashboardController
     _pendingResumeProgressHint = wasTranslationFailure && job.totalBlocks > 0
         ? _ResumeProgressHint(
             inputPath: job.inputPath,
-            completedBlocks: job.completedBlocks,
+            // Same phase-aware figure as startTranslation above: a job
+            // cancelled during cacheRestoration reports real progress via
+            // cachedBlocks, not the stale completedBlocks checkpoint.
+            completedBlocks: _confirmedProgressBlocks(job),
             totalBlocks: job.totalBlocks,
           )
         : null;
     _sessionPathRevision += 1;
     _inputPathRevision += 1;
+    // Retry restarts from the job's confirmed profile (or empty): drop any
+    // in-flight edit markers, they describe the discarded profile.
+    _styleFieldsEditedDuringGeneration.clear();
     state = state.copyWith(
       inputPath: job.inputPath,
       outputDirectory: outputDirectory,
@@ -1737,14 +1806,26 @@ class TranslationDashboardController
     );
     await startInspection(
       preservedStyleProfile: preservedStyleProfile,
-      chapterSelection: wasTranslationFailure
-          ? job.selectedChapterPaths ?? const <String>[]
-          : null,
+      // A null selection means "unknown" (jobs written before 1.4.3 have no
+      // selectedChapterPaths): fall back to the inspection's recommended
+      // selection instead of an empty one that would stall the retry.
+      chapterSelection: wasTranslationFailure ? job.selectedChapterPaths : null,
       generateStyle:
           !wasTranslationFailure ||
-          job.selectedChapterPaths?.isNotEmpty == true,
+          // Unknown selection (pre-1.4.3 job): the old job predates style
+          // profiles, so generate one rather than silently skipping.
+          (job.selectedChapterPaths?.isNotEmpty ?? true),
       preserveResumeHint: true,
     );
+    // A cancel requested during style-profile generation does not throw:
+    // _generateStyleProfile returns normally on cancellation and
+    // startInspection deliberately leaves the inspected job alone, so
+    // recheck here — otherwise _retryJob would proceed to startTranslation
+    // and silently start a new run the user just cancelled.
+    if (_cancelRequested) {
+      _handleCancellation(const TranslationCancelledException());
+      return;
+    }
     if (!mounted) {
       return;
     }
@@ -2319,10 +2400,20 @@ class TranslationDashboardController
       _estimateStaticCache = staticPart;
     }
     final TranslationJob? currentJob = job ?? state.job;
+    // Progress belongs to the chapter list it was measured against. When
+    // the caller passes an explicit new list (chapter selection changed),
+    // the old job's completedBlocks/totalBlocks and the frozen stopwatch no
+    // longer describe it — report zero progress instead of a stale mix.
+    final bool reuseProgress = identical(
+      sourceChapters,
+      state.inspectedChapters,
+    );
     return staticPart.withProgress(
-      completedBlocks: currentJob?.completedBlocks ?? 0,
-      totalBlocks: currentJob?.totalBlocks ?? staticPart.totalBlocks,
-      elapsed: _translationStopwatch?.elapsed,
+      completedBlocks: reuseProgress ? currentJob?.completedBlocks ?? 0 : 0,
+      totalBlocks: reuseProgress
+          ? currentJob?.totalBlocks ?? staticPart.totalBlocks
+          : staticPart.totalBlocks,
+      elapsed: reuseProgress ? _translationStopwatch?.elapsed : null,
     );
   }
 

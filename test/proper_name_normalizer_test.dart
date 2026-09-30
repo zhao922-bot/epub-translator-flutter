@@ -64,7 +64,7 @@ void main() {
           targetLanguage: 'Chinese',
           state: state,
         );
-        expect(out, contains('亚当·斯密（Adam Smith）的核心思想'));
+        expect(out, contains('亚当·斯密（Adam Smith） 的核心思想'));
         expect(out, contains('亚当·斯密也这样认为'));
         // The half-width pair must not survive anywhere in the block.
         expect(RegExp(r'\bAdam Smith\)').hasMatch(out), isFalse);
@@ -259,30 +259,30 @@ void main() {
       test('forward gloss canonicalizes body text, not attribute values', () {
         final ProperNameBookState state = ProperNameNormalizer.bookState();
         const String html =
-            '<img alt="亚当 (Adam Smith) pic"><p>亚当 (Adam Smith) 写中文。</p>';
+            '<img alt="亚当·斯密 (Adam Smith) pic"><p>亚当·斯密 (Adam Smith) 写中文。</p>';
         final String out = ProperNameNormalizer.normalizeHtml(
           html,
           mappings,
           targetLanguage: 'zh',
           state: state,
         );
-        expect(out, contains('alt="亚当 (Adam Smith) pic"'));
-        expect(out, contains('亚当（Adam Smith）写中文'));
+        expect(out, contains('alt="亚当·斯密 (Adam Smith) pic"'));
+        expect(out, contains('亚当·斯密（Adam Smith） 写中文'));
       });
 
       test('reverse gloss canonicalizes body text, not attribute values', () {
         final ProperNameBookState state = ProperNameNormalizer.bookState();
         const String html =
-            '<span title="Adam Smith（亚当）">x</span>'
-            '<p>Adam Smith（亚当）写中文。</p>';
+            '<span title="Adam Smith（亚当·斯密）">x</span>'
+            '<p>Adam Smith（亚当·斯密）写中文。</p>';
         final String out = ProperNameNormalizer.normalizeHtml(
           html,
           mappings,
           targetLanguage: 'zh',
           state: state,
         );
-        expect(out, contains('title="Adam Smith（亚当）"'));
-        expect(out, contains('亚当（Adam Smith）写中文'));
+        expect(out, contains('title="Adam Smith（亚当·斯密）"'));
+        expect(out, contains('亚当·斯密（Adam Smith）写中文'));
       });
 
       test('spaced angle brackets in prose are not treated as tags', () {

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math';
 
 import '../../domain/models/inspected_chapter.dart';
@@ -31,28 +32,26 @@ class TranslationBatchPlanner {
     List<ExtractedBlock> current = <ExtractedBlock>[];
     int currentBudget = 0;
     final int safeChunkSize = max(1, chunkSize);
+    // The read-only context appended to every batch (chapter title,
+    // bookMemory summary, before/after snippets) shares the request window
+    // with the blocks, so it must come out of the same budget. The title
+    // and bookMemory parts are identical for every batch; the snippet part
+    // depends on the batch's position within the chapter and is tracked
+    // incrementally below (mirroring buildContext's index ranges).
+    // The fixed JSON envelope (~100 chars of keys plus the read-only
+    // instruction line) is intentionally not counted separately:
+    // blockBudgetFor already pads every block by 96 chars, which absorbs
+    // it.
+    final int fixedContextOverhead =
+        chapterTitle.length + _serializedJsonSize(bookMemory);
+    final Map<String, int> indexById = <String, int>{
+      for (int index = 0; index < chapterBlocks.length; index += 1)
+        chapterBlocks[index].id: index,
+    };
+    int? currentMinIndex;
+    int? currentMaxIndex;
 
-    for (final ExtractedBlock block in pendingBlocks) {
-      final int blockBudget = blockBudgetFor(block);
-      final bool exceedsCurrent =
-          current.isNotEmpty && currentBudget + blockBudget > safeChunkSize;
-      if (exceedsCurrent) {
-        batches.add(
-          createBatch(
-            current,
-            chapterBlocks: chapterBlocks,
-            chapterTitle: chapterTitle,
-            bookMemory: bookMemory,
-          ),
-        );
-        current = <ExtractedBlock>[];
-        currentBudget = 0;
-      }
-      current.add(block);
-      currentBudget += blockBudget;
-    }
-
-    if (current.isNotEmpty) {
+    void emitBatch() {
       batches.add(
         createBatch(
           current,
@@ -61,8 +60,98 @@ class TranslationBatchPlanner {
           bookMemory: bookMemory,
         ),
       );
+      current = <ExtractedBlock>[];
+      currentBudget = 0;
+      currentMinIndex = null;
+      currentMaxIndex = null;
+    }
+
+    for (final ExtractedBlock block in pendingBlocks) {
+      final int blockBudget = blockBudgetFor(block);
+      final int? blockIndex = indexById[block.id];
+      // Snippet ranges for the batch if `block` joins it (mirrors
+      // buildContext: min/max over the batch blocks' chapter indexes).
+      final int? candidateMin = blockIndex == null
+          ? currentMinIndex
+          : (currentMinIndex == null
+                ? blockIndex
+                : min(currentMinIndex!, blockIndex));
+      final int? candidateMax = blockIndex == null
+          ? currentMaxIndex
+          : (currentMaxIndex == null
+                ? blockIndex
+                : max(currentMaxIndex!, blockIndex));
+      final int candidateSnippetOverhead =
+          candidateMin == null || candidateMax == null
+          ? 0
+          : _snippetOverheadFor(chapterBlocks, candidateMin, candidateMax);
+      final bool exceedsCurrent =
+          current.isNotEmpty &&
+          currentBudget +
+                  blockBudget +
+                  fixedContextOverhead +
+                  candidateSnippetOverhead >
+              safeChunkSize;
+      if (exceedsCurrent) {
+        emitBatch();
+        currentMinIndex = blockIndex;
+        currentMaxIndex = blockIndex;
+      } else {
+        currentMinIndex = candidateMin;
+        currentMaxIndex = candidateMax;
+      }
+      current.add(block);
+      currentBudget += blockBudget;
+    }
+
+    if (current.isNotEmpty) {
+      emitBatch();
     }
     return batches;
+  }
+
+  /// Char estimate of the before/after read-only snippets for a batch
+  /// spanning chapter indexes [firstIndex, lastIndex] (inclusive).
+  /// Mirrors [buildContext]'s ranges: at most [contextBeforeBlockCount]
+  /// snippets before and [contextAfterBlockCount] after the batch.
+  int _snippetOverheadFor(
+    List<ExtractedBlock> chapterBlocks,
+    int firstIndex,
+    int lastIndex,
+  ) {
+    final int beforeStart = max(0, firstIndex - contextBeforeBlockCount);
+    final int afterEnd = min(
+      chapterBlocks.length,
+      lastIndex + 1 + contextAfterBlockCount,
+    );
+    int total = 0;
+    for (int i = beforeStart; i < firstIndex; i++) {
+      total += _snippetChars(chapterBlocks[i]);
+    }
+    for (int i = lastIndex + 1; i < afterEnd; i++) {
+      total += _snippetChars(chapterBlocks[i]);
+    }
+    return total;
+  }
+
+  /// Char estimate of one read-only snippet: trimmed text plus its id and
+  /// a small allowance for JSON framing. Snippets with empty text are
+  /// dropped by [contextSnippets], so they cost nothing here either.
+  int _snippetChars(ExtractedBlock block) {
+    final String text = trimContextText(block.sourceText);
+    if (text.isEmpty) {
+      return 0;
+    }
+    return text.length + block.id.length + 24;
+  }
+
+  /// Serialized size of the bookMemory summary, as it will appear in the
+  /// request payload's context object.
+  int _serializedJsonSize(Map<String, Object?>? value) {
+    if (value == null || value.isEmpty) {
+      return 0;
+    }
+    return jsonEncode(value).length;
   }
 
   /// Test-friendly plan maps used by repository safety tests.

@@ -400,7 +400,7 @@ class _TranslationStyleProfileCardState
               ),
             ],
             selected: <TranslationStyleConfidence>{widget.profile.confidence},
-            onSelectionChanged: widget.isGenerating || !widget.editable
+            onSelectionChanged: !widget.editable
                 ? null
                 : (Set<TranslationStyleConfidence> next) {
                     if (next.isEmpty) {
@@ -427,7 +427,10 @@ class _TranslationStyleProfileCardState
         controller: controller,
         focusNode: focusNode,
         maxLines: maxLines,
-        enabled: !widget.isGenerating && widget.editable,
+        // Editable during generation on purpose: the controller tracks
+        // fields edited while a generation is in flight and merges them over
+        // the generated result instead of clobbering them.
+        enabled: widget.editable,
         decoration: InputDecoration(labelText: label, isDense: true),
         onChanged: onChanged,
       ),

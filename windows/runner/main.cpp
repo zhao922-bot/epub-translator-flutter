@@ -57,11 +57,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     }
     exe_path.resize(exe_path.size() * 2);
   }
+  // Absolute bundle path when the exe directory could be determined,
+  // relative "data" otherwise (unchanged legacy behavior).
+  std::wstring data_path = L"data";
   if (have_exe_dir) {
     std::wstring exe_dir(exe_path.data(), exe_path_len);
     const size_t sep = exe_dir.find_last_of(L"\\/");
     if (sep != std::wstring::npos) {
-      ::SetCurrentDirectoryW(exe_dir.substr(0, sep).c_str());
+      exe_dir = exe_dir.substr(0, sep);
+      // Best effort: keeps plugin-relative-path behavior identical to
+      // before. The bundle path below does NOT depend on this succeeding.
+      ::SetCurrentDirectoryW(exe_dir.c_str());
+      // Build the bundle path as an absolute path from the exe directory
+      // instead of relying on the CWD switch above: SetCurrentDirectoryW
+      // can fail on very deep install paths when the system's Win32
+      // long-path policy is off, and a relative "data" would then resolve
+      // against whatever directory the app was launched from.
+      data_path = exe_dir + L"\\data";
     }
   }
 
@@ -75,7 +87,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-  flutter::DartProject project(L"data");
+  flutter::DartProject project(data_path);
 
   // Already resolved against the launch directory above; moving them here
   // keeps the set_dart_entrypoint_arguments call next to the project setup.

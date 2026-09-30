@@ -75,7 +75,14 @@ void _throwIfMostlyUndecodable(String decoded, String filePath) {
       replacements++;
     }
   }
-  if (replacements >= 8 && replacements / decoded.length >= 0.01) {
+  // The ratio clause alone has a blind spot in large files: 200 destroyed
+  // chars in a 50k-char chapter is only 0.4%, yet it is a whole paragraph
+  // of garbage that would be sent to translation. An absolute count of 100+
+  // replacements (about a paragraph of destroyed text) therefore fails
+  // loudly regardless of file size, while a few stray bytes in a large
+  // file still pass.
+  if (replacements >= 8 &&
+      (replacements >= 100 || replacements / decoded.length >= 0.01)) {
     throw FormatException(
       'Could not decode $filePath as UTF-8 '
       '($replacements undecodable sequences): the file is probably in a '

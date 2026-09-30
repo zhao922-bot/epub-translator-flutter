@@ -314,7 +314,7 @@ void main() {
     ['OPS/missing.xhtml'],
   ]) {
     test(
-      'unknown, empty or missing retry scope never starts paid work: $scope',
+      'unknown, empty or missing retry scope never starts translation unconfirmed: $scope',
       () async {
         TestWidgetsFlutterBinding.ensureInitialized();
         final repository = RetryProbeRepository();
@@ -337,11 +337,16 @@ void main() {
         await Future<void>.delayed(Duration.zero);
         await controller.retryJob('old');
         expect(repository.selections, isEmpty);
-        expect(repository.styleRequests, 0);
+        // A null scope is "unknown" (pre-1.4.3 job): since round10/m3 the
+        // retry falls back to the inspection's recommended selection and
+        // generates the style profile the old job never had — one API call,
+        // but per-block translation still waits for the user to confirm.
+        // Explicit empty/missing scopes still start nothing at all.
+        expect(repository.styleRequests, scope == null ? 1 : 0);
         expect(controller.state.job!.status, TranslationJobStatus.inspected);
         expect(
           controller.state.inspectedChapters.any((c) => c.includeInTranslation),
-          isFalse,
+          scope == null,
         );
         expect(
           controller.state.logs.last,

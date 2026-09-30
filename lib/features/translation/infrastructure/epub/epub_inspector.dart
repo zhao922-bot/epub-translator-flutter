@@ -413,6 +413,7 @@ class EpubInspector {
     }
 
     final List<String> chapterPaths = <String>[];
+    final Set<String> seenChapterPaths = <String>{};
     final List<String> unresolvedIdRefs = <String>[];
     for (final XmlElement itemRef
         in opfDocument.descendants.whereType<XmlElement>()) {
@@ -427,10 +428,21 @@ class EpubInspector {
         }
         continue;
       }
-      final mediaType = mediaTypes[idRef] ?? '';
-      if (mediaType == 'application/xhtml+xml' ||
+      final String mediaType = mediaTypes[idRef] ?? '';
+      if (_isXhtmlMediaType(mediaType) ||
           (mediaType.isEmpty && _isHtmlDocument(chapterPath))) {
-        chapterPaths.add(chapterPath);
+        // A damaged or converter-generated spine may reference the same file
+        // twice (duplicate idref, or two idrefs normalizing to one href).
+        // Without dedup the chapter would be inspected and translated twice,
+        // doubling API cost and inflating progress.
+        if (seenChapterPaths.add(chapterPath)) {
+          chapterPaths.add(chapterPath);
+        } else {
+          AppLogger.debug(
+            'Skipping duplicate spine entry for $chapterPath.',
+            tag: 'inspect',
+          );
+        }
       }
     }
     return (chapterPaths: chapterPaths, unresolvedIdRefs: unresolvedIdRefs);
@@ -441,6 +453,17 @@ class EpubInspector {
     return lower.endsWith('.html') ||
         lower.endsWith('.xhtml') ||
         lower.endsWith('.htm');
+  }
+
+  /// Matches `application/xhtml+xml`, ignoring any `;`-suffixed parameters
+  /// (e.g. `application/xhtml+xml; charset=utf-8`) and surrounding
+  /// whitespace, case-insensitively. A bare `text/html` is intentionally
+  /// NOT accepted: the EPUB spec requires XHTML content documents in the
+  /// spine, and accepting `text/html` could pull non-chapter resources
+  /// (ad/analytics pages) into translation.
+  static bool _isXhtmlMediaType(String mediaType) {
+    final String base = mediaType.split(';').first.trim().toLowerCase();
+    return base == 'application/xhtml+xml';
   }
 
   static String _resolveManifestHref(String opfDirectory, String href) {

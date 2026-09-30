@@ -503,7 +503,10 @@ class EpubHtmlExtractor {
     final String pathToken = chapterPath.toLowerCase();
     final String titleToken = title.toLowerCase();
     // Title matching uses word boundaries so generic substrings don't misfire
-    // ("advert" inside "advertisement", "notes" inside "footnotes"). Path
+    // ("advert" inside "advertisement", "notes" inside "footnotes"), except
+    // for ancillary markers where even whole-word matching misfires on real
+    // chapter titles ("Cover Story", "Copyright and Fair Use") — those use
+    // the stand-alone check in _matchesAncillaryTitle. Path
     // matching requires a left token boundary for plain words: EPUB
     // filenames are conventional markers like `cover.xhtml` or
     // `book_cvi_r1.htm`, but bare substring matching misfires on ordinary
@@ -513,7 +516,7 @@ class EpubHtmlExtractor {
         _matchesPathToken(pathToken, needles) ||
         _matchesTitleWord(titleToken, needles);
 
-    if (matches(const <String>[
+    const List<String> ancillaryNeedles = <String>[
       'cover',
       'copyright',
       'credit',
@@ -525,7 +528,9 @@ class EpubHtmlExtractor {
       '1lib',
       '_cvi_',
       '_cop_',
-    ])) {
+    ];
+    if (_matchesPathToken(pathToken, ancillaryNeedles) ||
+        _matchesAncillaryTitle(titleToken, ancillaryNeedles)) {
       return ChapterCategory.ancillary;
     }
 
@@ -613,10 +618,16 @@ class EpubHtmlExtractor {
   /// `acknowledgments.xhtml` but not `attack.xhtml`. Stem needles keep
   /// working (`endnote` in `endnotes.xhtml`, `advert` in
   /// `advertisement.xhtml`) because only the left edge is anchored.
-  /// Delimiter-style markers (`ad_`, `_cvi_`, `z-lib`) already carry their
-  /// own delimiters and keep plain substring matching.
+  /// Delimiter-style markers (`_cvi_`, `_cop_`, `z-lib`) keep plain
+  /// substring matching for mid-token hits (e.g. `book_cvi_r1.htm`).
+  /// `ad_` is the exception: it carries only a right delimiter, so without
+  /// a left anchor it misfires on ordinary words (`dead_end.xhtml`,
+  /// `read_along.xhtml`, `instead_of.xhtml`).
   bool _matchesPathToken(String pathToken, List<String> needles) {
     return needles.any((String needle) {
+      if (needle == 'ad_') {
+        return RegExp(r'(?:^|[^a-z0-9])ad_').hasMatch(pathToken);
+      }
       if (RegExp(r'[^a-z0-9]').hasMatch(needle)) {
         return pathToken.contains(needle);
       }
@@ -631,5 +642,31 @@ class EpubHtmlExtractor {
       (String needle) =>
           RegExp('\\b${RegExp.escape(needle)}\\b').hasMatch(title),
     );
+  }
+
+  /// Title-side ancillary matching: the marker must stand alone as the
+  /// title (surrounding punctuation/whitespace ignored). A trailing
+  /// copyright colophon (©, years, publisher boilerplate without letters)
+  /// still counts, so "Copyright" and "Copyright © 2024" stay ancillary
+  /// while real chapters like "Cover Story" or "Copyright and Fair Use"
+  /// do not. Word-boundary matching misfires on the latter two.
+  bool _matchesAncillaryTitle(String title, List<String> needles) {
+    final String stripped = title.replaceAll(
+      RegExp(r'^[^a-z0-9]+|[^a-z0-9]+$'),
+      '',
+    );
+    return needles.any((String needle) {
+      if (stripped == needle) {
+        return true;
+      }
+      if (!stripped.startsWith(needle)) {
+        return false;
+      }
+      // Only copyright small print may follow the marker: ©, digits,
+      // whitespace and punctuation — no letters, so "Copyright and Fair
+      // Use" (rest = " and fair use") does not match.
+      final String rest = stripped.substring(needle.length);
+      return !RegExp(r'[a-z]').hasMatch(rest);
+    });
   }
 }

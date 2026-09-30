@@ -83,7 +83,7 @@ class ProperNameNormalizer {
       return html;
     }
 
-    final String prefixed = _prefixAndSuffixLatinIdentifiers(html);
+    final String prefixed = _prefixAndSuffixLatinIdentifiers(html, mappings);
     String working = prefixed;
     for (final ProperNameMap mapping in mappings) {
       working = _canonicalizeForwardHalfWidthGloss(working, mapping);
@@ -155,10 +155,21 @@ class ProperNameNormalizer {
     return out.toString();
   }
 
+  /// Normalizes a gloss candidate for comparison against a locked target:
+  /// whitespace is insignificant, and `·・•` are orthographic variants of
+  /// the same separator.
+  static String _glossComparisonKey(String value) =>
+      value.replaceAll(RegExp(r'\s+'), '').replaceAll(RegExp(r'[·・•]'), '');
+
   /// Folds a half-width forward gloss `中文 (English)` to the canonical
   /// `中文（English）` shape BEFORE the bare-name state machine runs, so a
   /// model that emitted `亚当·斯密 (Adam Smith)` converges to the same
   /// full-width shape as everything else instead of being double-glossed.
+  ///
+  /// Only folds when the text before the paren IS this name's locked
+  /// translation (after normalization): an unrelated preceding phrase
+  /// (`他在北京 (Adam Smith)`) or a truncated transliteration is left
+  /// alone instead of being mislabeled as the name's gloss.
   ///
   /// Runs on the markup-masked text: attribute values such as
   /// `alt="亚当 (Adam Smith) pic"` are metadata and are never canonicalized.
@@ -168,7 +179,9 @@ class ProperNameNormalizer {
   ) {
     final String source = RegExp.escape(mapping.source);
     final RegExp pattern = RegExp(
-      r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' + source + r'\s*\)\s*',
+      // No trailing `\s*`: the whitespace after `)` belongs to the prose and
+      // must survive the fold (`亚当·斯密 (Adam Smith) is` keeps its space).
+      r'([\u3400-\u9FFF][^()（）]{0,24}?)\s*\(\s*' + source + r'\s*\)',
     );
     return _rewriteOnMaskedText(html, pattern, (
       String original,
@@ -182,14 +195,19 @@ class ProperNameNormalizer {
         match.group(1)!,
         match.start,
       ).trim();
-      return '$head（${mapping.source}）';
+      // Strict: only the locked translation (after normalization) folds.
+      // Anything else — an unrelated phrase, a truncation — is left alone.
+      if (_glossComparisonKey(head) != _glossComparisonKey(mapping.target)) {
+        return original.substring(match.start, match.end);
+      }
+      return '${mapping.target}（${mapping.source}）';
     });
   }
 
   static bool _isBibliographicOrIndexEntry(String html) {
     return RegExp(
-      r'class="[^"]*(?:endnote|bibliograph|reference|index)[^"]*"'
-      r'|epub:type="[^"]*index[^"]*"',
+      r'''class=["'][^"']*(?:endnote|bibliograph|reference|index)[^"']*["']'''
+      r'''|epub:type=["'][^"']*index[^"']*["']''',
       caseSensitive: false,
     ).hasMatch(html);
   }
@@ -233,6 +251,17 @@ class ProperNameNormalizer {
       // gloss (between an opening paren and its closing paren) is already
       // canonical and must not be re-glossed.
       if (_isCanonicalGlossInnerName(masked, match)) {
+        if (state?.countedNames.contains(mapping.source) == false) {
+          state?.countedNames.add(mapping.source);
+        }
+        continue;
+      }
+      // A bare name immediately followed by a full-width parenthetical
+      // containing CJK already carries a model-provided gloss or appositive
+      // (`Adam Smith（亚当）`, `Adam Smith（英国经济学家）`): the strict
+      // reverse-gloss rule deliberately left it alone, so the bare-name
+      // machine must not stack a second gloss on top of it.
+      if (_isFollowedByGlossParen(masked, match)) {
         if (state?.countedNames.contains(mapping.source) == false) {
           state?.countedNames.add(mapping.source);
         }
@@ -420,12 +449,12 @@ class ProperNameNormalizer {
     if (!RegExp(r'\s').hasMatch(source)) {
       return RegExp(wordPattern(source), caseSensitive: false);
     }
-    final String emptyTagPair = r'<[^>]+>\s*</[^>]+>';
     // The empty-tag mask character (\uE003) is transparent to the matcher,
     // just like whitespace: a pagebreak anchor between name tokens must not
-    // break the match.
-    final String gap =
-        r'[\s\u00A0\uE003]*(?:' + emptyTagPair + r')?[\s\u00A0\uE003]*';
+    // break the match. The gap must be non-empty: an all-optional gap would
+    // match the empty string and let `#AdamSmith` match a locked
+    // `Adam Smith`, splitting the token.
+    final String gap = r'[\s\u00A0\uE003]+';
     final String pattern = source
         .split(RegExp(r'\s+'))
         .map(wordPattern)
@@ -455,7 +484,7 @@ class ProperNameNormalizer {
         .trim();
     final List<String> sourceWords = source.split(RegExp(r'\s+'));
     final String cleanedCompact = cleaned.replaceAll(' ', '');
-    if (sourceWords.length > 1 &&
+    if (sourceWords.isNotEmpty &&
         cleanedCompact.toLowerCase() == sourceWords.join().toLowerCase()) {
       final StringBuffer out = StringBuffer();
       int pos = 0;
@@ -488,9 +517,34 @@ class ProperNameNormalizer {
     return precededByOpen && followedByClose;
   }
 
+  /// Whether [match] is immediately followed by a parenthetical containing
+  /// CJK — the shape of a model-provided `English（中文）` gloss or appositive
+  /// that the strict reverse-gloss rule left untouched.
+  ///
+  /// The gap sees through whitespace and empty inline-tag pairs (`\uE003`,
+  /// transparent to the name matcher per m18); opaque markup (`\uE002`) still
+  /// blocks, so a parenthetical in the next block is never claimed. One
+  /// nesting level is allowed (`（亚当（字幼常））`), and half-width parens
+  /// count too — but only with CJK inside, so `(the economist)` is not
+  /// mistaken for a gloss.
+  static bool _isFollowedByGlossParen(String html, Match match) {
+    // NB: `^` anchors to the start of the *string*, not to `match.end`, so
+    // slice first like the sibling helpers do.
+    final Match? paren = RegExp(
+      r'^[\s\uE003]*[（(][^()（）]*(?:[（(][^()（）]*[)）][^()（）]*)*[)）]',
+    ).matchAsPrefix(html.substring(match.end));
+    return paren != null && _containsCjk(paren.group(0)!);
+  }
+
   /// Rewrites `English（中文）` → `中文（English）` across the block before the
   /// bare-name state machine runs, so the trailing parenthetical never
   /// survives and the same name cannot be re-matched twice.
+  ///
+  /// Only rewrites when the parenthetical IS this name's locked translation
+  /// (after normalization): an appositive or truncated transliteration
+  /// is left alone instead of being disguised as a gloss (which
+  /// would also pollute the book-wide first-occurrence state). An exact
+  /// variant (`亚当斯密` for locked `亚当·斯密`) is unified to the locked target.
   ///
   /// Runs on the markup-masked text: attribute values such as
   /// `title="Adam Smith（亚当）"` are metadata and are never canonicalized.
@@ -523,7 +577,13 @@ class ProperNameNormalizer {
         match.group(2)!,
         group2Start,
       ).trim();
-      return '$translated（$name）';
+      if (_glossComparisonKey(translated) !=
+          _glossComparisonKey(mapping.target)) {
+        // Strict: anything that is not the locked translation — an appositive,
+        // a truncation — is left untouched rather than disguised as a gloss.
+        return original.substring(match.start, match.end);
+      }
+      return '${mapping.target}（$name）';
     });
   }
 
@@ -554,7 +614,10 @@ class ProperNameNormalizer {
 
   /// Wraps Latin identifiers (URLs / email / footnote anchors / work-title
   /// glosses) in sentinels so the name substitution cannot corrupt them.
-  static String _prefixAndSuffixLatinIdentifiers(String html) {
+  static String _prefixAndSuffixLatinIdentifiers(
+    String html,
+    List<ProperNameMap> mappings,
+  ) {
     // Protect footnote-back link anchors: <a ...>II</a> etc. Those are pure
     // anchor text and must not be treated as a name occurrence.
     String out = html.replaceAllMapped(
@@ -562,13 +625,39 @@ class ProperNameNormalizer {
       (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
     );
     // Protect inline work titles in 《》 already carrying the original Latin
-    // gloss, e.g. 《国富论》（The Wealth of Nations）.
+    // gloss, e.g. 《国富论》（The Wealth of Nations） — but NOT when the
+    // parenthesized span is itself a locked proper name (`《国富论》(Adam
+    // Smith)`): that is a name occurrence and must flow through the normal
+    // name pipeline instead of being protected away.
     out = out.replaceAllMapped(
       RegExp(
         r'[《「『]\s*[\u3400-\u9FFF\w\s、·，。：；（）()\-—]+\s*[」』》]'
-        r"\s*[（(]\s*[A-Za-z][A-Za-z0-9 ,.;:()'\-]{2,60}\s*[)）]",
+        r"\s*[（(]\s*([A-Za-z][A-Za-z0-9 ,.;:()'\-]{2,60})\s*[)）]",
       ),
-      (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
+      (Match match) {
+        final String latin = match
+            .group(1)!
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim();
+        for (final ProperNameMap mapping in mappings) {
+          if (latin.toLowerCase() == mapping.source.toLowerCase()) {
+            return match.group(0)!;
+          }
+          // `《国富论》(by Adam Smith)`: the span is not exactly the locked
+          // name, but it contains it as a whole phrase — still a name
+          // occurrence. Only multi-word sources get this leniency: a
+          // single-word source like `An` would collide with ordinary
+          // English words inside work-title glosses (`An American Tragedy`).
+          if (mapping.source.trim().contains(' ') &&
+              RegExp(
+                '\\b${RegExp.escape(mapping.source.trim())}\\b',
+                caseSensitive: false,
+              ).hasMatch(latin)) {
+            return match.group(0)!;
+          }
+        }
+        return '\uE000${_protect(match.group(0)!)}\uE001';
+      },
     );
     // Also protect plain URLs/emails/docs so a name that happens to be a URL
     // path component is never treated as a person.
