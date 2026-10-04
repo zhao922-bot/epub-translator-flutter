@@ -110,9 +110,14 @@ body.epub-translator-cjk [data-translation="true"] {
     required String tocPath,
     required String tocHtml,
     required List<InspectedChapter> chapters,
+    String targetLanguage = 'Chinese',
   }) {
     final Map<String, String> rendered = <String, String>{tocPath: tocHtml};
-    _synchronizeHtmlTocLabels(rendered, chapters);
+    _synchronizeHtmlTocLabels(
+      rendered,
+      chapters,
+      targetLanguage: targetLanguage,
+    );
     return rendered[tocPath]!;
   }
 
@@ -153,7 +158,12 @@ body.epub-translator-cjk [data-translation="true"] {
         degradedBlockIds: degradedBlockIds,
       );
     }
-    _synchronizeHtmlTocLabels(translatedHtmlByPath, chapters);
+    _synchronizeHtmlTocLabels(
+      translatedHtmlByPath,
+      chapters,
+      targetLanguage: config.targetLanguage,
+      bilingual: config.bilingual,
+    );
     // Navigation metadata (OPF language + translated NCX labels) is rendered
     // inside the isolate from the same decoded archive, so the whole book is
     // never loaded into the main isolate just to read three small XML files.
@@ -269,7 +279,14 @@ body.epub-translator-cjk [data-translation="true"] {
         );
       }
       var replacement = bilingual
-          ? (const {'li', 'td', 'th', 'caption'}.contains(target.localName)
+          ? (const {
+                  'li',
+                  'td',
+                  'th',
+                  'caption',
+                  'summary',
+                  'figcaption',
+                }.contains(target.localName)
                 ? _bilingualStructuralItem(target, translationPart)
                 : '${target.outerHtml}\n$translationPart')
           : translationPart;
@@ -315,7 +332,9 @@ body.epub-translator-cjk [data-translation="true"] {
     );
     for (final dom.Node node in fragment.nodes.toList()) {
       if (node is dom.Element && node.localName == source.localName) {
-        final dom.Element translation = dom.Element.tag('div');
+        final dom.Element translation = dom.Element.tag(
+          source.localName == 'summary' ? 'span' : 'div',
+        );
         translation.attributes.addAll(node.attributes);
         translation.attributes.remove('value');
         translation.attributes.remove('rowspan');
@@ -350,12 +369,96 @@ body.epub-translator-cjk [data-translation="true"] {
         fragment.nodes.insert(index, wrapper);
       }
     }
+    final sources = <dom.Element, dom.Element>{};
+    void align(dom.Element source, dom.Element translated) {
+      if (source.localName != translated.localName) return;
+      sources[translated] = source;
+      final translatedChildren = translated.children;
+      bool sameTags(List<dom.Element> children) =>
+          children.length == translatedChildren.length &&
+          List.generate(children.length, (i) => i).every(
+            (i) => children[i].localName == translatedChildren[i].localName,
+          );
+      var sourceChildren = source.children.toList();
+      if (!sameTags(sourceChildren)) {
+        // CJK preparation unwraps decorative spans. Align promoted children
+        // with their original nodes, retaining the original text and lang.
+        Iterable<dom.Element> promoted(dom.Element child) sync* {
+          final letters = child.text.replaceAll(RegExp('[^A-Za-z]'), '');
+          final decorative =
+              child.localName == 'span' &&
+              !child.attributes.containsKey('id') &&
+              !child.attributes.containsKey('name') &&
+              !_isNonProseElement(child) &&
+              !_isInsideFootnoteMarkerAnchor(child) &&
+              child.classes.any(
+                (token) =>
+                    token.toLowerCase().startsWith('dropcap') ||
+                    (_isInitialSmallCapsClass(token) &&
+                        letters.isNotEmpty &&
+                        letters == letters.toUpperCase()),
+              );
+          if (decorative) {
+            for (final nested in child.children) {
+              yield* promoted(nested);
+            }
+          } else {
+            yield child;
+          }
+        }
+
+        final flattened = sourceChildren.expand(promoted).toList();
+        if (sameTags(flattened)) sourceChildren = flattened;
+      }
+      if (sourceChildren.length == translatedChildren.length &&
+          List.generate(sourceChildren.length, (i) => i).every(
+            (i) =>
+                sourceChildren[i].localName == translatedChildren[i].localName,
+          )) {
+        for (var i = 0; i < sourceChildren.length; i++) {
+          align(sourceChildren[i], translatedChildren[i]);
+        }
+      } else {
+        // A removed decorative span must not shift the remaining em/a/etc.
+        // Match unchanged sibling groups in order, never by displayed text.
+        for (final tag
+            in translatedChildren.map((child) => child.localName).toSet()) {
+          final original = sourceChildren
+              .where((child) => child.localName == tag)
+              .toList();
+          final output = translatedChildren
+              .where((child) => child.localName == tag)
+              .toList();
+          if (original.length == output.length) {
+            for (var i = 0; i < original.length; i++) {
+              align(original[i], output[i]);
+            }
+          }
+        }
+        // Stable ids also identify nodes moved out of removed wrappers.
+        for (final child in translatedChildren) {
+          final id = child.attributes['id'];
+          if (id == null || id.isEmpty) continue;
+          final matches = source
+              .querySelectorAll('[id]')
+              .where((element) => element.attributes['id'] == id)
+              .toList();
+          if (matches.length == 1 && !sources.containsKey(child)) {
+            align(matches.single, child);
+          }
+        }
+      }
+    }
+
+    if (fragment.children.length == 1) {
+      align(target, fragment.children.single);
+    }
     for (final element in fragment.querySelectorAll('*')) {
       final String? markedLanguage =
           element.attributes['lang'] ?? element.attributes['xml:lang'];
       final bool isStaleEcho =
           markedLanguage != null &&
-          _isStaleLanguageEcho(target, element, markedLanguage);
+          _isStaleLanguageEcho(sources[element], element, markedLanguage);
       if (markedLanguage != null && !isStaleEcho) {
         // The model deliberately marked a foreign-language passage the
         // source did not mark (m6: a kept English quote inside Chinese
@@ -371,7 +474,7 @@ body.epub-translator-cjk [data-translation="true"] {
   }
 
   /// True when the model's language marking on [fragmentElement] merely
-  /// echoes a marking the source [target] subtree already carried, while the
+  /// echoes a marking the corresponding [sourceElement] already carried, while the
   /// text itself was translated (round2: `<em lang="en">Hello.</em>` →
   /// `<em xml:lang="en">Bonjour.</em>`): the marking is stale and the
   /// translated text takes the target language.
@@ -380,32 +483,17 @@ body.epub-translator-cjk [data-translation="true"] {
   /// verbatim (a genuine foreign-language quote) — is deliberate and must
   /// survive untouched.
   bool _isStaleLanguageEcho(
-    dom.Element target,
+    dom.Element? sourceElement,
     dom.Element fragmentElement,
     String markedLanguage,
   ) {
-    final String fragmentText = _collapsedText(fragmentElement.text);
-    bool sawSameMarking = false;
-    for (final dom.Element sourceElement in <dom.Element>[
-      target,
-      ...target.querySelectorAll('*'),
-    ]) {
-      final String? sourceLanguage =
-          sourceElement.attributes['lang'] ??
-          sourceElement.attributes['xml:lang'];
-      if (sourceLanguage != markedLanguage ||
-          sourceElement.localName != fragmentElement.localName) {
-        continue;
-      }
-      sawSameMarking = true;
-      if (_collapsedText(sourceElement.text) == fragmentText) {
-        // The model preserved this passage verbatim: the marking is a
-        // genuine foreign-language quote, not a stale echo — even when a
-        // *different* same-tag element nearby was translated.
-        return false;
-      }
-    }
-    return sawSameMarking;
+    if (sourceElement == null) return false;
+    final sourceLanguage =
+        sourceElement.attributes['lang'] ??
+        sourceElement.attributes['xml:lang'];
+    return sourceLanguage == markedLanguage &&
+        _collapsedText(sourceElement.text) !=
+            _collapsedText(fragmentElement.text);
   }
 
   String _collapsedText(String text) =>
@@ -436,7 +524,11 @@ body.epub-translator-cjk [data-translation="true"] {
     String replacementHtml,
   ) {
     final String tag = target.localName ?? '';
-    if (tag != 'td' && tag != 'th' && tag != 'caption') {
+    if (tag != 'td' &&
+        tag != 'th' &&
+        tag != 'caption' &&
+        tag != 'summary' &&
+        tag != 'figcaption') {
       return replacementHtml;
     }
     final dom.DocumentFragment fragment = html_parser.parseFragment(
@@ -547,6 +639,7 @@ body.epub-translator-cjk [data-translation="true"] {
         .where(
           (dom.Element element) =>
               !_isInsideFootnoteMarkerAnchor(element) &&
+              !_isNonProseElement(element) &&
               element.classes.any(
                 (String className) =>
                     className.toLowerCase().startsWith('dropcap'),
@@ -565,7 +658,16 @@ body.epub-translator-cjk [data-translation="true"] {
         // When nothing follows, stay conservative and keep the letter too.
         final String? nextChar = _firstContentCharAfter(dropCap);
         if (nextChar != null && _containsCjk(nextChar)) {
-          dropCap.remove();
+          if (dropCap.attributes.containsKey('id') ||
+              dropCap.attributes.containsKey('name')) {
+            dropCap.nodes.clear();
+            _removeClassesWhere(
+              dropCap,
+              (className) => className.toLowerCase().startsWith('dropcap'),
+            );
+          } else {
+            dropCap.remove();
+          }
         } else {
           _removeClassesWhere(
             dropCap,
@@ -582,12 +684,14 @@ body.epub-translator-cjk [data-translation="true"] {
       if (followingElement != null &&
           _containsCjk(followingElement.text) &&
           !_isInsideFootnoteMarkerAnchor(followingElement) &&
+          !_isNonProseElement(followingElement) &&
           followingElement.classes.any(_isInitialSmallCapsClass)) {
         _removeClassesWhere(followingElement, _isInitialSmallCapsClass);
       }
     }
     for (final dom.Element element in fragment.querySelectorAll('[class]')) {
       if (!_isInsideFootnoteMarkerAnchor(element) &&
+          !_isNonProseElement(element) &&
           _containsCjk(element.text) &&
           element.classes.any(_isInitialSmallCapsClass)) {
         _removeClassesWhere(element, _isInitialSmallCapsClass);
@@ -605,6 +709,11 @@ body.epub-translator-cjk [data-translation="true"] {
       current = current.parentNode;
     }
     return false;
+  }
+
+  bool _isNonProseElement(dom.Element element) {
+    return EpubHtmlExtractor.nonTextAncestors.contains(element.localName) ||
+        _extractor.isInsideSkippedAncestor(element);
   }
 
   bool _containsFootnoteMarkerClass(dom.Element element) {
@@ -786,9 +895,12 @@ body.epub-translator-cjk [data-translation="true"] {
 
   void _synchronizeHtmlTocLabels(
     Map<String, String> renderedByPath,
-    List<InspectedChapter> chapters,
-  ) {
+    List<InspectedChapter> chapters, {
+    required String targetLanguage,
+    bool bilingual = false,
+  }) {
     final labelsByPath = _navigationLabels(chapters);
+    final languageTag = _languageTagForTarget(targetLanguage);
     if (labelsByPath.isEmpty) {
       return;
     }
@@ -796,11 +908,12 @@ body.epub-translator-cjk [data-translation="true"] {
       if (!_isTocLikeChapter(chapter)) {
         continue;
       }
-      final String? rendered = renderedByPath[chapter.path];
-      if (rendered == null) {
-        continue;
-      }
-      final dom.Document document = html_parser.parse(rendered);
+      // TOCs are normally excluded from paid translation. Their labels can
+      // still be synchronized from the already translated heading targets.
+      final rendered = renderedByPath[chapter.path] ?? chapter.originalHtml;
+      final dom.Document document = html_parser.parse(
+        XhtmlHtmlCompatibility.normalizeForHtmlParser(rendered),
+      );
       // EPUB 3 nav documents are handled from the manifest in the isolate.
       // Applying this legacy heuristic would also overwrite page-list labels.
       if (document.querySelectorAll('nav').any(isEpubTocElement)) {
@@ -808,6 +921,11 @@ body.epub-translator-cjk [data-translation="true"] {
       }
       bool changed = false;
       for (final dom.Element anchor in document.querySelectorAll('a[href]')) {
+        if (bilingual &&
+            chapter.includeInTranslation &&
+            !isTranslatedNavigationAnchor(anchor)) {
+          continue;
+        }
         final String href = anchor.attributes['href'] ?? '';
         if (href.isEmpty || Uri.tryParse(href)?.hasScheme == true) {
           continue;
@@ -817,8 +935,13 @@ body.epub-translator-cjk [data-translation="true"] {
         if (label == null || anchor.text.trim().isEmpty) {
           continue;
         }
-        _setAnchorLabelPreservingNestedElements(anchor, label);
-        changed = true;
+        changed =
+            replaceNavigationAnchorLabel(
+              anchor,
+              label,
+              languageTag: languageTag,
+            ) ||
+            changed;
       }
       if (changed) {
         renderedByPath[chapter.path] =
@@ -973,34 +1096,6 @@ body.epub-translator-cjk [data-translation="true"] {
         tag.codeUnitAt(0) == 0x68 && // 'h'
         tag.codeUnitAt(1) >= 0x31 && // '1'
         tag.codeUnitAt(1) <= 0x36; // '6'
-  }
-
-  /// Replace label text even when wrapped in formatting spans. Keep the
-  /// nested elements and page-number text intact instead of flattening them.
-  void _setAnchorLabelPreservingNestedElements(
-    dom.Element anchor,
-    String label,
-  ) {
-    final textNodes = <dom.Text>[];
-    void collect(dom.Node node) {
-      if (node is dom.Text && node.data.trim().isNotEmpty) textNodes.add(node);
-      if (node is dom.Element &&
-          !node.classes.contains('pagenum') &&
-          node.attributes['role'] != 'doc-pagebreak') {
-        for (final child in node.nodes) {
-          collect(child);
-        }
-      }
-    }
-
-    collect(anchor);
-    if (textNodes.isEmpty) {
-      return;
-    }
-    textNodes.first.text = label;
-    for (final dom.Text extra in textNodes.skip(1)) {
-      extra.remove();
-    }
   }
 
   String? _navigationLabelForChapter(InspectedChapter chapter) {

@@ -231,10 +231,22 @@ class EpubIsolateWorker {
     final xml.XmlDocument opf = xml.XmlDocument.parse(
       decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
     );
-    final List<xml.XmlElement> languages = opf.descendants
-        .whereType<xml.XmlElement>()
-        .where((xml.XmlElement element) => element.name.local == 'language')
-        .toList(growable: false);
+    final metadata = opf.rootElement.childElements
+        .where(
+          (element) =>
+              element.name.local == 'metadata' &&
+              (element.namespaceUri == 'http://www.idpf.org/2007/opf' ||
+                  element.namespaceUri == null),
+        )
+        .firstOrNull;
+    final List<xml.XmlElement> languages =
+        (metadata?.childElements ?? const <xml.XmlElement>[])
+            .where(
+              (element) =>
+                  element.name.local == 'language' &&
+                  element.namespaceUri == 'http://purl.org/dc/elements/1.1/',
+            )
+            .toList(growable: false);
     if (bilingual && languages.isNotEmpty) {
       final seen = <String>{};
       for (final language in languages) {
@@ -244,19 +256,11 @@ class EpubIsolateWorker {
         }
       }
       if (!seen.contains(languageTag.toLowerCase())) {
-        final metadata = opf.descendants
-            .whereType<xml.XmlElement>()
-            .where((element) => element.name.local == 'metadata')
-            .firstOrNull;
         metadata?.children.add(_dcLanguageElement(opf, languageTag));
       }
     } else if (languages.isEmpty) {
       // No dc:language present: append one instead of skipping, so the
       // finished book still carries the target language.
-      final xml.XmlElement? metadata = opf.descendants
-          .whereType<xml.XmlElement>()
-          .where((xml.XmlElement element) => element.name.local == 'metadata')
-          .firstOrNull;
       if (metadata != null) {
         metadata.children.add(_dcLanguageElement(opf, languageTag));
       }
@@ -305,6 +309,8 @@ class EpubIsolateWorker {
         documentPath: navPath,
         labelsByPath: labelsByPath,
         languageTag: languageTag,
+        preserveSourceLabels:
+            bilingual && renderedHtmlByPath.containsKey(navPath),
       );
       xml.XmlDocument.parse(replacements[navPath]!);
     }
@@ -313,17 +319,25 @@ class EpubIsolateWorker {
         .where((xml.XmlElement element) => element.name.local == 'spine')
         .firstOrNull;
     final String ncxId = spine?.getAttribute('toc') ?? '';
-    xml.XmlElement? ncxItem;
-    for (final xml.XmlElement item
-        in opf.descendants.whereType<xml.XmlElement>().where(
-          (xml.XmlElement element) => element.name.local == 'item',
-        )) {
-      if ((ncxId.isNotEmpty && item.getAttribute('id') == ncxId) ||
-          item.getAttribute('media-type') == 'application/x-dtbncx+xml') {
-        ncxItem = item;
-        break;
-      }
-    }
+    final items = opf.descendants.whereType<xml.XmlElement>().where(
+      (item) => item.name.local == 'item',
+    );
+    final explicit = items
+        .where(
+          (item) =>
+              ncxId.isNotEmpty &&
+              item.getAttribute('id') == ncxId &&
+              (item.getAttribute('href') ?? '').isNotEmpty,
+        )
+        .firstOrNull;
+    final fallback = items
+        .where(
+          (item) =>
+              item.getAttribute('media-type') == 'application/x-dtbncx+xml' &&
+              (item.getAttribute('href') ?? '').isNotEmpty,
+        )
+        .firstOrNull;
+    final ncxItem = explicit ?? fallback;
     final String ncxHref = ncxItem?.getAttribute('href') ?? '';
     if (ncxHref.isEmpty) {
       return replacements;
@@ -380,36 +394,20 @@ class EpubIsolateWorker {
     return replacements;
   }
 
-  /// Builds a `<dc:language>` element for an OPF missing one. Reuses the
-  /// document's declared Dublin Core namespace when present; otherwise the
-  /// new element carries its own `xmlns:dc` so the output stays well-formed.
+  /// Declare the namespace on the new element itself: a declaration on a
+  /// sibling or descendant cannot bind this element's prefix.
   static xml.XmlElement _dcLanguageElement(
     xml.XmlDocument opf,
     String languageTag,
   ) {
-    bool dcDeclared = false;
-    for (final xml.XmlElement element
-        in opf.descendants.whereType<xml.XmlElement>()) {
-      for (final xml.XmlAttribute attribute in element.attributes) {
-        if (attribute.name.qualified == 'xmlns:dc') {
-          dcDeclared = true;
-          break;
-        }
-      }
-      if (dcDeclared) {
-        break;
-      }
-    }
     final xml.XmlElement element = xml.XmlElement(
       xml.XmlName.fromString('dc:language'),
-      dcDeclared
-          ? <xml.XmlAttribute>[]
-          : <xml.XmlAttribute>[
-              xml.XmlAttribute(
-                xml.XmlName.fromString('xmlns:dc'),
-                'http://purl.org/dc/elements/1.1/',
-              ),
-            ],
+      <xml.XmlAttribute>[
+        xml.XmlAttribute(
+          xml.XmlName.fromString('xmlns:dc'),
+          'http://purl.org/dc/elements/1.1/',
+        ),
+      ],
     );
     element.innerText = languageTag;
     return element;

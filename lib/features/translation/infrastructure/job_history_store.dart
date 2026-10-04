@@ -231,9 +231,9 @@ class JobHistoryStore {
         }
       } on HistoryWriteConflict {
         rethrow;
-      } catch (_) {
-        // Unparseable file: fall through and overwrite. (A corrupt file
-        // would already have been backed aside by loadWithTombstone.)
+      } on FormatException {
+        await _backupCorruptHistoryFile();
+        if (await file.exists()) rethrow;
       }
     }
     final Map<String, Object?> payload = <String, Object?>{
@@ -316,9 +316,11 @@ class JobHistoryStore {
                 ? decoded['jobs']
                 : decoded;
             fileJobs = _parseJobs(jobsNode);
-          } catch (_) {
-            // Unparseable file: merge over empty. (A corrupt file would
-            // already have been backed aside by loadWithTombstone.)
+          } on FormatException {
+            // Only parse failures can start fresh, after preserving evidence.
+            // IO failures must propagate: an unreadable file is not empty.
+            await _backupCorruptHistoryFile();
+            if (await file.exists()) rethrow;
           }
         }
         final List<TranslationJob> toSave = merge(fileJobs, fileClearedAt);
@@ -345,16 +347,9 @@ class JobHistoryStore {
           // Best effort: the close below releases the lock anyway.
         }
         await lockHandle.close();
-        // Best effort: the lock file is only needed while a save is in
-        // flight; delete it so it does not linger forever. Deleting after
-        // unlock+close cannot break mutual exclusion: any contender either
-        // shared this file's identity (and blocked properly) or arrives
-        // after the critical section and reads fresh data.
-        try {
-          await lockFile.delete();
-        } catch (_) {
-          // Another instance may still have it open (Windows); harmless.
-        }
+        // Keep a stable sidecar identity. On POSIX a waiting process may
+        // already have opened this inode; unlinking it would let another
+        // writer create a different file and acquire an independent lock.
       }
     });
   }

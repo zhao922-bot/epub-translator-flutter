@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 
@@ -296,18 +298,68 @@ class XhtmlHtmlCompatibility {
             'noembed',
             'noframes',
           }.contains(tag.toLowerCase())) {
-        final matches = RegExp(
+        final closing = RegExp(
           '</${RegExp.escape(tag)}\\s*>',
           caseSensitive: false,
-        ).allMatches(source, cursor).iterator;
-        final next = matches.moveNext() ? matches.current.start : source.length;
+        );
+        final next = _rawTextEnd(source, cursor, closing);
+        final raw = source.substring(cursor, next);
         output.write(transform(source.substring(start, cursor)));
-        output.write(source.substring(cursor, next));
+        if (cdataAsText && closing.hasMatch(raw)) {
+          // HTML raw-text parsing ignores XML CDATA/comment boundaries. Hide
+          // a literal closing tag until XHTML serialization, using a comment
+          // whose base64 body cannot itself close the HTML raw-text element.
+          output.write(
+            '/*epub-translator-raw-v1:${base64Encode(utf8.encode(raw))}*/',
+          );
+        } else if (!cdataAsText) {
+          output.write(_restoreRawText(raw));
+        } else {
+          output.write(raw);
+        }
         start = cursor = next;
       }
     }
     output.write(transform(source.substring(start)));
     return output.toString();
+  }
+
+  static int _rawTextEnd(String source, int start, RegExp closing) {
+    var cursor = start;
+    while (cursor < source.length) {
+      final match = closing.allMatches(source, cursor).firstOrNull;
+      final end = match?.start ?? source.length;
+      final cdata = source.indexOf('<![CDATA[', cursor);
+      final comment = source.indexOf('<!--', cursor);
+      final special = cdata < 0
+          ? comment
+          : comment < 0
+          ? cdata
+          : cdata < comment
+          ? cdata
+          : comment;
+      if (special < 0 || special >= end) return end;
+      final terminator = special == cdata ? ']]>' : '-->';
+      final specialEnd = source.indexOf(
+        terminator,
+        special + (special == cdata ? 9 : 4),
+      );
+      if (specialEnd < 0) return source.length;
+      cursor = specialEnd + terminator.length;
+    }
+    return source.length;
+  }
+
+  static String _restoreRawText(String raw) {
+    final match = RegExp(
+      r'^/\*epub-translator-raw-v1:([A-Za-z0-9+/=]+)\*/$',
+    ).firstMatch(raw);
+    if (match == null) return raw;
+    try {
+      return utf8.decode(base64Decode(match.group(1)!));
+    } on FormatException {
+      return raw;
+    }
   }
 
   static const int _lessThan = 0x3C;

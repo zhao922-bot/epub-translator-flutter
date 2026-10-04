@@ -88,9 +88,22 @@ final secretKeyRotatedNoticeProvider = StateProvider<({int id})?>(
 );
 
 final connectionTestProvider =
-    StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>(
-      (ref) => ConnectionTestController(ref.watch(settingsRepositoryProvider)),
-    );
+    StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>((ref) {
+      final controller = ConnectionTestController(
+        ref.watch(settingsRepositoryProvider),
+      );
+      ref.listen<TranslationConfig>(settingsProvider, (previous, next) {
+        if (previous == null ||
+            previous.apiBaseUrl != next.apiBaseUrl ||
+            previous.apiKey != next.apiKey ||
+            previous.model != next.model ||
+            previous.httpProxy != next.httpProxy ||
+            previous.targetLanguage != next.targetLanguage) {
+          controller.clear();
+        }
+      });
+      return controller;
+    });
 
 class SettingsController extends StateNotifier<TranslationConfig> {
   SettingsController(
@@ -119,11 +132,19 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   final void Function()? onSecretKeyRotated;
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
+  Future<void>? _recoveryLoad;
+  int providerSelectionRevision = 0;
 
   Future<void> get ready => _initialLoad;
 
   Future<void> _load() async {
-    final TranslationConfig loaded = await _store.load();
+    final TranslationConfig loaded;
+    try {
+      loaded = await _store.load();
+    } catch (error) {
+      if (mounted) onSaveError?.call(error);
+      return;
+    }
     if (!mounted) {
       return;
     }
@@ -151,32 +172,48 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     return save;
   }
 
-  Future<void> _update(
+  Future<bool> _ensureConfigLoaded() async {
+    if (_store.configLoadError == null) return mounted;
+    final recovery = _recoveryLoad ??= _load();
+    try {
+      await recovery;
+    } finally {
+      if (identical(_recoveryLoad, recovery)) _recoveryLoad = null;
+    }
+    return mounted && _store.configLoadError == null;
+  }
+
+  Future<bool> _update(
     TranslationConfig Function(TranslationConfig config) update, {
     Set<SettingsSecretSlot> explicitSecretMutations =
         const <SettingsSecretSlot>{},
+    Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
   }) async {
     await _initialLoad;
     if (!mounted) {
-      return;
+      return false;
     }
+    if (!await _ensureConfigLoaded()) return false;
+    final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
     final TranslationConfig next = update(state);
     if (!mounted) {
-      return;
+      return false;
     }
     state = next;
     try {
-      await _persist(next, explicitSecretMutations: explicitSecretMutations);
-      onSaveError?.call(null);
+      await _persist(next, explicitSecretMutations: slots);
+      if (mounted) onSaveError?.call(null);
+      return true;
     } catch (error) {
       // The UI already shows the new value, so a silent failure would leave
       // it lying about what is actually persisted. Surface it instead of
       // letting the future go unhandled at the call site.
-      onSaveError?.call(error);
+      if (mounted) onSaveError?.call(error);
+      return false;
     }
   }
 
-  Future<void> setApiBaseUrl(String value) => _update((config) {
+  Future<bool> setApiBaseUrl(String value) => _update((config) {
     final String nextUrl = value.trim();
     return config.copyWith(
       apiProviderSelection: ApiProviderSelection.custom,
@@ -187,26 +224,22 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     );
   });
 
-  Future<void> setApiKey(String value) async {
-    await _initialLoad;
-    if (!mounted) {
-      return;
-    }
-    final Set<SettingsSecretSlot> slots = <SettingsSecretSlot>{
-      SettingsSecretSlot.legacy,
-      state.apiProviderSelection == ApiProviderSelection.deepseek
-          ? SettingsSecretSlot.deepSeek
-          : SettingsSecretSlot.custom,
-    };
-    await _update((config) {
+  Future<bool> setApiKey(String value) => _update(
+    (config) {
       final String nextKey = value.trim();
       return config.apiProviderSelection == ApiProviderSelection.deepseek
           ? config.copyWith(apiKey: nextKey, deepseekApiKey: nextKey)
           : config.copyWith(apiKey: nextKey, customApiKey: nextKey);
-    }, explicitSecretMutations: slots);
-  }
+    },
+    secretMutationsFor: (config) => <SettingsSecretSlot>{
+      SettingsSecretSlot.legacy,
+      config.apiProviderSelection == ApiProviderSelection.deepseek
+          ? SettingsSecretSlot.deepSeek
+          : SettingsSecretSlot.custom,
+    },
+  );
 
-  Future<void> setModel(String value) => _update((config) {
+  Future<bool> setModel(String value) => _update((config) {
     final String nextModel = value.trim();
     return config.copyWith(
       apiProviderSelection: ApiProviderSelection.custom,
@@ -248,7 +281,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> setRetryDelaySeconds(double value) =>
       _update((config) => config.copyWith(retryDelaySeconds: value.round()));
 
-  Future<void> setOutputSuffix(String value) =>
+  Future<bool> setOutputSuffix(String value) =>
       _update((config) => config.copyWith(outputSuffix: value.trim()));
 
   Future<void> setResidualQualityCheck(bool value) =>
@@ -260,14 +293,17 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> setTextScale(double value) =>
       _update((config) => config.copyWith(textScale: value.clamp(0.9, 1.3)));
 
-  Future<void> setLockedGlossary(String value) =>
+  Future<bool> setLockedGlossary(String value) =>
       _update((config) => config.copyWith(lockedGlossary: value));
 
-  Future<void> setHttpProxy(String value) =>
+  Future<bool> setHttpProxy(String value) =>
       _update((config) => config.copyWith(httpProxy: value.trim()));
 
   Future<void> applyApiProviderPreset(ApiProviderPreset preset) =>
-      _update(preset.applyTo);
+      _update((config) {
+        providerSelectionRevision++;
+        return preset.applyTo(config);
+      });
 
   Future<void> reduceConcurrencyForRateLimit() => _update((config) {
     final int next = (config.maxConcurrent - 1).clamp(1, 8);
@@ -280,20 +316,22 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
     : super(const AsyncData<String?>(null));
 
   final TranslationRepository _repository;
+  int _revision = 0;
 
   Future<void> run(TranslationConfig config) async {
     if (!mounted) {
       return;
     }
+    final revision = ++_revision;
     state = const AsyncLoading<String?>();
     try {
       final String result = await _repository.testConnection(config: config);
-      if (!mounted) {
+      if (!mounted || revision != _revision) {
         return;
       }
       state = AsyncData<String?>(result);
     } catch (error, stackTrace) {
-      if (!mounted) {
+      if (!mounted || revision != _revision) {
         return;
       }
       final ConnectionDiagnostic diagnostic = ConnectionDiagnostic.fromError(
@@ -308,6 +346,7 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
     if (!mounted) {
       return;
     }
+    _revision++;
     state = const AsyncData<String?>(null);
   }
 }

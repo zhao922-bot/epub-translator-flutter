@@ -78,6 +78,21 @@ void main() {
         request.response.write('local proxy reached');
         await request.response.close();
       });
+      if (kind != 'ipv4') {
+        // Verify the OS loopback route separately from the app's proxy code.
+        // Only an unavailable native route skips the proxy assertion below.
+        try {
+          final probe = await Socket.connect(
+            address,
+            server.port,
+            timeout: const Duration(seconds: 2),
+          );
+          probe.destroy();
+        } on SocketException catch (error) {
+          markTestSkipped('Native IPv6 loopback unavailable: $error');
+          return;
+        }
+      }
       final proxy = kind == 'ipv4'
           ? '127.0.0.1:${server.port}'
           : '${kind == 'ipv6-url' ? 'http://' : ''}[::1]:${server.port}';

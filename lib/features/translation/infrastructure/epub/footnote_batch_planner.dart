@@ -5,6 +5,7 @@ import 'package:html/parser.dart' as html_parser;
 
 import '../../domain/models/inspected_chapter.dart';
 import 'translation_batch_planner.dart';
+import 'epub_semantics.dart';
 
 /// Plans compact API batches for standalone EPUB footnote and endnote files.
 ///
@@ -113,11 +114,7 @@ class FootnoteBatchPlanner {
   static bool _hasExplicitFootnoteSemantics(String originalHtml) {
     final dom.Document document = html_parser.parse(originalHtml);
     for (final dom.Element element in document.querySelectorAll('*')) {
-      final Set<String> epubTypes = (element.attributes['epub:type'] ?? '')
-          .toLowerCase()
-          .split(RegExp(r'\s+'))
-          .where((String value) => value.isNotEmpty)
-          .toSet();
+      final Set<String> epubTypes = EpubSemantics.typesOf(element);
       if (epubTypes.any(
         const <String>{'footnote', 'endnote', 'footnotes', 'endnotes'}.contains,
       )) {

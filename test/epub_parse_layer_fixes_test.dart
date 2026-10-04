@@ -293,9 +293,11 @@ void main() {
           );
       final String? opf = result['OEBPS/content.opf'];
       expect(opf, isNotNull);
-      expect(opf, contains('<dc:language>zh-CN</dc:language>'));
-      // The rewritten OPF must stay well-formed XML.
-      expect(() => xml.XmlDocument.parse(opf!), returnsNormally);
+      final language = xml.XmlDocument.parse(opf!).descendants
+          .whereType<xml.XmlElement>()
+          .singleWhere((element) => element.name.local == 'language');
+      expect(language.innerText, 'zh-CN');
+      expect(language.namespaceUri, 'http://purl.org/dc/elements/1.1/');
     });
 
     test('OPF without any dc namespace declaration stays well-formed', () {

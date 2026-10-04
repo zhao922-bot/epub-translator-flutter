@@ -288,6 +288,7 @@ class TranslationDashboardController
   // passed to start/update so the native side never applies one run's
   // stashed notification updates to another run.
   String _fgServiceRunId = '';
+  bool _foregroundServiceActive = false;
   // API key in effect when the current/last run started, used for error
   // redaction even if the user changes the key mid-run.
   String? _runApiKey;
@@ -318,12 +319,53 @@ class TranslationDashboardController
   List<String>? _activeTranslationChapterPaths;
   DateTime? _lastProgressHistoryPersistAt;
 
+  @override
+  void dispose() {
+    final activeJob = state.job;
+    final shouldCancel = state.isRunActive || state.isGeneratingStyleProfile;
+    _cancelRequested = true;
+    if (shouldCancel && activeJob != null) {
+      unawaited(
+        Future<void>.sync(() => repository.cancelJob(activeJob.id)).catchError((
+          Object error,
+        ) {
+          AppLogger.warn(
+            'Cancel during disposal failed (${error.runtimeType}).',
+            tag: 'dashboard',
+          );
+        }),
+      );
+    }
+    _translationStopwatch?.stop();
+    _stopTranslationForegroundService();
+    super.dispose();
+  }
+
   AppStrings get _s => AppStrings(state.config.uiLanguage);
 
   Future<String> _defaultOutputDirectory(String? inputPath) =>
       (defaultOutputDirectoryResolver ?? PlatformUtils.defaultOutputDirectory)(
         inputPath,
       );
+
+  Future<String?> _tryDefaultOutputDirectory(
+    String? inputPath, {
+    bool Function()? isCurrent,
+  }) async {
+    try {
+      return await _defaultOutputDirectory(inputPath);
+    } catch (error) {
+      if (mounted && (isCurrent?.call() ?? true)) {
+        state = state.copyWith(
+          logs: <String>[
+            ...state.logs,
+            _pickErrorLog(error, _s.logCouldNotSelectDirectory),
+          ],
+        );
+      }
+      return null;
+    }
+  }
 
   Future<bool> _waitForSettingsReady() async {
     final Future<void> Function()? wait = settingsReady;
@@ -364,17 +406,20 @@ class TranslationDashboardController
       // referenced and let its 7-day sweep delete a source file a history
       // entry may still retry.
       await _initialJobHistoryLoad;
+      if (!mounted) return;
       // Sync the history's input paths to the Android native side:
       // its 7-day stale-import sweep must not delete a source file a
       // history entry may still retry. No-op off Android.
       await PlatformUtils.setProtectedImportPaths(
         state.jobHistory.map((TranslationJob job) => job.inputPath).toList(),
       );
+      if (!mounted) return;
       // Guard against the native side never responding (e.g. the Android
       // activity was destroyed while the picker was open): treat it like a
       // cancelled pick instead of hanging forever.
       selectedPath = await (epubPickerOverride ?? PlatformUtils.pickEpubFile)(
         onWindowsNotice: (WindowsPathNotice notice) {
+          if (!mounted) return;
           if (notice == WindowsPathNotice.dialogOpened) {
             _logWindowsPathNotice(notice, null);
           } else {
@@ -383,6 +428,7 @@ class TranslationDashboardController
         },
       ).timeout(const Duration(minutes: 5), onTimeout: () => null);
     } catch (error) {
+      if (!mounted) return;
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
@@ -391,7 +437,7 @@ class TranslationDashboardController
       );
       return;
     }
-    if (selectedPath == null || selectedPath.isEmpty) {
+    if (!mounted || selectedPath == null || selectedPath.isEmpty) {
       return;
     }
     for (final WindowsPathNotice notice in pendingNotices) {
@@ -433,9 +479,14 @@ class TranslationDashboardController
   Future<void> _pickOutputDirectoryGuarded() async {
     if (!PlatformUtils.supportsDirectoryPicker) {
       _sessionPathRevision += 1;
-      final String outputDirectory = await _defaultOutputDirectory(
+      final String? outputDirectory = await _tryDefaultOutputDirectory(
         state.inputPath,
       );
+      if (!mounted ||
+          outputDirectory == null ||
+          _logIfRunActive(_s.logChangeOutputAfterRun)) {
+        return;
+      }
       state = state.copyWith(
         outputDirectory: outputDirectory,
         logs: <String>[...state.logs, _s.logAndroidOutputDir(outputDirectory)],
@@ -451,6 +502,7 @@ class TranslationDashboardController
       selectedDirectory =
           await (directoryPickerOverride ?? PlatformUtils.pickDirectory)(
             onWindowsNotice: (WindowsPathNotice notice) {
+              if (!mounted) return;
               if (notice == WindowsPathNotice.dialogOpened) {
                 _logWindowsPathNotice(notice, null);
               } else {
@@ -459,6 +511,7 @@ class TranslationDashboardController
             },
           ).timeout(const Duration(minutes: 5), onTimeout: () => null);
     } catch (error) {
+      if (!mounted) return;
       state = state.copyWith(
         logs: <String>[
           ...state.logs,
@@ -467,9 +520,10 @@ class TranslationDashboardController
       );
       return;
     }
-    if (selectedDirectory == null || selectedDirectory.isEmpty) {
+    if (!mounted || selectedDirectory == null || selectedDirectory.isEmpty) {
       return;
     }
+    if (_logIfRunActive(_s.logChangeOutputAfterRun)) return;
     for (final WindowsPathNotice notice in pendingNotices) {
       _logWindowsPathNotice(notice, selectedDirectory);
     }
@@ -523,6 +577,7 @@ class TranslationDashboardController
     // drag-drop and manual-entry paths did not, so they run them here.
     bool skipWindowsNotices = false,
   }) async {
+    if (!mounted) return false;
     final String normalizedPath = value.trim();
     if (normalizedPath.isEmpty) {
       return false;
@@ -536,10 +591,15 @@ class TranslationDashboardController
 
     _sessionPathRevision += 1;
     final int inputPathRevision = ++_inputPathRevision;
-    final String inferredOutput = state.outputDirectory.isEmpty
-        ? await _defaultOutputDirectory(normalizedPath)
+    final String? inferredOutput = state.outputDirectory.isEmpty
+        ? await _tryDefaultOutputDirectory(
+            normalizedPath,
+            isCurrent: () => inputPathRevision == _inputPathRevision,
+          )
         : state.outputDirectory;
-    if (!mounted || inputPathRevision != _inputPathRevision) {
+    if (!mounted ||
+        inferredOutput == null ||
+        inputPathRevision != _inputPathRevision) {
       return false;
     }
     if (_logIfRunActive(dropped ? _s.logDropAfterRun : _s.logSelectAfterRun)) {
@@ -765,6 +825,7 @@ class TranslationDashboardController
             chapters: state.inspectedChapters,
             isCancelled: () => _cancelRequested,
           );
+      if (!mounted) return;
       if (_cancelRequested) {
         state = state.copyWith(isGeneratingStyleProfile: false);
         return;
@@ -810,7 +871,9 @@ class TranslationDashboardController
         ],
       );
     } catch (error) {
-      if (_cancelRequested) {
+      if (!mounted) return;
+      if (error is TranslationCancelledException ||
+          (error is DioException && error.type == DioExceptionType.cancel)) {
         state = state.copyWith(isGeneratingStyleProfile: false);
         return;
       }
@@ -981,10 +1044,16 @@ class TranslationDashboardController
 
     final String inputPath = state.inputPath;
     final int inputPathRevision = _inputPathRevision;
-    final String inferredOutputDirectory = state.outputDirectory.isEmpty
-        ? await _defaultOutputDirectory(inputPath)
+    final String? inferredOutputDirectory = state.outputDirectory.isEmpty
+        ? await _tryDefaultOutputDirectory(
+            inputPath,
+            isCurrent: () =>
+                inputPathRevision == _inputPathRevision &&
+                state.inputPath == inputPath,
+          )
         : state.outputDirectory;
     if (!mounted ||
+        inferredOutputDirectory == null ||
         inputPathRevision != _inputPathRevision ||
         state.inputPath != inputPath) {
       return;
@@ -1037,7 +1106,7 @@ class TranslationDashboardController
         outputDirectory: outputDirectory,
         config: state.config,
         onProgress: (TranslationJob job, String logLine) {
-          if (_cancelRequested) {
+          if (!mounted || _cancelRequested) {
             return;
           }
           state = state.copyWith(
@@ -1047,6 +1116,7 @@ class TranslationDashboardController
         },
         isCancelled: () => _cancelRequested,
       );
+      if (!mounted) return;
       if (_cancelRequested) {
         _handleCancellation(const TranslationCancelledException());
         return;
@@ -1096,6 +1166,7 @@ class TranslationDashboardController
         // a cancel (_retryJob) recheck _cancelRequested themselves.
       }
     } catch (error) {
+      if (!mounted) return;
       if (_handleCancellation(error)) {
         return;
       }
@@ -1314,7 +1385,7 @@ class TranslationDashboardController
             ? state.styleProfile
             : null,
         onProgress: (TranslationJob job, String logLine) {
-          if (_cancelRequested) {
+          if (!mounted || _cancelRequested) {
             return;
           }
           final TranslationJob progressJob = _translationHistoryJob(
@@ -1348,6 +1419,7 @@ class TranslationDashboardController
         },
         isCancelled: () => _cancelRequested,
       );
+      if (!mounted) return true;
       // A returned terminal result means the repository already committed the
       // EPUB. A cancellation arriving afterward cannot undo that output.
       final bool failedResult =
@@ -1399,6 +1471,7 @@ class TranslationDashboardController
       _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
     } catch (error) {
+      if (!mounted) return true;
       if (_handleCancellation(error)) {
         // The run started and was then cancelled; report it as started.
         return true;
@@ -1518,7 +1591,7 @@ class TranslationDashboardController
     state = state.copyWith(isSharing: true);
     try {
       final String? outputPath = await _completedOutputPath();
-      if (outputPath == null) {
+      if (outputPath == null || !mounted) {
         return;
       }
 
@@ -1590,7 +1663,7 @@ class TranslationDashboardController
     state = state.copyWith(isSaving: true);
     try {
       final String? outputPath = await _completedOutputPath();
-      if (outputPath == null) {
+      if (outputPath == null || !mounted) {
         return;
       }
 
@@ -1659,12 +1732,15 @@ class TranslationDashboardController
 
       final File outputFile = File(outputPath);
       final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
+      if (!mounted) return;
       if (type != FileSystemEntityType.file || !await outputFile.exists()) {
+        if (!mounted) return;
         state = state.copyWith(
           logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
         );
         return;
       }
+      if (!mounted) return;
 
       try {
         if (PlatformUtils.isAndroid) {
@@ -1822,11 +1898,11 @@ class TranslationDashboardController
     // startInspection deliberately leaves the inspected job alone, so
     // recheck here — otherwise _retryJob would proceed to startTranslation
     // and silently start a new run the user just cancelled.
-    if (_cancelRequested) {
-      _handleCancellation(const TranslationCancelledException());
+    if (!mounted) {
       return;
     }
-    if (!mounted) {
+    if (_cancelRequested) {
+      _handleCancellation(const TranslationCancelledException());
       return;
     }
     if (!wasTranslationFailure) {
@@ -1889,15 +1965,16 @@ class TranslationDashboardController
     // Our own clear is the newest tombstone by definition; keep it
     // strictly monotonic so a same-millisecond double clear cannot tie.
     final int nowMs = DateTime.now().millisecondsSinceEpoch;
-    if (nowMs > _lastSeenHistoryClearedAt) {
-      _lastSeenHistoryClearedAt = nowMs;
-    }
+    _lastSeenHistoryClearedAt = nowMs > _lastSeenHistoryClearedAt
+        ? nowMs
+        : _lastSeenHistoryClearedAt + 1;
     // Set synchronously, before any await: a persist that read the file
     // before this clear must save verbatim (not merge) so it cannot
     // resurrect the entries being cleared. Reset once our clear's save has
     // landed — afterwards the file carries our tombstone and the merge path
     // is safe again.
     _ownClearTombstoneMs = _lastSeenHistoryClearedAt;
+    final clearMs = _ownClearTombstoneMs;
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
       logs: <String>[...state.logs, _s.logClearedHistory],
@@ -1908,7 +1985,41 @@ class TranslationDashboardController
     // "cleared" history would resurrect on next launch, and the user must
     // be told the clear did not stick.
     try {
-      await _persistJobHistoryWithError();
+      final store = historyStore;
+      if (store != null) {
+        // Capture the clear independently of UI lifetime. Queue it after
+        // previous writes, but never wait for/read disposed controller state.
+        final save = _pendingHistorySave.then((_) async {
+          var candidate = clearMs;
+          // Ordinary merged saves must reject stale tombstones. An explicit
+          // clear can rebase on that newer file value and try again. Keep
+          // this bounded when another instance keeps clearing concurrently.
+          for (var attempt = 0; attempt < 3; attempt++) {
+            final result = await store.saveMerged(
+              clearedAtEpochMs: candidate,
+              merge: (_, _) => const <TranslationJob>[],
+            );
+            if (result.written) {
+              return (written: true, fileClearedAt: candidate);
+            }
+            if (result.fileClearedAt > _lastSeenHistoryClearedAt) {
+              _lastSeenHistoryClearedAt = result.fileClearedAt;
+            }
+            candidate = result.fileClearedAt >= candidate
+                ? result.fileClearedAt + 1
+                : candidate + 1;
+          }
+          return (written: false, fileClearedAt: _lastSeenHistoryClearedAt);
+        });
+        _pendingHistorySave = save.then<void>((_) {}, onError: (_, _) {});
+        final result = await save;
+        if (result.fileClearedAt > _lastSeenHistoryClearedAt) {
+          _lastSeenHistoryClearedAt = result.fileClearedAt;
+        }
+        if (!result.written) {
+          throw StateError('Job history clear was not written.');
+        }
+      }
     } catch (_) {
       if (mounted) {
         state = state.copyWith(
@@ -1917,7 +2028,7 @@ class TranslationDashboardController
       }
       return false;
     } finally {
-      _ownClearTombstoneMs = 0;
+      if (_ownClearTombstoneMs == clearMs) _ownClearTombstoneMs = 0;
     }
     return true;
   }
@@ -1956,14 +2067,16 @@ class TranslationDashboardController
 
     final File outputFile = File(outputPath);
     final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
+    if (!mounted) return null;
     if (type != FileSystemEntityType.file || !await outputFile.exists()) {
+      if (!mounted) return null;
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
       );
       return null;
     }
 
-    return outputPath;
+    return mounted ? outputPath : null;
   }
 
   /// Unique-enough job id: wall-clock millis plus a process-local monotonic
@@ -1984,6 +2097,7 @@ class TranslationDashboardController
   /// Maps a Windows path observation from the native bridge to a localized
   /// log line. Best-effort: never throws.
   void _logWindowsPathNotice(WindowsPathNotice notice, String? selectedPath) {
+    if (!mounted) return;
     final String message;
     switch (notice) {
       case WindowsPathNotice.dialogOpened:
@@ -2040,6 +2154,7 @@ class TranslationDashboardController
   /// the UI can listen on to show a Snackbar whose action opens the system
   /// app-settings screen. Returns true when the error was handled.
   bool _handlePermanentPermissionDenial(Object error) {
+    if (!mounted) return false;
     if (error is! PlatformException ||
         error.code != 'PERMISSION_PERMANENTLY_DENIED') {
       return false;
@@ -2059,6 +2174,7 @@ class TranslationDashboardController
       return;
     }
     _lastFgServicePercent = -1;
+    _foregroundServiceActive = true;
     _lastFgServiceChapter = null;
     // Opaque run token so the native side only applies stashed
     // notification updates to the run that produced them.
@@ -2072,7 +2188,7 @@ class TranslationDashboardController
     // in a process the system may kill at any moment. Block cache and
     // checkpoints survive, so the user can resume after reopening.
     AndroidServiceBridge.setForegroundServiceTimeoutHandler(() async {
-      if (!state.isRunActive) {
+      if (!mounted || !state.isRunActive) {
         return;
       }
       // The native side may have persisted a timeout notice (notifications
@@ -2134,9 +2250,10 @@ class TranslationDashboardController
   /// C-M7: stops the foreground service; always called from a finally block
   /// so completion, failure and cancellation all clean up.
   void _stopTranslationForegroundService() {
-    if (!PlatformUtils.isAndroid) {
+    if (!PlatformUtils.isAndroid || !_foregroundServiceActive) {
       return;
     }
+    _foregroundServiceActive = false;
     AndroidServiceBridge.setNotificationCancelHandler(null);
     AndroidServiceBridge.setForegroundServiceTimeoutHandler(null);
     unawaited(AndroidServiceBridge.stopTranslationService());
@@ -2255,6 +2372,7 @@ class TranslationDashboardController
     // directory is restored as-is: translation creates it when missing.
     final bool inputExists =
         paths.inputPath.isNotEmpty && await File(paths.inputPath).exists();
+    if (!mounted || _sessionPathRevision != revisionBeforeLoad) return;
     state = state.copyWith(
       inputPath: inputExists ? paths.inputPath : state.inputPath,
       outputDirectory: paths.outputDirectory.isEmpty
@@ -2455,12 +2573,12 @@ class TranslationDashboardController
     if (loaded.clearedAt > _lastSeenHistoryClearedAt) {
       _lastSeenHistoryClearedAt = loaded.clearedAt;
     }
-    final List<TranslationJob> history = loaded.jobs
-        .map(_restoreInterruptedJob)
-        .toList(growable: false);
     if (!mounted) {
       return;
     }
+    final List<TranslationJob> history = loaded.jobs
+        .map(_restoreInterruptedJob)
+        .toList(growable: false);
     if (_historyClearRevision != clearRevisionBeforeLoad || history.isEmpty) {
       return;
     }
@@ -2561,7 +2679,7 @@ class TranslationDashboardController
     if (result.fileClearedAt > _lastSeenHistoryClearedAt) {
       _lastSeenHistoryClearedAt = result.fileClearedAt;
     }
-    if (!result.written) {
+    if (!result.written && mounted) {
       // Another instance cleared after our last read; the write was refused
       // so the cleared entries stay cleared. Our in-memory entries predate
       // that clear, so they are stale: drop them now — the next persist

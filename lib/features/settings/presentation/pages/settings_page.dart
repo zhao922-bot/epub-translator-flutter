@@ -16,11 +16,61 @@ import '../../../translation/infrastructure/epub/translation_api_client.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../application/settings_controller.dart';
 
-class SettingsPage extends ConsumerWidget {
+class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends ConsumerState<SettingsPage> {
+  final _connectionFields = List.generate(
+    4,
+    (_) => GlobalKey<SettingsTextFieldState>(),
+  );
+  bool _committingConnectionFields = false;
+
+  Future<bool> _commitConnectionFields() async {
+    // Capture every field before settings notifications rebuild the page.
+    // Commit the key first so it still belongs to the displayed provider.
+    final results = await Future.wait([
+      for (final index in [1, 0, 2, 3])
+        if (_connectionFields[index].currentState case final field?)
+          field.commitPending(),
+    ]);
+    return results.every((succeeded) => succeeded);
+  }
+
+  Future<void> _selectProvider(ApiProviderPreset preset) async {
+    if (_committingConnectionFields) return;
+    setState(() => _committingConnectionFields = true);
+    try {
+      if (!await _commitConnectionFields()) return;
+      if (!mounted || ref.read(translationDashboardProvider).isRunActive) {
+        return;
+      }
+      await ref.read(settingsProvider.notifier).applyApiProviderPreset(preset);
+    } finally {
+      if (mounted) setState(() => _committingConnectionFields = false);
+    }
+  }
+
+  Future<void> _testConnection() async {
+    if (_committingConnectionFields) return;
+    setState(() => _committingConnectionFields = true);
+    try {
+      if (!await _commitConnectionFields()) return;
+    } finally {
+      if (mounted) setState(() => _committingConnectionFields = false);
+    }
+    if (!mounted || ref.read(translationDashboardProvider).isRunActive) return;
+    await ref
+        .read(connectionTestProvider.notifier)
+        .run(ref.read(settingsProvider));
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final config = ref.watch(settingsProvider);
     final bool isRunActive = ref.watch(
       translationDashboardProvider.select(
@@ -29,7 +79,6 @@ class SettingsPage extends ConsumerWidget {
     );
     final controller = ref.read(settingsProvider.notifier);
     final connectionTestState = ref.watch(connectionTestProvider);
-    final connectionTestController = ref.read(connectionTestProvider.notifier);
     final strings = ref.watch(appStringsProvider);
     final bool secretKeyRotated =
         ref.watch(secretKeyRotatedNoticeProvider) != null;
@@ -71,11 +120,12 @@ class SettingsPage extends ConsumerWidget {
             title: strings.apiSection,
             icon: Icons.cloud_outlined,
             trailing: FilledButton.tonalIcon(
-              onPressed: connectionTestState.isLoading || isRunActive
+              onPressed:
+                  connectionTestState.isLoading ||
+                      isRunActive ||
+                      _committingConnectionFields
                   ? null
-                  : () => connectionTestController.run(
-                      ref.read(settingsProvider),
-                    ),
+                  : _testConnection,
               icon: connectionTestState.isLoading
                   ? const SizedBox(
                       width: 16,
@@ -100,18 +150,22 @@ class SettingsPage extends ConsumerWidget {
                       key: ValueKey<String>('api-provider-${preset.name}'),
                       label: Text(preset.label),
                       selected: preset.matches(config),
-                      onSelected: isRunActive
+                      onSelected: isRunActive || _committingConnectionFields
                           ? null
-                          : (_) => controller.applyApiProviderPreset(preset),
+                          : (_) => _selectProvider(preset),
                     );
                   }).toList(),
                 ),
                 const SizedBox(height: 12),
                 SettingsTextField(
+                  key: _connectionFields[0],
                   strings: strings,
                   fieldKey: const ValueKey<String>('settings-api-base-url'),
+                  readOnly: _committingConnectionFields,
                   value: config.apiBaseUrl,
                   onChanged: controller.setApiBaseUrl,
+                  onCommit: controller.setApiBaseUrl,
+                  resetKey: controller.providerSelectionRevision,
                   enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.baseUrl,
@@ -121,10 +175,14 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 SettingsTextField(
+                  key: _connectionFields[1],
                   strings: strings,
                   fieldKey: const ValueKey<String>('settings-api-key'),
+                  readOnly: _committingConnectionFields,
                   value: config.apiKey,
                   onChanged: controller.setApiKey,
+                  onCommit: controller.setApiKey,
+                  resetKey: controller.providerSelectionRevision,
                   obscureText: true,
                   canToggleObscureText: true,
                   enabled: !isRunActive,
@@ -136,10 +194,14 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 SettingsTextField(
+                  key: _connectionFields[2],
                   strings: strings,
                   fieldKey: const ValueKey<String>('settings-model'),
+                  readOnly: _committingConnectionFields,
                   value: config.model,
                   onChanged: controller.setModel,
+                  onCommit: controller.setModel,
+                  resetKey: controller.providerSelectionRevision,
                   enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.model,
@@ -149,10 +211,13 @@ class SettingsPage extends ConsumerWidget {
                 ),
                 const SizedBox(height: 10),
                 SettingsTextField(
+                  key: _connectionFields[3],
                   strings: strings,
                   fieldKey: const ValueKey<String>('settings-http-proxy'),
+                  readOnly: _committingConnectionFields,
                   value: config.httpProxy,
                   onChanged: controller.setHttpProxy,
+                  onCommit: controller.setHttpProxy,
                   enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.httpProxy,
@@ -304,6 +369,7 @@ class SettingsPage extends ConsumerWidget {
                       ),
                       value: config.outputSuffix,
                       onChanged: controller.setOutputSuffix,
+                      onCommit: controller.setOutputSuffix,
                       enabled: !isRunActive,
                       decoration: InputDecoration(
                         labelText: strings.outputSuffix,
@@ -318,6 +384,7 @@ class SettingsPage extends ConsumerWidget {
                       ),
                       value: config.lockedGlossary,
                       onChanged: controller.setLockedGlossary,
+                      onCommit: controller.setLockedGlossary,
                       enabled: !isRunActive,
                       maxLines: 4,
                       decoration: InputDecoration(

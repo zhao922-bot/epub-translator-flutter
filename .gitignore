@@ -50,7 +50,7 @@ app.*.map.json
 
 # Windows specific
 /windows/x64/
-/windows/flutter/
+/windows/flutter/ephemeral/
 /windows/CMakeFiles/
 
 # Codex skills directory (optional - include if you want to track skills)

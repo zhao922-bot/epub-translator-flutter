@@ -3,6 +3,7 @@ import 'dart:collection';
 import 'package:html/dom.dart' as dom;
 import 'xhtml_html_compatibility.dart';
 import 'epub_html_extractor.dart';
+import 'epub_semantics.dart';
 
 /// A source-owned HTML skeleton with translatable text slots.
 ///
@@ -113,6 +114,7 @@ class ProtectedAnchorTextSlots {
           protected ||
           EpubHtmlExtractor.nonTextAncestors.contains(node.localName) ||
           _isRawTextElement(node) ||
+          _isProtectedSemanticMarker(node) ||
           _isProtectedAnchor(node);
       for (final dom.Node child in node.nodes) {
         visit(child, protected: childProtected);
@@ -129,7 +131,7 @@ class ProtectedAnchorTextSlots {
     }
 
     final Set<String> roles = _tokens(element.attributes['role']);
-    final Set<String> epubTypes = _tokens(element.attributes['epub:type']);
+    final Set<String> epubTypes = EpubSemantics.typesOf(element);
     final String id = element.attributes['id']?.toLowerCase() ?? '';
     if (id.startsWith('footnote_ref_') ||
         roles.contains('doc-backlink') ||
@@ -143,6 +145,22 @@ class ProtectedAnchorTextSlots {
       return true;
     }
     return _isCrossFileHref(href) && hasFootnoteMarkerClass(element);
+  }
+
+  /// Semantic page/note markers may be spans (or other inline elements),
+  /// even when a different anchor caused the block to use text slots.
+  static bool _isProtectedSemanticMarker(dom.Element element) {
+    final roles = _tokens(element.attributes['role']);
+    final types = EpubSemantics.typesOf(element);
+    if (roles.contains('doc-pagebreak') || types.contains('pagebreak')) {
+      final compact = element.text.replaceAll(RegExp(r'\s+'), '');
+      return compact.length <= 12 &&
+          (_isShortMarker(compact) ||
+              RegExp(r'^[0-9ivxlcdmIVXLCDM]+$').hasMatch(compact));
+    }
+    return _isShortMarker(element.text) &&
+        (roles.any(const {'doc-noteref', 'doc-backlink'}.contains) ||
+            types.any(const {'noteref', 'backlink'}.contains));
   }
 
   static bool _isRawTextElement(dom.Element element) {

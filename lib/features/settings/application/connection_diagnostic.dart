@@ -1,5 +1,6 @@
 import '../../../shared/security/sensitive_text.dart';
 import '../../translation/domain/models/translation_config.dart';
+import '../../translation/infrastructure/epub/translation_api_client.dart';
 
 class ConnectionDiagnostic {
   const ConnectionDiagnostic(this.message);
@@ -17,7 +18,7 @@ class ConnectionDiagnostic {
     final String lower = raw.toLowerCase();
     final String host = _hostFromConfig(config);
 
-    if (error is FormatException ||
+    if (error is MissingApiConfigurationException ||
         lower.contains('required before testing the connection')) {
       return const ConnectionDiagnostic(
         'Fill in the Base URL, API key, and model before testing the connection.',

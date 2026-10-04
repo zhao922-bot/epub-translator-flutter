@@ -217,7 +217,7 @@ class EpubTranslationRepository implements TranslationRepository {
         AppStrings(config.uiLanguage).epubDecompressionLimit(inputPath),
       );
     } catch (error) {
-      if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
+      if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
       rethrow;
@@ -258,7 +258,7 @@ class EpubTranslationRepository implements TranslationRepository {
         AppStrings(config.uiLanguage).outputPathTooLong(error.detail),
       );
     } catch (error) {
-      if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
+      if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
       rethrow;
@@ -283,7 +283,7 @@ class EpubTranslationRepository implements TranslationRepository {
     } on TranslationCancelledException {
       rethrow;
     } catch (error) {
-      if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
+      if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
       rethrow;

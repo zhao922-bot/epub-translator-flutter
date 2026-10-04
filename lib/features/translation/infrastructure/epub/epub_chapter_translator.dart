@@ -29,6 +29,7 @@ import 'epub_source_guard.dart';
 import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
+import 'epub_semantics.dart';
 import 'translation_api_client.dart';
 import 'translation_batch_planner.dart';
 
@@ -2048,7 +2049,7 @@ class EpubChapterTranslator {
       if (error is TranslationCancelledException) {
         rethrow;
       }
-      if (_isCancelError(error) || (isCancelled?.call() ?? false)) {
+      if (_isCancelError(error)) {
         throw const TranslationCancelledException();
       }
       rethrow;
@@ -2567,6 +2568,56 @@ class EpubChapterTranslator {
   }
 
   static String _lockHtmlStructure({
+    required String sourceHtml,
+    required String translatedHtml,
+  }) {
+    final locked = _lockHtmlStructureCore(
+      sourceHtml: sourceHtml,
+      translatedHtml: translatedHtml,
+    );
+    final source = _singleRootElement(sourceHtml);
+    final model = _singleRootElement(translatedHtml);
+    final result = _singleRootElement(locked);
+    if (source == null || model == null || result == null) return locked;
+    bool changed = false;
+    void preserve(dom.Element original, dom.Element reply, dom.Element output) {
+      if (original.localName != reply.localName ||
+          original.localName != output.localName ||
+          EpubHtmlExtractor.nonTextAncestors.contains(original.localName)) {
+        return;
+      }
+      // Only carry language metadata on an unambiguously aligned subtree.
+      // Source IDs, links and all other attributes remain source-owned.
+      if (!original.attributes.containsKey('lang') &&
+          !original.attributes.containsKey('xml:lang') &&
+          reply.text == output.text) {
+        final language =
+            reply.attributes['lang'] ?? reply.attributes['xml:lang'];
+        final xmlLanguage = reply.attributes['xml:lang'];
+        if (language != null &&
+            RegExp(
+              r'^[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*$',
+            ).hasMatch(language) &&
+            (xmlLanguage == null || xmlLanguage == language)) {
+          output.attributes['lang'] = language;
+          output.attributes['xml:lang'] = language;
+          changed = true;
+        }
+      }
+      if (original.children.length != reply.children.length ||
+          original.children.length != output.children.length) {
+        return;
+      }
+      for (var i = 0; i < original.children.length; i++) {
+        preserve(original.children[i], reply.children[i], output.children[i]);
+      }
+    }
+
+    preserve(source, model, result);
+    return changed ? result.outerHtml : locked;
+  }
+
+  static String _lockHtmlStructureCore({
     required String sourceHtml,
     required String translatedHtml,
   }) {
@@ -3308,10 +3359,7 @@ class EpubChapterTranslator {
   }
 
   static Set<String> _epubTypes(dom.Element element) {
-    return (element.attributes['epub:type']?.toLowerCase() ?? '')
-        .split(RegExp(r'\s+'))
-        .where((String type) => type.isNotEmpty)
-        .toSet();
+    return EpubSemantics.typesOf(element);
   }
 
   static Set<String> _roleTokens(dom.Element element) {
@@ -4943,6 +4991,12 @@ class EpubChapterTranslator {
               // never hit again.
               block.id,
               block.sourceHtml,
+              // Earlier alias-marked footnotes were translated as prose.
+              // Invalidate only those cache entries, retaining ordinary text.
+              if (RegExp(
+                r'\b(?!epub:)[\w-]+:type\s*=',
+              ).hasMatch(block.sourceHtml))
+                'epub-type-alias-protection-v1',
               // Old cell caches may contain model-owned layout or links.
               // Invalidate just these blocks, retaining ordinary paid text.
               if (block.tagName == 'td' || block.tagName == 'th')
@@ -5006,7 +5060,8 @@ class EpubChapterTranslator {
         .querySelectorAll('span[class]')
         .toList(growable: false);
     for (final dom.Element span in spans) {
-      if (_isInsideFootnoteMarkerAnchor(span)) {
+      if (_isInsideFootnoteMarkerAnchor(span) ||
+          const EpubHtmlExtractor().isInsideSkippedAncestor(span)) {
         continue;
       }
       final bool isDropCap = span.classes.any(
@@ -5018,7 +5073,16 @@ class EpubChapterTranslator {
       if (!isDropCap && !isUppercaseSmallCaps) {
         continue;
       }
-      _unwrapElement(span);
+      if (span.attributes.containsKey('id') ||
+          span.attributes.containsKey('name')) {
+        span.classes.removeWhere(
+          (token) =>
+              token.toLowerCase().startsWith('dropcap') ||
+              _isSmallCapsClass(token),
+        );
+      } else {
+        _unwrapElement(span);
+      }
       changed = true;
     }
     return changed ? fragment.outerHtml : sourceHtml;

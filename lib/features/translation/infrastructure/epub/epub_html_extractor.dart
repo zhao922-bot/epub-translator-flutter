@@ -4,6 +4,7 @@ import 'package:path/path.dart' as path;
 
 import '../../domain/models/inspected_chapter.dart';
 import 'epub_text_decoder.dart';
+import 'epub_semantics.dart';
 import 'xhtml_html_compatibility.dart';
 
 /// Shared HTML extraction / chapter categorization for inspect + repack.
@@ -115,7 +116,7 @@ class EpubHtmlExtractor {
         ExtractedBlock(
           id: '${element.localName ?? 'node'}-$index',
           tagName: element.localName ?? 'node',
-          sourceHtml: element.outerHtml,
+          sourceHtml: EpubSemantics.sourceHtmlWithBindings(element),
           sourceText: sourceText,
           isAuthorSignature:
               detectAuthorSignatures && _isAuthorSignatureElement(element),
@@ -500,7 +501,7 @@ class EpubHtmlExtractor {
   }
 
   ChapterCategory categorizeChapter(String chapterPath, String title) {
-    final String pathToken = chapterPath.toLowerCase();
+    final String pathToken = path.posix.basename(chapterPath).toLowerCase();
     final String titleToken = title.toLowerCase();
     // Title matching uses word boundaries so generic substrings don't misfire
     // ("advert" inside "advertisement", "notes" inside "footnotes"), except
@@ -529,7 +530,7 @@ class EpubHtmlExtractor {
       '_cvi_',
       '_cop_',
     ];
-    if (_matchesPathToken(pathToken, ancillaryNeedles) ||
+    if (_matchesAncillaryPath(pathToken) ||
         _matchesAncillaryTitle(titleToken, ancillaryNeedles)) {
       return ChapterCategory.ancillary;
     }
@@ -580,13 +581,7 @@ class EpubHtmlExtractor {
   }
 
   Set<String> epubTypesOf(dom.Element element) {
-    final String raw =
-        element.attributes['epub:type'] ?? element.attributes['type'] ?? '';
-    return raw
-        .toLowerCase()
-        .split(RegExp(r'\s+'))
-        .where((String part) => part.isNotEmpty)
-        .toSet();
+    return EpubSemantics.typesOf(element);
   }
 
   bool isProtectedPagebreakText(String value) {
@@ -623,6 +618,24 @@ class EpubHtmlExtractor {
   /// `ad_` is the exception: it carries only a right delimiter, so without
   /// a left anchor it misfires on ordinary words (`dead_end.xhtml`,
   /// `read_along.xhtml`, `instead_of.xhtml`).
+  bool _matchesAncillaryPath(String fileName) {
+    final stem = path.posix.basenameWithoutExtension(fileName);
+    // Explicit publisher codes retain their meaning; ordinary title words
+    // must form a complete filename, optionally with a numeric suffix.
+    if (_matchesPathToken(stem, const [
+      'ad_',
+      '_cvi_',
+      '_cop_',
+      'z-lib',
+      '1lib',
+    ])) {
+      return true;
+    }
+    return RegExp(
+      r'^(?:cover|copyright|credits?|signup|advert(?:isement)?s?|promo(?:tion)?)[_\-\s]*\d*$',
+    ).hasMatch(stem);
+  }
+
   bool _matchesPathToken(String pathToken, List<String> needles) {
     return needles.any((String needle) {
       if (needle == 'ad_') {

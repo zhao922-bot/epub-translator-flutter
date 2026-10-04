@@ -247,6 +247,16 @@ class ProperNameNormalizer {
         continue;
       }
       final String raw = match.group(0)!;
+      // Transparent empty inline nodes can own IDs, names or page markers.
+      // Keep them immediately before the canonical name: links still land
+      // at the name, and its Chinese/English display text stays contiguous.
+      final markers = RegExp(r'[\uE003]+')
+          .allMatches(raw)
+          .map(
+            (run) =>
+                html.substring(match.start + run.start, match.start + run.end),
+          )
+          .join();
       // A bare English name that sits inside an existing `中文（English）`
       // gloss (between an opening paren and its closing paren) is already
       // canonical and must not be re-glossed.
@@ -270,14 +280,14 @@ class ProperNameNormalizer {
       if (state?.countedNames.contains(mapping.source) == true) {
         output
           ..write(html.substring(cursor, match.start))
-          ..write(mapping.target);
+          ..write('$markers${mapping.target}');
         cursor = match.end;
         continue;
       }
       output
         ..write(html.substring(cursor, match.start))
         ..write(
-          '${mapping.target}（${_cleanLooseHtmlTokens(raw, mapping.source)}）',
+          '$markers${mapping.target}（${_cleanLooseHtmlTokens(raw, mapping.source)}）',
         );
       state?.countedNames.add(mapping.source);
       cursor = match.end;

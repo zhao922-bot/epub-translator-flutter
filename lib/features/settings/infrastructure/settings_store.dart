@@ -119,6 +119,10 @@ class SettingsStore {
   final Map<SettingsSecretSlot, _SecretReadStatus> _secretReadStatuses =
       <SettingsSecretSlot, _SecretReadStatus>{};
 
+  // Compare against this instance's last loaded/saved values. An unchanged
+  // local snapshot must not overwrite keys another app instance updated.
+  Map<SettingsSecretSlot, String>? _secretSnapshot;
+
   /// Set when an Android KeyStore read reported SECRET_KEY_ROTATED (the
   /// device key was invalidated and regenerated): previously stored keys
   /// are unrecoverable and the user must re-enter them. Surfaced to the
@@ -159,8 +163,18 @@ class SettingsStore {
   /// knows their settings were reset and where the original file went.
   String? lastCorruptBackupPath;
 
+  Object? _configLoadError;
+  Object? get configLoadError => _configLoadError;
+
   Future<TranslationConfig> load() async {
-    final TranslationConfig config = await _loadConfigFromFile();
+    final TranslationConfig config;
+    try {
+      config = await _loadConfigFromFile();
+      _configLoadError = null;
+    } catch (error) {
+      _configLoadError = error;
+      rethrow;
+    }
     final List<_SecretReadResult> storedKeys = await _readAllSecrets();
     final _SecretReadResult storedApiKey = storedKeys[0];
     final _SecretReadResult storedDeepSeekKey = storedKeys[1];
@@ -187,6 +201,7 @@ class SettingsStore {
       deepseekApiKey: deepSeekKey,
       customApiKey: customKey,
     );
+    _secretSnapshot = _secretValues(resolvedConfig);
     if (config.apiKey.isNotEmpty &&
         !_legacyMigrationFailed &&
         _legacyMigrationAttempts < _maxLegacyMigrationAttempts) {
@@ -253,6 +268,8 @@ class SettingsStore {
   }
 
   Future<TranslationConfig> _loadConfigFromFile() async {
+    didCorruptReset = false;
+    lastCorruptBackupPath = null;
     final File file = await _settingsFile();
     if (!await file.exists()) {
       didCorruptReset = false;
@@ -276,12 +293,18 @@ class SettingsStore {
         lastCorruptBackupPath = null;
         return config;
       } catch (retryError) {
+        // An unreadable file is not corrupt. Keep it in place and refuse
+        // saves until a later load succeeds, rather than persisting defaults.
+        if (retryError is! FormatException && retryError is! TypeError) {
+          rethrow;
+        }
         // Back the corrupt file up before it gets overwritten by the next
         // save: a silent reset would lose every setting with no way to
         // recover. The backup path is exposed via [lastCorruptBackupPath]
         // so the UI can tell the user where their settings went.
-        didCorruptReset = true;
         lastCorruptBackupPath = await _backupCorruptSettingsFile(file);
+        if (await file.exists()) rethrow;
+        didCorruptReset = true;
         AppLogger.error(
           'Failed to parse settings.json; using defaults.',
           tag: 'settings',
@@ -317,10 +340,14 @@ class SettingsStore {
         '${path.basename(file.path)}.bad-${DateTime.now().microsecondsSinceEpoch}',
       );
       await file.rename(backupPath);
-      await _pruneCorruptBackups(
-        file.parent,
-        '${path.basename(file.path)}.bad-',
-      );
+      try {
+        await _pruneCorruptBackups(
+          file.parent,
+          '${path.basename(file.path)}.bad-',
+        );
+      } catch (_) {
+        // Retention failure must not hide a successfully preserved backup.
+      }
       AppLogger.warn(
         'Backed up corrupt settings file to $backupPath',
         tag: 'settings',
@@ -385,8 +412,14 @@ class SettingsStore {
     TranslationConfig config, {
     Set<SettingsSecretSlot>? explicitSecretMutations,
   }) async {
+    if (_configLoadError != null) {
+      throw StateError('Settings could not be loaded; reload before saving.');
+    }
     final Set<SettingsSecretSlot> explicit =
-        explicitSecretMutations ?? SettingsSecretSlot.values.toSet();
+        explicitSecretMutations ??
+        (_secretSnapshot == null
+            ? SettingsSecretSlot.values.toSet()
+            : const <SettingsSecretSlot>{});
     if (!_didLoad) {
       // A store that never loaded has no secret read statuses: _saveSecret
       // could not tell "key was cleared" from "backend is broken" and might
@@ -394,21 +427,32 @@ class SettingsStore {
       // protected instead of being deleted blindly.
       await _readAllSecrets();
     }
+    final values = _secretValues(config);
+    final baseline = _secretSnapshot ??= Map.of(values);
+    final slotsToSave = <SettingsSecretSlot>{
+      ...explicit,
+      for (final slot in SettingsSecretSlot.values)
+        if (values[slot] != baseline[slot]) slot,
+    };
     // The JSON write sits in a finally block on purpose: a secret-store
     // failure (e.g. the Windows DPAPI file being locked so deleteSecret
     // throws StateError) must not silently discard the non-secret settings
     // the user just changed. The secret error still propagates so the
     // caller reports the failed key save and the user can retry.
     try {
-      await _saveSecrets(
-        config,
-        slotsToSave: SettingsSecretSlot.values.toSet(),
-        explicit: explicit,
-      );
+      await _saveSecrets(config, slotsToSave: slotsToSave, explicit: explicit);
     } finally {
       await _writeSettingsJson(config);
     }
   }
+
+  static Map<SettingsSecretSlot, String> _secretValues(
+    TranslationConfig config,
+  ) => <SettingsSecretSlot, String>{
+    SettingsSecretSlot.legacy: config.apiKey.trim(),
+    SettingsSecretSlot.deepSeek: config.deepseekApiKey.trim(),
+    SettingsSecretSlot.custom: config.customApiKey.trim(),
+  };
 
   Future<void> _saveSecrets(
     TranslationConfig config, {
@@ -544,6 +588,7 @@ class SettingsStore {
       await write(trimmed);
       _secretReadStatuses[slot] = _SecretReadStatus.value;
     }
+    _secretSnapshot?[slot] = trimmed;
   }
 
   Future<File> _settingsFile() async {

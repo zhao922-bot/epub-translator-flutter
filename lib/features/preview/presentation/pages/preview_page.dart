@@ -121,15 +121,25 @@ class PreviewPage extends ConsumerWidget {
                     ),
                   );
                 }
+                // Reserve a proportion of the available height for the
+                // separator; fixed minimum list heights starve the detail
+                // on short windows (especially with a bottom navigation bar).
+                final separatorHeight = (constraints.maxHeight * .12).clamp(
+                  0.0,
+                  48.0,
+                );
+                final checklistHeight =
+                    ((constraints.maxHeight - separatorHeight) * .46).clamp(
+                      0.0,
+                      300.0,
+                    );
                 return Column(
                   children: [
+                    SizedBox(height: checklistHeight, child: checklist),
                     SizedBox(
-                      height: (constraints.maxHeight * .46).clamp(160.0, 300.0),
-                      child: checklist,
+                      height: separatorHeight,
+                      child: const Center(child: Divider(height: 1)),
                     ),
-                    const SizedBox(height: 16),
-                    const Divider(),
-                    const SizedBox(height: 16),
                     Expanded(child: detail),
                   ],
                 );

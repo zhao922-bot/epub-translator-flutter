@@ -104,7 +104,7 @@ void main() {
       );
     });
 
-    test('saveMerged removes the lock sidecar on success', () async {
+    test('saveMerged retains a stable lock sidecar on success', () async {
       final Directory temp = await Directory.systemTemp.createTemp(
         'history_lock_',
       );
@@ -120,7 +120,9 @@ void main() {
       );
 
       expect(result.written, isTrue);
-      expect(await File('${historyFile.path}.lock').exists(), isFalse);
+      // Waiting POSIX writers may already hold this file open. Keep the
+      // same identity for later writers rather than unlinking their lock.
+      expect(await File('${historyFile.path}.lock').exists(), isTrue);
       // The payload itself was still written.
       expect(await historyFile.exists(), isTrue);
     });

@@ -1,5 +1,9 @@
 import 'dart:convert';
 
+import 'package:html/parser.dart' as html_parser;
+
+import 'xhtml_html_compatibility.dart';
+
 /// Encoding-aware text decoding for EPUB payloads (chapter HTML and package
 /// metadata such as container.xml / OPF / NCX).
 ///
@@ -107,49 +111,31 @@ bool _isUtf8Name(String declared) {
 String? _sniffDeclaredEncoding(List<int> bytes) {
   final String xmlHead = _asciiHead(bytes, 2048);
   final RegExpMatch? xmlMatch = RegExp(
-    '<\\?xml\\b[^>]*?\\bencoding\\s*=\\s*["\']([^"\']+)["\']',
+    '^\\s*<\\?xml\\b[^>]*?\\bencoding\\s*=\\s*["\']([^"\']+)["\']',
     caseSensitive: false,
   ).firstMatch(xmlHead);
   if (xmlMatch != null) {
     return xmlMatch.group(1)!.trim();
   }
-  final String htmlHead = _stripIgnorableMarkup(_asciiHead(bytes, 8192));
-  final RegExp metaTagRegex = RegExp(r'<meta\b[^>]*>', caseSensitive: false);
-  final RegExp attrRegex = RegExp(
-    r'''([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)''',
-    caseSensitive: false,
+  // The HTML tokenizer handles comments truncated by the scan window and
+  // quoted attributes. The XHTML adapter keeps tag-shaped CDATA opaque.
+  final document = html_parser.parse(
+    XhtmlHtmlCompatibility.normalizeForHtmlParser(_asciiHead(bytes, 8192)),
   );
   final RegExp contentCharsetRegex = RegExp(
     '\\bcharset\\s*=\\s*["\']?([A-Za-z0-9._-]+)',
     caseSensitive: false,
   );
-  for (final RegExpMatch tagMatch in metaTagRegex.allMatches(htmlHead)) {
-    final String tagText = tagMatch.group(0)!;
-    String? httpEquiv;
-    String? contentValue;
+  for (final meta in document.querySelectorAll('meta')) {
+    final httpEquiv = meta.attributes['http-equiv']?.trim().toLowerCase();
+    final contentValue = meta.attributes['content'];
     // Match attributes by NAME, not by a bare `charset=` scan over the tag:
     // a bare scan also fires inside quoted attribute values (e.g.
     // `<meta name="desc" content="see charset=gbk">`), which would sniff the
     // wrong encoding from unrelated text.
-    for (final RegExpMatch attr in attrRegex.allMatches(tagText)) {
-      final String name = attr.group(1)!.toLowerCase();
-      final String raw = attr.group(2)!;
-      final String value =
-          raw.length >= 2 &&
-              ((raw.startsWith('"') && raw.endsWith('"')) ||
-                  (raw.startsWith("'") && raw.endsWith("'")))
-          ? raw.substring(1, raw.length - 1)
-          : raw;
-      if (name == 'charset') {
-        final String charset = value.trim().split(';').first.trim();
-        if (charset.isNotEmpty) {
-          return charset;
-        }
-      } else if (name == 'http-equiv') {
-        httpEquiv = value.trim().toLowerCase();
-      } else if (name == 'content') {
-        contentValue = value;
-      }
+    final charset = meta.attributes['charset']?.trim().split(';').first.trim();
+    if (charset != null && charset.isNotEmpty) {
+      return charset;
     }
     // `<meta http-equiv="Content-Type" content="text/html; charset=Big5">`:
     // here the charset lives inside the content VALUE rather than in an
@@ -166,27 +152,6 @@ String? _sniffDeclaredEncoding(List<int> bytes) {
     }
   }
   return null;
-}
-
-/// Removes HTML comments and script/style element *contents* from a scan
-/// window before charset sniffing: a `<meta charset="gbk">` inside a
-/// comment or a JS string is not a real declaration, and sniffing it would
-/// reject a perfectly good UTF-8 book.
-String _stripIgnorableMarkup(String head) {
-  String stripped = head.replaceAll(RegExp(r'<!--.*?-->', dotAll: true), ' ');
-  stripped = stripped.replaceAll(
-    RegExp(
-      r'<script\b[^>]*>.*?</script\s*>',
-      caseSensitive: false,
-      dotAll: true,
-    ),
-    ' ',
-  );
-  stripped = stripped.replaceAll(
-    RegExp(r'<style\b[^>]*>.*?</style\s*>', caseSensitive: false, dotAll: true),
-    ' ',
-  );
-  return stripped;
 }
 
 /// Maps every byte to its ASCII code point, replacing non-ASCII bytes with a

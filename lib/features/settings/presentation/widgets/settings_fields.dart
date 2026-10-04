@@ -81,23 +81,33 @@ class SettingsTextField extends StatefulWidget {
     required this.fieldKey,
     required this.value,
     required this.onChanged,
+    this.onCommit,
+    this.resetKey,
     required this.decoration,
     required this.strings,
     this.obscureText = false,
     this.canToggleObscureText = false,
     this.maxLines = 1,
     this.enabled = true,
+    this.readOnly = false,
   });
 
   final Key fieldKey;
   final String value;
-  final ValueChanged<String> onChanged;
+  final FutureOr<void> Function(String) onChanged;
+
+  /// False keeps the value retryable when loading or persistence failed.
+  final FutureOr<bool> Function(String)? onCommit;
+
+  /// Explicit preset changes replace pending edits; save echoes do not.
+  final Object? resetKey;
   final InputDecoration decoration;
   final AppStrings strings;
   final bool obscureText;
   final bool canToggleObscureText;
   final int maxLines;
   final bool enabled;
+  final bool readOnly;
 
   @override
   State<SettingsTextField> createState() => SettingsTextFieldState();
@@ -117,6 +127,9 @@ class SettingsTextFieldState extends State<SettingsTextField> {
   static const Duration _commitDelay = Duration(milliseconds: 800);
   Timer? _commitTimer;
   String _lastCommitted = '';
+  Future<bool>? _pendingCommit;
+  String? _pendingText;
+  int _commitSequence = 0;
 
   @override
   void initState() {
@@ -137,24 +150,59 @@ class SettingsTextFieldState extends State<SettingsTextField> {
 
   void _scheduleCommit() {
     _commitTimer?.cancel();
-    if (_controller.text == _lastCommitted) {
+    if (_controller.text == _lastCommitted &&
+        (_pendingCommit == null || _pendingText == _controller.text)) {
       return;
     }
-    _commitTimer = Timer(_commitDelay, _flushCommit);
+    _commitTimer = Timer(_commitDelay, () => unawaited(commitPending()));
   }
 
   void _flushCommit() {
+    unawaited(commitPending());
+  }
+
+  /// Commit the displayed value before an action consumes settings. Await
+  /// the controller so its asynchronous initial-load gate has also completed.
+  Future<bool> commitPending() async {
     _commitTimer?.cancel();
     _commitTimer = null;
-    if (!mounted) {
-      return;
+    if (!mounted || !widget.enabled) {
+      return false;
     }
     final String text = _controller.text;
-    if (text == _lastCommitted) {
-      return;
+    if (text == _pendingText) {
+      return _pendingCommit!;
     }
-    _lastCommitted = text;
-    widget.onChanged(text);
+    if (_pendingCommit == null && text == _lastCommitted) return true;
+    final sequence = ++_commitSequence;
+    _pendingText = text;
+    final pending = _commitText(text, sequence);
+    _pendingCommit = pending;
+    return pending;
+  }
+
+  Future<bool> _commitText(String text, int sequence) async {
+    try {
+      final commit = widget.onCommit;
+      final bool succeeded;
+      if (commit != null) {
+        succeeded = await commit(text);
+      } else {
+        await widget.onChanged(text);
+        succeeded = true;
+      }
+      if (sequence == _commitSequence && succeeded) _lastCommitted = text;
+      return succeeded;
+    } catch (_) {
+      // Controller callbacks surface their own persistence notice. A failed
+      // callback must also remain retryable and must not escape a timer.
+      return false;
+    } finally {
+      if (sequence == _commitSequence) {
+        _pendingCommit = null;
+        _pendingText = null;
+      }
+    }
   }
 
   @override
@@ -163,10 +211,20 @@ class SettingsTextFieldState extends State<SettingsTextField> {
     if (widget.obscureText != oldWidget.obscureText) {
       _obscureText = widget.obscureText;
     }
-    if (widget.value != oldWidget.value && widget.value != _controller.text) {
-      // An external value (e.g. a preset) supersedes any pending keystrokes.
+    final reset = widget.resetKey != oldWidget.resetKey;
+    final dirty = _controller.text != _lastCommitted;
+    if (reset ||
+        (widget.value != oldWidget.value &&
+            widget.value != _controller.text &&
+            !dirty &&
+            _pendingCommit == null)) {
+      // Initial values update untouched fields. Only an explicit preset
+      // change may supersede newer edits during an older async commit.
       _commitTimer?.cancel();
       _commitTimer = null;
+      _commitSequence++;
+      _pendingCommit = null;
+      _pendingText = null;
       _lastCommitted = widget.value;
       _controller.value = TextEditingValue(
         text: widget.value,
@@ -174,13 +232,12 @@ class SettingsTextFieldState extends State<SettingsTextField> {
       );
     }
     if (oldWidget.enabled && !widget.enabled) {
-      // The run started and disabled the field: discard the half-typed,
-      // unconfirmed input instead of persisting it mid-run. Marking it as
-      // committed suppresses the timer, the blur commit that disabling
-      // triggers, and a later dispose flush.
+      // Discard half-typed input during a run, but retain the last confirmed
+      // save. widget.value may itself be a failed or pending memory update.
+      // commitPending blocks blur/dispose writes while disabled.
       _commitTimer?.cancel();
       _commitTimer = null;
-      _lastCommitted = _controller.text;
+      _controller.text = widget.value;
     }
   }
 
@@ -229,7 +286,10 @@ class SettingsTextFieldState extends State<SettingsTextField> {
       maxLines: widget.maxLines,
       minLines: widget.maxLines > 1 ? 3 : 1,
       enabled: widget.enabled,
-      onChanged: widget.enabled ? (_) => _scheduleCommit() : null,
+      readOnly: widget.readOnly,
+      onChanged: widget.enabled && !widget.readOnly
+          ? (_) => _scheduleCommit()
+          : null,
       onFieldSubmitted: widget.enabled ? (_) => _flushCommit() : null,
       decoration: decoration,
     );

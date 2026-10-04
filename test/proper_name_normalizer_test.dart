@@ -1,5 +1,6 @@
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/proper_name_normalizer.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:html/parser.dart' as html;
 
 void main() {
   group('ProperNameNormalizer', () {
@@ -84,10 +85,16 @@ void main() {
         targetLanguage: 'Chinese',
         state: state,
       );
-      expect(out, contains('即Pierre 范登·伯格（Van Den Berghe）所称的'));
+      final document = html.parseFragment(out);
+      expect(document.text, contains('即Pierre 范登·伯格（Van Den Berghe）所称的'));
       expect(out, contains('范登·伯格也作此论断'));
-      // The pagebreak anchor must not survive inside the gloss.
-      expect(RegExp(r'<span').hasMatch(out), isFalse);
+      // Preserve the source-owned jump target outside the English gloss.
+      final marker = document.querySelector('#page_281')!;
+      expect(marker.attributes['epub:type'], 'pagebreak');
+      expect(marker.attributes['role'], 'doc-pagebreak');
+      expect(marker.attributes['aria-label'], '281');
+      expect(marker.text, isEmpty);
+      expect(out, contains('范登·伯格（Van Den Berghe）'));
       // The gloss must not be duplicated on the already-annotated name.
       expect(RegExp(r'范登·伯格（范登·伯格').hasMatch(out), isFalse);
     });

@@ -293,18 +293,25 @@ class EpubInspector {
           orElse: () => null,
         );
     final String ncxId = spine?.getAttribute('toc') ?? '';
-    String ncxHref = '';
-    for (final XmlElement item
-        in opfDocument.descendants.whereType<XmlElement>()) {
-      if (item.name.local != 'item') {
-        continue;
-      }
-      if ((ncxId.isNotEmpty && item.getAttribute('id') == ncxId) ||
-          item.getAttribute('media-type') == 'application/x-dtbncx+xml') {
-        ncxHref = item.getAttribute('href') ?? '';
-        break;
-      }
-    }
+    final items = opfDocument.descendants.whereType<XmlElement>().where(
+      (item) => item.name.local == 'item',
+    );
+    final explicit = items
+        .where(
+          (item) =>
+              ncxId.isNotEmpty &&
+              item.getAttribute('id') == ncxId &&
+              (item.getAttribute('href') ?? '').isNotEmpty,
+        )
+        .firstOrNull;
+    final fallback = items
+        .where(
+          (item) =>
+              item.getAttribute('media-type') == 'application/x-dtbncx+xml' &&
+              (item.getAttribute('href') ?? '').isNotEmpty,
+        )
+        .firstOrNull;
+    final String ncxHref = (explicit ?? fallback)?.getAttribute('href') ?? '';
     if (ncxHref.isEmpty) {
       return null;
     }

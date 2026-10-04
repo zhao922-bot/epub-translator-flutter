@@ -23,6 +23,13 @@ class TranslationParseException extends FormatException {
   const TranslationParseException(super.message);
 }
 
+class MissingApiConfigurationException extends FormatException {
+  const MissingApiConfigurationException()
+    : super(
+        'API base URL, API key, and model are required before testing the connection.',
+      );
+}
+
 /// Why a user-typed proxy setting cannot be used as an HTTP proxy.
 enum ProxySettingError {
   /// The value is not shaped like `host:port` or `http(s)://host:port`.
@@ -243,9 +250,7 @@ class TranslationApiClient {
     if (config.apiBaseUrl.trim().isEmpty ||
         config.apiKey.trim().isEmpty ||
         config.model.trim().isEmpty) {
-      throw const FormatException(
-        'API base URL, API key, and model are required before testing the connection.',
-      );
+      throw const MissingApiConfigurationException();
     }
 
     // Fail fast on a proxy the client cannot use: without this the probe
@@ -427,6 +432,17 @@ class TranslationApiClient {
       throw TranslationParseException(
         'Translation API response choice is not a JSON object '
         '(${firstChoice.runtimeType}).',
+      );
+    }
+    // A complete JSON/HTML envelope can still contain incomplete prose.
+    // Reject explicit non-natural completion statuses before any consumer
+    // validates, caches, or displays the content. Older compatible gateways
+    // sometimes omit this field; retain their existing behavior.
+    final dynamic finishReason = firstChoice['finish_reason'];
+    if (finishReason != null && finishReason != 'stop') {
+      throw TranslationParseException(
+        'Translation API response did not finish normally '
+        '(finish_reason=$finishReason).',
       );
     }
     final dynamic rawMessage = firstChoice['message'];

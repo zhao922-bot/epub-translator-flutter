@@ -9,14 +9,14 @@
 
 ## 下载安装
 
-当前源码版本：**1.4.8+12**。本次更新包含 HTML 重建脚注 marker 换位、重试画像阶段取消、spine media-type 参数、专名误判、语言标记、历史记录与 Android/Windows 平台修复，详见 [更新日志](CHANGELOG.md)。
+当前版本：**1.4.9+13**。本次更新汇总多轮深入检查的修复，覆盖设置与密钥保存、任务恢复与取消、脚注和页码保护、双语目录、EPUB 元数据及平台文件流程，详见 [更新日志](CHANGELOG.md)。
 
-以下为目前已发布的安装包；**尚未发布 v1.4.8 安装包**，体验本次修复请从源码构建。
+安装包与校验值见 [v1.4.9 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.9)。
 
 | 平台 | 下载 | 说明 |
 |------|------|------|
-| Windows x64 | [v1.4.0 便携包](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.0) | 解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.4.2 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.2) | 下载该版本发布页中的 APK 安装 |
+| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.4.9/epub-translator-flutter-v1.4.9-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.4.9/epub-translator-flutter-v1.4.9-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [已发布的 v1.4.2 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.2) | v1.4.9 APK 等待原发布签名确认；当前找到的本地签名与 v1.4.2 不同，不能直接覆盖更新 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -56,6 +56,8 @@
 flutter pub get
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 # 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
+# 可选 EXE 安装包：先安装 Inno Setup 6.3+ 并将 ISCC 加入 PATH
+ISCC /DAppVersion=1.4.9 tool\windows_installer.iss
 flutter build apk --release       # 需配置 android/key.properties 签名
 ```
 
@@ -74,7 +76,7 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 ## 开发验证
 
-v1.4.8 修复集本地验证：**1108 项测试通过、17 项依赖环境的测试跳过**，静态分析无问题；Android debug APK 构建通过（Windows 原生构建未验证）。测试覆盖模拟 API 和真实 EPUB 打包，未调用收费接口；不等同于所有设备与阅读器的兼容性认证。
+v1.4.9 修复集本地验证：**1292 项测试通过、21 项依赖环境的测试跳过**，静态分析无问题。Windows release 构建、便携包启动检查通过；Android 原生单元测试 4 项通过，release APK 等待签名确认。测试覆盖模拟 API、页面生命周期、设置持久化及真实 EPUB 打包，未调用收费接口；尚无 Android 真机完整流程验证。
 
 ```powershell
 $env:LIVE_TRANSLATION_E2E='0'

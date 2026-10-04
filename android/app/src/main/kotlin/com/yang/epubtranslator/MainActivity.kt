@@ -63,11 +63,13 @@ class MainActivity : FlutterActivity() {
          * second reply would throw IllegalStateException.
          */
         val done = AtomicBoolean(false)
+        var requestCode: Int = -1
     }
 
     /** The attempt whose picker UI is currently open, if any. Replaces the
      * old pendingPickResult: the result now travels with its attempt. */
     private var pendingPick: ImportAttempt? = null
+    private val pickerRequests = PickerRequestRegistry<ImportAttempt>()
     /** Latest import attempt ever started; the watchdog only acts when it
      * is still this attempt (a newer pick supersedes it). */
     private val lastImportAttempt = AtomicReference<ImportAttempt?>(null)
@@ -262,6 +264,9 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        savedInstanceState?.getIntArray(PICKER_REQUEST_CODES_STATE)?.let {
+            pickerRequests.restoreAbandoned(it)
+        }
         super.onCreate(savedInstanceState)
         // Zombie-service sweep: the translation runs in the Dart isolate,
         // which is (re)created together with this activity, so a service
@@ -334,6 +339,11 @@ class MainActivity : FlutterActivity() {
         old.shutdownNow()
     }
 
+    override fun onSaveInstanceState(outState: android.os.Bundle) {
+        outState.putIntArray(PICKER_REQUEST_CODES_STATE, pickerRequests.outstandingCodes())
+        super.onSaveInstanceState(outState)
+    }
+
     private fun pickEpubFile(result: MethodChannel.Result) {
         if (pendingPick != null) {
             result.error("PICK_IN_PROGRESS", "An EPUB picker is already open.", null)
@@ -347,6 +357,12 @@ class MainActivity : FlutterActivity() {
 
         importAttemptCounter += 1
         val attempt = ImportAttempt(id = importAttemptCounter, result = result)
+        val requestCode = pickerRequests.register(attempt)
+        if (requestCode == null) {
+            result.error("PICK_REQUESTS_EXHAUSTED", "Too many outstanding file pickers.", null)
+            return
+        }
+        attempt.requestCode = requestCode
         lastImportAttempt.set(attempt)
         pendingPick = attempt
         // The whole pick operation (picker UI + copy) shares the Dart
@@ -421,6 +437,7 @@ class MainActivity : FlutterActivity() {
                 if (attempt.done.compareAndSet(false, true)) {
                     if (pickerOpen) {
                         pendingPick = null
+                        pickerRequests.abandon(attempt.requestCode)
                     }
                     result.error(
                         "PICK_TIMEOUT",
@@ -442,13 +459,14 @@ class MainActivity : FlutterActivity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         try {
-            startActivityForResult(intent, REQUEST_PICK_EPUB)
+            startActivityForResult(intent, attempt.requestCode)
         } catch (error: Exception) {
             // No app can handle the picker (e.g. stripped-down ROMs without
             // DocumentsUI). Clear the pending slot, otherwise every later
             // import would wrongly report PICK_IN_PROGRESS until the
             // process dies.
             cancelPickTimeout()
+            pickerRequests.consume(attempt.requestCode)
             pendingPick = null
             attempt.done.set(true)
             result.error(
@@ -469,9 +487,10 @@ class MainActivity : FlutterActivity() {
     @Deprecated("Deprecated in Android, still supported by FlutterActivity.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_PICK_EPUB) {
-            return
-        }
+        // Consume the attempt attached to this request. A timeout leaves a
+        // tombstone: its late result can never consume the new pending pick.
+        val attempt = pickerRequests.consume(requestCode) ?: return
+        if (pendingPick !== attempt || attempt.done.get()) return
         // NOTE: the pick watchdog is deliberately NOT cancelled here. It
         // doubles as the copy watchdog: a copy wedged in InputStream.read()
         // never reaches the loop's deadline check, so the watchdog must stay
@@ -482,7 +501,6 @@ class MainActivity : FlutterActivity() {
         // below is the exception: with no copy task submitted, it answers
         // via replyToImport(), which drops the watchdog.
 
-        val attempt = pendingPick ?: return
         pendingPick = null
         val result = attempt.result
 
@@ -1937,7 +1955,7 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val TAG = "EpubTranslator"
-        private const val REQUEST_PICK_EPUB = 6001
+        private const val PICKER_REQUEST_CODES_STATE = "epub_picker_request_codes"
         private const val REQUEST_WRITE_DOWNLOADS = 6002
         private const val REQUEST_POST_NOTIFICATIONS = 6003
         /** Native-side backstop matching the Dart 5-minute picker timeout. */
