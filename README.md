@@ -16,7 +16,7 @@
 | 平台 | 下载 | 说明 |
 |------|------|------|
 | Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.4.9/epub-translator-flutter-v1.4.9-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.4.9/epub-translator-flutter-v1.4.9-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [已发布的 v1.4.2 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.4.2) | v1.4.9 APK 等待原发布签名确认；当前找到的本地签名与 v1.4.2 不同，不能直接覆盖更新 |
+| Android | [v1.4.9 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.4.9/epub-translator-flutter-v1.4.9-android.apk) | 已验证与 v1.4.2 同签名，已安装 v1.4.2 的用户可直接覆盖升级，无需卸载 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -76,7 +76,7 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 ## 开发验证
 
-v1.4.9 修复集本地验证：**1292 项测试通过、21 项依赖环境的测试跳过**，静态分析无问题。Windows release 构建、便携包启动检查通过；Android 原生单元测试 4 项通过，release APK 等待签名确认。测试覆盖模拟 API、页面生命周期、设置持久化及真实 EPUB 打包，未调用收费接口；尚无 Android 真机完整流程验证。
+v1.4.9 修复集本地验证：**1292 项测试通过、21 项依赖环境的测试跳过**，静态分析无问题。Windows release 构建、便携包启动检查通过；Android 原生单元测试 4 项通过，release APK 已构建并上传至发布页（已验证与 v1.4.2 同签名，可直接覆盖升级）。测试覆盖模拟 API、页面生命周期、设置持久化及真实 EPUB 打包，未调用收费接口；尚无 Android 真机完整流程验证。
 
 ```powershell
 $env:LIVE_TRANSLATION_E2E='0'
