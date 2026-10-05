@@ -24,6 +24,7 @@ class _CommittedRepacker extends EpubRepacker {
     CancelToken? cancelToken,
     bool Function()? isCancelled,
     Set<String> degradedBlockIds = const <String>{},
+    String? translatedTitle,
   }) async {
     await File(outputFilePath).writeAsString('committed');
     onCommitted();

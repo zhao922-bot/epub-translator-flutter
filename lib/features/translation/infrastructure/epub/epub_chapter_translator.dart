@@ -4,6 +4,8 @@ import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:archive/archive.dart';
+import 'package:xml/xml.dart' as xml;
 import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:path/path.dart' as path;
@@ -1940,6 +1942,21 @@ class EpubChapterTranslator {
       }
       final Stopwatch repackStopwatch = Stopwatch()..start();
       throwIfCancelled();
+      // Translate the book's metadata title (one lightweight call) so the
+      // finished EPUB's dc:title / NCX docTitle show the target language.
+      // Fail-safe: null keeps the original title.
+      String? translatedTitle;
+      if (dioReady) {
+        final String? originalTitle = _readOriginalBookTitle(inputPath);
+        if (originalTitle != null) {
+          translatedTitle = await _translateBookTitle(
+            dio: dio,
+            config: config,
+            originalTitle: originalTitle,
+            cancelToken: cancelToken,
+          );
+        }
+      }
       await _repacker.writeTranslatedEpub(
         inputPath: inputPath,
         outputFilePath: outputFilePath,
@@ -1948,6 +1965,7 @@ class EpubChapterTranslator {
         cancelToken: cancelToken,
         isCancelled: isCancelled,
         degradedBlockIds: _degradedBlocks,
+        translatedTitle: translatedTitle,
       );
       repackStopwatch.stop();
 
@@ -4799,6 +4817,112 @@ class EpubChapterTranslator {
 
   static String idiomaticTranslationInstructionForTest() {
     return EpubChapterTranslator()._idiomaticTranslationInstruction();
+  }
+
+  /// Reads the book's dc:title from the input EPUB's OPF metadata.
+  /// Returns null when the title cannot be determined.
+  String? _readOriginalBookTitle(String inputPath) {
+    try {
+      final List<int> bytes = File(inputPath).readAsBytesSync();
+      final Archive archive = ZipDecoder().decodeBytes(bytes);
+      String? opfPath;
+      for (final ArchiveFile file in archive.files) {
+        if (file.name == 'META-INF/container.xml') {
+          final String containerXml = utf8.decode(file.content as List<int>);
+          final xml.XmlDocument container = xml.XmlDocument.parse(
+            containerXml,
+          );
+          opfPath = container.descendants
+              .whereType<xml.XmlElement>()
+              .firstWhere(
+                (xml.XmlElement e) => e.name.local == 'rootfile',
+                orElse: () => xml.XmlElement(xml.XmlName('missing')),
+              )
+              .getAttribute('full-path');
+          break;
+        }
+      }
+      if (opfPath == null || opfPath.isEmpty) return null;
+      for (final ArchiveFile file in archive.files) {
+        if (file.name == opfPath) {
+          final String opfXml = utf8.decode(file.content as List<int>);
+          final xml.XmlDocument opf = xml.XmlDocument.parse(opfXml);
+          final Iterable<xml.XmlElement> titleCandidates = opf.descendants
+              .whereType<xml.XmlElement>()
+              .where(
+                (xml.XmlElement e) =>
+                    e.name.local == 'title' &&
+                    e.name.namespaceUri ==
+                        'http://purl.org/dc/elements/1.1/',
+              );
+          final xml.XmlElement? title = titleCandidates.isEmpty
+              ? null
+              : titleCandidates.first;
+          final String text = title?.innerText.trim() ?? '';
+          return text.isEmpty ? null : text;
+        }
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Whether [text] already appears to be in the target language's script.
+  /// Used to skip translating book titles that need no translation.
+  bool _titleAlreadyInTargetLanguage(String text, String targetLanguage) {
+    final String normalized = targetLanguage.trim().toLowerCase();
+    final bool wantsCjk =
+        normalized.contains('chinese') ||
+        normalized.contains('中文') ||
+        normalized.contains('汉语') ||
+        normalized.contains('漢語') ||
+        normalized.contains('japanese') ||
+        normalized.contains('korean');
+    if (!wantsCjk) return false;
+    return RegExp(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]').hasMatch(text);
+  }
+
+  /// Translates the book's metadata title with a single lightweight API call.
+  /// Returns null when translation is unnecessary or fails (fail-safe: the
+  /// original title is kept by the repacker).
+  Future<String?> _translateBookTitle({
+    required Dio dio,
+    required TranslationConfig config,
+    required String originalTitle,
+    CancelToken? cancelToken,
+  }) async {
+    if (_titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
+      return null;
+    }
+    try {
+      final Map<String, dynamic> requestData = <String, dynamic>{
+        'model': config.model,
+        'temperature': 0.2,
+        'messages': <Map<String, String>>[
+          <String, String>{
+            'role': 'system',
+            'content':
+                'Translate the book title into ${config.targetLanguage}. Return only the translated title, with no explanation, quotes, or formatting.',
+          },
+          <String, String>{'role': 'user', 'content': originalTitle},
+        ],
+      };
+      final Response<dynamic> response = await _apiClient.postChatCompletions(
+        dio: dio,
+        data: requestData,
+        cancelToken: cancelToken,
+      );
+      final String translated = _apiClient
+          .extractMessageContent(response.data)
+          .trim();
+      if (translated.isEmpty || translated == originalTitle.trim()) {
+        return null;
+      }
+      return translated;
+    } catch (_) {
+      return null;
+    }
   }
 
   String _linePreview(String value) {

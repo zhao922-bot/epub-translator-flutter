@@ -129,6 +129,7 @@ body.epub-translator-cjk [data-translation="true"] {
     CancelToken? cancelToken,
     bool Function()? isCancelled,
     Set<String> degradedBlockIds = const <String>{},
+    String? translatedTitle,
   }) async {
     void throwIfCancelled() {
       if (cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)) {
@@ -180,6 +181,7 @@ body.epub-translator-cjk [data-translation="true"] {
         navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
         bilingual: config.bilingual,
         expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
+        translatedTitle: translatedTitle,
         // Isolate cannot be hard-interrupted; refuse final commit on cancel.
         shouldCommit: () =>
             !(cancelToken?.isCancelled == true ||

@@ -129,6 +129,7 @@ class EpubIsolateWorker {
     bool Function()? shouldCommit,
     String Function(String outputPath, String tempPath)? lockedMessage,
     String? expectedSourceFingerprint,
+    String? translatedTitle,
   }) async {
     final String tempPath = await Isolate.run(
       () => _writeTranslatedEpubToTempSync(
@@ -139,6 +140,7 @@ class EpubIsolateWorker {
         navigationLanguageTag: navigationLanguageTag,
         bilingual: bilingual,
         expectedSourceFingerprint: expectedSourceFingerprint,
+        translatedTitle: translatedTitle,
       ),
     );
 
@@ -195,6 +197,7 @@ class EpubIsolateWorker {
     required String? languageTag,
     bool bilingual = false,
     Map<String, String> renderedHtmlByPath = const <String, String>{},
+    String? translatedTitle,
   }) {
     if (languageTag == null) {
       // The target language is unknown: OPF/NCX navigation metadata is left
@@ -267,6 +270,25 @@ class EpubIsolateWorker {
     } else {
       for (final xml.XmlElement language in languages) {
         language.innerText = languageTag;
+      }
+    }
+
+    // Translated book title: update OPF dc:title so e-readers show the
+    // target-language title in the library. Fail-safe: any problem leaves
+    // the original title untouched.
+    final String? newTitle = translatedTitle?.trim();
+    if (newTitle != null && newTitle.isNotEmpty && metadata != null) {
+      try {
+        final xml.XmlElement? titleElement = metadata.childElements
+            .where(
+              (xml.XmlElement e) =>
+                  e.name.local == 'title' &&
+                  e.name.namespaceUri == 'http://purl.org/dc/elements/1.1/',
+            )
+            .firstOrNull;
+        titleElement?.innerText = newTitle;
+      } catch (_) {
+        // Keep the original title on any XML manipulation failure.
       }
     }
 
@@ -361,6 +383,25 @@ class EpubIsolateWorker {
       decodeEpubText(bytes: ncxBytes, filePath: ncxPath, strict: true),
     );
     ncx.rootElement.setAttribute('xml:lang', languageTag);
+    // Translated book title: keep NCX docTitle in sync with OPF dc:title.
+    final String? ncxTitle = translatedTitle?.trim();
+    if (ncxTitle != null && ncxTitle.isNotEmpty) {
+      try {
+        final xml.XmlElement? docTitleText = ncx.descendants
+            .whereType<xml.XmlElement>()
+            .where((xml.XmlElement e) => e.name.local == 'docTitle')
+            .firstOrNull
+            ?.descendants
+            .whereType<xml.XmlElement>()
+            .where((xml.XmlElement e) => e.name.local == 'text')
+            .firstOrNull;
+        if (docTitleText != null) {
+          docTitleText.innerText = ncxTitle;
+        }
+      } catch (_) {
+        // Keep the original docTitle on any XML manipulation failure.
+      }
+    }
     for (final xml.XmlElement navPoint
         in ncx.descendants.whereType<xml.XmlElement>().where(
           (xml.XmlElement element) => element.name.local == 'navPoint',
@@ -813,6 +854,7 @@ class EpubIsolateWorker {
     String? navigationLanguageTag,
     bool bilingual = false,
     String? expectedSourceFingerprint,
+    String? translatedTitle,
   }) {
     // Memory layout note: at peak this function holds the decoded source
     // archive (decompressed payloads), the repacked archive (mostly shared
@@ -860,6 +902,7 @@ class EpubIsolateWorker {
           languageTag: navigationLanguageTag,
           bilingual: bilingual,
           renderedHtmlByPath: translatedHtmlByPath,
+          translatedTitle: translatedTitle,
         ),
       );
     }
