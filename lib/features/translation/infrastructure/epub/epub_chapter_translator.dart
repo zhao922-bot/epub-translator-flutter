@@ -118,7 +118,7 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
 
-  static const String _cacheSchemaVersion = 'v14-complete-text-blocks';
+  static const String _cacheSchemaVersion = 'v15-second-person-and-idiom';
   static const int _initialMemoryFrontMatterLimit = 2;
   static const int _initialMemoryContentLimit = 2;
   static const int _memoryChapterTextLimit = 2400;
@@ -126,6 +126,14 @@ class EpubChapterTranslator {
   static const int _memoryListLimit = 8;
   static const int _memoryGlossaryLimit = 32;
   static const int _recentChapterMemoryLimit = 2;
+
+  static String chineseSecondPersonInstructionForTest({
+    required TranslationConfig config,
+  }) {
+    return EpubChapterTranslator()._chineseSecondPersonInstruction(
+      config: config,
+    );
+  }
 
   static bool shouldFallbackBatchDioExceptionForTest(DioException error) {
     return TranslationApiClient.shouldFallbackBatchDioException(error);
@@ -2189,7 +2197,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': userContent},
           ],
@@ -3611,7 +3619,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
@@ -3931,7 +3939,7 @@ class EpubChapterTranslator {
             <String, String>{
               'role': 'system',
               'content':
-                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
@@ -4173,7 +4181,7 @@ class EpubChapterTranslator {
         <String, String>{
           'role': 'system',
           'content':
-              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
+              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
         },
         <String, String>{'role': 'user', 'content': userText},
       ],
@@ -4425,7 +4433,7 @@ class EpubChapterTranslator {
               <String, String>{
                 'role': 'system',
                 'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}',
+                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
               },
               <String, String>{'role': 'user', 'content': payload},
             ],
@@ -4745,6 +4753,52 @@ class EpubChapterTranslator {
         'assarting（伐林开垦）. On later occurrences use only the translated '
         'form without parentheses. Keep the gloss term inside the same inline '
         'text run and exact same element as the translated term would occupy.';
+  }
+
+  /// Second-person formality rule for Chinese targets, applied to every
+  /// translation path like the terminology gloss rule.
+  ///
+  /// Models tend to mix 你 (informal) and 您 (formal) within one book;
+  /// published Chinese translations conventionally use 您 throughout, so
+  /// the rule is stated explicitly. Prompt-level only: a model can still
+  /// deviate, but in practice the explicit instruction holds.
+  String _chineseSecondPersonInstruction({required TranslationConfig config}) {
+    final String normalized = config.targetLanguage.trim().toLowerCase();
+    final bool isChinese =
+        normalized.contains('chinese') ||
+        normalized.contains('中文') ||
+        normalized.contains('汉语') ||
+        normalized.contains('漢語');
+    if (!isChinese) {
+      return '';
+    }
+    // Second-person formality is a pragmatic judgment, not a fixed rule: the
+    // model chooses between 您 and 你 from the speaker/addressee relationship
+    // visible in context. Prompt-level only; consistency for the same speaker
+    // pair across batches is best-effort.
+    return ' When the target language is Chinese, choose between 您 (formal) '
+        'and 你 (informal) for the second person based on the relationship '
+        'between speaker and addressee: use 您 for strangers, business or '
+        'service interactions, and respectful address; use 你 for family, '
+        'close friends, lovers, children, and the narrator\'s intimate asides '
+        'to the reader (for example, "you see" as a discourse marker becomes '
+        '你看, not 您看). Once chosen for a given pair of speakers, keep it '
+        'consistent throughout the book.';
+  }
+
+  /// Universal (not language-gated): render meaning, not words. Idioms,
+  /// metaphors, and figurative expressions must be translated by their
+  /// intended meaning in natural target-language phrasing, never word for
+  /// word. Prompt-level only; the model can still produce translationese.
+  String _idiomaticTranslationInstruction() {
+    return ' Translate meaning, not words: render idioms, metaphors, and '
+        'figurative expressions by their intended meaning in natural, '
+        'idiomatic target-language phrasing. Never translate them word for '
+        'word or calque source-language metaphors literally.';
+  }
+
+  static String idiomaticTranslationInstructionForTest() {
+    return EpubChapterTranslator()._idiomaticTranslationInstruction();
   }
 
   String _linePreview(String value) {

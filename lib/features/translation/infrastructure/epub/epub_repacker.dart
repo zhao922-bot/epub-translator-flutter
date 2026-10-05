@@ -241,9 +241,11 @@ body.epub-translator-cjk [data-translation="true"] {
       final isDegraded = degradedBlockIds.contains(
         degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
       );
-      final String normalizedTranslation = _normalizeCjkInitialTypography(
-        translatedHtml,
-        container: _replacementContainerFor(target),
+      final String normalizedTranslation = _collapseRedundantWhitespace(
+        _normalizeCjkInitialTypography(
+          translatedHtml,
+          container: _replacementContainerFor(target),
+        ),
       );
       containsCjkTranslation =
           containsCjkTranslation || _containsCjk(normalizedTranslation);
@@ -698,6 +700,43 @@ body.epub-translator-cjk [data-translation="true"] {
       }
     }
     return fragment.outerHtml;
+  }
+
+  /// Collapse runs of ASCII whitespace in translated text to a single space.
+  ///
+  /// Models sometimes emit multiple consecutive spaces; renderers collapse
+  /// them visually, but the redundant whitespace litters the EPUB source.
+  /// `<pre>` content is left untouched, and non-breaking spaces (U+00A0,
+  /// e.g. from `&nbsp;`) are preserved — only ASCII whitespace runs are
+  /// collapsed.
+  String _collapseRedundantWhitespace(String translatedHtml) {
+    final dom.DocumentFragment fragment = html_parser.parseFragment(
+      XhtmlHtmlCompatibility.normalizeForHtmlParser(translatedHtml),
+    );
+    bool changed = false;
+    void collapseNode(dom.Node node, bool insidePre) {
+      final bool inPre =
+          insidePre || (node is dom.Element && node.localName == 'pre');
+      if (node is dom.Text) {
+        if (!inPre) {
+          final String collapsed = node.text.replaceAll(
+            RegExp(r'[ \t\n\r\f\v]+'),
+            ' ',
+          );
+          if (collapsed != node.text) {
+            node.text = collapsed;
+            changed = true;
+          }
+        }
+        return;
+      }
+      for (final dom.Node child in node.nodes.toList()) {
+        collapseNode(child, inPre);
+      }
+    }
+
+    collapseNode(fragment, false);
+    return changed ? fragment.outerHtml : translatedHtml;
   }
 
   bool _isInsideFootnoteMarkerAnchor(dom.Element element) {

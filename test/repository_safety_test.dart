@@ -1398,7 +1398,7 @@ void main() {
           .convert(
             utf8.encode(
               <Object>[
-                'v14-complete-text-blocks',
+                'v15-second-person-and-idiom',
                 'https://api.example.test/v1',
                 config.model.trim(),
                 config.targetLanguage.trim(),

@@ -140,7 +140,34 @@ class XhtmlHtmlCompatibility {
   /// HTML-only `&nbsp;` named entity. EPUB 2 content documents are XHTML, so
   /// strict readers require `<meta />` / `<br />` and an XML-safe entity.
   static String normalizeForXhtmlOutput(String source) {
-    return _mapMarkup(source, _normalizeXhtmlMarkup);
+    return _mapMarkup(_repairDoctypeKeywords(source), _normalizeXhtmlMarkup);
+  }
+
+  /// `package:html` drops the PUBLIC/SYSTEM keyword when serializing a
+  /// doctype that carries identifiers, e.g.
+  /// `<!DOCTYPE html "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">`
+  /// which is invalid XML (`">" expected` at the first quoted string).
+  /// The keyword is recoverable deterministically: two quoted identifiers
+  /// with no keyword can only be a PUBLIC doctype, one can only be SYSTEM.
+  /// Without this repair, every EPUB whose chapters declare such a doctype
+  /// (e.g. Project Gutenberg's XHTML 1.1 books) fails repack validation.
+  static String _repairDoctypeKeywords(String source) {
+    String repaired = source.replaceFirstMapped(
+      RegExp(
+        '<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s+"([^"]*)"\\s*>',
+        caseSensitive: false,
+      ),
+      (Match m) =>
+          '<!DOCTYPE ${m.group(1)} PUBLIC "${m.group(2)}" "${m.group(3)}">',
+    );
+    repaired = repaired.replaceFirstMapped(
+      RegExp(
+        '<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s*>',
+        caseSensitive: false,
+      ),
+      (Match m) => '<!DOCTYPE ${m.group(1)} SYSTEM "${m.group(2)}">',
+    );
+    return repaired;
   }
 
   static String _normalizeXhtmlMarkup(String source) {
