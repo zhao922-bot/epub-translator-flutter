@@ -11,12 +11,12 @@
 
 当前版本：**1.6.0+16**。本次更新为四轮代码审查的 16 项修复：翻译可靠性（空原文重跑、字段类型降级、降级上下文、缓存范围）、密钥安全（迁移/删除/历史合并）、EPUB 导出（doctype、输出目录预检、文件名长度、重试目录）、缓存配额与 ZIP 预检，详见 [更新日志](CHANGELOG.md)。
 
-安装包与校验值见 [v1.5.0 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.5.0)（v1.6.0 安装包待发布）。
+安装包与校验值见 [v1.6.0 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.0)。
 
 | 平台 | 下载 | 说明 |
 |------|------|------|
 | Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.5.0/epub-translator-flutter-v1.5.0-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.5.0/epub-translator-flutter-v1.5.0-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.5.0 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.5.0/epub-translator-flutter-v1.5.0-android.apk) | 已验证与 v1.4.2 同签名，已安装 v1.4.2 的用户可直接覆盖升级，无需卸载 |
+| Android | [v1.6.0 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.0/epub-translator-flutter-v1.6.0-android.apk) | 与 v1.5.0 同签名，已安装旧版的用户可直接覆盖升级，无需卸载 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
