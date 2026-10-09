@@ -98,15 +98,25 @@ class TranslationCacheStore {
   /// already-paid translation progress after a process crash. Leftover
   /// `.tmp.*` files count toward the cap (they occupy real disk space) but
   /// are never evicted here: they may belong to an in-flight write in
-  /// another isolate or process, and stale ones are reclaimed by
-  /// `cleanStaleAtomicTempFiles` on write sweeps.
+  /// another isolate or process. Stale ones are removed before accounting.
   Future<void> pruneCacheDirectoryForTest(
     Directory root, {
     int maxBytes = _maxCacheBytes,
   }) async {
+    // Sweep every shard, including ones no longer receiving writes. Do not
+    // memoize this maintenance pass: a previously fresh orphan can age out.
+    await cleanStaleAtomicTempFiles(root);
+    await for (final entity in root.list(recursive: true, followLinks: false)) {
+      if (entity is Directory) {
+        await cleanStaleAtomicTempFiles(entity);
+      }
+    }
     final List<_CacheEntry> entries = <_CacheEntry>[];
     int totalBytes = 0;
-    await for (final FileSystemEntity entity in root.list(recursive: true)) {
+    await for (final FileSystemEntity entity in root.list(
+      recursive: true,
+      followLinks: false,
+    )) {
       if (entity is! File) {
         continue;
       }
@@ -121,8 +131,7 @@ class TranslationCacheStore {
         totalBytes += stat.size;
         // Leftover `.tmp.*` files count toward the cap but are never
         // evicted here: a temp file may belong to an in-flight write in
-        // another isolate or process, and stale ones are reclaimed by
-        // `cleanStaleAtomicTempFiles` on write sweeps.
+        // another isolate or process. Stale ones were swept above.
         if (!isAtomicTemp) {
           entries.add(
             _CacheEntry(file: entity, size: stat.size, modified: stat.modified),

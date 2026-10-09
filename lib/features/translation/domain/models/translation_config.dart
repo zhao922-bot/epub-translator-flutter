@@ -217,13 +217,13 @@ class TranslationConfig {
       apiKey: _readTrimmedString(json['apiKey']),
       model: model,
       apiProviderSelection: providerSelection,
-      deepseekApiKey: '',
+      deepseekApiKey: _readTrimmedString(json['deepseekApiKey']),
       customApiBaseUrl: json['customApiBaseUrl'] is String
           ? _readTrimmedStringAllowEmpty(json['customApiBaseUrl'])
           : providerSelection == ApiProviderSelection.custom
           ? apiBaseUrl
           : '',
-      customApiKey: '',
+      customApiKey: _readTrimmedString(json['customApiKey']),
       customModel: json['customModel'] is String
           ? _readTrimmedStringAllowEmpty(json['customModel'])
           : providerSelection == ApiProviderSelection.custom

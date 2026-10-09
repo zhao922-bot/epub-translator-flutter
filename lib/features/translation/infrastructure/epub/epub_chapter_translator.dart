@@ -4,8 +4,6 @@ import 'dart:math';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
-import 'package:archive/archive.dart';
-import 'package:xml/xml.dart' as xml;
 import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:path/path.dart' as path;
@@ -714,6 +712,7 @@ class EpubChapterTranslator {
     late final Dio dio;
     bool dioReady = false;
     try {
+      chapters = chapters.map(_restoreChapterSources).toList();
       final List<InspectedChapter> selectedChapters = chapters
           .where((InspectedChapter chapter) => chapter.includeInTranslation)
           .map(
@@ -727,6 +726,17 @@ class EpubChapterTranslator {
         0,
         (int sum, InspectedChapter chapter) => sum + chapter.blocks.length,
       );
+      // Stable across checkpoints/retries, but changes when the initial memory
+      // sample or preceding rolling-memory chapters change with the selection.
+      final String contextIdentity = sha256
+          .convert(
+            utf8.encode(
+              jsonEncode(
+                selectedChapters.map((chapter) => chapter.path).toList(),
+              ),
+            ),
+          )
+          .toString();
 
       if (selectedChapters.isEmpty) {
         throw const FormatException(
@@ -784,6 +794,7 @@ class EpubChapterTranslator {
         // paid work starts.
         await throwIfOutputPathTooLongForWindows(outputFilePath);
       }
+      await validateOutputDirectory(outputDirectory, config.uiLanguage);
       if (totalBlocks == 0) {
         await validateInspectedSource(chapters, inputPath: inputPath);
         return await _repackZeroBlockSelection(
@@ -1013,6 +1024,7 @@ class EpubChapterTranslator {
                   block,
                   chapterPath: chapter.path,
                   inputFingerprint: inputFingerprint,
+                  contextIdentity: contextIdentity,
                   confirmedStyleProfile: userStyleProfile,
                 ),
             throwIfCancelled: throwIfCancelled,
@@ -1350,6 +1362,7 @@ class EpubChapterTranslator {
                   reference.block,
                   chapterPath: reference.chapter.path,
                   inputFingerprint: inputFingerprint,
+                  contextIdentity: contextIdentity,
                   confirmedStyleProfile: userStyleProfile,
                 ),
                 translated,
@@ -1674,6 +1687,7 @@ class EpubChapterTranslator {
                                 batch.blocks[index],
                                 chapterPath: chapter.path,
                                 inputFingerprint: inputFingerprint,
+                                contextIdentity: contextIdentity,
                                 confirmedStyleProfile: userStyleProfile,
                               ),
                               translated[index],
@@ -1947,7 +1961,12 @@ class EpubChapterTranslator {
       // Fail-safe: null keeps the original title.
       String? translatedTitle;
       if (dioReady) {
-        final String? originalTitle = _readOriginalBookTitle(inputPath);
+        final String? originalTitle = await EpubIsolateWorker.readBookTitle(
+          inputPath,
+          expectedSourceFingerprint: sourceIdentityForChapters(
+            chapters,
+          )?.sha256,
+        );
         if (originalTitle != null) {
           translatedTitle = await _translateBookTitle(
             dio: dio,
@@ -2168,6 +2187,7 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required ExtractedBlock block,
+    required TranslationBatchContext context,
     String? chapterPath,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
@@ -2217,6 +2237,7 @@ class EpubChapterTranslator {
               'content':
                   'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
             },
+            if (!context.isEmpty) _fallbackContextMessage(context),
             <String, String>{'role': 'user', 'content': userContent},
           ],
         };
@@ -2573,6 +2594,28 @@ class EpubChapterTranslator {
           block.copyWith(sourceHtml: '', sourceText: ''),
       ],
     );
+  }
+
+  static InspectedChapter _restoreChapterSources(InspectedChapter chapter) {
+    if (!chapter.blocks.any((block) => block.sourceHtml.isEmpty)) {
+      return chapter;
+    }
+    final restored = const EpubHtmlExtractor()
+        .inspectChapterBytes(
+          chapterPath: chapter.path,
+          bytes: utf8.encode(chapter.originalHtml),
+        )
+        .blocks;
+    if (restored.length != chapter.blocks.length ||
+        List.generate(restored.length, (i) => i).any(
+          (i) =>
+              restored[i].id != chapter.blocks[i].id ||
+              restored[i].tagName != chapter.blocks[i].tagName,
+        ) ||
+        restored.any((block) => block.sourceHtml.isEmpty)) {
+      throw FormatException('Source block order changed: ${chapter.path}');
+    }
+    return chapter.copyWith(blocks: restored);
   }
 
   static String _trimMemoryText(String value) {
@@ -4201,6 +4244,7 @@ class EpubChapterTranslator {
           'content':
               'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
         },
+        if (!context.isEmpty) _fallbackContextMessage(context),
         <String, String>{'role': 'user', 'content': userText},
       ],
     };
@@ -4465,8 +4509,12 @@ class EpubChapterTranslator {
 
           final Map<String, dynamic> jsonPayload = _apiClient
               .decodeBatchJsonPayload(response.data);
-          final List<dynamic> blocksJson =
-              jsonPayload['blocks'] as List<dynamic>? ?? <dynamic>[];
+          final Object? blocksJson = jsonPayload['blocks'];
+          if (blocksJson is! List) {
+            throw const FormatException(
+              'Translated batch blocks is not a JSON array.',
+            );
+          }
           if (blocksJson.length != batch.blocks.length) {
             throw const FormatException(
               'Translated batch length does not match request length.',
@@ -4480,9 +4528,9 @@ class EpubChapterTranslator {
                 'Translated batch item is not a JSON object.',
               );
             }
-            final String? id = item['id'] as String?;
-            final String? html = item['html'] as String?;
-            if (id == null || html == null || html.trim().isEmpty) {
+            final Object? id = item['id'];
+            final Object? html = item['html'];
+            if (id is! String || html is! String || html.trim().isEmpty) {
               throw const FormatException(
                 'Translated batch item is missing id or html.',
               );
@@ -4657,6 +4705,7 @@ class EpubChapterTranslator {
               dio: dio,
               config: config,
               block: block,
+              context: batch.context,
               chapterPath: chapterPath,
               retryDelayOverride: retryDelayOverride,
               cancelToken: cancelToken,
@@ -4819,68 +4868,32 @@ class EpubChapterTranslator {
     return EpubChapterTranslator()._idiomaticTranslationInstruction();
   }
 
-  /// Reads the book's dc:title from the input EPUB's OPF metadata.
-  /// Returns null when the title cannot be determined.
-  String? _readOriginalBookTitle(String inputPath) {
-    try {
-      final List<int> bytes = File(inputPath).readAsBytesSync();
-      final Archive archive = ZipDecoder().decodeBytes(bytes);
-      String? opfPath;
-      for (final ArchiveFile file in archive.files) {
-        if (file.name == 'META-INF/container.xml') {
-          final String containerXml = utf8.decode(file.content as List<int>);
-          final xml.XmlDocument container = xml.XmlDocument.parse(
-            containerXml,
-          );
-          opfPath = container.descendants
-              .whereType<xml.XmlElement>()
-              .firstWhere(
-                (xml.XmlElement e) => e.name.local == 'rootfile',
-                orElse: () => xml.XmlElement(xml.XmlName('missing')),
-              )
-              .getAttribute('full-path');
-          break;
-        }
-      }
-      if (opfPath == null || opfPath.isEmpty) return null;
-      for (final ArchiveFile file in archive.files) {
-        if (file.name == opfPath) {
-          final String opfXml = utf8.decode(file.content as List<int>);
-          final xml.XmlDocument opf = xml.XmlDocument.parse(opfXml);
-          final Iterable<xml.XmlElement> titleCandidates = opf.descendants
-              .whereType<xml.XmlElement>()
-              .where(
-                (xml.XmlElement e) =>
-                    e.name.local == 'title' &&
-                    e.name.namespaceUri ==
-                        'http://purl.org/dc/elements/1.1/',
-              );
-          final xml.XmlElement? title = titleCandidates.isEmpty
-              ? null
-              : titleCandidates.first;
-          final String text = title?.innerText.trim() ?? '';
-          return text.isEmpty ? null : text;
-        }
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
   /// Whether [text] already appears to be in the target language's script.
   /// Used to skip translating book titles that need no translation.
-  bool _titleAlreadyInTargetLanguage(String text, String targetLanguage) {
+  @visibleForTesting
+  static bool titleAlreadyInTargetLanguage(String text, String targetLanguage) {
     final String normalized = targetLanguage.trim().toLowerCase();
-    final bool wantsCjk =
-        normalized.contains('chinese') ||
-        normalized.contains('中文') ||
-        normalized.contains('汉语') ||
-        normalized.contains('漢語') ||
-        normalized.contains('japanese') ||
-        normalized.contains('korean');
-    if (!wantsCjk) return false;
-    return RegExp(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]').hasMatch(text);
+    final letters = text.replaceAll(
+      RegExp(r'[\s\d\p{P}\p{S}]', unicode: true),
+      '',
+    );
+    if (normalized.contains('japanese') ||
+        normalized == 'ja' ||
+        normalized.contains('日语') ||
+        normalized.contains('日本語')) {
+      return RegExp(r'[\u3040-\u30ff]').hasMatch(letters) &&
+          RegExp(r'^[\u3040-\u30ff\u3400-\u9fff]+$').hasMatch(letters);
+    }
+    if (normalized.contains('korean') ||
+        normalized == 'ko' ||
+        normalized.contains('韩语') ||
+        normalized.contains('한국어')) {
+      return RegExp(r'^[\uac00-\ud7a3]+$').hasMatch(letters);
+    }
+    // Han characters alone cannot distinguish Chinese variants or a Japanese
+    // kanji-only title. Ask the translator rather than guessing, including
+    // simplified/traditional conversion and mixed-script titles.
+    return false;
   }
 
   /// Translates the book's metadata title with a single lightweight API call.
@@ -4892,7 +4905,7 @@ class EpubChapterTranslator {
     required String originalTitle,
     CancelToken? cancelToken,
   }) async {
-    if (_titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
+    if (titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
       return null;
     }
     try {
@@ -4985,6 +4998,79 @@ class EpubChapterTranslator {
     throw FormatException(finding.messageForBlock(block.id));
   }
 
+  static String _truncateUtf16(String value, int limit) {
+    if (value.length <= limit) return value;
+    // Do not leave a dangling high surrogate at the truncation boundary.
+    int end = limit;
+    if (end > 0 &&
+        value.codeUnitAt(end - 1) >= 0xd800 &&
+        value.codeUnitAt(end - 1) <= 0xdbff) {
+      end -= 1;
+    }
+    return value.substring(0, end);
+  }
+
+  /// Keep valid JSON and prioritize terminology over rolling summaries.
+  /// Each section has its own serialized budget, so fallback requests remain
+  /// small even when the original batch exceeded the provider's window.
+  static Map<String, String> _fallbackContextMessage(
+    TranslationBatchContext context,
+  ) {
+    Object? bounded(Object? value, int budget) {
+      if (value is String) {
+        String text = _truncateUtf16(value, budget);
+        while (jsonEncode(text).length > budget && text.isNotEmpty) {
+          text = _truncateUtf16(text, text.length ~/ 2);
+        }
+        return text;
+      }
+      if (value is List) {
+        final List<Object?> result = <Object?>[];
+        for (final Object? item in value) {
+          final int remaining = budget - jsonEncode(result).length - 1;
+          if (remaining < 32) break;
+          final Object? clipped = bounded(item, remaining);
+          if (jsonEncode(<Object?>[...result, clipped]).length > budget) break;
+          result.add(clipped);
+        }
+        return result;
+      }
+      if (value is Map) {
+        final Map<String, Object?> result = <String, Object?>{};
+        for (final MapEntry<dynamic, dynamic> entry in value.entries) {
+          final String key = entry.key.toString();
+          final int remaining =
+              budget - jsonEncode(result).length - jsonEncode(key).length - 2;
+          if (remaining < 32) break;
+          final Object? clipped = bounded(entry.value, remaining);
+          if (jsonEncode(<String, Object?>{...result, key: clipped}).length >
+              budget) {
+            break;
+          }
+          result[key] = clipped;
+        }
+        return result;
+      }
+      return value;
+    }
+
+    final Map<String, Object?> memory =
+        context.bookMemory ?? const <String, Object?>{};
+    return <String, String>{
+      'role': 'system',
+      'content':
+          'Read-only reference context follows. Use it for terminology, '
+          'continuity, and pronouns. Do not translate or return this context; '
+          'translate only the HTML fragment or text in the user message.\n'
+          '${jsonEncode(<String, Object?>{
+            'chapterTitle': bounded(context.chapterTitle, 512),
+            'before': bounded(context.before.map((s) => s.toJson()).toList(), 2048),
+            'after': bounded(context.after.map((s) => s.toJson()).toList(), 2048),
+            'bookMemory': <String, Object?>{if (memory.containsKey('glossary')) 'glossary': bounded(memory['glossary'], 8192), if (memory.containsKey('bookSummary')) 'bookSummary': bounded(memory['bookSummary'], 1024), if (memory.containsKey('recentChapters')) 'recentChapters': bounded(memory['recentChapters'], 2048), if (memory.containsKey('styleGuide')) 'styleGuide': bounded(memory['styleGuide'], 512)},
+          })}',
+    };
+  }
+
   String _outputFilePath({
     required String inputPath,
     required String outputDirectory,
@@ -4992,12 +5078,101 @@ class EpubChapterTranslator {
   }) {
     final String safeSuffix = TranslationApiClient.sanitizeOutputSuffix(suffix);
     final String baseName = path.basenameWithoutExtension(inputPath);
-    String candidate = path.join(outputDirectory, '$baseName$safeSuffix.epub');
+    String candidate = path.join(
+      outputDirectory,
+      outputFileNameForTest(baseName, safeSuffix),
+    );
     // Never overwrite the source EPUB even if sanitization collapses the name.
     if (_sameFilesystemPath(candidate, inputPath)) {
-      candidate = path.join(outputDirectory, '$baseName${safeSuffix}_out.epub');
+      candidate = path.join(
+        outputDirectory,
+        outputFileNameForTest(baseName, '${safeSuffix}_out'),
+      );
     }
     return candidate;
+  }
+
+  /// Reserve room for the repack temporary suffix. Windows counts UTF-16
+  /// units; POSIX filesystems count UTF-8 bytes per component.
+  @visibleForTesting
+  static String outputFileNameForTest(
+    String baseName,
+    String suffix, {
+    bool? windows,
+  }) {
+    final bool useUtf16 = windows ?? Platform.isWindows;
+    int size(String value) =>
+        useUtf16 ? value.length : utf8.encode(value).length;
+    String truncate(String value, int budget) {
+      if (useUtf16) return _truncateUtf16(value, budget);
+      final result = StringBuffer();
+      int used = 0;
+      for (final rune in value.runes) {
+        final character = String.fromCharCode(rune);
+        final bytes = utf8.encode(character).length;
+        if (used + bytes > budget) break;
+        result.write(character);
+        used += bytes;
+      }
+      return result.toString();
+    }
+
+    const int limit = 255 - 22;
+    final String name = '$baseName$suffix.epub';
+    if (size(name) <= limit) return name;
+    final String hash = sha256
+        .convert(utf8.encode(name))
+        .toString()
+        .substring(0, 12);
+    final String tail = '${truncate(suffix, 64)}_$hash.epub';
+    return '${truncate(baseName, limit - size(tail))}$tail';
+  }
+
+  @visibleForTesting
+  static Future<void> validateOutputDirectory(
+    String directory,
+    UiLanguage language,
+  ) async {
+    final bool chinese = language == UiLanguage.chinese;
+    if (await FileSystemEntity.type(directory) !=
+        FileSystemEntityType.directory) {
+      throw StateError(
+        chinese
+            ? '输出目录不存在或不是目录：$directory'
+            : 'Output directory does not exist or is not a directory: $directory',
+      );
+    }
+    File? probe;
+    try {
+      // Probe the directory itself: Windows ACLs distinguish creating files
+      // from creating subdirectories (which can also inherit different ACLs).
+      final candidate = File(
+        path.join(
+          directory,
+          '.epub-write-probe-${DateTime.now().microsecondsSinceEpoch}-'
+          '${Random.secure().nextInt(1 << 32)}',
+        ),
+      );
+      await candidate.create(exclusive: true);
+      probe = candidate;
+      await probe.writeAsBytes([0], flush: true);
+      await probe.delete();
+      probe = null;
+    } on FileSystemException catch (error) {
+      throw StateError(
+        chinese
+            ? '无法写入输出目录：$directory（$error）'
+            : 'Output directory is not writable: $directory ($error)',
+      );
+    } finally {
+      if (probe != null && await probe.exists()) {
+        try {
+          await probe.delete();
+        } on FileSystemException {
+          // Preserve the original write failure if cleanup also fails.
+        }
+      }
+    }
   }
 
   /// Longest write-path form the app ever produces for [outputFilePath]:
@@ -5029,6 +5204,13 @@ class EpubChapterTranslator {
     String outputFilePath, {
     Future<bool?> Function()? longPathsEnabledReader,
   }) async {
+    final String fileName = path.windows.basename(outputFilePath);
+    if (fileName.length + 22 > 255) {
+      throw FileSystemException(
+        'Output filename plus temporary suffix exceeds 255 UTF-16 code units.',
+        outputFilePath,
+      );
+    }
     if (!outputPathExceedsWindowsMaxPath(outputFilePath)) {
       return;
     }
@@ -5143,6 +5325,7 @@ class EpubChapterTranslator {
     ExtractedBlock block, {
     required String chapterPath,
     required String inputFingerprint,
+    String contextIdentity = '',
     TranslationStyleProfile? confirmedStyleProfile,
   }) {
     return sha256
@@ -5160,6 +5343,8 @@ class EpubChapterTranslator {
               _styleProfileCacheValue(confirmedStyleProfile),
               inputFingerprint,
               chapterPath,
+              if (contextIdentity.isNotEmpty)
+                'selection-context-v1:$contextIdentity',
               // Block ids are positional within a chapter (e.g. "p-3"), so
               // two blocks with identical source HTML at different positions
               // get different keys. Neighbor context feeds the prompt for

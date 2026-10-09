@@ -432,15 +432,10 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   }
 
   static Future<void> _deleteLinuxSecret(String name) async {
-    // Best effort: deleting a key that was never stored is not an error.
-    try {
-      await _runDesktopSecretHelper(
-        'secret-tool',
-        linuxSecretClearArgs(_desktopSecretService, name),
-      );
-    } catch (_) {
-      // Ignore: nothing to delete, or no secret-tool installed.
-    }
+    await _runDesktopSecretHelper(
+      'secret-tool',
+      linuxSecretClearArgs(_desktopSecretService, name),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -564,15 +559,11 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   }
 
   static Future<void> _deleteMacosSecret(String name) async {
-    // Best effort: deleting a key that was never stored is not an error.
-    try {
-      await _runDesktopSecretHelper(
-        'security',
-        macosSecretDeleteArgs(_desktopSecretService, name),
-      );
-    } catch (_) {
-      // Ignore: nothing to delete, or `security` unavailable.
-    }
+    await _runDesktopSecretHelper(
+      'security',
+      macosSecretDeleteArgs(_desktopSecretService, name),
+      missingExitCode: 44, // errSecItemNotFound: already absent.
+    );
   }
 
   /// Runs a desktop secret helper (`secret-tool` / `security`) and returns
@@ -588,6 +579,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     String executable,
     List<String> args, {
     String? stdinInput,
+    int? missingExitCode,
   }) async {
     assert(
       args.isNotEmpty && args.first == executable,
@@ -614,6 +606,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       return await _collectHelperOutput(
         process,
         executable,
+        missingExitCode: missingExitCode,
       ).timeout(const Duration(seconds: 30));
     } on TimeoutException {
       process.kill();
@@ -623,8 +616,9 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
 
   static Future<String> _collectHelperOutput(
     Process process,
-    String executable,
-  ) async {
+    String executable, {
+    int? missingExitCode,
+  }) async {
     final Future<List<int>> stdoutBytes = process.stdout.fold<List<int>>(
       <int>[],
       (List<int> acc, List<int> chunk) => acc..addAll(chunk),
@@ -640,7 +634,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       await stderrBytes,
       allowMalformed: true,
     );
-    if (exitCode != 0) {
+    if (exitCode != 0 && exitCode != missingExitCode) {
       final String detail = stderrText.trim();
       throw StateError(
         'Secret helper "$executable" failed'

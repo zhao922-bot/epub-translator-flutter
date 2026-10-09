@@ -316,6 +316,9 @@ class TranslationDashboardController
   int _ownClearTombstoneMs = 0;
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
+  int _activeTranslationRunStartedAt = 0;
+  int _activeTranslationRecordRevision = 0;
+  String _activeTranslationOutputDirectory = '';
   List<String>? _activeTranslationChapterPaths;
   DateTime? _lastProgressHistoryPersistAt;
 
@@ -1302,8 +1305,19 @@ class TranslationDashboardController
     // The checkpoint is unverified until the cache scan runs: the progress
     // bar and block counters start at zero while `resumeCheckpointBlocks`
     // keeps the pending figure (the UI labels it as "to verify").
+    final int previousRun = state.jobHistory.fold<int>(
+      state.job?.runStartedAt ?? 0,
+      (latest, job) => job.runStartedAt > latest ? job.runStartedAt : latest,
+    );
+    final int now = DateTime.now().microsecondsSinceEpoch;
+    _activeTranslationRunStartedAt = now > previousRun ? now : previousRun + 1;
+    _activeTranslationRecordRevision = 0;
+    _activeTranslationOutputDirectory = state.outputDirectory;
     final TranslationJob queuedJob =
         state.job?.copyWith(
+          outputDirectory: _activeTranslationOutputDirectory,
+          runStartedAt: _activeTranslationRunStartedAt,
+          recordRevision: _activeTranslationRecordRevision,
           selectedChapterPaths: selectedPaths,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
@@ -1329,6 +1343,9 @@ class TranslationDashboardController
           id: _newJobId(),
           inputPath: state.inputPath,
           outputPath: state.outputDirectory,
+          outputDirectory: _activeTranslationOutputDirectory,
+          runStartedAt: _activeTranslationRunStartedAt,
+          recordRevision: _activeTranslationRecordRevision,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
           selectedChapterPaths: selectedPaths,
@@ -2440,6 +2457,9 @@ class TranslationDashboardController
         ? job
         : job.copyWith(
             id: historyJobId,
+            outputDirectory: _activeTranslationOutputDirectory,
+            runStartedAt: _activeTranslationRunStartedAt,
+            recordRevision: ++_activeTranslationRecordRevision,
             selectedChapterPaths: _activeTranslationChapterPaths,
           );
   }
@@ -2465,6 +2485,9 @@ class TranslationDashboardController
     TranslationJob job, {
     bool persist = true,
   }) {
+    if (job.outputDirectory.isEmpty) {
+      job = job.copyWith(outputDirectory: state.outputDirectory);
+    }
     final List<TranslationJob> history = <TranslationJob>[
       job,
       ...state.jobHistory.where(
@@ -2549,12 +2572,18 @@ class TranslationDashboardController
   }
 
   String _outputDirectoryForRetry(TranslationJob job) {
+    if (job.outputDirectory.isNotEmpty) {
+      return job.outputDirectory;
+    }
     if (job.outputPath.isEmpty) {
       return state.outputDirectory;
     }
-    if (path.extension(job.outputPath).toLowerCase() == '.epub') {
+    final type = FileSystemEntity.typeSync(job.outputPath);
+    if (type == FileSystemEntityType.file) {
       return path.dirname(job.outputPath);
     }
+    // An absent path could be either a former file or an intended directory.
+    // Preserve it rather than silently redirecting an export to its parent.
     return job.outputPath;
   }
 
@@ -2603,15 +2632,38 @@ class TranslationDashboardController
   }
 
   List<TranslationJob> _mergeJobHistory(List<TranslationJob> jobs) {
-    final Set<String> included = <String>{};
-    final List<TranslationJob> merged = <TranslationJob>[
-      ...state.jobHistory,
-      ...jobs,
-    ];
-    return merged
-        .where((TranslationJob job) => included.add(job.id))
-        .take(20)
-        .toList(growable: false);
+    return _mergeHistorySnapshots(state.jobHistory, jobs);
+  }
+
+  static List<TranslationJob> _mergeHistorySnapshots(
+    List<TranslationJob> memoryJobs,
+    List<TranslationJob> fileJobs,
+  ) {
+    // A new run supersedes every snapshot of the old one. Within one run,
+    // terminal states outrank in-flight snapshots; revisions break ties so
+    // a stale instance cannot roll back progress within the same status.
+    int priority(TranslationJob job) => switch (job.status) {
+      TranslationJobStatus.completed => 5,
+      TranslationJobStatus.completedWithWarnings => 4,
+      TranslationJobStatus.failed || TranslationJobStatus.cancelled => 3,
+      TranslationJobStatus.running || TranslationJobStatus.queued => 2,
+      _ => 1,
+    };
+    final merged = <String, TranslationJob>{};
+    for (final job in [...memoryJobs, ...fileJobs]) {
+      final previous = merged[job.id];
+      final int order = previous == null
+          ? 1
+          : job.runStartedAt != previous.runStartedAt
+          ? job.runStartedAt.compareTo(previous.runStartedAt)
+          : priority(job) != priority(previous)
+          ? priority(job).compareTo(priority(previous))
+          : job.recordRevision.compareTo(previous.recordRevision);
+      if (order > 0) {
+        merged[job.id] = job;
+      }
+    }
+    return merged.values.take(20).toList(growable: false);
   }
 
   void _persistJobHistory() {
@@ -2666,14 +2718,8 @@ class TranslationDashboardController
         // lock): another instance may have added jobs after our last read.
         // The read and the write are serialized by the store's lock, so the
         // merge sees the other instance's latest write instead of
-        // discarding it. Our entries first (our active job's copy is the
-        // freshest), then file entries we don't already have, capped at 20
-        // (the same union _loadJobHistory uses).
-        final Set<String> included = <String>{};
-        return <TranslationJob>[...memoryJobs, ...fileJobs]
-            .where((TranslationJob job) => included.add(job.id))
-            .take(20)
-            .toList(growable: false);
+        // discarding it. Completed records outrank stale interrupted copies.
+        return _mergeHistorySnapshots(memoryJobs, fileJobs);
       },
     );
     if (result.fileClearedAt > _lastSeenHistoryClearedAt) {

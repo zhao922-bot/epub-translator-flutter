@@ -152,9 +152,60 @@ class XhtmlHtmlCompatibility {
   /// Without this repair, every EPUB whose chapters declare such a doctype
   /// (e.g. Project Gutenberg's XHTML 1.1 books) fails repack validation.
   static String _repairDoctypeKeywords(String source) {
-    String repaired = source.replaceFirstMapped(
+    var cursor = 0;
+    while (cursor < source.length) {
+      if (_isWhitespace(source.codeUnitAt(cursor)) ||
+          source.codeUnitAt(cursor) == 0xfeff) {
+        cursor++;
+        continue;
+      }
+      String? terminator;
+      if (source.startsWith('<!--', cursor)) {
+        terminator = '-->';
+      } else if (source.startsWith('<?', cursor)) {
+        terminator = '?>';
+      } else if (source.startsWith('<![CDATA[', cursor)) {
+        terminator = ']]>';
+      }
+      if (terminator != null) {
+        final end = source.indexOf(terminator, cursor);
+        if (end < 0) return source;
+        cursor = end + terminator.length;
+        continue;
+      }
+      // Stop at the root element: examples in script/body are not a prolog.
+      if (!source.substring(cursor).toUpperCase().startsWith('<!DOCTYPE')) {
+        return source;
+      }
+      var end = cursor + 9;
+      int? quote;
+      var subsetDepth = 0;
+      for (; end < source.length; end++) {
+        final char = source.codeUnitAt(end);
+        if (quote != null) {
+          if (char == quote) quote = null;
+        } else if (char == _singleQuote || char == _doubleQuote) {
+          quote = char;
+        } else if (char == 91) {
+          subsetDepth++;
+        } else if (char == 93) {
+          subsetDepth--;
+        } else if (char == _greaterThan && subsetDepth == 0) {
+          break;
+        }
+      }
+      if (end == source.length) return source;
+      final node = source.substring(cursor, end + 1);
+      final repaired = _repairDoctypeNode(node);
+      return source.replaceRange(cursor, end + 1, repaired);
+    }
+    return source;
+  }
+
+  static String _repairDoctypeNode(String node) {
+    String repaired = node.replaceFirstMapped(
       RegExp(
-        '<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s+"([^"]*)"\\s*>',
+        '^<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s+"([^"]*)"\\s*>\$',
         caseSensitive: false,
       ),
       (Match m) =>
@@ -162,7 +213,7 @@ class XhtmlHtmlCompatibility {
     );
     repaired = repaired.replaceFirstMapped(
       RegExp(
-        '<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s*>',
+        '^<!DOCTYPE\\s+([A-Za-z][^\\s>]*)\\s+"([^"]*)"\\s*>\$',
         caseSensitive: false,
       ),
       (Match m) => '<!DOCTYPE ${m.group(1)} SYSTEM "${m.group(2)}">',

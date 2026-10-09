@@ -29,6 +29,9 @@ class TranslationJob {
     required this.outputPath,
     required this.status,
     required this.progress,
+    this.outputDirectory = '',
+    this.runStartedAt = 0,
+    this.recordRevision = 0,
     this.phase = TranslationJobPhase.inspection,
     this.currentChapter,
     this.currentBlock,
@@ -52,6 +55,13 @@ class TranslationJob {
   final String id;
   final String inputPath;
   final String outputPath;
+
+  /// Destination directory, independent of the (possibly not yet created) EPUB.
+  final String outputDirectory;
+
+  /// Monotonic run timestamp and snapshot revision; zero for legacy history.
+  final int runStartedAt;
+  final int recordRevision;
   final TranslationJobStatus status;
   final TranslationJobPhase phase;
   final double progress;
@@ -110,6 +120,9 @@ class TranslationJob {
       id: id,
       inputPath: _readString(json['inputPath']),
       outputPath: _readString(json['outputPath']),
+      outputDirectory: _readString(json['outputDirectory']),
+      runStartedAt: _readNonNegativeInt(json['runStartedAt']),
+      recordRevision: _readNonNegativeInt(json['recordRevision']),
       status: _readStatus(json['status']),
       phase: _readPhase(
         json['phase'],
@@ -146,6 +159,9 @@ class TranslationJob {
     String? id,
     String? inputPath,
     String? outputPath,
+    String? outputDirectory,
+    int? runStartedAt,
+    int? recordRevision,
     TranslationJobStatus? status,
     TranslationJobPhase? phase,
     double? progress,
@@ -171,6 +187,9 @@ class TranslationJob {
       id: id ?? this.id,
       inputPath: inputPath ?? this.inputPath,
       outputPath: outputPath ?? this.outputPath,
+      outputDirectory: outputDirectory ?? this.outputDirectory,
+      runStartedAt: runStartedAt ?? this.runStartedAt,
+      recordRevision: recordRevision ?? this.recordRevision,
       status: status ?? this.status,
       phase: phase ?? this.phase,
       progress: progress ?? this.progress,
@@ -212,6 +231,9 @@ class TranslationJob {
       'id': id,
       'inputPath': inputPath,
       'outputPath': outputPath,
+      'outputDirectory': outputDirectory,
+      'runStartedAt': runStartedAt,
+      'recordRevision': recordRevision,
       'status': status.name,
       'phase': phase.name,
       'progress': progress,

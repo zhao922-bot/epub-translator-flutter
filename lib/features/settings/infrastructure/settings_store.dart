@@ -122,6 +122,7 @@ class SettingsStore {
   // Compare against this instance's last loaded/saved values. An unchanged
   // local snapshot must not overwrite keys another app instance updated.
   Map<SettingsSecretSlot, String>? _secretSnapshot;
+  final Map<SettingsSecretSlot, String> _pendingPlaintextKeys = {};
 
   /// Set when an Android KeyStore read reported SECRET_KEY_ROTATED (the
   /// device key was invalidated and regenerated): previously stored keys
@@ -184,12 +185,14 @@ class SettingsStore {
         : config.apiKey;
     final String deepSeekKey = storedDeepSeekKey.value?.isNotEmpty == true
         ? storedDeepSeekKey.value!
-        : config.apiProviderSelection == ApiProviderSelection.deepseek
+        : config.apiProviderSelection == ApiProviderSelection.deepseek &&
+              legacyKey.isNotEmpty
         ? legacyKey
         : config.deepseekApiKey;
     final String customKey = storedCustomKey.value?.isNotEmpty == true
         ? storedCustomKey.value!
-        : config.apiProviderSelection == ApiProviderSelection.custom
+        : config.apiProviderSelection == ApiProviderSelection.custom &&
+              legacyKey.isNotEmpty
         ? legacyKey
         : config.customApiKey;
     final String resolvedApiKey =
@@ -202,16 +205,39 @@ class SettingsStore {
       customApiKey: customKey,
     );
     _secretSnapshot = _secretValues(resolvedConfig);
-    if (config.apiKey.isNotEmpty &&
+    final providerSlot =
+        config.apiProviderSelection == ApiProviderSelection.deepseek
+        ? SettingsSecretSlot.deepSeek
+        : SettingsSecretSlot.custom;
+    // Keep the original provider association even if the user switches providers
+    // while the secure backend is unavailable.
+    _pendingPlaintextKeys.clear();
+    if (config.deepseekApiKey.isNotEmpty) {
+      _pendingPlaintextKeys[SettingsSecretSlot.deepSeek] =
+          config.deepseekApiKey;
+    }
+    if (config.customApiKey.isNotEmpty) {
+      _pendingPlaintextKeys[SettingsSecretSlot.custom] = config.customApiKey;
+    }
+    if (config.apiKey.isNotEmpty) {
+      _pendingPlaintextKeys[providerSlot] = config.apiKey;
+    }
+    final bool needsSecureAllocation =
+        storedApiKey.value?.isNotEmpty == true &&
+        (providerSlot == SettingsSecretSlot.deepSeek
+                    ? storedDeepSeekKey
+                    : storedCustomKey)
+                .status ==
+            _SecretReadStatus.missing;
+    if ((_pendingPlaintextKeys.isNotEmpty || needsSecureAllocation) &&
         !_legacyMigrationFailed &&
         _legacyMigrationAttempts < _maxLegacyMigrationAttempts) {
       _legacyMigrationAttempts += 1;
       try {
         final Set<SettingsSecretSlot> migrationSlots = <SettingsSecretSlot>{
-          SettingsSecretSlot.legacy,
-          config.apiProviderSelection == ApiProviderSelection.deepseek
-              ? SettingsSecretSlot.deepSeek
-              : SettingsSecretSlot.custom,
+          if (config.apiKey.isNotEmpty) SettingsSecretSlot.legacy,
+          ..._pendingPlaintextKeys.keys,
+          if (needsSecureAllocation) providerSlot,
         };
         await _saveSecrets(
           resolvedConfig,
@@ -562,7 +588,14 @@ class SettingsStore {
     try {
       await writeFileAtomically(
         file,
-        const JsonEncoder.withIndent('  ').convert(config.toJson()),
+        const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
+          ...config.toJson(),
+          if (_pendingPlaintextKeys.containsKey(SettingsSecretSlot.deepSeek))
+            'deepseekApiKey':
+                _pendingPlaintextKeys[SettingsSecretSlot.deepSeek],
+          if (_pendingPlaintextKeys.containsKey(SettingsSecretSlot.custom))
+            'customApiKey': _pendingPlaintextKeys[SettingsSecretSlot.custom],
+        }),
       );
     } catch (error) {
       throw mapSettingsWriteError(file.path, error);
@@ -589,6 +622,7 @@ class SettingsStore {
       _secretReadStatuses[slot] = _SecretReadStatus.value;
     }
     _secretSnapshot?[slot] = trimmed;
+    _pendingPlaintextKeys.remove(slot);
   }
 
   Future<File> _settingsFile() async {

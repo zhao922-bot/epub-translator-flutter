@@ -204,6 +204,34 @@ void main() {
       expect(await checkpoint.exists(), isTrue);
     });
 
+    test(
+      'sweeps orphan temps across unused shards before evicting blocks',
+      () async {
+        final block = await writeBlock('valid.html', 120);
+        final stale = File(path.join(root.path, 'blocks', 'unused', 'x.tmp.1'));
+        await stale.parent.create(recursive: true);
+        await stale.writeAsString('x' * 1000);
+        await stale.setLastModified(
+          DateTime.now().subtract(const Duration(minutes: 31)),
+        );
+        final fresh = await writeBlock('fresh.html.tmp.2', 0);
+        final jobTemp = await writeCheckpoint('job.json.tmp.3', 31);
+        final store = TranslationCacheStore();
+        await store.pruneCacheDirectoryForTest(root, maxBytes: 25);
+        expect(await stale.exists(), isFalse);
+        expect(await jobTemp.exists(), isFalse);
+        expect(await block.exists(), isTrue);
+        expect(await fresh.exists(), isTrue);
+        // A later maintenance pass must sweep again, even without shard writes.
+        await fresh.setLastModified(
+          DateTime.now().subtract(const Duration(minutes: 31)),
+        );
+        await store.pruneCacheDirectoryForTest(root, maxBytes: 25);
+        expect(await fresh.exists(), isFalse);
+        expect(await block.exists(), isTrue);
+      },
+    );
+
     test('does nothing when blocks/ are under the cap', () async {
       final File block = await writeBlock('small.html', 5);
       final File checkpoint = await writeCheckpoint('job1.json', 5);

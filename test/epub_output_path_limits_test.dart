@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
@@ -7,6 +8,8 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
@@ -18,6 +21,180 @@ import 'package:flutter_test/flutter_test.dart';
 /// API work when that exceeds MAX_PATH (260) while the system long-path
 /// policy is off.
 void main() {
+  test(
+    'output probe needs file creation but never subdirectory creation',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'direct_output_probe_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      // Model a destination where creating subdirectories is denied. This is
+      // an I/O-path regression, not a claim to reproduce Windows ACLs on Linux.
+      await IOOverrides.runZoned(
+        () => EpubChapterTranslator.validateOutputDirectory(
+          temp.path,
+          UiLanguage.chinese,
+        ),
+        createDirectory: (path) =>
+            throw FileSystemException('Subdirectories denied', path),
+      );
+      expect(temp.listSync(), isEmpty);
+    },
+  );
+
+  group('output filename component limit', () {
+    test('reserves the temporary suffix at the exact UTF-16 boundary', () {
+      final name = EpubChapterTranslator.outputFileNameForTest(
+        'a' * 228,
+        '',
+        windows: true,
+      );
+      expect(name.length + 22, 255);
+      expect(name, '${'a' * 228}.epub');
+      final shortened = EpubChapterTranslator.outputFileNameForTest(
+        'a' * 229,
+        '',
+        windows: true,
+      );
+      expect(shortened.length + 22, lessThanOrEqualTo(255));
+      expect(shortened, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
+    });
+
+    test(
+      'shortens astral titles safely with a stable collision-resistant hash',
+      () {
+        final title = '😀' * 150;
+        final name = EpubChapterTranslator.outputFileNameForTest(title, '_zh');
+        expect(name.length + 22, lessThanOrEqualTo(255));
+        expect(name, contains('_zh_'));
+        expect(name.runes, isNot(contains(0xfffd)));
+        expect(name, EpubChapterTranslator.outputFileNameForTest(title, '_zh'));
+        expect(
+          name,
+          isNot(
+            EpubChapterTranslator.outputFileNameForTest('${title}other', '_zh'),
+          ),
+        );
+      },
+    );
+
+    test('long suffix also leaves room for the title and hash', () {
+      final name = EpubChapterTranslator.outputFileNameForTest(
+        'book',
+        'x' * 300,
+      );
+      expect(name.length + 22, lessThanOrEqualTo(255));
+      expect(name, startsWith('book'));
+      expect(name, endsWith('.epub'));
+    });
+
+    test('component guard is independent of long-path policy', () async {
+      for (final enabled in <bool?>[false, true, null]) {
+        await expectLater(
+          EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+            'C:\\out\\${'a' * 229}.epub',
+            longPathsEnabledReader: () async => enabled,
+          ),
+          throwsA(isA<FileSystemException>()),
+        );
+      }
+      final name = EpubChapterTranslator.outputFileNameForTest(
+        'a' * 300,
+        '_zh',
+      );
+      await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+        'C:\\${'directory\\' * 40}$name',
+        longPathsEnabledReader: () async => true,
+      );
+    });
+  });
+  test(
+    'Linux Chinese filenames fit the UTF-8 temporary component limit',
+    () async {
+      final title = '中' * 75;
+      final name = EpubChapterTranslator.outputFileNameForTest(
+        title,
+        '_translated',
+        windows: false,
+      );
+      expect(name, isNot('${title}_translated.epub'));
+      expect(name, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
+      expect(utf8.encode(name).length + 22, lessThanOrEqualTo(255));
+      expect(
+        EpubChapterTranslator.outputFileNameForTest(
+          title,
+          '_translated',
+          windows: true,
+        ),
+        '${title}_translated.epub',
+      );
+      final emoji = EpubChapterTranslator.outputFileNameForTest(
+        '😀' * 75,
+        '_zh',
+        windows: false,
+      );
+      expect(utf8.encode(emoji).length + 22, lessThanOrEqualTo(255));
+      expect(emoji.runes, isNot(contains(0xfffd)));
+      if (!Platform.isWindows) {
+        final temp = await Directory.systemTemp.createTemp('utf8_filename_');
+        addTearDown(() => temp.delete(recursive: true));
+        await File(
+          '${temp.path}/$name.tmp.1234567890123456',
+        ).writeAsString('ok');
+      }
+    },
+  );
+
+  test(
+    'invalid output directories fail before building the API client',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'output_directory_probe_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final regularFile = await File(
+        '${temp.path}/not-a-directory',
+      ).writeAsString('x');
+      final client = _CountingApiClient();
+      final translator = EpubChapterTranslator(apiClient: client);
+      final chapter = const EpubHtmlExtractor()
+          .inspectChapterBytes(
+            chapterPath: 'chapter.xhtml',
+            bytes: utf8.encode('<html><body><p>Hello world.</p></body></html>'),
+          )
+          .copyWith(includeInTranslation: true);
+      for (final directory in [regularFile.path, '${temp.path}/missing']) {
+        await expectLater(
+          translator.translateChapters(
+            inputPath: '${temp.path}/book.epub',
+            outputDirectory: directory,
+            config: TranslationConfig.defaults().copyWith(
+              apiKey: 'sk-test',
+              uiLanguage: UiLanguage.chinese,
+            ),
+            chapters: [chapter],
+            cancelToken: CancelToken(),
+          ),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('输出目录'),
+            ),
+          ),
+        );
+      }
+      expect(client.buildCount, 0);
+      await EpubChapterTranslator.validateOutputDirectory(
+        temp.path,
+        UiLanguage.chinese,
+      );
+      expect(
+        temp.listSync().where((e) => e.path.contains('epub-write-probe')),
+        isEmpty,
+      );
+    },
+  );
   group('outputPathExceedsWindowsMaxPath', () {
     test('boundary: 237 chars fits (237 + 22 == 259, the longest usable)', () {
       final String path = "C:\\${'a' * 234}";
@@ -51,7 +228,7 @@ void main() {
   });
 
   group('throwIfOutputPathTooLongForWindows', () {
-    final String longPath = "C:\\${'a' * 236}.epub";
+    final String longPath = "C:\\${'directory\\' * 25}book.epub";
 
     test('throws when the long-path policy is off', () async {
       await expectLater(
@@ -190,5 +367,14 @@ class _LongPathThrowingTranslator extends EpubChapterTranslator {
     TranslationCancellationCheck? isCancelled,
   }) {
     throw WindowsLongPathException(failingPath);
+  }
+}
+
+class _CountingApiClient extends TranslationApiClient {
+  int buildCount = 0;
+  @override
+  Dio buildDio(TranslationConfig config) {
+    buildCount += 1;
+    throw StateError('API client must not be built');
   }
 }

@@ -217,6 +217,18 @@ void main() {
     expect(loaded.apiKey, 'sk-legacy-secure');
     expect(loaded.deepseekApiKey, 'sk-legacy-secure');
     expect(loaded.customApiKey, isEmpty);
+    expect(secrets.deepSeekApiKey, 'sk-legacy-secure');
+    await store.save(
+      loaded.copyWith(
+        apiProviderSelection: ApiProviderSelection.custom,
+        apiKey: '',
+      ),
+    );
+    final restarted = SettingsStore(
+      settingsFileProvider: () async => settingsFile,
+      secretStore: secrets,
+    );
+    expect((await restarted.load()).deepseekApiKey, 'sk-legacy-secure');
   });
 
   test(
@@ -248,6 +260,30 @@ void main() {
       expect(loaded.apiKey, 'sk-legacy');
       expect(secrets.apiKey, isNull);
       expect(await settingsFile.readAsString(), contains('sk-legacy'));
+      await store.save(loaded.copyWith(themeMode: AppThemeMode.light));
+      expect(await settingsFile.readAsString(), contains('sk-legacy'));
+      final restarted = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+      expect((await restarted.load()).apiKey, 'sk-legacy');
+      await store.save(
+        loaded.copyWith(
+          apiProviderSelection: ApiProviderSelection.custom,
+          apiKey: '',
+        ),
+      );
+      final afterSwitch = SettingsStore(
+        settingsFileProvider: () async => settingsFile,
+        secretStore: secrets,
+      );
+      final switched = await afterSwitch.load();
+      expect(switched.apiKey, isEmpty);
+      expect(switched.deepseekApiKey, 'sk-legacy');
+      secrets.failWrites = false;
+      await afterSwitch.load();
+      expect(secrets.deepSeekApiKey, 'sk-legacy');
+      expect(await settingsFile.readAsString(), isNot(contains('sk-legacy')));
     },
   );
 
@@ -668,6 +704,32 @@ void main() {
         jsonDecode(await settingsFile.readAsString()) as Map<String, dynamic>;
     expect(persisted['apiProviderSelection'], ApiProviderSelection.custom.name);
   });
+
+  test(
+    'failed deletion keeps the saved snapshot and retries the clear',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'failed_secret_delete_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final secrets = _FakeSettingsSecretStore()
+        ..apiKey = 'sk-existing'
+        ..deepSeekApiKey = 'sk-existing'
+        ..failDeletes = true;
+      final store = SettingsStore(
+        settingsFileProvider: () async => File('${temp.path}/settings.json'),
+        secretStore: secrets,
+      );
+      final loaded = await store.load();
+      final cleared = loaded.copyWith(apiKey: '');
+      await expectLater(store.save(cleared), throwsStateError);
+      expect(secrets.apiKey, 'sk-existing');
+      final mutations = secrets.secretMutationCount;
+      await expectLater(store.save(cleared), throwsStateError);
+      expect(secrets.secretMutationCount, greaterThan(mutations));
+      expect((await store.load()).apiKey, 'sk-existing');
+    },
+  );
 
   group('settings.json write-error classification', () {
     FileSystemException lockError(int code) => FileSystemException(

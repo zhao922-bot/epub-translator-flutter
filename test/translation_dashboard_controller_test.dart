@@ -689,6 +689,41 @@ class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
   }
 }
 
+class _ProgressThenErrorRepository extends _SuccessfulInspectionRepository {
+  _ProgressThenErrorRepository() : super(blockCount: 10);
+  final started = Completer<void>();
+  final release = Completer<Object>();
+  late void Function(int) progress;
+
+  @override
+  Future<TranslationRunResult> translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
+    progress = (completed) => onProgress?.call(
+      TranslationJob(
+        id: 'repository-run',
+        inputPath: inputPath,
+        outputPath: '$outputDirectory/not-created.epub',
+        status: TranslationJobStatus.running,
+        phase: TranslationJobPhase.translation,
+        progress: completed / 10,
+        completedBlocks: completed,
+        totalBlocks: 10,
+      ),
+      'Progress',
+    );
+    progress(2);
+    started.complete();
+    throw await release.future;
+  }
+}
+
 class _FailingHistoryStore extends JobHistoryStore {
   _FailingHistoryStore({this.initial = const <TranslationJob>[]});
 
@@ -757,6 +792,214 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 }
 
 void main() {
+  for (final cancelled in [false, true]) {
+    test(
+      'persisted progress cannot overwrite ${cancelled ? 'cancellation' : 'failure'} on restart',
+      () async {
+        final temp = await Directory.systemTemp.createTemp('history_terminal_');
+        addTearDown(() => temp.delete(recursive: true));
+        final store = JobHistoryStore(
+          historyFileProvider: () async => File('${temp.path}/history.json'),
+        );
+        final repository = _ProgressThenErrorRepository();
+        final controller = TranslationDashboardController(
+          repository: repository,
+          historyStore: store,
+        );
+        addTearDown(controller.dispose);
+        controller.syncSettings(
+          TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+        );
+        controller.setInputPath('${temp.path}/book.epub');
+        controller.setOutputDirectory(temp.path);
+        await controller.startInspection();
+        final run = controller.startTranslation();
+        await repository.started.future;
+        await controller.debugPersistJobHistoryNow();
+        final running = (await store.load()).first;
+        expect(running.status, TranslationJobStatus.running);
+        expect(running.runStartedAt, greaterThan(0));
+        repository.progress(4);
+        repository.release.complete(
+          cancelled
+              ? const TranslationCancelledException()
+              : StateError('original failure'),
+        );
+        await run;
+        await controller.debugPersistJobHistoryNow();
+        final terminal = (await store.load()).first;
+        expect(
+          terminal.status,
+          cancelled
+              ? TranslationJobStatus.cancelled
+              : TranslationJobStatus.failed,
+        );
+        expect(terminal.completedBlocks, 4);
+        expect(terminal.progress, 0.4);
+        expect(terminal.recordRevision, greaterThan(running.recordRevision));
+        if (!cancelled) {
+          expect(terminal.errorMessage, contains('original failure'));
+        }
+        expect(terminal.outputDirectory, temp.path);
+        expect(await File(terminal.outputPath).exists(), isFalse);
+        final retryRepository = _SuccessfulInspectionRepository();
+        final restored = TranslationDashboardController(
+          repository: retryRepository,
+          historyStore: store,
+        );
+        addTearDown(restored.dispose);
+        restored.syncSettings(
+          TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+        );
+        await restored.debugPersistJobHistoryNow();
+        expect(
+          restored.state.jobHistory.first.errorMessage,
+          terminal.errorMessage,
+        );
+        expect(restored.state.jobHistory.first.completedBlocks, 4);
+        await restored.retryJob(terminal.id);
+        expect(retryRepository.lastOutputDirectory, temp.path);
+        await restored.debugPersistJobHistoryNow();
+        final retried = (await store.load()).first;
+        expect(retried.runStartedAt, greaterThan(terminal.runStartedAt));
+        // A stale instance saving the older failure must retain the newer run.
+        await controller.debugPersistJobHistoryNow();
+        expect((await store.load()).first.runStartedAt, retried.runStartedAt);
+      },
+    );
+  }
+
+  test(
+    'a new queued round supersedes an old completed disk snapshot',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('history_round_');
+      addTearDown(() => temp.delete(recursive: true));
+      final store = JobHistoryStore(
+        historyFileProvider: () async => File('${temp.path}/history.json'),
+      );
+      final repository = _FailThenBlockTranslationRepository();
+      final controller = TranslationDashboardController(
+        repository: repository,
+        historyStore: store,
+      );
+      addTearDown(controller.dispose);
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      controller.setInputPath('${temp.path}/book.epub');
+      await controller.startInspection();
+      await controller.startTranslation();
+      await controller.debugPersistJobHistoryNow();
+      final old = (await store.load()).first;
+      await store.save([
+        old.copyWith(
+          status: TranslationJobStatus.completed,
+          recordRevision: 999,
+        ),
+      ]);
+      final retry = controller.startTranslation();
+      await repository.secondTranslationStarted.future;
+      await controller.debugPersistJobHistoryNow();
+      final queued = (await store.load()).first;
+      expect(queued.status, TranslationJobStatus.queued);
+      expect(queued.runStartedAt, greaterThan(old.runStartedAt));
+      repository.releaseSecondTranslation.complete();
+      await retry;
+      await controller.debugPersistJobHistoryNow();
+    },
+  );
+
+  test(
+    'stale interrupted history cannot overwrite a completed disk job',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('history_conflict_');
+      addTearDown(() => temp.delete(recursive: true));
+      final store = JobHistoryStore(
+        historyFileProvider: () async => File('${temp.path}/history.json'),
+      );
+      const running = TranslationJob(
+        id: 'shared',
+        inputPath: 'book.epub',
+        outputPath: 'out',
+        status: TranslationJobStatus.running,
+        phase: TranslationJobPhase.translation,
+        progress: 0.3,
+      );
+      await store.save([running]);
+      final controller = TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+        historyStore: store,
+      );
+      addTearDown(controller.dispose);
+      await controller.debugPersistJobHistoryNow();
+      expect(
+        controller.state.jobHistory.single.status,
+        TranslationJobStatus.cancelled,
+      );
+      final completed = running.copyWith(
+        status: TranslationJobStatus.completed,
+        outputPath: 'out/book.epub',
+        progress: 1,
+        completedBlocks: 10,
+      );
+      await store.save([completed]);
+      await controller.debugPersistJobHistoryNow();
+      final saved = (await store.load()).single;
+      expect(saved.status, TranslationJobStatus.completed);
+      expect(saved.outputPath, 'out/book.epub');
+      expect(saved.completedBlocks, 10);
+    },
+  );
+
+  test(
+    'retry resolves actual files and preserves .epub directories and unknown paths',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'retry_epub_directory_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final directory = await Directory(
+        '${temp.path}/collection.epub',
+      ).create();
+      final file = await File(
+        '${temp.path}/actual.epub',
+      ).writeAsString('output');
+      for (final phase in [
+        TranslationJobPhase.inspection,
+        TranslationJobPhase.translation,
+      ]) {
+        for (final entry in [
+          (output: directory.path, expected: directory.path),
+          (
+            output: '${temp.path}/missing.epub',
+            expected: '${temp.path}/missing.epub',
+          ),
+          (output: file.path, expected: temp.path),
+        ]) {
+          final repository = _SuccessfulInspectionRepository();
+          final controller = TranslationDashboardController(
+            repository: repository,
+            historyStore: _MemoryJobHistoryStore(
+              initial: [
+                TranslationJob(
+                  id: 'directory-job',
+                  inputPath: '${temp.path}/book.epub',
+                  outputPath: entry.output,
+                  status: TranslationJobStatus.cancelled,
+                  phase: phase,
+                  progress: 0,
+                ),
+              ],
+            ),
+          );
+          addTearDown(controller.dispose);
+          await controller.debugPersistJobHistoryNow();
+          await controller.retryJob('directory-job');
+          expect(repository.lastOutputDirectory, entry.expected);
+        }
+      }
+    },
+  );
   test(
     'clearJobHistory reports failure when the tombstone cannot persist',
     () async {

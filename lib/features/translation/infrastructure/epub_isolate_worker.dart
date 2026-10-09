@@ -99,6 +99,53 @@ class EpubIsolateWorker {
     return Isolate.run(() => _loadArchiveSnapshotSync(inputPath));
   }
 
+  /// Only the small title crosses the isolate boundary. The same guarded ZIP
+  /// loader and source fingerprint used by inspection apply to this read.
+  static Future<String?> readBookTitle(
+    String inputPath, {
+    String? expectedSourceFingerprint,
+  }) {
+    return Isolate.run(() {
+      final snapshot = _loadArchiveSnapshotSync(inputPath);
+      checkEpubSourceHash(snapshot.fingerprint, expectedSourceFingerprint);
+      try {
+        final container = xml.XmlDocument.parse(
+          decodeEpubText(
+            bytes: snapshot.files['META-INF/container.xml']!,
+            filePath: 'META-INF/container.xml',
+            strict: true,
+          ),
+        );
+        final opfPath = container.descendants
+            .whereType<xml.XmlElement>()
+            .where((e) => e.name.local == 'rootfile')
+            .firstOrNull
+            ?.getAttribute('full-path');
+        if (opfPath == null) return null;
+        final opf = xml.XmlDocument.parse(
+          decodeEpubText(
+            bytes: snapshot.files[opfPath]!,
+            filePath: opfPath,
+            strict: true,
+          ),
+        );
+        final title = opf.descendants
+            .whereType<xml.XmlElement>()
+            .where(
+              (e) =>
+                  e.name.local == 'title' &&
+                  e.name.namespaceUri == 'http://purl.org/dc/elements/1.1/',
+            )
+            .firstOrNull
+            ?.innerText
+            .trim();
+        return title == null || title.isEmpty ? null : title;
+      } catch (_) {
+        return null;
+      }
+    });
+  }
+
   /// Repacks an EPUB, replacing selected XHTML payloads, on a background isolate.
   ///
   /// Writes to a same-directory temp file first, then commits to [outputFilePath]
@@ -286,7 +333,10 @@ class EpubIsolateWorker {
                   e.name.namespaceUri == 'http://purl.org/dc/elements/1.1/',
             )
             .firstOrNull;
-        titleElement?.innerText = newTitle;
+        if (titleElement != null) {
+          titleElement.innerText = newTitle;
+          titleElement.setAttribute('xml:lang', languageTag);
+        }
       } catch (_) {
         // Keep the original title on any XML manipulation failure.
       }
@@ -397,6 +447,11 @@ class EpubIsolateWorker {
             .firstOrNull;
         if (docTitleText != null) {
           docTitleText.innerText = ncxTitle;
+          docTitleText.setAttribute('xml:lang', languageTag);
+          (docTitleText.parent as xml.XmlElement).setAttribute(
+            'xml:lang',
+            languageTag,
+          );
         }
       } catch (_) {
         // Keep the original docTitle on any XML manipulation failure.
@@ -787,6 +842,7 @@ class EpubIsolateWorker {
   /// content is touched: a malicious archive is rejected without ever
   /// materializing its payload.
   static Archive _decodeArchiveWithLimits(String inputPath, List<int> bytes) {
+    checkZipEntryCountForTest(inputPath, bytes);
     final Archive archive = ZipDecoder().decodeBytes(bytes);
     checkArchiveLimitsForTest(
       inputPath: inputPath,
@@ -794,6 +850,86 @@ class EpubIsolateWorker {
       compressedBytes: bytes.length,
     );
     return archive;
+  }
+
+  /// The decoder builds *all* central-directory headers before its first
+  /// callback, even with decodeStream. Walk their lengths without allocating
+  /// entry objects before handing the bytes to it. Count actual headers too:
+  /// an attacker can under-report the EOCD count or repeat identical names.
+  @visibleForTesting
+  static void checkZipEntryCountForTest(String inputPath, List<int> bytes) {
+    Never invalid() => throw const FormatException('Invalid ZIP directory.');
+    int u16(int at) {
+      if (at < 0 || at + 2 > bytes.length) invalid();
+      return bytes[at] | (bytes[at + 1] << 8);
+    }
+
+    int u32(int at) => u16(at) | (u16(at + 2) << 16);
+    int u64(int at) {
+      final low = u32(at);
+      final high = u32(at + 4);
+      // No supported input can need a >32-bit count, size or offset.
+      if (high != 0) invalid();
+      return low;
+    }
+
+    void checkCount(int count) {
+      if (count > _kMaxEpubEntryCount) {
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: bytes.length,
+          uncompressedBytes: count,
+          limitBytes: _kMaxEpubEntryCount,
+        );
+      }
+    }
+
+    int end = bytes.length - 22;
+    final int searchStart = bytes.length - 22 - 65535;
+    while (end >= 0 && end >= searchStart) {
+      if (u32(end) == 0x06054b50 && end + 22 + u16(end + 20) == bytes.length) {
+        break;
+      }
+      end--;
+    }
+    if (end < 0 || end < searchStart) invalid();
+    if (u16(end + 4) != 0 || u16(end + 6) != 0) invalid();
+    int count = u16(end + 10);
+    int size = u32(end + 12);
+    int offset = u32(end + 16);
+    int directoryBoundary = end;
+    if (end >= 20 && u32(end - 20) == 0x07064b50) {
+      final locator = end - 20;
+      if (u32(locator + 4) != 0 || u32(locator + 16) != 1) invalid();
+      final zip64 = u64(locator + 8);
+      if (zip64 + 56 > locator || u32(zip64) != 0x06064b50) invalid();
+      final recordSize = u64(zip64 + 4);
+      if (recordSize < 44 || zip64 + 12 + recordSize != locator) invalid();
+      if (u32(zip64 + 16) != 0 || u32(zip64 + 20) != 0) invalid();
+      count = u64(zip64 + 32);
+      checkCount(count);
+      if (u64(zip64 + 24) != count) invalid();
+      size = u64(zip64 + 40);
+      offset = u64(zip64 + 48);
+      directoryBoundary = zip64;
+    } else {
+      checkCount(count);
+      if (u16(end + 8) != count) invalid();
+    }
+    final directoryEnd = offset + size;
+    if (directoryEnd != directoryBoundary) invalid();
+    int actualCount = 0;
+    while (offset < directoryEnd) {
+      if (offset + 46 > directoryEnd || u32(offset) != 0x02014b50) {
+        invalid();
+      }
+      checkCount(++actualCount);
+      final length =
+          46 + u16(offset + 28) + u16(offset + 30) + u16(offset + 32);
+      if (offset + length > directoryEnd) invalid();
+      offset += length;
+    }
+    if (actualCount != count) invalid();
   }
 
   /// Visible for testing: the pure limit check behind

@@ -17,6 +17,31 @@ import 'package:xml/xml.dart' as xml;
 /// translating. The repair reinserts the keyword deterministically.
 void main() {
   group('doctype keyword repair', () {
+    test('prolog comment example is preserved before real PUBLIC doctype', () {
+      const comment =
+          '<!-- example: <!DOCTYPE html "example" "example.dtd"> -->';
+      const source =
+          '$comment<!DOCTYPE html PUBLIC "public-id" "real.dtd">'
+          '<html><body><p>x</p></body></html>';
+      final serialized = html_parser.parse(source).outerHtml;
+      final output = XhtmlHtmlCompatibility.normalizeForXhtmlOutput(serialized);
+      expect(output, contains(comment));
+      expect(output, contains('<!DOCTYPE html PUBLIC "public-id" "real.dtd">'));
+      expect(() => xml.XmlDocument.parse(output), returnsNormally);
+    });
+
+    test('PI, CDATA and script examples are not doctypes', () {
+      const source =
+          '<?example <!DOCTYPE html "pi"> ?>'
+          '<![CDATA[<!DOCTYPE html "cdata">]]>'
+          '<!DOCTYPE html "real.dtd"><html><script>'
+          '<!DOCTYPE html "script"></script></html>';
+      final output = XhtmlHtmlCompatibility.normalizeForXhtmlOutput(source);
+      expect(output, contains('<?example <!DOCTYPE html "pi"> ?>'));
+      expect(output, contains('<![CDATA[<!DOCTYPE html "cdata">]]>'));
+      expect(output, contains('<!DOCTYPE html SYSTEM "real.dtd">'));
+      expect(output, contains('<!DOCTYPE html "script">'));
+    });
     test('two identifiers without keyword become PUBLIC', () {
       // Exactly what package:html emits for an XHTML 1.1 doctype.
       const String broken =

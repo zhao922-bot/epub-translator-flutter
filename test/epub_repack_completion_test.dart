@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
@@ -90,7 +91,9 @@ void main() {
       );
       addTearDown(() => tempDir.delete(recursive: true));
       final File input = File('${tempDir.path}/book.epub');
-      await input.writeAsString('source');
+      // Title inspection now validates ZIP metadata before decoding. Keep
+      // this checkpoint-failure fixture a valid (title-less) source archive.
+      await input.writeAsBytes(ZipEncoder().encodeBytes(Archive()));
       bool cancelled = false;
       final EpubChapterTranslator translator = EpubChapterTranslator(
         cacheStore: _TerminalSaveFailureCacheStore(),
