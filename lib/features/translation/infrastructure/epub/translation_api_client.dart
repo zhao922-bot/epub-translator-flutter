@@ -92,37 +92,7 @@ class TranslationApiClient {
   /// proxy would fail later with a confusing connection error. Use
   /// [validateProxySetting] to tell the user why a value is invalid.
   static String? proxyHostPort(String value) {
-    String trimmed = value.trim();
-    if (trimmed.isEmpty) {
-      return null;
-    }
-    if (trimmed.contains('://')) {
-      final Uri? parsed = Uri.tryParse(trimmed);
-      if (parsed == null ||
-          parsed.host.isEmpty ||
-          !parsed.hasPort ||
-          !_isValidProxyPort(parsed.port)) {
-        return null;
-      }
-      final String scheme = parsed.scheme.toLowerCase();
-      if (scheme != 'http' && scheme != 'https') {
-        return null;
-      }
-      final String host = parsed.host;
-      return '$host:${parsed.port}';
-    }
-    final RegExpMatch? match = RegExp(
-      r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$',
-    ).firstMatch(trimmed);
-    if (match == null) {
-      return null;
-    }
-    final String host = (match.group(1) ?? match.group(2) ?? '').trim();
-    final int? port = int.tryParse(match.group(3)!);
-    if (host.isEmpty || !_isValidProxyPort(port)) {
-      return null;
-    }
-    return '$host:$port';
+    return _parseProxySetting(value).hostPort;
   }
 
   /// Why a user-typed proxy setting is unusable, for inline error display.
@@ -132,36 +102,47 @@ class TranslationApiClient {
   /// "unsupported protocol" so the settings page can explain the problem
   /// instead of saving a value that silently does nothing.
   static ProxySettingError? validateProxySetting(String value) {
+    return _parseProxySetting(value).error;
+  }
+
+  /// Validation and transport must agree, including explicit default ports
+  /// (which Uri normalizes away) and brackets required by HttpClient for IPv6.
+  static ({String? hostPort, ProxySettingError? error}) _parseProxySetting(
+    String value,
+  ) {
     final String trimmed = value.trim();
     if (trimmed.isEmpty) {
-      return null;
+      return (hostPort: null, error: null);
     }
-    if (trimmed.contains('://')) {
-      final Uri? parsed = Uri.tryParse(trimmed);
-      if (parsed == null ||
-          parsed.host.isEmpty ||
-          !parsed.hasPort ||
-          !_isValidProxyPort(parsed.port)) {
-        return ProxySettingError.invalidFormat;
-      }
-      final String scheme = parsed.scheme.toLowerCase();
-      if (scheme != 'http' && scheme != 'https') {
-        return ProxySettingError.unsupportedScheme;
-      }
-      return null;
+    const invalid = (hostPort: null, error: ProxySettingError.invalidFormat);
+    final bool hasScheme = trimmed.contains('://');
+    if (!hasScheme &&
+        !RegExp(r'^(?:\[[^\]]+\]|[^:/?#\s]+):\d{1,5}$').hasMatch(trimmed)) {
+      return invalid;
     }
-    final RegExpMatch? match = RegExp(
-      r'^(?:\[([^\]]+)\]|([^:]+)):(\d{1,5})$',
-    ).firstMatch(trimmed);
-    if (match == null) {
-      return ProxySettingError.invalidFormat;
+    final String uriValue = hasScheme ? trimmed : 'http://$trimmed';
+    final Uri? parsed = Uri.tryParse(uriValue);
+    // Inspect the original authority so explicit :80 / :443 remain valid.
+    final String authority = uriValue
+        .substring(uriValue.indexOf('://') + 3)
+        .split(RegExp(r'[/?#]'))
+        .first;
+    final RegExpMatch? portMatch = RegExp(r':(\d{1,5})$').firstMatch(authority);
+    final int? port = int.tryParse(portMatch?.group(1) ?? '');
+    if (parsed == null ||
+        parsed.host.isEmpty ||
+        RegExp(r'\s').hasMatch(authority) ||
+        !_isValidProxyPort(port)) {
+      return invalid;
     }
-    final String host = (match.group(1) ?? match.group(2) ?? '').trim();
-    final int? port = int.tryParse(match.group(3)!);
-    if (host.isEmpty || !_isValidProxyPort(port)) {
-      return ProxySettingError.invalidFormat;
+    if (parsed.scheme != 'http' && parsed.scheme != 'https') {
+      return (hostPort: null, error: ProxySettingError.unsupportedScheme);
     }
-    return null;
+    final String host = parsed.host;
+    final String formattedHost = host.contains(':') && !host.startsWith('[')
+        ? '[$host]'
+        : host;
+    return (hostPort: '$formattedHost:$port', error: null);
   }
 
   /// PAC-style proxy selector for [hostPort] (`"host:port"`) with no_proxy
@@ -343,9 +324,11 @@ class TranslationApiClient {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     int? maxAttemptsOverride,
+    void Function()? throwIfCancelled,
   }) async {
     for (int attempt = 1; ; attempt += 1) {
       try {
+        throwIfCancelled?.call();
         if (cancelToken?.isCancelled ?? false) {
           throw const TranslationCancelledException();
         }
@@ -354,6 +337,9 @@ class TranslationApiClient {
         if (error is TranslationCancelledException || isCancelError(error)) {
           throw const TranslationCancelledException();
         }
+        // Callback cancellation must win before retry policy/backoff, even
+        // when it changed while the failed request was completing.
+        throwIfCancelled?.call();
         final bool retryable = shouldRetry?.call(error) ?? true;
         final int maxAttempts =
             maxAttemptsOverride ?? maxAttemptsForError(config, error);

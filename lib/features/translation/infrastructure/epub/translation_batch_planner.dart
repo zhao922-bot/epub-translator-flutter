@@ -58,6 +58,7 @@ class TranslationBatchPlanner {
           chapterBlocks: chapterBlocks,
           chapterTitle: chapterTitle,
           bookMemory: bookMemory,
+          indexById: indexById,
         ),
       );
       current = <ExtractedBlock>[];
@@ -176,6 +177,7 @@ class TranslationBatchPlanner {
     required List<ExtractedBlock> chapterBlocks,
     required String chapterTitle,
     Map<String, Object?>? bookMemory,
+    Map<String, int>? indexById,
   }) {
     final List<ExtractedBlock> immutableBlocks =
         List<ExtractedBlock>.unmodifiable(blocks);
@@ -186,6 +188,7 @@ class TranslationBatchPlanner {
         batchBlocks: immutableBlocks,
         chapterBlocks: chapterBlocks,
         bookMemory: bookMemory,
+        indexById: indexById,
       ),
     );
   }
@@ -207,6 +210,7 @@ class TranslationBatchPlanner {
     required List<ExtractedBlock> batchBlocks,
     required List<ExtractedBlock> chapterBlocks,
     Map<String, Object?>? bookMemory,
+    Map<String, int>? indexById,
   }) {
     if (batchBlocks.isEmpty || chapterBlocks.isEmpty) {
       return TranslationBatchContext(
@@ -215,12 +219,14 @@ class TranslationBatchPlanner {
       );
     }
 
-    final Map<String, int> indexById = <String, int>{
-      for (int index = 0; index < chapterBlocks.length; index += 1)
-        chapterBlocks[index].id: index,
-    };
+    final Map<String, int> chapterIndex =
+        indexById ??
+        <String, int>{
+          for (int index = 0; index < chapterBlocks.length; index += 1)
+            chapterBlocks[index].id: index,
+        };
     final List<int> indexes = batchBlocks
-        .map((ExtractedBlock block) => indexById[block.id])
+        .map((ExtractedBlock block) => chapterIndex[block.id])
         .whereType<int>()
         .toList(growable: false);
     if (indexes.isEmpty) {

@@ -145,11 +145,15 @@ class EpubTranslationRepository implements TranslationRepository {
     required Dio dio,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
+    CancelToken? cancelToken,
+    TranslationCancellationCheck? isCancelled,
   }) {
     return _translator.generateStyleProfileForTest(
       dio: dio,
       config: config,
       chapters: chapters,
+      cancelToken: cancelToken,
+      isCancelled: isCancelled,
     );
   }
 
@@ -279,6 +283,7 @@ class EpubTranslationRepository implements TranslationRepository {
         config: config,
         chapters: chapters,
         cancelToken: cancelToken,
+        isCancelled: isCancelled,
       );
     } on TranslationCancelledException {
       rethrow;

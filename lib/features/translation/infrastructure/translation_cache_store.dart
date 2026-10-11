@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -14,6 +15,23 @@ final translationCacheStoreProvider = Provider<TranslationCacheStore>(
 );
 
 class TranslationCacheStore {
+  TranslationCacheStore({
+    Directory? cacheRoot,
+    int maxCacheBytes = _maxCacheBytes,
+    this.pruneInterval = const Duration(minutes: 5),
+    DateTime Function()? now,
+    @visibleForTesting this.onMaintenanceScan,
+  }) : _rootOverride = cacheRoot,
+       _capacity = maxCacheBytes,
+       _now = now ?? DateTime.now;
+
+  final Directory? _rootOverride;
+  final int _capacity;
+  final Duration pruneInterval;
+  final DateTime Function() _now;
+  @visibleForTesting
+  final Future<void> Function()? onMaintenanceScan;
+
   /// Parent directories already swept for stale `.tmp.*` files. Atomic
   /// writes can leave orphans if the process is killed between the temp
   /// write and the rename; each directory is swept once per instance,
@@ -30,11 +48,45 @@ class TranslationCacheStore {
   /// evicted (see [pruneCacheDirectoryForTest]).
   static const int _maxCacheBytes = 512 * 1024 * 1024;
 
-  /// Size check runs at most every [_pruneCheckInterval] writes so a large
-  /// book does not stat the cache directory per block.
-  static const int _pruneCheckInterval = 64;
-  int _writesSincePruneCheck = 0;
-  bool _pruning = false;
+  // A full pass establishes/reconciles the disk baseline. Between passes,
+  // successful writes update it by byte delta, not by accumulating payloads.
+  final Map<String, int> _sizes = <String, int>{};
+  final Map<String, Future<void>> _fileGates = <String, Future<void>>{};
+  Map<String, int>? _scanChanges;
+  int _estimatedBytes = 0;
+  DateTime? _lastPrune;
+  bool _maintenancePending = false;
+  Future<void> _maintenanceTail = Future<void>.value();
+
+  @visibleForTesting
+  int get estimatedCacheBytesForTest => _estimatedBytes;
+
+  @visibleForTesting
+  Future<void> waitForMaintenanceForTest() => _maintenanceTail;
+
+  // Writes and eviction share a per-file gate; unrelated keys stay parallel.
+  Future<void> _withFileGate(File file, Future<void> Function() action) {
+    final String key = file.path;
+    final Future<void> previous = _fileGates[key] ?? Future<void>.value();
+    final Completer<void> gate = Completer<void>();
+    _fileGates[key] = gate.future;
+    return previous.then((_) async {
+      try {
+        await action();
+      } finally {
+        gate.complete();
+        if (identical(_fileGates[key], gate.future)) {
+          _fileGates.remove(key);
+        }
+      }
+    });
+  }
+
+  void _recordSize(String key, int size) {
+    _estimatedBytes += size - (_sizes[key] ?? 0);
+    _sizes[key] = size;
+    _scanChanges?[key] = size;
+  }
 
   Future<void> _sweepStaleTempFiles(Directory directory) async {
     if (!_sweptTempDirs.add(directory.path)) {
@@ -63,31 +115,45 @@ class TranslationCacheStore {
     // silently treat torn HTML as a valid cached translation.
     // `writeFileAtomically` gives each concurrent write a unique temp path,
     // so parallel writes to the same key cannot interleave into torn HTML.
-    await writeFileAtomically(file, translatedHtml);
-    await _pruneIfNeeded();
+    await _withFileGate(file, () async {
+      if (!_sizes.containsKey(file.path)) {
+        final FileStat stat = await file.stat();
+        _recordSize(
+          file.path,
+          stat.type == FileSystemEntityType.file ? stat.size : 0,
+        );
+      }
+      await writeFileAtomically(file, translatedHtml);
+      _recordSize(file.path, utf8.encode(translatedHtml).length);
+    });
+    _pruneIfNeeded();
   }
 
-  /// Evicts the oldest cache entries when the cache grows past
-  /// [_maxCacheBytes]. Purely defensive: any failure is swallowed so cache
-  /// maintenance can never break a translation run.
-  Future<void> _pruneIfNeeded() async {
-    _writesSincePruneCheck += 1;
-    if (_writesSincePruneCheck < _pruneCheckInterval || _pruning) {
+  /// Schedules an initial baseline scan, then maintenance on writes when the
+  /// time interval expires or estimated capacity is exceeded. Pending requests
+  /// are coalesced; failures cannot break a translation run.
+  void _pruneIfNeeded() {
+    final DateTime now = _now();
+    if (_maintenancePending ||
+        (_lastPrune != null &&
+            now.difference(_lastPrune!) < pruneInterval &&
+            _estimatedBytes <= _capacity)) {
       return;
     }
-    _writesSincePruneCheck = 0;
-    _pruning = true;
-    try {
-      final Directory root = await _cacheRoot();
-      if (!await root.exists()) {
-        return;
-      }
-      await pruneCacheDirectoryForTest(root);
-    } catch (_) {
-      // Cache maintenance must never break translation.
-    } finally {
-      _pruning = false;
-    }
+    _maintenancePending = true;
+    _lastPrune = now;
+    // Start on a separate event turn, and never join this future from put.
+    _maintenanceTail = _maintenanceTail.then(
+      (_) => Future<void>(() async {
+        try {
+          await _scanAndPrune(await _cacheRoot(), _capacity);
+        } catch (_) {
+          // Cache maintenance must never break translation.
+        } finally {
+          _maintenancePending = false;
+        }
+      }),
+    );
   }
 
   /// Scans [root] and evicts the oldest entries under `blocks/` until the
@@ -102,62 +168,103 @@ class TranslationCacheStore {
   Future<void> pruneCacheDirectoryForTest(
     Directory root, {
     int maxBytes = _maxCacheBytes,
-  }) async {
-    // Sweep every shard, including ones no longer receiving writes. Do not
-    // memoize this maintenance pass: a previously fresh orphan can age out.
-    await cleanStaleAtomicTempFiles(root);
-    await for (final entity in root.list(recursive: true, followLinks: false)) {
-      if (entity is Directory) {
-        await cleanStaleAtomicTempFiles(entity);
-      }
-    }
-    final List<_CacheEntry> entries = <_CacheEntry>[];
-    int totalBytes = 0;
-    await for (final FileSystemEntity entity in root.list(
-      recursive: true,
-      followLinks: false,
-    )) {
-      if (entity is! File) {
-        continue;
-      }
-      final String relative = path.relative(entity.path, from: root.path);
-      if (relative == 'jobs' || relative.startsWith('jobs${path.separator}')) {
-        continue;
-      }
-      final String name = path.basename(entity.path);
-      final bool isAtomicTemp = name.contains('.tmp.');
-      try {
-        final FileStat stat = await entity.stat();
-        totalBytes += stat.size;
-        // Leftover `.tmp.*` files count toward the cap but are never
-        // evicted here: a temp file may belong to an in-flight write in
-        // another isolate or process. Stale ones were swept above.
-        if (!isAtomicTemp) {
-          entries.add(
-            _CacheEntry(file: entity, size: stat.size, modified: stat.modified),
-          );
-        }
-      } catch (_) {
-        // A file that vanishes mid-scan is simply skipped.
-      }
-    }
-    if (totalBytes <= maxBytes) {
-      return;
-    }
-    entries.sort(
-      (_CacheEntry a, _CacheEntry b) => a.modified.compareTo(b.modified),
+  }) {
+    final Future<void> pass = _maintenanceTail.then(
+      (_) => _scanAndPrune(root, maxBytes),
     );
-    final int targetBytes = (maxBytes * 0.9).toInt();
-    for (final _CacheEntry entry in entries) {
-      if (totalBytes <= targetBytes) {
-        break;
+    _maintenanceTail = pass.catchError((Object _) {});
+    return pass;
+  }
+
+  Future<void> _scanAndPrune(Directory root, int maxBytes) async {
+    final Map<String, int> changes = <String, int>{};
+    _scanChanges = changes;
+    try {
+      if (!await root.exists()) return;
+      // Sweep every shard, including ones no longer receiving writes. Do not
+      // memoize this maintenance pass: a previously fresh orphan can age out.
+      await cleanStaleAtomicTempFiles(root);
+      await for (final entity in root.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is Directory) {
+          await cleanStaleAtomicTempFiles(entity);
+        }
       }
-      try {
-        await entry.file.delete();
-        totalBytes -= entry.size;
-      } catch (_) {
-        // Best effort; a locked file is left for the next pass.
+      final List<_CacheEntry> entries = <_CacheEntry>[];
+      final Map<String, int> scannedSizes = <String, int>{};
+      int tempBytes = 0;
+      await for (final FileSystemEntity entity in root.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is! File) continue;
+        final String relative = path.relative(entity.path, from: root.path);
+        if (relative == 'jobs' ||
+            relative.startsWith('jobs${path.separator}')) {
+          continue;
+        }
+        final bool isAtomicTemp = path.basename(entity.path).contains('.tmp.');
+        try {
+          final FileStat stat = await entity.stat();
+          if (stat.type != FileSystemEntityType.file) continue;
+          // Fresh temps count toward the cap but cannot be evicted: they may
+          // belong to another live writer. Stale ones were swept above.
+          if (isAtomicTemp) {
+            tempBytes += stat.size;
+          } else {
+            scannedSizes[entity.path] = stat.size;
+            entries.add(
+              _CacheEntry(
+                file: entity,
+                size: stat.size,
+                modified: stat.modified,
+              ),
+            );
+          }
+        } catch (_) {
+          // A file that vanishes mid-scan is simply skipped.
+        }
       }
+      await onMaintenanceScan?.call();
+      // Overlay writes completed during listing, including newly created keys.
+      scannedSizes.addAll(changes);
+      int totalBytes = tempBytes + scannedSizes.values.fold(0, (a, b) => a + b);
+      if (totalBytes > maxBytes) {
+        entries.sort(
+          (_CacheEntry a, _CacheEntry b) => a.modified.compareTo(b.modified),
+        );
+        final int targetBytes = (maxBytes * 0.9).toInt();
+        for (final _CacheEntry entry in entries) {
+          if (totalBytes <= targetBytes) break;
+          try {
+            await _withFileGate(entry.file, () async {
+              // Never delete a replacement written since this scan began.
+              if (changes.containsKey(entry.file.path)) return;
+              final FileStat current = await entry.file.stat();
+              if (current.type != FileSystemEntityType.file ||
+                  current.size != entry.size ||
+                  current.modified != entry.modified) {
+                return;
+              }
+              await entry.file.delete();
+              totalBytes -= entry.size;
+              _recordSize(entry.file.path, 0);
+            });
+          } catch (_) {
+            // Best effort; a locked file is left for the next pass.
+          }
+        }
+      }
+      scannedSizes.addAll(changes);
+      scannedSizes.removeWhere((_, size) => size == 0);
+      _sizes
+        ..clear()
+        ..addAll(scannedSizes);
+      _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
+    } finally {
+      _scanChanges = null;
     }
   }
 
@@ -272,6 +379,7 @@ class TranslationCacheStore {
   }
 
   Future<Directory> _cacheRoot() async {
+    if (_rootOverride != null) return _rootOverride;
     final Directory appDirectory = Directory(
       await PlatformUtils.appDocumentsDirectory(),
     );

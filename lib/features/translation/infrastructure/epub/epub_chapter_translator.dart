@@ -32,6 +32,12 @@ import 'protected_anchor_text_slots.dart';
 import 'epub_semantics.dart';
 import 'translation_api_client.dart';
 import 'translation_batch_planner.dart';
+import 'translation_progress_persistence.dart';
+import 'translation_run_context.dart';
+import 'translation_work_queue.dart';
+
+part 'epub_book_memory.dart';
+part 'epub_translation_strategy.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
 ///
@@ -62,7 +68,8 @@ class EpubChapterTranslator {
   /// untranslated. (Not keyed by identity either: block instances are copied
   /// around ([ExtractedBlock.copyWith]), so identity checks would silently
   /// miss.)
-  final Set<String> _degradedBlocks = <String>{};
+  TranslationRunContext _run = TranslationRunContext(concurrency: 1);
+  Set<String> get _degradedBlocks => _run.degradedBlocks;
 
   /// Degraded blocks that were also counted in `apiTranslatedBlocks` (the
   /// main block pipeline; footnote degrades are tracked in [_degradedBlocks]
@@ -74,7 +81,7 @@ class EpubChapterTranslator {
   /// points take `apiCounted` from the calling pipeline (main block batches
   /// count every block up front, footnote persistence counts per reference),
   /// so the subtraction stays exact no matter which pipeline degraded.
-  int _apiDegradedBlocks = 0;
+  int get _apiDegradedBlocks => _run.apiDegradedBlocks;
 
   /// Records [blockId] of [chapterPath] as degraded. The chapter scope is
   /// required because block ids are only unique within a chapter.
@@ -88,15 +95,11 @@ class EpubChapterTranslator {
     required String blockId,
     bool apiCounted = false,
   }) {
-    final bool added = _degradedBlocks.add(
-      EpubRepacker.degradedKeyForBlock(
-        chapterPath: chapterPath,
-        blockId: blockId,
-      ),
+    _run.markDegraded(
+      chapterPath: chapterPath,
+      blockId: blockId,
+      apiCounted: apiCounted,
     );
-    if (added && apiCounted) {
-      _apiDegradedBlocks += 1;
-    }
   }
 
   /// Whether [blockId] of [chapterPath] was recorded as degraded.
@@ -117,20 +120,47 @@ class EpubChapterTranslator {
   final TranslationApiClient _apiClient;
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
+  late final _EpubBookMemory _memory = _EpubBookMemory(this);
+  late final _EpubTranslationStrategy _strategy = _EpubTranslationStrategy(
+    this,
+  );
+
+  EpubChapterTranslator _invocation(TranslationRunContext run) {
+    final EpubChapterTranslator invocation = EpubChapterTranslator(
+      cacheStore: _cacheStore,
+      repacker: _repacker,
+      apiClient: _apiClient,
+      batchPlanner: _batchPlanner,
+      footnoteBatchPlanner: _footnoteBatchPlanner,
+    );
+    invocation._run = run;
+    return invocation;
+  }
+
+  Future<Response<dynamic>> _postChatCompletions({
+    required Dio dio,
+    required Map<String, dynamic> data,
+    CancelToken? cancelToken,
+  }) {
+    return _run.requests.run(() {
+      _run.throwIfCancelled();
+      if (cancelToken?.isCancelled ?? false) {
+        throw const TranslationCancelledException();
+      }
+      return _apiClient.postChatCompletions(
+        dio: dio,
+        data: data,
+        cancelToken: cancelToken ?? _run.cancelToken,
+      );
+    });
+  }
 
   static const String _cacheSchemaVersion = 'v15-second-person-and-idiom';
-  static const int _initialMemoryFrontMatterLimit = 2;
-  static const int _initialMemoryContentLimit = 2;
-  static const int _memoryChapterTextLimit = 2400;
-  static const int _minimumRepresentativeStyleCharacters = 240;
-  static const int _memoryListLimit = 8;
-  static const int _memoryGlossaryLimit = 32;
-  static const int _recentChapterMemoryLimit = 2;
 
   static String chineseSecondPersonInstructionForTest({
     required TranslationConfig config,
   }) {
-    return EpubChapterTranslator()._chineseSecondPersonInstruction(
+    return EpubChapterTranslator()._strategy._chineseSecondPersonInstruction(
       config: config,
     );
   }
@@ -152,12 +182,11 @@ class EpubChapterTranslator {
     String cacheKey,
     String translatedHtml,
   ) async {
-    try {
-      await cacheStore.putBlockTranslation(cacheKey, translatedHtml);
-      return null;
-    } catch (error) {
-      return error;
-    }
+    return TranslationProgressPersistence.putError(
+      cacheStore,
+      cacheKey,
+      translatedHtml,
+    );
   }
 
   static String prepareBlockHtmlForTargetForTest({
@@ -207,7 +236,7 @@ class EpubChapterTranslator {
   static List<Map<String, String>> styleProfileSourceChaptersForTest(
     List<InspectedChapter> chapters,
   ) {
-    return _styleProfileSourceChapters(chapters);
+    return _EpubBookMemory._styleProfileSourceChapters(chapters);
   }
 
   static String outputFilePathForTest({
@@ -270,9 +299,8 @@ class EpubChapterTranslator {
     );
   }
 
-  void _beginDegradedTracking() {
-    _degradedBlocks.clear();
-    _apiDegradedBlocks = 0;
+  void _beginDegradedTracking({int concurrency = 1}) {
+    _run = TranslationRunContext(concurrency: concurrency);
   }
 
   Future<List<String>> translateBlockBatchForTest({
@@ -285,8 +313,8 @@ class EpubChapterTranslator {
     List<ExtractedBlock> contextAfter = const <ExtractedBlock>[],
     Map<String, Object?>? bookMemory,
   }) {
-    _beginDegradedTracking();
-    return _translateBlockBatch(
+    _beginDegradedTracking(concurrency: config.maxConcurrent);
+    return _strategy.translateBlockBatch(
       dio: dio,
       config: config,
       chapterPath: chapterPath,
@@ -309,8 +337,8 @@ class EpubChapterTranslator {
     required List<FootnoteBlockReference> references,
     Map<String, Object?>? bookMemory,
   }) {
-    _beginDegradedTracking();
-    return _translateFootnoteBatch(
+    _beginDegradedTracking(concurrency: config.maxConcurrent);
+    return _strategy._translateFootnoteBatch(
       dio: dio,
       config: config,
       batch: FootnoteTranslationBatch(
@@ -329,7 +357,7 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
   }) async {
-    return (await _generateInitialBookMemory(
+    return (await _memory.generateInitialBookMemory(
       dio: dio,
       config: config,
       chapters: chapters,
@@ -340,23 +368,35 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
+    TranslationCancellationCheck? isCancelled,
   }) async {
+    final TranslationRunContext run = TranslationRunContext(
+      concurrency: config.maxConcurrent,
+      cancelToken: cancelToken,
+      isCancelled: isCancelled,
+    );
+    run.throwIfCancelled();
     if (!config.styleProfileEnabled) {
       return TranslationStyleProfile.empty;
     }
-    await validateInspectedSource(chapters);
-    final Dio dio = _apiClient.buildDio(config);
+    run.watchCancellation();
+    Dio? dio;
     try {
-      return await _generateStyleProfile(
+      await validateInspectedSource(chapters);
+      run.throwIfCancelled();
+      dio = _apiClient.buildDio(config);
+      return await _invocation(run)._memory.generateStyleProfile(
         dio: dio,
         config: config,
         chapters: chapters,
-        cancelToken: cancelToken,
+        cancelToken: run.cancelToken,
+        throwIfCancelled: run.throwIfCancelled,
       );
     } finally {
       // Fresh Dio per call (own HttpClient pool); close it so sockets/FDs
       // do not accumulate across runs.
-      dio.close(force: true);
+      run.dispose();
+      dio?.close(force: true);
     }
   }
 
@@ -364,304 +404,26 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
-  }) async {
-    return _generateStyleProfile(dio: dio, config: config, chapters: chapters);
-  }
-
-  /// Dedicated style-profile call, not piggybacked on book-memory summary.
-  Future<TranslationStyleProfile> _generateStyleProfile({
-    required Dio dio,
-    required TranslationConfig config,
-    required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
+    TranslationCancellationCheck? isCancelled,
   }) async {
-    final List<Map<String, String>> sourceChapters =
-        _styleProfileSourceChapters(chapters);
-    if (sourceChapters.isEmpty) {
-      return TranslationStyleProfile.empty;
-    }
-
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'kind': 'styleProfile',
-      'targetLanguage': config.targetLanguage,
-      'chapters': sourceChapters,
-    };
-    final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
-      dio: dio,
-      config: config,
-      payload: payload,
-      systemPrompt:
-          'You analyze an EPUB before translation. Return strict JSON only. '
-          'Required top-level object keys: primaryGenre, secondaryGenres, tone, '
-          'sentenceStyle, translationConstraints, avoid, confidence. '
-          'primaryGenre must be a practical book type such as business nonfiction, '
-          'science fiction, romance, historical fiction, literary fiction, mystery, '
-          'fantasy, memoir, self-help, biography, or philosophy. '
-          'secondaryGenres is a short string array. tone and sentenceStyle are short phrases. '
-          'translationConstraints and avoid may be either string arrays or single strings. '
-          'Write notes for translators into ${config.targetLanguage}. '
-          'confidence must be one of: high, medium, low. '
-          'Prefer executable style rules over marketing labels. '
-          'Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language. '
-          'If evidence is thin, still provide a best-effort primaryGenre with confidence low. '
-          'Do not wrap the JSON in markdown fences.',
+    final TranslationRunContext run = TranslationRunContext(
+      concurrency: config.maxConcurrent,
       cancelToken: cancelToken,
+      isCancelled: isCancelled,
     );
-    return _parseStyleProfileResponse(jsonPayload);
-  }
-
-  /// Samples meaningful front matter plus early/middle/late body chapters.
-  ///
-  /// Indexes, contents, copyright pages, credits and other structural matter
-  /// must not influence the inferred writing style even when an EPUB uses
-  /// opaque filenames or generic document titles.
-  static List<Map<String, String>> _styleProfileSourceChapters(
-    List<InspectedChapter> chapters,
-  ) {
-    final List<InspectedChapter> eligible = chapters
-        .where((InspectedChapter chapter) => chapter.includeInTranslation)
-        .where((InspectedChapter chapter) => chapter.blocks.isNotEmpty)
-        .where(
-          (InspectedChapter chapter) => !_excludeFromStyleSampling(chapter),
-        )
-        .toList(growable: false);
-    if (eligible.isEmpty) {
-      return const <Map<String, String>>[];
+    run.watchCancellation();
+    try {
+      return await _invocation(run)._memory.generateStyleProfile(
+        dio: dio,
+        config: config,
+        chapters: chapters,
+        cancelToken: run.cancelToken,
+        throwIfCancelled: run.throwIfCancelled,
+      );
+    } finally {
+      run.dispose();
     }
-
-    final List<InspectedChapter> selected = <InspectedChapter>[];
-    final Map<String, String> rolesByPath = <String, String>{};
-    void add(InspectedChapter chapter, String role) {
-      if (selected.any((InspectedChapter c) => c.path == chapter.path)) {
-        return;
-      }
-      selected.add(chapter);
-      rolesByPath[chapter.path] = role;
-    }
-
-    for (final InspectedChapter chapter
-        in eligible
-            .where(
-              (InspectedChapter c) => c.category == ChapterCategory.frontMatter,
-            )
-            .where(_isMeaningfulFrontMatter)
-            .take(2)) {
-      add(chapter, 'frontMatter');
-    }
-
-    final List<InspectedChapter> contentCandidates = eligible
-        .where((InspectedChapter c) => c.category == ChapterCategory.content)
-        .toList(growable: false);
-    final List<InspectedChapter> substantialContent = contentCandidates
-        .where(
-          (InspectedChapter chapter) =>
-              _representativeStyleText(chapter.blocks).length >=
-              _minimumRepresentativeStyleCharacters,
-        )
-        .toList(growable: false);
-    final int desiredRepresentativeCount = min(3, contentCandidates.length);
-    final List<InspectedChapter> content =
-        desiredRepresentativeCount > 0 &&
-            substantialContent.length >= desiredRepresentativeCount
-        ? substantialContent
-        : contentCandidates;
-    final List<InspectedChapter> representativeContent =
-        _representativeContentChapters(content);
-    for (int index = 0; index < representativeContent.length; index += 1) {
-      final String role = switch (index) {
-        0 => 'earlyContent',
-        1 when representativeContent.length >= 3 => 'middleContent',
-        _ => 'lateContent',
-      };
-      add(representativeContent[index], role);
-    }
-
-    if (selected.length < 2) {
-      for (final InspectedChapter chapter in eligible) {
-        add(chapter, 'fallback');
-        if (selected.length >= 4) {
-          break;
-        }
-      }
-    }
-
-    return selected
-        .map((InspectedChapter chapter) {
-          return <String, String>{
-            'path': chapter.path,
-            'title': chapter.title,
-            'category': chapter.category.name,
-            'role': rolesByPath[chapter.path] ?? 'fallback',
-            'text': _representativeStyleText(chapter.blocks),
-          };
-        })
-        .where((Map<String, String> chapter) => chapter['text']!.isNotEmpty)
-        .toList(growable: false);
-  }
-
-  static List<InspectedChapter> _representativeContentChapters(
-    List<InspectedChapter> content,
-  ) {
-    if (content.length <= 3) {
-      return content;
-    }
-    return <InspectedChapter>[
-      content.first,
-      content[content.length ~/ 2],
-      content.last,
-    ];
-  }
-
-  static bool _excludeFromStyleSampling(InspectedChapter chapter) {
-    if (chapter.category == ChapterCategory.ancillary ||
-        chapter.category == ChapterCategory.reference ||
-        chapter.category == ChapterCategory.backMatter) {
-      return true;
-    }
-    final String normalizedPath = chapter.path
-        .replaceAll('\\', '/')
-        .toLowerCase();
-    final String fileName = normalizedPath.split('/').last;
-    final String normalizedTitle = chapter.title.trim().toLowerCase();
-    if (RegExp(r'^(nav|navigation)(\.[^.]+)?$').hasMatch(fileName) ||
-        RegExp(r'(^|[-_.])(fn|footnotes?)([-_.]|$)').hasMatch(fileName) ||
-        <String>{
-          'footnote',
-          'footnotes',
-          'navigation',
-          'table of contents',
-          'contents',
-        }.contains(normalizedTitle)) {
-      return true;
-    }
-    final String token = '$normalizedPath $normalizedTitle';
-    return <String>[
-      'index',
-      '_ind_',
-      'table of contents',
-      'contents',
-      '_toc_',
-      'copyright',
-      '_cop_',
-      'cover',
-      '_cvi_',
-      'title page',
-      '_tp_',
-      'acknowledg',
-      '_ack_',
-      'illustration',
-      '_ill_',
-      'about the author',
-      '_ata_',
-      'bibliography',
-      'endnote',
-      'about the publisher',
-      'book perk',
-      'card page',
-      'advertisement',
-      'also by',
-      'books by',
-    ].any(token.contains);
-  }
-
-  static bool _isMeaningfulFrontMatter(InspectedChapter chapter) {
-    final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
-    return <String>[
-      'preface',
-      '_prf_',
-      'foreword',
-      'introduction',
-      'prologue',
-    ].any(token.contains);
-  }
-
-  static String _representativeStyleText(List<ExtractedBlock> blocks) {
-    final List<String> texts = blocks
-        .map((ExtractedBlock block) => block.sourceText.trim())
-        .where((String value) => value.isNotEmpty)
-        .toList(growable: false);
-    if (texts.isEmpty) {
-      return '';
-    }
-    if (texts.length <= 12) {
-      return _trimMemoryText(texts.join('\n'));
-    }
-
-    const int segmentBlocks = 4;
-    const int segmentCharacterLimit = _memoryChapterTextLimit ~/ 3;
-    final int middleStart = max(0, (texts.length - segmentBlocks) ~/ 2);
-    final int endingStart = max(0, texts.length - segmentBlocks);
-    final List<String> opening = texts.take(segmentBlocks).toList();
-    final List<String> middle = texts
-        .skip(middleStart)
-        .take(segmentBlocks)
-        .toList();
-    final List<String> ending = texts
-        .skip(endingStart)
-        .take(segmentBlocks)
-        .toList();
-
-    return <String>[
-      '[Opening]\n${_trimStyleSegment(opening, segmentCharacterLimit)}',
-      '[Middle]\n${_trimStyleSegment(middle, segmentCharacterLimit)}',
-      '[Ending]\n${_trimStyleSegment(ending, segmentCharacterLimit)}',
-    ].join('\n');
-  }
-
-  static String _trimStyleSegment(List<String> texts, int limit) {
-    final String collapsed = texts
-        .join('\n')
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
-    if (collapsed.length <= limit) {
-      return collapsed;
-    }
-    return '${collapsed.substring(0, limit - 3)}...';
-  }
-
-  static TranslationStyleProfile _parseStyleProfileResponse(
-    Map<String, dynamic> jsonPayload,
-  ) {
-    Object? candidate = jsonPayload['styleProfile'];
-    if (candidate is! Map) {
-      candidate = jsonPayload;
-    }
-    final Map<String, Object?> styleJson = <String, Object?>{
-      for (final MapEntry<dynamic, dynamic> entry in candidate.entries)
-        entry.key.toString(): entry.value,
-    };
-    // Common alternate key names from model drift.
-    styleJson.putIfAbsent(
-      'primaryGenre',
-      () => styleJson['genre'] ?? styleJson['primary_genre'],
-    );
-    styleJson.putIfAbsent(
-      'secondaryGenres',
-      () => styleJson['secondary'] ?? styleJson['tags'],
-    );
-    styleJson.putIfAbsent(
-      'translationConstraints',
-      () => styleJson['constraints'] ?? styleJson['do'],
-    );
-    final TranslationStyleProfile profile = TranslationStyleProfile.fromJson(
-      styleJson,
-    );
-    if (!profile.isEmpty) {
-      return profile;
-    }
-    // Last-resort: if model only returned a genre-like string field.
-    final String genre = TranslationStyleProfile.fromJson(<String, Object?>{
-      'primaryGenre': styleJson['primaryGenre'],
-    }).primaryGenre;
-    if (genre.isEmpty) {
-      return TranslationStyleProfile.empty;
-    }
-    return TranslationStyleProfile(
-      primaryGenre: genre,
-      confidence: TranslationStyleConfidenceParsing.parse(
-        styleJson['confidence'],
-      ),
-    );
   }
 
   Future<Map<String, Object?>> updateBookMemoryAfterChapterForTest({
@@ -670,7 +432,7 @@ class EpubChapterTranslator {
     required Map<String, Object?> currentMemory,
     required InspectedChapter chapter,
   }) async {
-    return (await _updateBookMemoryAfterChapter(
+    return (await _memory.updateBookMemoryAfterChapter(
       dio: dio,
       config: config,
       currentMemory: _BookMemory.fromJson(currentMemory),
@@ -696,7 +458,40 @@ class EpubChapterTranslator {
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
-    _beginDegradedTracking();
+    final TranslationRunContext run = TranslationRunContext(
+      concurrency: config.maxConcurrent,
+      cancelToken: cancelToken,
+      isCancelled: isCancelled,
+    );
+    final EpubChapterTranslator invocation = _invocation(run);
+    _run = run;
+    run.watchCancellation();
+    try {
+      return await invocation._translateChapters(
+        inputPath: inputPath,
+        outputDirectory: outputDirectory,
+        config: config,
+        chapters: chapters,
+        cancelToken: run.cancelToken,
+        confirmedStyleProfile: confirmedStyleProfile,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
+      );
+    } finally {
+      run.dispose();
+    }
+  }
+
+  Future<TranslationRunResult> _translateChapters({
+    required String inputPath,
+    required String outputDirectory,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    required CancelToken cancelToken,
+    TranslationStyleProfile? confirmedStyleProfile,
+    TranslationProgressCallback? onProgress,
+    TranslationCancellationCheck? isCancelled,
+  }) async {
     // Localized strings for the user-visible run log; the run's UI language
     // comes from the config, not from a BuildContext (see runLog* keys).
     final AppStrings s = AppStrings(config.uiLanguage);
@@ -829,8 +624,6 @@ class EpubChapterTranslator {
       int memoryRequestCount = 0;
       int footnoteBatchCount = 0;
       int footnoteRequestCount = 0;
-      DateTime lastResumeSaveAt = DateTime.now();
-      int blocksSinceResumeSave = 0;
 
       final TranslationStyleProfile? confirmedProfile =
           config.styleProfileEnabled ? confirmedStyleProfile : null;
@@ -902,97 +695,46 @@ class EpubChapterTranslator {
       }
 
       void throwIfCancelled() {
-        if (cancelToken.isCancelled || (isCancelled?.call() ?? false)) {
-          throw const TranslationCancelledException();
-        }
+        _run.throwIfCancelled();
       }
 
-      bool cacheWriteFailed = false;
-      bool checkpointSaveFailed = false;
-
-      /// Best-effort block-cache write. The cache is an acceleration layer,
-      /// not part of correctness: a full disk, a permission change, or an
-      /// antivirus file lock must never abort a translation whose API
-      /// responses are already in memory. The in-memory translations keep
-      /// flowing to the final repack; the first failure is logged once so
-      /// the run report stays honest. Returns whether the write succeeded
-      /// so write counters do not inflate the final report with failed
-      /// writes.
-      Future<bool> cachePutBestEffort(
-        String cacheKey,
-        String translatedHtml,
-      ) async {
-        final Object? cacheError = await putBlockCacheErrorForTest(
-          _cacheStore,
-          cacheKey,
-          translatedHtml,
-        );
-        if (cacheError != null) {
+      final TranslationProgressPersistence
+      persistence = TranslationProgressPersistence(
+        cacheStore: _cacheStore,
+        stateFor: (TranslationJob job) => _resumeStateFromJob(
+          jobKey: jobKey,
+          inputFingerprint: inputFingerprint,
+          job: job,
+        ),
+        onCacheError: (Object cacheError, bool firstFailure) {
           AppLogger.warn(
             'Block cache write failed (${cacheError.runtimeType}); continuing '
             'without cache.',
             tag: 'translate',
           );
-          if (!cacheWriteFailed) {
-            cacheWriteFailed = true;
+          if (firstFailure) {
             emit(
               currentJob,
               s.runLogCacheWriteFailing('${cacheError.runtimeType}'),
             );
           }
-        }
-        return cacheError == null;
-      }
-
-      Future<void> saveResumeState(
-        TranslationJob job, {
-        bool force = false,
-      }) async {
-        final DateTime now = DateTime.now();
-        if (!force &&
-            blocksSinceResumeSave < 20 &&
-            now.difference(lastResumeSaveAt) < const Duration(seconds: 10)) {
-          return;
-        }
-        await _cacheStore.saveJobState(
-          _resumeStateFromJob(
-            jobKey: jobKey,
-            inputFingerprint: inputFingerprint,
-            job: job,
-          ),
-        );
-        lastResumeSaveAt = now;
-        blocksSinceResumeSave = 0;
-      }
-
-      /// Best-effort checkpoint write. Mirrors [cachePutBestEffort]: the
-      /// checkpoint is a resume aid, not part of correctness, and on
-      /// Windows a transient antivirus/OneDrive lock can make the atomic
-      /// rename of `jobs/<jobKey>.json` throw a FileSystemException. That
-      /// must never kill a run whose translations are already in memory
-      /// (and paid for). The first failure is logged once and reported to
-      /// the job log; later saves keep being attempted silently.
-      Future<void> saveResumeStateBestEffort(
-        TranslationJob job, {
-        bool force = false,
-      }) async {
-        try {
-          await saveResumeState(job, force: force);
-        } catch (error) {
+        },
+        onCheckpointError: (Object error, bool firstFailure) {
           AppLogger.warn(
             'Checkpoint save failed (${error.runtimeType}); continuing '
             'without a fresh checkpoint.',
             tag: 'translate',
           );
-          if (!checkpointSaveFailed) {
-            checkpointSaveFailed = true;
+          if (firstFailure) {
             emit(
               currentJob,
               s.runLogCheckpointSaveFailing('${error.runtimeType}'),
             );
           }
-        }
-      }
+        },
+      );
+      final cachePutBestEffort = persistence.putBlock;
+      final saveResumeStateBestEffort = persistence.save;
 
       if (previousState != null) {
         emit(
@@ -1113,16 +855,16 @@ class EpubChapterTranslator {
         initialBookMemoryAttempted = true;
         throwIfCancelled();
         try {
-          final bool hasInitialMemorySources = _initialMemorySourceChapters(
-            chapters,
-          ).isNotEmpty;
+          final bool hasInitialMemorySources =
+              _EpubBookMemory._initialMemorySourceChapters(chapters).isNotEmpty;
           final Stopwatch memoryStopwatch = Stopwatch()..start();
-          final _BookMemory initialMemory = await _generateInitialBookMemory(
-            dio: dio,
-            config: config,
-            chapters: chapters,
-            cancelToken: cancelToken,
-          );
+          final _BookMemory initialMemory = await _memory
+              .generateInitialBookMemory(
+                dio: dio,
+                config: config,
+                chapters: chapters,
+                cancelToken: cancelToken,
+              );
           bookMemory = userStyleProfile == null
               ? initialMemory
               : initialMemory.copyWith(
@@ -1385,7 +1127,7 @@ class EpubChapterTranslator {
             )) {
               apiTranslatedBlocks += 1;
             }
-            blocksSinceResumeSave += 1;
+            persistence.blockCompleted();
             currentJob = currentJob.copyWith(
               progress: completedBlocks / totalBlocks,
               currentChapter: reference.chapter.title,
@@ -1402,85 +1144,98 @@ class EpubChapterTranslator {
           totalCacheWriteElapsed += cacheStopwatch.elapsed;
         }
 
-        for (int batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-          throwIfCancelled();
-          final FootnoteTranslationBatch batch = batches[batchIndex];
-          final Stopwatch batchStopwatch = Stopwatch()..start();
-          Duration batchApiElapsed = Duration.zero;
-          int requestCount = 0;
+        await const TranslationWorkQueue().map<FootnoteTranslationBatch, void>(
+          batches,
+          concurrency: concurrency,
+          throwIfCancelled: throwIfCancelled,
+          process: (FootnoteTranslationBatch batch, int batchIndex) async {
+            final Stopwatch batchStopwatch = Stopwatch()..start();
+            Duration batchApiElapsed = Duration.zero;
+            int requestCount = 0;
 
-          Future<Map<String, String>> sendFootnoteRequest(
-            FootnoteTranslationBatch requestBatch,
-          ) async {
-            final Stopwatch requestStopwatch = Stopwatch()..start();
+            Future<Map<String, String>> sendFootnoteRequest(
+              FootnoteTranslationBatch requestBatch,
+            ) async {
+              final Stopwatch requestStopwatch = Stopwatch()..start();
+              try {
+                return await _strategy._translateFootnoteBatch(
+                  dio: dio,
+                  config: config,
+                  batch: requestBatch,
+                  cancelToken: cancelToken,
+                  onRequestAttempt: () {
+                    requestCount += 1;
+                    footnoteRequestCount += 1;
+                  },
+                );
+              } finally {
+                requestStopwatch.stop();
+                batchApiElapsed += requestStopwatch.elapsed;
+                totalApiElapsed += requestStopwatch.elapsed;
+              }
+            }
+
             try {
-              return await _translateFootnoteBatch(
-                dio: dio,
-                config: config,
-                batch: requestBatch,
-                cancelToken: cancelToken,
-                onRequestAttempt: () {
-                  requestCount += 1;
-                  footnoteRequestCount += 1;
-                },
-              );
-            } finally {
-              requestStopwatch.stop();
-              batchApiElapsed += requestStopwatch.elapsed;
-              totalApiElapsed += requestStopwatch.elapsed;
-            }
-          }
-
-          try {
-            final Map<String, String> translated = await sendFootnoteRequest(
-              batch,
-            );
-            await persistTranslations(batch.references, translated);
-            await saveResumeStateBestEffort(currentJob, force: true);
-          } catch (error) {
-            if (error is! DioException ||
-                !TranslationApiClient.shouldFallbackBatchDioException(error)) {
-              rethrow;
-            }
-            if (batch.references.length <= 1) {
-              rethrow;
-            }
-            for (final FootnoteBlockReference reference in batch.references) {
-              throwIfCancelled();
               final Map<String, String> translated = await sendFootnoteRequest(
-                FootnoteTranslationBatch(<FootnoteBlockReference>[
-                  reference,
-                ], context: batch.context),
+                batch,
               );
-              await persistTranslations(<FootnoteBlockReference>[
-                reference,
-              ], translated);
+              await persistTranslations(batch.references, translated);
+              await saveResumeStateBestEffort(currentJob, force: true);
+            } catch (error) {
+              if (error is! DioException ||
+                  !TranslationApiClient.shouldFallbackBatchDioException(
+                    error,
+                  )) {
+                rethrow;
+              }
+              if (batch.references.length <= 1) {
+                rethrow;
+              }
+              await const TranslationWorkQueue()
+                  .map<FootnoteBlockReference, void>(
+                    batch.references,
+                    concurrency: concurrency,
+                    throwIfCancelled: throwIfCancelled,
+                    process:
+                        (FootnoteBlockReference reference, int index) async {
+                          final Map<String, String> translated =
+                              await sendFootnoteRequest(
+                                FootnoteTranslationBatch(
+                                  <FootnoteBlockReference>[reference],
+                                  context: batch.context,
+                                ),
+                              );
+                          await persistTranslations(<FootnoteBlockReference>[
+                            reference,
+                          ], translated);
+                        },
+                  );
+              await saveResumeStateBestEffort(currentJob, force: true);
             }
-            await saveResumeStateBestEffort(currentJob, force: true);
-          }
-          batchStopwatch.stop();
-          footnoteBatchCount += 1;
-          emit(
-            currentJob,
-            s.runLogFootnoteBatchPerformance(
-              batchIndex + 1,
-              batches.length,
-              batch.references.length,
-              requestCount,
-              _formatDuration(batchStopwatch.elapsed),
-              _formatDuration(batchApiElapsed),
-            ),
-          );
-          emit(
-            currentJob,
-            s.runLogFootnoteBatchDone(
-              completedBlocks,
-              totalBlocks,
-              batchIndex + 1,
-              batches.length,
-            ),
-          );
-        }
+            batchStopwatch.stop();
+            footnoteBatchCount += 1;
+            emit(
+              currentJob,
+              s.runLogFootnoteBatchPerformance(
+                batchIndex + 1,
+                batches.length,
+                batch.references.length,
+                requestCount,
+                _formatDuration(batchStopwatch.elapsed),
+                _formatDuration(batchApiElapsed),
+              ),
+            );
+            emit(
+              currentJob,
+              s.runLogFootnoteBatchDone(
+                completedBlocks,
+                totalBlocks,
+                batchIndex + 1,
+                batches.length,
+              ),
+            );
+          },
+        );
 
         for (
           int chapterIndex = startChapterIndex;
@@ -1626,105 +1381,71 @@ class EpubChapterTranslator {
             s.runLogPreparedBatches(batches.length, chapter.title),
           );
 
-          for (
-            int batchStart = 0;
-            batchStart < batches.length;
-            batchStart += concurrency
-          ) {
-            throwIfCancelled();
-            final int batchEnd = min(batchStart + concurrency, batches.length);
-            final List<TranslationBlockBatch> batchWindow = batches.sublist(
-              batchStart,
-              batchEnd,
-            );
-            // Each batch in this window runs concurrently; split the
-            // chapter-wide concurrency budget across them so per-batch
-            // individual fallbacks cannot burst to concurrency^2 requests.
-            final int fallbackWindow = batchWindow.isEmpty
-                ? 1
-                : (concurrency ~/ batchWindow.length).clamp(1, concurrency);
-            final List<_TimedBatchResult> translatedWindow =
-                await Future.wait<_TimedBatchResult>(
-                  batchWindow.asMap().entries.map((entry) async {
-                    final int batchNumber = batchStart + entry.key + 1;
-                    final TranslationBlockBatch batch = entry.value;
-                    final Stopwatch apiStopwatch = Stopwatch()..start();
-                    final List<String> translated = await _translateBlockBatch(
-                      dio: dio,
-                      config: config,
-                      batch: batch,
-                      chapterPath: chapter.path,
-                      cancelToken: cancelToken,
-                      fallbackWindow: fallbackWindow,
-                    );
-                    apiStopwatch.stop();
-                    // Persist this batch's translations immediately. If a
-                    // sibling batch in this window fails fatally, the
-                    // Future.wait above rethrows — but this batch's
-                    // already-billed translations are already on disk, so a
-                    // later resume reuses them instead of paying twice.
-                    // Degraded marks for this batch's own blocks are all
-                    // recorded by now, so the cacheable check is complete.
-                    final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
-                    final List<int> cacheableIndexes = <int>[
-                      for (
-                        int index = 0;
-                        index < batch.blocks.length;
-                        index += 1
-                      )
-                        if (!_isDegradedBlock(
+          await const TranslationWorkQueue().map<TranslationBlockBatch, void>(
+            batches,
+            concurrency: concurrency,
+            throwIfCancelled: throwIfCancelled,
+            process: (TranslationBlockBatch batch, int batchIndex) async {
+              final int batchNumber = batchIndex + 1;
+              final Stopwatch apiStopwatch = Stopwatch()..start();
+              final List<String> translated = await _strategy
+                  .translateBlockBatch(
+                    dio: dio,
+                    config: config,
+                    batch: batch,
+                    chapterPath: chapter.path,
+                    cancelToken: cancelToken,
+                  );
+              apiStopwatch.stop();
+              // Persist paid responses before reporting completion,
+              // including when another worker has already failed.
+              // Degraded marks for this batch's own blocks are all
+              // recorded by now, so the cacheable check is complete.
+              final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
+              final List<int> cacheableIndexes = <int>[
+                for (int index = 0; index < batch.blocks.length; index += 1)
+                  if (!_isDegradedBlock(
+                    chapterPath: chapter.path,
+                    blockId: batch.blocks[index].id,
+                  ))
+                    index,
+              ];
+              final List<bool> cacheWriteResults =
+                  await Future.wait<bool>(<Future<bool>>[
+                    for (final int index in cacheableIndexes)
+                      cachePutBestEffort(
+                        _blockCacheKey(
+                          config,
+                          batch.blocks[index],
                           chapterPath: chapter.path,
-                          blockId: batch.blocks[index].id,
-                        ))
-                          index,
-                    ];
-                    final List<bool> cacheWriteResults =
-                        await Future.wait<bool>(<Future<bool>>[
-                          for (final int index in cacheableIndexes)
-                            cachePutBestEffort(
-                              _blockCacheKey(
-                                config,
-                                batch.blocks[index],
-                                chapterPath: chapter.path,
-                                inputFingerprint: inputFingerprint,
-                                contextIdentity: contextIdentity,
-                                confirmedStyleProfile: userStyleProfile,
-                              ),
-                              translated[index],
-                            ),
-                        ]);
-                    cacheWriteStopwatch.stop();
-                    // Count only the writes that actually succeeded: a
-                    // swallowed cache failure must not inflate the final
-                    // "cache writes" report.
-                    final int succeededCacheWrites = cacheWriteResults
-                        .where((bool ok) => ok)
-                        .length;
-                    // Each compound assignment below executes synchronously
-                    // (no await between read and write), so concurrent
-                    // window closures cannot interleave mid-update.
-                    chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-                    totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-                    chapterCacheWrites += succeededCacheWrites;
-                    cacheWriteCount += succeededCacheWrites;
-                    return _TimedBatchResult(
-                      batch: batch,
-                      translatedBlocks: translated,
-                      batchNumber: batchNumber,
-                      elapsed: apiStopwatch.elapsed,
-                    );
-                  }),
-                );
-            throwIfCancelled();
-
-            for (
-              int batchIndex = 0;
-              batchIndex < translatedWindow.length;
-              batchIndex += 1
-            ) {
+                          inputFingerprint: inputFingerprint,
+                          contextIdentity: contextIdentity,
+                          confirmedStyleProfile: userStyleProfile,
+                        ),
+                        translated[index],
+                      ),
+                  ]);
+              cacheWriteStopwatch.stop();
+              // Count only the writes that actually succeeded: a
+              // swallowed cache failure must not inflate the final
+              // "cache writes" report.
+              final int succeededCacheWrites = cacheWriteResults
+                  .where((bool ok) => ok)
+                  .length;
+              // Each compound assignment below executes synchronously
+              // (no await between read and write), so concurrent
+              // window closures cannot interleave mid-update.
+              chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+              totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+              chapterCacheWrites += succeededCacheWrites;
+              cacheWriteCount += succeededCacheWrites;
+              final _TimedBatchResult timedBatch = _TimedBatchResult(
+                batch: batch,
+                translatedBlocks: translated,
+                batchNumber: batchNumber,
+                elapsed: apiStopwatch.elapsed,
+              );
               throwIfCancelled();
-              final _TimedBatchResult timedBatch = translatedWindow[batchIndex];
-              final TranslationBlockBatch batch = timedBatch.batch;
               final List<String> translatedBatch = timedBatch.translatedBlocks;
               chapterApiElapsed += timedBatch.elapsed;
               totalApiElapsed += timedBatch.elapsed;
@@ -1753,7 +1474,7 @@ class EpubChapterTranslator {
                 );
                 translatedById[sourceBlock.id] = translatedBlock;
                 completedBlocks += 1;
-                blocksSinceResumeSave += 1;
+                persistence.blockCompleted();
                 final TranslationJob nextJob = currentJob.copyWith(
                   progress: completedBlocks / totalBlocks,
                   currentChapter: chapter.title,
@@ -1778,8 +1499,8 @@ class EpubChapterTranslator {
                   chapter.title,
                 ),
               );
-            }
-          }
+            },
+          );
 
           completedFiles += 1;
           chapterStopwatch.stop();
@@ -1836,7 +1557,7 @@ class EpubChapterTranslator {
             await ensureInitialBookMemory();
             try {
               final Stopwatch memoryStopwatch = Stopwatch()..start();
-              bookMemory = await _updateBookMemoryAfterChapter(
+              bookMemory = await _memory.updateBookMemoryAfterChapter(
                 dio: dio,
                 config: config,
                 currentMemory: bookMemory ?? _BookMemory.empty,
@@ -2183,402 +1904,6 @@ class EpubChapterTranslator {
     return TranslationRunResult(job: completedJob, chapters: chapters);
   }
 
-  Future<String> _translateBlock({
-    required Dio dio,
-    required TranslationConfig config,
-    required ExtractedBlock block,
-    required TranslationBatchContext context,
-    String? chapterPath,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    TranslationStyleProfile styleProfile = TranslationStyleProfile.empty,
-    bool styleProfileConfirmed = false,
-  }) async {
-    Object? lastError;
-    String? lastCleaned;
-    String? lastLocked;
-    for (int attempt = 1; ; attempt += 1) {
-      try {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        String userContent = block.sourceHtml;
-        if (attempt > 1 && lastError != null) {
-          // Tell the model why the previous attempt was rejected so a clean
-          // retry has a concrete instruction instead of repeating the same
-          // (often untranslated) output. Keep the reason lossy/safe — never
-          // embed the raw exception or API key here.
-          final String reason = _safeErrorText(
-            lastError,
-            config,
-          ).replaceAll(RegExp(r'\s+'), ' ').trim();
-          final String retryInstruction = _isEmptyTranslationResponse(lastError)
-              ? 'The previous response was empty. Return a complete HTML '
-                    'fragment with every human-readable text node translated '
-                    'into ${config.targetLanguage}.'
-              : 'Translate every human-readable text node into '
-                    '${config.targetLanguage}.';
-          userContent =
-              '$userContent\n\n'
-              '[RETRY] The previous translation was rejected for this reason: '
-              '$reason. $retryInstruction Only titles, proper names, and '
-              'reference data (such as author names, journal names, volume, '
-              'issue, year, and page numbers in a bibliography entry) may '
-              'stay in the original language. Return the complete HTML '
-              'fragment with all tags, attributes, and inline emphasis '
-              'preserved.';
-        }
-        final Map<String, dynamic> requestData = <String, dynamic>{
-          'model': config.model,
-          'temperature': 0.2,
-          'messages': <Map<String, String>>[
-            <String, String>{
-              'role': 'system',
-              'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
-            },
-            if (!context.isEmpty) _fallbackContextMessage(context),
-            <String, String>{'role': 'user', 'content': userContent},
-          ],
-        };
-        final Response<dynamic> response = await _apiClient.postChatCompletions(
-          dio: dio,
-          data: requestData,
-          cancelToken: cancelToken,
-        );
-
-        final String cleaned = _apiClient
-            .extractMessageContent(response.data)
-            .trim();
-        lastCleaned = cleaned;
-        if (cleaned.isEmpty) {
-          throw const FormatException(
-            'The translation API returned an empty block.',
-          );
-        }
-        final String locked = _lockTranslatedHtmlStructure(block, cleaned);
-        lastLocked = locked;
-        _validateTranslatedBlockQuality(
-          config: config,
-          block: block,
-          translatedHtml: locked,
-        );
-        return locked;
-      } catch (error) {
-        if (_isCancelError(error) || error is TranslationCancelledException) {
-          throw const TranslationCancelledException();
-        }
-        // 401/403/404 are deterministic configuration errors: fail fast with
-        // the precise diagnostic instead of burning maxRetries attempts.
-        if (TranslationApiClient.isDeterministicHttpError(error)) {
-          throw StateError(
-            TranslationApiClient.deterministicHttpErrorMessage(error, config),
-          );
-        }
-        lastError = error;
-        // A parse failure is deterministic for the same prompt (re-sending
-        // the block would just bill the same request again), and a 413 on a
-        // single block means even one block is too large to ever succeed:
-        // break out and let the normal failure path degrade/throw instead
-        // of wasting retries.
-        final bool payloadTooLarge =
-            error is DioException && error.response?.statusCode == 413;
-        if (error is TranslationParseException ||
-            payloadTooLarge ||
-            attempt >=
-                TranslationApiClient.maxAttemptsForError(config, error)) {
-          break;
-        }
-        await TranslationApiClient.delayUnlessCancelled(
-          retryDelayOverride ??
-              TranslationApiClient.retryDelayForError(config, error, attempt),
-          cancelToken: cancelToken,
-        );
-      }
-    }
-    // A residual-quality rejection that survives every retry must NOT abort
-    // the whole book. The model is not reliably deterministic: one unstable
-    // batch reply that leaves a source-language run can fail all retries even
-    // when the same block translates correctly on another call. Degrade that
-    // one block to its last usable translation (or the source HTML when no
-    // reply ever came back), record it for the run report, and keep going.
-    // Degrade to the last usable translation. Prefer the structure-locked
-    // variant so a quality rejection does not let tag/attribute drift from
-    // the raw model reply leak into the EPUB.
-    String degradeFallback() {
-      final String? usable =
-          lastLocked ??
-          (lastCleaned != null && lastCleaned.trim().isNotEmpty
-              ? lastCleaned
-              : null);
-      return usable ?? block.sourceHtml;
-    }
-
-    if (lastError is FormatException && _isQualityRejection(lastError)) {
-      _markDegradedBlock(
-        chapterPath: chapterPath ?? '',
-        blockId: block.id,
-        apiCounted: true,
-      );
-      return degradeFallback();
-    }
-    if (lastError is FormatException &&
-        _isEmptyTranslationResponse(lastError)) {
-      throw StateError(
-        'Translation failed after ${config.maxRetries} attempts for block '
-        '${block.id}: the translation API returned empty content.',
-      );
-    }
-    if (TranslationApiClient.isRequestTimeout(lastError)) {
-      _markDegradedBlock(
-        chapterPath: chapterPath ?? '',
-        blockId: block.id,
-        apiCounted: true,
-      );
-      return degradeFallback();
-    }
-    if (lastError is TranslationParseException) {
-      // A single block whose reply never parsed (e.g. a non-JSON gateway
-      // response) is deterministic for this prompt but not systemic: re-
-      // sending would just re-bill the same broken prompt. Degrade this
-      // block instead of aborting the whole book — consistent with the
-      // footnote path, which also degrades per item on parse failures. A
-      // systematically broken gateway degrades every block, and the run is
-      // then marked failed via allBlocksDegraded, so nothing is silently
-      // shipped in the source language.
-      _markDegradedBlock(
-        chapterPath: chapterPath ?? '',
-        blockId: block.id,
-        apiCounted: true,
-      );
-      AppLogger.warn(
-        'Block ${block.id} kept its source text: the translation API '
-        'returned an unparseable response (${lastError.runtimeType}).',
-        tag: 'translate',
-      );
-      return degradeFallback();
-    }
-    if (lastError is DioException && lastError.error is HandshakeException) {
-      final String host = Uri.parse(
-        _apiClient.normalizedBaseUrl(config.apiBaseUrl),
-      ).host;
-      throw StateError(
-        'TLS handshake failed while connecting to $host. The API endpoint may be blocked on this network, require a proxy/VPN, or be interrupted by certificate inspection.',
-      );
-    }
-    throw StateError(
-      'Translation failed after ${config.maxRetries} attempts: $lastError',
-    );
-  }
-
-  /// Whether [error] is a residual-quality gate rejection. Other transport
-  /// failures remain fatal unless they are explicitly handled below.
-  static bool _isQualityRejection(Object error) {
-    final String message = error.toString();
-    return RegExp(
-      r'Possible untranslated source-language text remains in block '
-      r'|Possible untranslated source-language token '
-      r'|Possible untranslated source-language text',
-    ).hasMatch(message);
-  }
-
-  static bool _isEmptyTranslationResponse(Object error) {
-    return error is FormatException &&
-        error.toString().contains(
-          'The translation API returned an empty block.',
-        );
-  }
-
-  Future<_BookMemory> _generateInitialBookMemory({
-    required Dio dio,
-    required TranslationConfig config,
-    required List<InspectedChapter> chapters,
-    CancelToken? cancelToken,
-  }) async {
-    final List<Map<String, String>> sourceChapters =
-        _initialMemorySourceChapters(chapters);
-    if (sourceChapters.isEmpty) {
-      return _BookMemory.empty;
-    }
-
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'kind': 'initialBookMemory',
-      'targetLanguage': config.targetLanguage,
-      'styleProfileEnabled': config.styleProfileEnabled,
-      'chapters': sourceChapters,
-    };
-    final String styleProfilePrompt = config.styleProfileEnabled
-        ? ' Also return styleProfile as an object with keys: primaryGenre, secondaryGenres, tone, sentenceStyle, translationConstraints, avoid, confidence. primaryGenre should be a practical book type such as business nonfiction, science fiction, romance, historical fiction, literary fiction, mystery, fantasy, memoir, or self-help. secondaryGenres is a short string array. tone and sentenceStyle are short phrases. translationConstraints and avoid are short actionable string arrays for translators. confidence must be one of: high, medium, low. If evidence is weak, set confidence to low and keep constraints conservative. Prefer executable style rules over marketing labels. Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language.'
-        : ' Do not invent a styleProfile.';
-    final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
-      dio: dio,
-      config: config,
-      payload: payload,
-      systemPrompt:
-          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${config.styleProfileEnabled ? ', styleProfile' : ''}. Keep bookSummary under 120 words. styleGuide is a short string array. glossary is an array of objects with source and target. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
-      cancelToken: cancelToken,
-    );
-    final _BookMemory memory = _BookMemory.fromJson(jsonPayload);
-    if (!config.styleProfileEnabled) {
-      return memory.copyWith(clearStyleProfile: true);
-    }
-    return memory;
-  }
-
-  Future<_BookMemory> _updateBookMemoryAfterChapter({
-    required Dio dio,
-    required TranslationConfig config,
-    required _BookMemory currentMemory,
-    required InspectedChapter chapter,
-    CancelToken? cancelToken,
-  }) async {
-    final String chapterText = _chapterMemoryText(
-      chapter,
-      preferTranslated: true,
-    );
-    if (chapterText.isEmpty) {
-      return currentMemory;
-    }
-
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'kind': 'chapterMemory',
-      'targetLanguage': config.targetLanguage,
-      'bookMemory': currentMemory.toJson(),
-      'chapter': <String, String>{
-        'title': chapter.title,
-        'category': chapter.category.name,
-        'text': chapterText,
-      },
-    };
-    final Map<String, dynamic> jsonPayload = await _requestMemoryJson(
-      dio: dio,
-      config: config,
-      payload: payload,
-      systemPrompt:
-          'Summarize the just-translated EPUB chapter into rolling translation memory. Return strict JSON only with keys: title, summary, continuityNotes, glossary. Keep summary under 100 words. continuityNotes is a short string array focused on unresolved plot, tone, names, and terminology for later chapters. glossary is an array of objects with source and target. Write notes for ${config.targetLanguage}.',
-      cancelToken: cancelToken,
-    );
-    return currentMemory.mergeChapter(_ChapterMemory.fromJson(jsonPayload));
-  }
-
-  Future<Map<String, dynamic>> _requestMemoryJson({
-    required Dio dio,
-    required TranslationConfig config,
-    required Map<String, dynamic> payload,
-    required String systemPrompt,
-    CancelToken? cancelToken,
-  }) {
-    return _apiClient.runRetried<Map<String, dynamic>>(
-      config: config,
-      shouldRetry: TranslationApiClient.shouldRetryBatchError,
-      cancelToken: cancelToken,
-      operation: () async {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        final Response<dynamic> response = await _apiClient.postChatCompletions(
-          dio: dio,
-          data: <String, dynamic>{
-            'model': config.model,
-            'temperature': 0.1,
-            'max_tokens': 900,
-            'messages': <Map<String, String>>[
-              <String, String>{'role': 'system', 'content': systemPrompt},
-              <String, String>{'role': 'user', 'content': jsonEncode(payload)},
-            ],
-          },
-          cancelToken: cancelToken,
-        );
-        return _apiClient.decodeJsonObject(
-          _apiClient.extractMessageContent(response.data),
-        );
-      },
-    );
-  }
-
-  static List<Map<String, String>> _initialMemorySourceChapters(
-    List<InspectedChapter> chapters,
-  ) {
-    final List<InspectedChapter> eligibleChapters = chapters
-        .where(
-          (InspectedChapter chapter) =>
-              chapter.includeInTranslation &&
-              !FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter),
-        )
-        .toList(growable: false);
-    final List<InspectedChapter> selected = <InspectedChapter>[];
-
-    void addChapter(InspectedChapter chapter) {
-      if (selected.any(
-        (InspectedChapter selectedChapter) =>
-            selectedChapter.path == chapter.path,
-      )) {
-        return;
-      }
-      selected.add(chapter);
-    }
-
-    for (final InspectedChapter chapter
-        in eligibleChapters
-            .where(
-              (InspectedChapter chapter) =>
-                  chapter.category == ChapterCategory.frontMatter,
-            )
-            .take(_initialMemoryFrontMatterLimit)) {
-      addChapter(chapter);
-    }
-    for (final InspectedChapter chapter
-        in eligibleChapters
-            .where(
-              (InspectedChapter chapter) =>
-                  chapter.category == ChapterCategory.content,
-            )
-            .take(_initialMemoryContentLimit)) {
-      addChapter(chapter);
-    }
-    if (selected.isEmpty) {
-      for (final InspectedChapter chapter in eligibleChapters.take(
-        _initialMemoryFrontMatterLimit + _initialMemoryContentLimit,
-      )) {
-        addChapter(chapter);
-      }
-    }
-
-    return selected
-        .map(
-          (InspectedChapter chapter) => <String, String>{
-            'title': chapter.title,
-            'category': chapter.category.name,
-            'text': _chapterMemoryText(chapter),
-          },
-        )
-        .where((Map<String, String> chapter) => chapter['text']!.isNotEmpty)
-        .toList(growable: false);
-  }
-
-  static String _chapterMemoryText(
-    InspectedChapter chapter, {
-    bool preferTranslated = false,
-  }) {
-    final String text = chapter.blocks
-        .map<String>((ExtractedBlock block) {
-          final String? translatedHtml = block.translatedHtml;
-          if (preferTranslated &&
-              translatedHtml != null &&
-              translatedHtml.trim().isNotEmpty) {
-            return _plainTextFromHtmlFragment(translatedHtml);
-          }
-          return block.sourceText;
-        })
-        .where((String value) => value.trim().isNotEmpty)
-        .join('\n');
-    return _trimMemoryText(text);
-  }
-
-  static String _plainTextFromHtmlFragment(String value) {
-    return XhtmlHtmlCompatibility.parseFragment(value).text ?? '';
-  }
-
   /// Drops the per-block source HTML/text of a finished chapter to release
   /// memory. The chapter's translations are already in the block cache and
   /// staged for repack; repack only needs [InspectedChapter.originalHtml]
@@ -2616,14 +1941,6 @@ class EpubChapterTranslator {
       throw FormatException('Source block order changed: ${chapter.path}');
     }
     return chapter.copyWith(blocks: restored);
-  }
-
-  static String _trimMemoryText(String value) {
-    final String collapsed = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (collapsed.length <= _memoryChapterTextLimit) {
-      return collapsed;
-    }
-    return '${collapsed.substring(0, _memoryChapterTextLimit - 3)}...';
   }
 
   static String _lockTranslatedHtmlStructure(
@@ -2774,9 +2091,8 @@ class EpubChapterTranslator {
       return rebuiltRoot.outerHtml;
     }
 
-    final String translatedPlainText = _plainTextFromHtmlFragment(
-      trimmedTranslation,
-    );
+    final String translatedPlainText =
+        _EpubBookMemory._plainTextFromHtmlFragment(trimmedTranslation);
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
         <({_HtmlTextSlot slot, String sourceText})>[];
@@ -3478,1394 +2794,13 @@ class EpubChapterTranslator {
         '十一': '11',
       };
 
-  Future<Map<String, String>> _translateFootnoteBatch({
-    required Dio dio,
-    required TranslationConfig config,
-    required FootnoteTranslationBatch batch,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-  }) async {
-    final Set<String> requestedIds = batch.references
-        .map((FootnoteBlockReference reference) => reference.requestId)
-        .toSet();
-    if (requestedIds.length != batch.references.length) {
-      throw const FormatException(
-        'Cross-file footnote request ids must be unique.',
-      );
-    }
-
-    final List<FootnoteBlockReference> htmlReferences =
-        <FootnoteBlockReference>[];
-    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
-    for (final FootnoteBlockReference reference in batch.references) {
-      final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
-        reference.block.sourceHtml,
-      );
-      if (template != null && template.hasProtectedAnchors) {
-        slotRequests.add(
-          _ProtectedSlotRequest(
-            id: reference.requestId,
-            block: reference.block,
-            template: template,
-            chapterPath: reference.chapter.path,
-          ),
-        );
-        continue;
-      }
-      htmlReferences.add(reference);
-    }
-
-    final Map<String, String> translatedById = <String, String>{};
-    if (htmlReferences.isNotEmpty) {
-      try {
-        translatedById.addAll(
-          await _translateFootnoteHtmlBatch(
-            dio: dio,
-            config: config,
-            references: htmlReferences,
-            context: batch.context,
-            retryDelayOverride: retryDelayOverride,
-            cancelToken: cancelToken,
-            onRequestAttempt: onRequestAttempt,
-          ),
-        );
-      } on DioException catch (error) {
-        // 401/403/404/400 are deterministic configuration errors: fail fast
-        // with the precise localized diagnostic instead of burning
-        // per-reference fallback requests that would all fail the same way.
-        if (TranslationApiClient.isDeterministicHttpError(error)) {
-          throw StateError(
-            TranslationApiClient.deterministicHttpErrorMessage(error, config),
-          );
-        }
-        if (TranslationApiClient.isConnectionTimeout(error)) {
-          // A connection timeout is endpoint-wide rather than payload-size
-          // related. The batch already retried once, so retain its source
-          // blocks instead of multiplying the outage into per-block calls.
-          for (final FootnoteBlockReference reference in htmlReferences) {
-            _markDegradedBlock(
-              chapterPath: reference.chapter.path,
-              blockId: reference.block.id,
-            );
-            translatedById[reference.requestId] = reference.block.sourceHtml;
-          }
-        } else {
-          // Send and receive timeouts degrade alike: a receive timeout on a
-          // large batch can be payload related, and a send timeout means
-          // the payload never left — retrying each reference on its own
-          // (one that still times out degrades to its source HTML) matches
-          // the main block path, which degrades on any request timeout.
-          if (!TranslationApiClient.isRequestTimeout(error)) {
-            rethrow;
-          }
-          // A receive timeout on a large batch can be payload related. Retry
-          // each reference independently; one that still times out degrades
-          // to its source HTML and is reported with the run.
-          for (final FootnoteBlockReference reference in htmlReferences) {
-            try {
-              translatedById.addAll(
-                await _translateFootnoteHtmlBatch(
-                  dio: dio,
-                  config: config,
-                  references: <FootnoteBlockReference>[reference],
-                  context: batch.context,
-                  retryDelayOverride: retryDelayOverride,
-                  cancelToken: cancelToken,
-                  onRequestAttempt: onRequestAttempt,
-                ),
-              );
-            } on DioException catch (singleError) {
-              if (!TranslationApiClient.isRequestTimeout(singleError)) {
-                rethrow;
-              }
-              _markDegradedBlock(
-                chapterPath: reference.chapter.path,
-                blockId: reference.block.id,
-              );
-              translatedById[reference.requestId] = reference.block.sourceHtml;
-            }
-          }
-        }
-      } on FormatException {
-        // A malformed model reply is usually deterministic for the same
-        // prompt, so the whole batch is not re-sent. Retry each reference
-        // on its own; one that still comes back malformed degrades to its
-        // source HTML and is reported with the run instead of aborting the
-        // whole book.
-        for (final FootnoteBlockReference reference in htmlReferences) {
-          try {
-            translatedById.addAll(
-              await _translateFootnoteHtmlBatch(
-                dio: dio,
-                config: config,
-                references: <FootnoteBlockReference>[reference],
-                context: batch.context,
-                retryDelayOverride: retryDelayOverride,
-                cancelToken: cancelToken,
-                onRequestAttempt: onRequestAttempt,
-              ),
-            );
-          } on FormatException {
-            _markDegradedBlock(
-              chapterPath: reference.chapter.path,
-              blockId: reference.block.id,
-            );
-            translatedById[reference.requestId] = reference.block.sourceHtml;
-          }
-        }
-      }
-    }
-    if (slotRequests.isNotEmpty) {
-      translatedById.addAll(
-        await _translateProtectedSlotBatch(
-          dio: dio,
-          config: config,
-          requests: slotRequests,
-          context: batch.context,
-          retryDelayOverride: retryDelayOverride,
-          cancelToken: cancelToken,
-          onRequestAttempt: onRequestAttempt,
-        ),
-      );
-    }
-    return <String, String>{
-      for (final FootnoteBlockReference reference in batch.references)
-        reference.requestId: translatedById[reference.requestId]!,
-    };
-  }
-
-  Future<Map<String, String>> _translateFootnoteHtmlBatch({
-    required Dio dio,
-    required TranslationConfig config,
-    required List<FootnoteBlockReference> references,
-    required TranslationBatchContext context,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-  }) {
-    final Set<String> requestedIds = references
-        .map((FootnoteBlockReference reference) => reference.requestId)
-        .toSet();
-    final Map<String, dynamic> payloadMap = <String, dynamic>{
-      if (!context.isEmpty) 'context': context.toJson(),
-      'blocks': references
-          .map(
-            (FootnoteBlockReference reference) => <String, String>{
-              'id': reference.requestId,
-              'html': reference.block.sourceHtml,
-            },
-          )
-          .toList(),
-    };
-    final String payload = jsonEncode(payloadMap);
-
-    return _apiClient.runRetried<Map<String, String>>(
-      config: config,
-      retryDelayOverride: retryDelayOverride,
-      shouldRetry: TranslationApiClient.shouldRetryBatchError,
-      cancelToken: cancelToken,
-      operation: () async {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        final TranslationStyleProfile batchStyleProfile =
-            _styleProfileFromBookMemoryJson(context.bookMemory);
-        final bool batchStyleConfirmed =
-            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
-        final Map<String, dynamic> requestData = <String, dynamic>{
-          'model': config.model,
-          'temperature': 0.2,
-          'messages': <Map<String, String>>[
-            <String, String>{
-              'role': 'system',
-              'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
-            },
-            <String, String>{'role': 'user', 'content': payload},
-          ],
-        };
-        onRequestAttempt?.call();
-        final Response<dynamic> response = await _apiClient.postChatCompletions(
-          dio: dio,
-          data: requestData,
-          cancelToken: cancelToken,
-        );
-        final Map<String, dynamic> jsonPayload = _apiClient
-            .decodeBatchJsonPayload(response.data);
-        final Object? rawBlocks = jsonPayload['blocks'];
-        if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != references.length) {
-          throw const FormatException(
-            'Translated footnote batch length does not match request length.',
-          );
-        }
-
-        final Map<String, String> rawTranslatedById = <String, String>{};
-        for (final Object? item in rawBlocks) {
-          if (item is! Map<String, dynamic>) {
-            throw const FormatException(
-              'Translated footnote batch item is not a JSON object.',
-            );
-          }
-          final Object? rawId = item['id'];
-          final Object? rawHtml = item['html'];
-          if (rawId is! String ||
-              rawId.isEmpty ||
-              rawHtml is! String ||
-              rawHtml.trim().isEmpty) {
-            throw const FormatException(
-              'Translated footnote batch item is missing id or html.',
-            );
-          }
-          if (!requestedIds.contains(rawId)) {
-            throw FormatException(
-              'Translated footnote batch contains unknown id $rawId.',
-            );
-          }
-          if (rawTranslatedById.containsKey(rawId)) {
-            throw FormatException(
-              'Translated footnote batch contains duplicate id $rawId.',
-            );
-          }
-          rawTranslatedById[rawId] = rawHtml.trim();
-        }
-
-        final Map<String, String> translatedById = <String, String>{};
-        for (final FootnoteBlockReference reference in references) {
-          final String? translated = rawTranslatedById[reference.requestId];
-          if (translated == null) {
-            throw FormatException(
-              'Translated footnote ${reference.requestId} is missing from the batch response.',
-            );
-          }
-          final String locked = _lockTranslatedHtmlStructure(
-            reference.block,
-            translated,
-          );
-          _validateTranslatedBlockQuality(
-            config: config,
-            block: reference.block,
-            translatedHtml: locked,
-          );
-          translatedById[reference.requestId] = locked;
-        }
-        return translatedById;
-      },
-    );
-  }
-
-  Future<Map<String, String>> _translateProtectedSlotBatch({
-    required Dio dio,
-    required TranslationConfig config,
-    required List<_ProtectedSlotRequest> requests,
-    required TranslationBatchContext context,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-    int? maxBatchAttempts,
-    // The slot pipeline is shared: the main block pipeline counts every
-    // block up front (pass true so degrades are subtracted from the
-    // report), the footnote pipeline never counts degrades (leave false).
-    bool apiCounted = false,
-  }) async {
-    final Set<String> requestedIds = requests
-        .map((_ProtectedSlotRequest request) => request.id)
-        .toSet();
-    if (requestedIds.length != requests.length) {
-      throw const FormatException('Protected slot request ids must be unique.');
-    }
-    try {
-      return await _translateProtectedSlotBatchOnce(
-        dio: dio,
-        config: config,
-        requests: requests,
-        context: context,
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        onRequestAttempt: onRequestAttempt,
-        maxAttemptsOverride: maxBatchAttempts,
-      );
-    } on FormatException catch (error) {
-      if (requests.length == 1) {
-        try {
-          return await _translateProtectedSlotsIndividually(
-            dio: dio,
-            config: config,
-            request: requests.single,
-            context: context,
-            retryDelayOverride: retryDelayOverride,
-            cancelToken: cancelToken,
-            onRequestAttempt: onRequestAttempt,
-          );
-        } on FormatException catch (singleError) {
-          if (_isQualityRejection(singleError)) {
-            _markDegradedBlock(
-              chapterPath: requests.single.chapterPath,
-              blockId: requests.single.block.id,
-              apiCounted: apiCounted,
-            );
-            return <String, String>{
-              requests.single.id: requests.single.block.sourceHtml,
-            };
-          }
-          if (singleError is TranslationParseException) {
-            // A deterministic parse failure (empty reply, markdown/HTML
-            // wrapper) on one stubborn slot must not kill the whole book.
-            // The normal block path degrades per block on the same class of
-            // error; do the same here: keep the source text, record the
-            // degrade for the run report, and keep translating.
-            _markDegradedBlock(
-              chapterPath: requests.single.chapterPath,
-              blockId: requests.single.block.id,
-              apiCounted: apiCounted,
-            );
-            AppLogger.warn(
-              'Protected slot block ${requests.single.block.id} kept its '
-              'source text: the translation API returned an unparseable '
-              'response.',
-              tag: 'translate',
-            );
-            return <String, String>{
-              requests.single.id: requests.single.block.sourceHtml,
-            };
-          }
-          rethrow;
-        }
-      }
-      if (error is TranslationParseException) {
-        // Deterministic failure: the model did not return JSON for this
-        // prompt shape, so bisecting would just re-bill the same broken
-        // prompt at every level of the split. Translate each block's slots
-        // directly instead (the single-request path below still degrades
-        // quality rejections per block).
-        final Map<String, String> translated = <String, String>{};
-        for (final _ProtectedSlotRequest request in requests) {
-          translated.addAll(
-            await _translateProtectedSlotBatch(
-              dio: dio,
-              config: config,
-              requests: <_ProtectedSlotRequest>[request],
-              context: context,
-              retryDelayOverride: retryDelayOverride,
-              cancelToken: cancelToken,
-              onRequestAttempt: onRequestAttempt,
-              apiCounted: apiCounted,
-            ),
-          );
-        }
-        return translated;
-      }
-      // Validation failure on a well-formed reply: bisect, but each level
-      // gets a single attempt. A deterministic validation failure must not
-      // eat maxRetries at every level of the split.
-      final int midpoint = requests.length ~/ 2;
-      final Map<String, String> left = await _translateProtectedSlotBatch(
-        dio: dio,
-        config: config,
-        requests: requests.sublist(0, midpoint),
-        context: context,
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        onRequestAttempt: onRequestAttempt,
-        maxBatchAttempts: 1,
-        apiCounted: apiCounted,
-      );
-      final Map<String, String> right = await _translateProtectedSlotBatch(
-        dio: dio,
-        config: config,
-        requests: requests.sublist(midpoint),
-        context: context,
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        onRequestAttempt: onRequestAttempt,
-        maxBatchAttempts: 1,
-        apiCounted: apiCounted,
-      );
-      return <String, String>{...left, ...right};
-    } on DioException catch (error) {
-      if (_isCancelError(error)) {
-        throw const TranslationCancelledException();
-      }
-      // 401/403/404 are deterministic configuration errors: fail fast with
-      // the precise diagnostic instead of billing per-block fallback
-      // requests that would all fail the same way.
-      if (TranslationApiClient.isDeterministicHttpError(error)) {
-        throw StateError(
-          TranslationApiClient.deterministicHttpErrorMessage(error, config),
-        );
-      }
-      if (TranslationApiClient.isConnectionTimeout(error)) {
-        for (final _ProtectedSlotRequest request in requests) {
-          _markDegradedBlock(
-            chapterPath: request.chapterPath,
-            blockId: request.block.id,
-            apiCounted: apiCounted,
-          );
-        }
-        return <String, String>{
-          for (final _ProtectedSlotRequest request in requests)
-            request.id: request.block.sourceHtml,
-        };
-      }
-      if (TranslationApiClient.isRequestTimeout(error) &&
-          requests.length == 1) {
-        // A send timeout on a single slot request means the payload never
-        // left; degrading to the source text matches the main block path,
-        // which degrades on any request timeout instead of aborting the run.
-        _markDegradedBlock(
-          chapterPath: requests.single.chapterPath,
-          blockId: requests.single.block.id,
-          apiCounted: apiCounted,
-        );
-        return <String, String>{
-          requests.single.id: requests.single.block.sourceHtml,
-        };
-      }
-      if (!TranslationApiClient.shouldFallbackBatchDioException(error) ||
-          requests.length == 1) {
-        rethrow;
-      }
-    }
-
-    // Transport-level fallback (e.g. 413 payload too large): split the batch
-    // with the normal per-level retry policy; smaller payloads usually pass.
-    final int midpoint = requests.length ~/ 2;
-    final Map<String, String> left = await _translateProtectedSlotBatch(
-      dio: dio,
-      config: config,
-      requests: requests.sublist(0, midpoint),
-      context: context,
-      retryDelayOverride: retryDelayOverride,
-      cancelToken: cancelToken,
-      onRequestAttempt: onRequestAttempt,
-      apiCounted: apiCounted,
-    );
-    final Map<String, String> right = await _translateProtectedSlotBatch(
-      dio: dio,
-      config: config,
-      requests: requests.sublist(midpoint),
-      context: context,
-      retryDelayOverride: retryDelayOverride,
-      cancelToken: cancelToken,
-      onRequestAttempt: onRequestAttempt,
-      apiCounted: apiCounted,
-    );
-    return <String, String>{...left, ...right};
-  }
-
-  Future<Map<String, String>> _translateProtectedSlotBatchOnce({
-    required Dio dio,
-    required TranslationConfig config,
-    required List<_ProtectedSlotRequest> requests,
-    required TranslationBatchContext context,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-    int? maxAttemptsOverride,
-  }) {
-    final Set<String> requestedIds = requests
-        .map((_ProtectedSlotRequest request) => request.id)
-        .toSet();
-    final Map<String, _ProtectedSlotRequest> requestById =
-        <String, _ProtectedSlotRequest>{
-          for (final _ProtectedSlotRequest request in requests)
-            request.id: request,
-        };
-    final String payload = jsonEncode(<String, Object?>{
-      if (!context.isEmpty) 'context': context.toJson(),
-      'blocks': requests
-          .map((_ProtectedSlotRequest request) => request.toJson())
-          .toList(growable: false),
-    });
-
-    return _apiClient.runRetried<Map<String, String>>(
-      config: config,
-      retryDelayOverride: retryDelayOverride,
-      shouldRetry: TranslationApiClient.shouldRetryBatchError,
-      cancelToken: cancelToken,
-      maxAttemptsOverride: maxAttemptsOverride,
-      operation: () async {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        final TranslationStyleProfile batchStyleProfile =
-            _styleProfileFromBookMemoryJson(context.bookMemory);
-        final bool batchStyleConfirmed =
-            _styleProfileConfirmedFromBookMemoryJson(context.bookMemory);
-        final Map<String, dynamic> requestData = <String, dynamic>{
-          'model': config.model,
-          'temperature': 0.2,
-          'messages': <Map<String, String>>[
-            <String, String>{
-              'role': 'system',
-              'content':
-                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
-            },
-            <String, String>{'role': 'user', 'content': payload},
-          ],
-        };
-        onRequestAttempt?.call();
-        final Response<dynamic> response = await _apiClient.postChatCompletions(
-          dio: dio,
-          data: requestData,
-          cancelToken: cancelToken,
-        );
-        final Map<String, dynamic> jsonPayload = _apiClient
-            .decodeBatchJsonPayload(response.data);
-        final Object? rawBlocks = jsonPayload['blocks'];
-        if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != requests.length) {
-          throw const FormatException(
-            'Translated slot block count does not match request count.',
-          );
-        }
-
-        final Map<String, List<String>> translatedSlotsById =
-            <String, List<String>>{};
-        for (final Object? rawBlock in rawBlocks) {
-          if (rawBlock is! Map<String, dynamic> ||
-              rawBlock.keys.toSet().difference(const <String>{
-                'id',
-                'slots',
-              }).isNotEmpty ||
-              const <String>{
-                'id',
-                'slots',
-              }.difference(rawBlock.keys.toSet()).isNotEmpty) {
-            throw const FormatException(
-              'Translated slot block must contain only id and slots.',
-            );
-          }
-          final Object? rawId = rawBlock['id'];
-          final Object? rawSlots = rawBlock['slots'];
-          if (rawId is! String ||
-              !requestedIds.contains(rawId) ||
-              translatedSlotsById.containsKey(rawId)) {
-            throw const FormatException(
-              'Translated slot response contains an unknown or duplicate block id.',
-            );
-          }
-          final _ProtectedSlotRequest request = requestById[rawId]!;
-          if (rawSlots is! List<dynamic> ||
-              rawSlots.length != request.template.slotTexts.length) {
-            throw FormatException(
-              'Translated slot count does not match block $rawId.',
-            );
-          }
-          final Map<String, String> textBySlotId = <String, String>{};
-          final Set<String> expectedSlotIds = request.slotIds.toSet();
-          for (final Object? rawSlot in rawSlots) {
-            if (rawSlot is! Map<String, dynamic> ||
-                rawSlot.keys.toSet().difference(const <String>{
-                  'id',
-                  'text',
-                }).isNotEmpty ||
-                const <String>{
-                  'id',
-                  'text',
-                }.difference(rawSlot.keys.toSet()).isNotEmpty) {
-              throw const FormatException(
-                'Translated slot must contain only id and text.',
-              );
-            }
-            final Object? rawSlotId = rawSlot['id'];
-            final Object? rawText = rawSlot['text'];
-            if (rawSlotId is! String ||
-                !expectedSlotIds.contains(rawSlotId) ||
-                textBySlotId.containsKey(rawSlotId) ||
-                rawText is! String) {
-              throw const FormatException(
-                'Translated slot contains an unknown or duplicate id, or non-string text.',
-              );
-            }
-            textBySlotId[rawSlotId] = rawText;
-          }
-          translatedSlotsById[rawId] = request.slotIds
-              .map((String slotId) => textBySlotId[slotId]!)
-              .toList(growable: false);
-        }
-
-        return <String, String>{
-          for (final _ProtectedSlotRequest request in requests)
-            request.id: _renderAndValidateProtectedSlots(
-              config: config,
-              request: request,
-              translatedSlots: translatedSlotsById[request.id]!,
-            ),
-        };
-      },
-    );
-  }
-
-  Future<Map<String, String>> _translateProtectedSlotsIndividually({
-    required Dio dio,
-    required TranslationConfig config,
-    required _ProtectedSlotRequest request,
-    required TranslationBatchContext context,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-  }) async {
-    // A manual retry loop instead of runRetried so that (a) a whole-round
-    // retry carries the previous failure reason into the prompt — like
-    // _translateBlock's [RETRY] instruction, a blind re-send of the same
-    // prompt usually reproduces the same rejection — and (b) a repeated
-    // *identical* render/quality failure stops re-billing the whole round:
-    // the model is deterministically reproducing the rejected shape, so
-    // further rounds would just burn tokens. The caller then degrades the
-    // block instead of aborting the book.
-    final Set<String> seenFailureSignatures = <String>{};
-    String? retryReason;
-    for (int attempt = 1; ; attempt += 1) {
-      try {
-        if (cancelToken?.isCancelled ?? false) {
-          throw const TranslationCancelledException();
-        }
-        return await _translateProtectedSlotsIndividuallyOnce(
-          dio: dio,
-          config: config,
-          request: request,
-          context: context,
-          retryDelayOverride: retryDelayOverride,
-          cancelToken: cancelToken,
-          onRequestAttempt: onRequestAttempt,
-          retryReason: retryReason,
-        );
-      } catch (error, stackTrace) {
-        if (error is TranslationCancelledException || _isCancelError(error)) {
-          throw const TranslationCancelledException();
-        }
-        final bool retryable = TranslationApiClient.shouldRetryBatchError(
-          error,
-        );
-        final int maxAttempts = TranslationApiClient.maxAttemptsForError(
-          config,
-          error,
-        );
-        final String signature = _safeErrorText(
-          error,
-          config,
-        ).replaceAll(RegExp(r'\s+'), ' ').trim();
-        final bool repeatedDeterministic =
-            error is FormatException &&
-            error is! TranslationParseException &&
-            !seenFailureSignatures.add(signature);
-        if (!retryable || repeatedDeterministic || attempt >= maxAttempts) {
-          Error.throwWithStackTrace(error, stackTrace);
-        }
-        retryReason = signature;
-        await TranslationApiClient.delayUnlessCancelled(
-          retryDelayOverride ??
-              TranslationApiClient.retryDelayForError(config, error, attempt),
-          cancelToken: cancelToken,
-        );
-      }
-    }
-  }
-
-  Future<Map<String, String>> _translateProtectedSlotsIndividuallyOnce({
-    required Dio dio,
-    required TranslationConfig config,
-    required _ProtectedSlotRequest request,
-    required TranslationBatchContext context,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-    String? retryReason,
-  }) async {
-    final List<String> translatedSlots = <String>[];
-    for (final String sourceText in request.template.slotTexts) {
-      // Retry at the slot level: a transient failure on slot k must not
-      // re-bill the slots that already translated cleanly. A render/quality
-      // failure of the rebuilt block still retries the whole round via the
-      // loop in [_translateProtectedSlotsIndividually].
-      translatedSlots.add(
-        await _apiClient.runRetried<String>(
-          config: config,
-          retryDelayOverride: retryDelayOverride,
-          shouldRetry: TranslationApiClient.shouldRetryBatchError,
-          cancelToken: cancelToken,
-          operation: () => _translateProtectedSlotTextOnce(
-            dio: dio,
-            config: config,
-            sourceText: sourceText,
-            context: context,
-            cancelToken: cancelToken,
-            onRequestAttempt: onRequestAttempt,
-            retryReason: retryReason,
-          ),
-        ),
-      );
-    }
-    return <String, String>{
-      request.id: _renderAndValidateProtectedSlots(
-        config: config,
-        request: request,
-        translatedSlots: translatedSlots,
-      ),
-    };
-  }
-
-  Future<String> _translateProtectedSlotTextOnce({
-    required Dio dio,
-    required TranslationConfig config,
-    required String sourceText,
-    required TranslationBatchContext context,
-    CancelToken? cancelToken,
-    void Function()? onRequestAttempt,
-    String? retryReason,
-  }) async {
-    final String trimmedSource = sourceText.trim();
-    if (cancelToken?.isCancelled ?? false) {
-      throw const TranslationCancelledException();
-    }
-    // Tell the model why the previous whole-round attempt was rejected so
-    // the retry has a concrete instruction instead of reproducing the same
-    // rejected shape. The reason is lossy/safe — never the raw exception.
-    final String userText = retryReason == null
-        ? trimmedSource
-        : '$trimmedSource\n\n[RETRY] The previous translation was rejected '
-              'for this reason: $retryReason. Translate the text again into '
-              '${config.targetLanguage}, returning only the translated text '
-              'with no JSON, HTML, Markdown formatting, labels, or '
-              'explanation.';
-    final TranslationStyleProfile batchStyleProfile =
-        _styleProfileFromBookMemoryJson(context.bookMemory);
-    final bool batchStyleConfirmed = _styleProfileConfirmedFromBookMemoryJson(
-      context.bookMemory,
-    );
-    final Map<String, dynamic> requestData = <String, dynamic>{
-      'model': config.model,
-      'temperature': 0.2,
-      'messages': <Map<String, String>>[
-        <String, String>{
-          'role': 'system',
-          'content':
-              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
-        },
-        if (!context.isEmpty) _fallbackContextMessage(context),
-        <String, String>{'role': 'user', 'content': userText},
-      ],
-    };
-    onRequestAttempt?.call();
-    final Response<dynamic> response = await _apiClient.postChatCompletions(
-      dio: dio,
-      data: requestData,
-      cancelToken: cancelToken,
-    );
-    final String translated = _apiClient.extractMessageContent(response.data);
-    _validateIndividualSlotTranslation(
-      sourceText: trimmedSource,
-      translatedText: translated,
-    );
-    return translated.trim();
-  }
-
-  /// Matches an HTML tag open inside a protected-slot translation
-  /// (`<p>`, `</p>`, `<!DOCTYPE …>`, `<?xml …>`). The `<` must be
-  /// immediately followed by a letter, `/`, `!` or `?`: `a < b > c` is
-  /// plain text (browsers treat `< ` as text, not markup), so a comparison
-  /// must not trip the wrapper detector — otherwise it would burn
-  /// maxRetries² paid retries across the nested retry layers.
-  static final RegExp _slotWrapperTagPattern = RegExp(r'</?[A-Za-z!?][^>]*>');
-
-  /// Test hook for [_slotWrapperTagPattern].
+  /// Test-visible detector used by individual protected-slot translation.
   @visibleForTesting
   static bool slotTranslationHasWrapperTag(String text) =>
-      _slotWrapperTagPattern.hasMatch(text);
-
-  static void _validateIndividualSlotTranslation({
-    required String sourceText,
-    required String translatedText,
-  }) {
-    final String trimmed = translatedText.trim();
-    if (trimmed.isEmpty) {
-      // Deterministic: re-sending the same prompt will not make the model
-      // produce content, so throw TranslationParseException (no retry) rather
-      // than FormatException (which the retry policy would re-bill).
-      throw const TranslationParseException(
-        'Individual protected slot translation is empty.',
-      );
-    }
-    if (trimmed.contains('```') ||
-        _hasUnexpectedJsonWrapper(
-          sourceText: sourceText,
-          translatedText: trimmed,
-        ) ||
-        _hasMarkdownWrapper(trimmed) ||
-        RegExp(r'<!--[\s\S]*?-->').hasMatch(trimmed) ||
-        // See [_slotWrapperTagPattern]: `<` must abut a letter/`/`/`!`/`?`
-        // or a comparison like "a < b" is misread as markup.
-        _slotWrapperTagPattern.hasMatch(trimmed) ||
-        _hasTranslationExplanationPrefix(trimmed)) {
-      throw const TranslationParseException(
-        'Individual protected slot translation contains wrapper content.',
-      );
-    }
-  }
-
-  static bool _hasMarkdownWrapper(String value) {
-    if (RegExp(r'^`{1,2}[\s\S]+`{1,2}$').hasMatch(value) ||
-        RegExp(r'^~~[\s\S]+~~$').hasMatch(value) ||
-        RegExp(r'^\*\*[\s\S]+\*\*$').hasMatch(value) ||
-        RegExp(r'^__[\s\S]+__$').hasMatch(value) ||
-        RegExp(r'^\*[\s\S]+\*$').hasMatch(value) ||
-        RegExp(r'^_[\s\S]+_$').hasMatch(value) ||
-        RegExp(r'!?\[[^\]\r\n]+\]\([^\)\r\n]+\)').hasMatch(value)) {
-      return true;
-    }
-    return value
-        .split(RegExp(r'\r?\n'))
-        .any(
-          (String line) =>
-              RegExp(r'^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s+').hasMatch(line) ||
-              RegExp(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$').hasMatch(line) ||
-              RegExp(r'^\s*\|.*\|\s*$').hasMatch(line),
-        );
-  }
-
-  static bool _hasTranslationExplanationPrefix(String value) {
-    return RegExp(
-          r'^(?:(?:好的|当然|可以|没问题)[，,。.!！\s]*)?(?:(?:以下|下面)是)?(?:译文|翻译(?:结果|内容)?)(?:如下)?\s*[:：]',
-        ).hasMatch(value) ||
-        RegExp(
-          r"^(?:(?:sure|certainly|of course|okay|ok)[,!.]?\s*)?(?:here(?:'s| is)\s+)?(?:the\s+)?(?:translation|translated text)(?:\s+is)?\s*[:：]",
-          caseSensitive: false,
-        ).hasMatch(value);
-  }
-
-  static bool _hasUnexpectedJsonWrapper({
-    required String sourceText,
-    required String translatedText,
-  }) {
-    if (!RegExp(
-      r'^[\[{"\d\-]|^(?:true|false|null)$',
-    ).hasMatch(translatedText)) {
-      return false;
-    }
-    try {
-      final Object? decoded = jsonDecode(translatedText);
-      if (decoded is String) {
-        final String source = sourceText.trim();
-        return !(source.startsWith('"') && source.endsWith('"'));
-      }
-      return true;
-    } on FormatException {
-      return false;
-    }
-  }
-
-  static String _renderAndValidateProtectedSlots({
-    required TranslationConfig config,
-    required _ProtectedSlotRequest request,
-    required List<String> translatedSlots,
-  }) {
-    final String rendered = request.template.render(translatedSlots);
-    _validateTranslatedBlockQuality(
-      config: config,
-      block: request.block,
-      translatedHtml: rendered,
-    );
-    return rendered;
-  }
-
-  /// Parses [sourceHtml] for protected-anchor slot translation, returning
-  /// null when the fragment does not meet [ProtectedAnchorTextSlots.parse]'s
-  /// single-root requirement. [ProtectedAnchorTextSlots.containsProtectedAnchors]
-  /// is intentionally looser than [parse] (it also covers ordinary
-  /// multi-root HTML), so a block can pass the check yet fail the parse;
-  /// falling back to the plain HTML path keeps one odd block from failing
-  /// its whole batch.
-  static ProtectedAnchorTextSlots? _tryParseProtectedSlots(String sourceHtml) {
-    try {
-      return ProtectedAnchorTextSlots.parse(sourceHtml);
-    } on FormatException {
-      return null;
-    }
-  }
-
-  Future<List<String>> _translateBlockBatch({
-    required Dio dio,
-    required TranslationConfig config,
-    required TranslationBlockBatch batch,
-    String? chapterPath,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    int? fallbackWindow,
-  }) async {
-    final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
-    final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
-    for (final ExtractedBlock block in batch.blocks) {
-      final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
-        block.sourceHtml,
-      );
-      if (template != null && template.hasProtectedAnchors) {
-        slotRequests.add(
-          _ProtectedSlotRequest(
-            id: block.id,
-            block: block,
-            template: template,
-            chapterPath: chapterPath ?? '',
-          ),
-        );
-        continue;
-      }
-      htmlBlocks.add(block);
-    }
-
-    final Map<String, String> translatedById = <String, String>{};
-    if (htmlBlocks.isNotEmpty) {
-      final List<String> translatedHtml = await _translateHtmlBlockBatch(
-        dio: dio,
-        config: config,
-        chapterPath: chapterPath,
-        batch: TranslationBlockBatch(htmlBlocks, context: batch.context),
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        fallbackWindow: fallbackWindow,
-      );
-      for (int index = 0; index < htmlBlocks.length; index += 1) {
-        translatedById[htmlBlocks[index].id] = translatedHtml[index];
-      }
-    }
-    if (slotRequests.isNotEmpty) {
-      translatedById.addAll(
-        await _translateProtectedSlotBatch(
-          dio: dio,
-          config: config,
-          requests: slotRequests,
-          context: batch.context,
-          retryDelayOverride: retryDelayOverride,
-          cancelToken: cancelToken,
-          // Main block pipeline: every block was counted up front, so a
-          // degraded slot must be subtracted from the report.
-          apiCounted: true,
-        ),
-      );
-    }
-    return batch.blocks
-        .map((ExtractedBlock block) => translatedById[block.id]!)
-        .toList(growable: false);
-  }
-
-  Future<List<String>> _translateHtmlBlockBatch({
-    required Dio dio,
-    required TranslationConfig config,
-    required TranslationBlockBatch batch,
-    String? chapterPath,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    int? fallbackWindow,
-  }) async {
-    final Map<String, dynamic> payloadMap = <String, dynamic>{
-      if (!batch.context.isEmpty) 'context': batch.context.toJson(),
-      'blocks': batch.blocks
-          .map(
-            (ExtractedBlock block) => <String, String>{
-              'id': block.id,
-              'html': block.sourceHtml,
-            },
-          )
-          .toList(),
-    };
-    final String payload = jsonEncode(payloadMap);
-
-    try {
-      final _BatchParseOutcome
-      parsed = await _apiClient.runRetried<_BatchParseOutcome>(
-        config: config,
-        retryDelayOverride: retryDelayOverride,
-        shouldRetry: TranslationApiClient.shouldRetryBatchError,
-        cancelToken: cancelToken,
-        operation: () async {
-          if (cancelToken?.isCancelled ?? false) {
-            throw const TranslationCancelledException();
-          }
-          final TranslationStyleProfile batchStyleProfile =
-              _styleProfileFromBookMemoryJson(batch.context.bookMemory);
-          final bool batchStyleConfirmed =
-              _styleProfileConfirmedFromBookMemoryJson(
-                batch.context.bookMemory,
-              );
-          final Map<String, dynamic> requestData = <String, dynamic>{
-            'model': config.model,
-            'temperature': 0.2,
-            'messages': <Map<String, String>>[
-              <String, String>{
-                'role': 'system',
-                'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
-              },
-              <String, String>{'role': 'user', 'content': payload},
-            ],
-          };
-          final Response<dynamic> response = await _apiClient
-              .postChatCompletions(
-                dio: dio,
-                data: requestData,
-                cancelToken: cancelToken,
-              );
-
-          final Map<String, dynamic> jsonPayload = _apiClient
-              .decodeBatchJsonPayload(response.data);
-          final Object? blocksJson = jsonPayload['blocks'];
-          if (blocksJson is! List) {
-            throw const FormatException(
-              'Translated batch blocks is not a JSON array.',
-            );
-          }
-          if (blocksJson.length != batch.blocks.length) {
-            throw const FormatException(
-              'Translated batch length does not match request length.',
-            );
-          }
-
-          final Map<String, String> translatedById = <String, String>{};
-          for (final dynamic item in blocksJson) {
-            if (item is! Map<String, dynamic>) {
-              throw const FormatException(
-                'Translated batch item is not a JSON object.',
-              );
-            }
-            final Object? id = item['id'];
-            final Object? html = item['html'];
-            if (id is! String || html is! String || html.trim().isEmpty) {
-              throw const FormatException(
-                'Translated batch item is missing id or html.',
-              );
-            }
-            translatedById[id] = html.trim();
-          }
-
-          final Map<String, String> okById = <String, String>{};
-          final List<ExtractedBlock> failedBlocks = <ExtractedBlock>[];
-          for (final ExtractedBlock block in batch.blocks) {
-            try {
-              final String? translated = translatedById[block.id];
-              if (translated == null || translated.isEmpty) {
-                throw const FormatException(
-                  'A translated block is missing from the batch response.',
-                );
-              }
-              final String locked = _lockTranslatedHtmlStructure(
-                block,
-                translated,
-              );
-              _validateTranslatedBlockQuality(
-                config: config,
-                block: block,
-                translatedHtml: locked,
-              );
-              okById[block.id] = locked;
-            } on FormatException catch (error) {
-              // A residual-quality rejection is often transient: let it
-              // bubble up so the whole batch is retried instead of paying
-              // per-block fallback requests for a glitch that a re-send
-              // usually fixes.
-              if (_isQualityRejection(error)) {
-                rethrow;
-              }
-              // One structurally bad block must not discard the blocks that
-              // already parsed cleanly and passed quality: only the failures
-              // are re-sent individually below instead of re-billing the
-              // whole batch.
-              failedBlocks.add(block);
-            }
-          }
-          return _BatchParseOutcome(okById: okById, failedBlocks: failedBlocks);
-        },
-      );
-      if (parsed.failedBlocks.isNotEmpty) {
-        final TranslationStyleProfile fallbackStyleProfile =
-            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
-        final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
-          batch.context.bookMemory,
-        );
-        final List<String> retried = await _translateBlocksIndividually(
-          dio: dio,
-          config: config,
-          batch: TranslationBlockBatch(
-            parsed.failedBlocks,
-            context: batch.context,
-          ),
-          chapterPath: chapterPath,
-          styleProfile: fallbackStyleProfile,
-          styleProfileConfirmed: fallbackConfirmed,
-          retryDelayOverride: retryDelayOverride,
-          fallbackWindow: fallbackWindow,
-          cancelToken: cancelToken,
-        );
-        for (int index = 0; index < parsed.failedBlocks.length; index += 1) {
-          parsed.okById[parsed.failedBlocks[index].id] = retried[index];
-        }
-      }
-      return <String>[
-        for (final ExtractedBlock block in batch.blocks)
-          parsed.okById[block.id]!,
-      ];
-    } on DioException catch (error) {
-      if (_isCancelError(error)) {
-        throw const TranslationCancelledException();
-      }
-      // 401/403/404 are deterministic configuration errors: fail fast with
-      // the precise diagnostic instead of billing per-block fallback
-      // requests that would all fail the same way.
-      if (TranslationApiClient.isDeterministicHttpError(error)) {
-        throw StateError(
-          TranslationApiClient.deterministicHttpErrorMessage(error, config),
-        );
-      }
-      if (TranslationApiClient.isConnectionTimeout(error)) {
-        for (final ExtractedBlock block in batch.blocks) {
-          _markDegradedBlock(
-            chapterPath: chapterPath ?? '',
-            blockId: block.id,
-            apiCounted: true,
-          );
-        }
-        return batch.blocks
-            .map((ExtractedBlock block) => block.sourceHtml)
-            .toList(growable: false);
-      }
-      if (TranslationApiClient.shouldFallbackBatchDioException(error)) {
-        final TranslationStyleProfile fallbackStyleProfile =
-            _styleProfileFromBookMemoryJson(batch.context.bookMemory);
-        final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
-          batch.context.bookMemory,
-        );
-        return _translateBlocksIndividually(
-          dio: dio,
-          config: config,
-          batch: batch,
-          chapterPath: chapterPath,
-          styleProfile: fallbackStyleProfile,
-          styleProfileConfirmed: fallbackConfirmed,
-          retryDelayOverride: retryDelayOverride,
-          cancelToken: cancelToken,
-          fallbackWindow: fallbackWindow,
-        );
-      }
-      rethrow;
-    } on FormatException catch (_) {
-      final TranslationStyleProfile fallbackStyleProfile =
-          _styleProfileFromBookMemoryJson(batch.context.bookMemory);
-      final bool fallbackConfirmed = _styleProfileConfirmedFromBookMemoryJson(
-        batch.context.bookMemory,
-      );
-      return _translateBlocksIndividually(
-        dio: dio,
-        config: config,
-        batch: batch,
-        chapterPath: chapterPath,
-        styleProfile: fallbackStyleProfile,
-        styleProfileConfirmed: fallbackConfirmed,
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        fallbackWindow: fallbackWindow,
-      );
-    }
-  }
-
-  /// Fallback for a failed batch: re-translate its blocks individually, but
-  /// still honoring [config.maxConcurrent]. A batch can hold dozens of small
-  /// blocks, so an unbounded [Future.wait] here would burst that many
-  /// simultaneous API requests and trip server-side rate limits.
-  Future<List<String>> _translateBlocksIndividually({
-    required Dio dio,
-    required TranslationConfig config,
-    required TranslationBlockBatch batch,
-    String? chapterPath,
-    required TranslationStyleProfile styleProfile,
-    required bool styleProfileConfirmed,
-    Duration? retryDelayOverride,
-    CancelToken? cancelToken,
-    bool Function()? isCancelled,
-    int? fallbackWindow,
-  }) async {
-    bool cancelled() =>
-        cancelToken?.isCancelled == true || (isCancelled?.call() ?? false);
-    // The per-batch fallback shares the chapter-wide concurrency budget with
-    // the outer batch window that is already running this batch in parallel:
-    // without this, a fallback storm would burst to maxConcurrent^2
-    // simultaneous API requests.
-    final int requestedLimit =
-        fallbackWindow ?? (config.maxConcurrent < 1 ? 1 : config.maxConcurrent);
-    final int limit = requestedLimit < 1 ? 1 : requestedLimit;
-    final List<String> results = <String>[];
-    for (int start = 0; start < batch.blocks.length; start += limit) {
-      if (cancelled()) {
-        throw const TranslationCancelledException();
-      }
-      final int end = min(start + limit, batch.blocks.length);
-      final List<String> window = await Future.wait<String>(
-        batch.blocks.sublist(start, end).map((ExtractedBlock block) async {
-          try {
-            return await _translateBlock(
-              dio: dio,
-              config: config,
-              block: block,
-              context: batch.context,
-              chapterPath: chapterPath,
-              retryDelayOverride: retryDelayOverride,
-              cancelToken: cancelToken,
-              styleProfile: styleProfile,
-              styleProfileConfirmed: styleProfileConfirmed,
-            );
-          } catch (error) {
-            if (error is TranslationCancelledException ||
-                _isCancelError(error)) {
-              rethrow;
-            }
-            // Fatal block failures stay loud: _translateBlock only throws
-            // StateError for systemic problems (a persistently empty reply,
-            // a TLS failure, ...), and the caller reports those with the
-            // block id instead of silently shipping source text.
-            if (error is StateError) {
-              rethrow;
-            }
-            // One stubborn block with an unexpected non-fatal error must not
-            // discard the windows that already succeeded (and were already
-            // billed) or abort the whole book. Degrade it to its source
-            // HTML, record it for the run report, and keep translating the
-            // rest.
-            _markDegradedBlock(
-              chapterPath: chapterPath ?? '',
-              blockId: block.id,
-              apiCounted: true,
-            );
-            AppLogger.warn(
-              'Block ${block.id} kept its source text after repeated '
-              'failures (${error.runtimeType}).',
-              tag: 'translate',
-            );
-            return block.sourceHtml;
-          }
-        }),
-      );
-      results.addAll(window);
-    }
-    return results;
-  }
-
-  TranslationStyleProfile _styleProfileFromBookMemoryJson(
-    Map<String, Object?>? bookMemory,
-  ) {
-    if (bookMemory == null) {
-      return TranslationStyleProfile.empty;
-    }
-    final Object? raw = bookMemory['styleProfile'];
-    if (raw is Map<String, Object?>) {
-      return TranslationStyleProfile.fromJson(raw);
-    }
-    if (raw is Map) {
-      return TranslationStyleProfile.fromJson(
-        raw.map(
-          (dynamic key, dynamic value) =>
-              MapEntry<String, Object?>(key.toString(), value),
-        ),
-      );
-    }
-    return TranslationStyleProfile.empty;
-  }
-
-  bool _styleProfileConfirmedFromBookMemoryJson(
-    Map<String, Object?>? bookMemory,
-  ) {
-    if (bookMemory == null) {
-      return false;
-    }
-    final Object? raw = bookMemory['styleProfileConfirmed'];
-    return raw == true;
-  }
-
-  String _styleProfileInstruction({
-    required TranslationConfig config,
-    TranslationStyleProfile? styleProfile,
-    bool confirmed = false,
-  }) {
-    if (!config.styleProfileEnabled) {
-      return '';
-    }
-    final TranslationStyleProfile? profile = styleProfile;
-    if (profile == null || profile.isEmpty) {
-      return '';
-    }
-    if (confirmed) {
-      return profile.toConfirmedPromptInstruction(
-        targetLanguage: config.targetLanguage,
-      );
-    }
-    return profile.toPromptInstruction(targetLanguage: config.targetLanguage);
-  }
-
-  /// Terminology gloss rule that applies to every translation path.
-  ///
-  /// For CJK targets (mainly Chinese), a term that is hard to transliterate and
-  /// carries real historical/technical meaning (for example "assarting") should
-  /// be translated and, on its FIRST occurrence in the book, kept in the
-  /// original language inside full-width parentheses as a gloss. Later
-  /// occurrences use only the translated form. This helps preserve semantic
-  /// precision without leaving bare source-language tokens flagged by the
-  /// residual-quality check.
-  String _terminologyGlossInstruction({required TranslationConfig config}) {
-    if (!_isCjkTargetLanguage(config.targetLanguage)) {
-      return '';
-    }
-    return ' For a term that is hard to transliterate and carries real '
-        'historical or technical meaning (for example "assarting" meaning '
-        '"clearing forest land"), translate it into ${config.targetLanguage} '
-        'and, on its first occurrence in the book, keep the original term '
-        'inside full-width parentheses as a gloss, for example '
-        'assarting（伐林开垦）. On later occurrences use only the translated '
-        'form without parentheses. Keep the gloss term inside the same inline '
-        'text run and exact same element as the translated term would occupy.';
-  }
-
-  /// Second-person formality rule for Chinese targets, applied to every
-  /// translation path like the terminology gloss rule.
-  ///
-  /// Models tend to mix 你 (informal) and 您 (formal) within one book;
-  /// published Chinese translations conventionally use 您 throughout, so
-  /// the rule is stated explicitly. Prompt-level only: a model can still
-  /// deviate, but in practice the explicit instruction holds.
-  String _chineseSecondPersonInstruction({required TranslationConfig config}) {
-    final String normalized = config.targetLanguage.trim().toLowerCase();
-    final bool isChinese =
-        normalized.contains('chinese') ||
-        normalized.contains('中文') ||
-        normalized.contains('汉语') ||
-        normalized.contains('漢語');
-    if (!isChinese) {
-      return '';
-    }
-    // Second-person formality is a pragmatic judgment, not a fixed rule: the
-    // model chooses between 您 and 你 from the speaker/addressee relationship
-    // visible in context. Prompt-level only; consistency for the same speaker
-    // pair across batches is best-effort.
-    return ' When the target language is Chinese, choose between 您 (formal) '
-        'and 你 (informal) for the second person based on the relationship '
-        'between speaker and addressee: use 您 for strangers, business or '
-        'service interactions, and respectful address; use 你 for family, '
-        'close friends, lovers, children, and the narrator\'s intimate asides '
-        'to the reader (for example, "you see" as a discourse marker becomes '
-        '你看, not 您看). Once chosen for a given pair of speakers, keep it '
-        'consistent throughout the book.';
-  }
-
-  /// Universal (not language-gated): render meaning, not words. Idioms,
-  /// metaphors, and figurative expressions must be translated by their
-  /// intended meaning in natural target-language phrasing, never word for
-  /// word. Prompt-level only; the model can still produce translationese.
-  String _idiomaticTranslationInstruction() {
-    return ' Translate meaning, not words: render idioms, metaphors, and '
-        'figurative expressions by their intended meaning in natural, '
-        'idiomatic target-language phrasing. Never translate them word for '
-        'word or calque source-language metaphors literally.';
-  }
+      _EpubTranslationStrategy._slotWrapperTagPattern.hasMatch(text);
 
   static String idiomaticTranslationInstructionForTest() {
-    return EpubChapterTranslator()._idiomaticTranslationInstruction();
+    return EpubChapterTranslator()._strategy._idiomaticTranslationInstruction();
   }
 
   /// Whether [text] already appears to be in the target language's script.
@@ -4921,7 +2856,7 @@ class EpubChapterTranslator {
           <String, String>{'role': 'user', 'content': originalTitle},
         ],
       };
-      final Response<dynamic> response = await _apiClient.postChatCompletions(
+      final Response<dynamic> response = await _postChatCompletions(
         dio: dio,
         data: requestData,
         cancelToken: cancelToken,
@@ -5604,263 +3539,6 @@ class _HtmlTextSlot {
   }
 }
 
-class _BookMemory {
-  const _BookMemory({
-    this.bookSummary = '',
-    this.styleGuide = const <String>[],
-    this.glossary = const <Map<String, String>>[],
-    this.recentChapters = const <_ChapterMemory>[],
-    this.styleProfile = TranslationStyleProfile.empty,
-    this.styleProfileConfirmed = false,
-  });
-
-  static const _BookMemory empty = _BookMemory();
-
-  factory _BookMemory.fromJson(Map<String, Object?> json) {
-    final Object? rawStyleProfile = json['styleProfile'];
-    final TranslationStyleProfile styleProfile =
-        rawStyleProfile is Map<String, Object?>
-        ? TranslationStyleProfile.fromJson(rawStyleProfile)
-        : rawStyleProfile is Map
-        ? TranslationStyleProfile.fromJson(
-            rawStyleProfile.map(
-              (dynamic key, dynamic value) =>
-                  MapEntry<String, Object?>(key.toString(), value),
-            ),
-          )
-        : TranslationStyleProfile.empty;
-    return _BookMemory(
-      bookSummary: _stringValue(json['bookSummary']),
-      styleGuide: _stringList(
-        json['styleGuide'],
-        limit: EpubChapterTranslator._memoryListLimit,
-      ),
-      glossary: _glossaryList(json['glossary']),
-      recentChapters: _chapterMemoryList(json['recentChapters']),
-      styleProfile: styleProfile,
-      styleProfileConfirmed: json['styleProfileConfirmed'] == true,
-    );
-  }
-
-  final String bookSummary;
-  final List<String> styleGuide;
-  final List<Map<String, String>> glossary;
-  final List<_ChapterMemory> recentChapters;
-  final TranslationStyleProfile styleProfile;
-  final bool styleProfileConfirmed;
-
-  bool get isEmpty =>
-      bookSummary.trim().isEmpty &&
-      styleGuide.isEmpty &&
-      glossary.isEmpty &&
-      recentChapters.isEmpty &&
-      styleProfile.isEmpty;
-
-  _BookMemory copyWith({
-    String? bookSummary,
-    List<String>? styleGuide,
-    List<Map<String, String>>? glossary,
-    List<_ChapterMemory>? recentChapters,
-    TranslationStyleProfile? styleProfile,
-    bool? styleProfileConfirmed,
-    bool clearStyleProfile = false,
-  }) {
-    return _BookMemory(
-      bookSummary: bookSummary ?? this.bookSummary,
-      styleGuide: styleGuide ?? this.styleGuide,
-      glossary: glossary ?? this.glossary,
-      recentChapters: recentChapters ?? this.recentChapters,
-      styleProfile: clearStyleProfile
-          ? TranslationStyleProfile.empty
-          : (styleProfile ?? this.styleProfile),
-      styleProfileConfirmed: clearStyleProfile
-          ? false
-          : (styleProfileConfirmed ?? this.styleProfileConfirmed),
-    );
-  }
-
-  _BookMemory mergeChapter(_ChapterMemory chapter) {
-    final List<_ChapterMemory> mergedRecent = <_ChapterMemory>[
-      ...recentChapters,
-      chapter,
-    ];
-    final List<_ChapterMemory> limitedRecent =
-        mergedRecent.length <= EpubChapterTranslator._recentChapterMemoryLimit
-        ? mergedRecent
-        : mergedRecent.sublist(
-            mergedRecent.length -
-                EpubChapterTranslator._recentChapterMemoryLimit,
-          );
-
-    return _BookMemory(
-      bookSummary: bookSummary,
-      styleGuide: styleGuide,
-      glossary: _mergeGlossary(glossary, chapter.glossary),
-      recentChapters: List<_ChapterMemory>.unmodifiable(limitedRecent),
-      styleProfile: styleProfile,
-      styleProfileConfirmed: styleProfileConfirmed,
-    );
-  }
-
-  Map<String, Object?> toJson() {
-    return <String, Object?>{
-      if (bookSummary.trim().isNotEmpty) 'bookSummary': bookSummary.trim(),
-      'styleGuide': styleGuide,
-      'glossary': glossary,
-      'recentChapters': recentChapters
-          .map((_ChapterMemory chapter) => chapter.toJson())
-          .toList(growable: false),
-      if (!styleProfile.isEmpty) 'styleProfile': styleProfile.toJson(),
-      if (styleProfileConfirmed) 'styleProfileConfirmed': true,
-    };
-  }
-
-  static String _stringValue(Object? value) {
-    return value is String ? value.trim() : '';
-  }
-
-  static List<String> _stringList(Object? value, {required int limit}) {
-    if (value is! List<dynamic>) {
-      return const <String>[];
-    }
-    return value
-        .whereType<String>()
-        .map((String item) => item.trim())
-        .where((String item) => item.isNotEmpty)
-        .take(limit)
-        .toList(growable: false);
-  }
-
-  static List<Map<String, String>> _glossaryList(Object? value) {
-    if (value is! List<dynamic>) {
-      return const <Map<String, String>>[];
-    }
-    return value
-        .whereType<Map<dynamic, dynamic>>()
-        .map((Map<dynamic, dynamic> item) {
-          final String source = _stringValue(item['source']);
-          final String target = _stringValue(item['target']);
-          if (source.isEmpty || target.isEmpty) {
-            return null;
-          }
-          return <String, String>{'source': source, 'target': target};
-        })
-        .whereType<Map<String, String>>()
-        .take(EpubChapterTranslator._memoryGlossaryLimit)
-        .toList(growable: false);
-  }
-
-  static List<_ChapterMemory> _chapterMemoryList(Object? value) {
-    if (value is! List<dynamic>) {
-      return const <_ChapterMemory>[];
-    }
-    return value
-        .whereType<Map<dynamic, dynamic>>()
-        .map(
-          (Map<dynamic, dynamic> item) => _ChapterMemory.fromJson(
-            item.map(
-              (dynamic key, dynamic value) =>
-                  MapEntry<String, Object?>(key.toString(), value),
-            ),
-          ),
-        )
-        .where((_ChapterMemory chapter) => !chapter.isEmpty)
-        .take(EpubChapterTranslator._recentChapterMemoryLimit)
-        .toList(growable: false);
-  }
-
-  static List<Map<String, String>> _mergeGlossary(
-    List<Map<String, String>> existing,
-    List<Map<String, String>> incoming,
-  ) {
-    final Map<String, Map<String, String>> merged =
-        <String, Map<String, String>>{};
-    for (final Map<String, String> entry in <Map<String, String>>[
-      ...existing,
-      ...incoming,
-    ]) {
-      merged[entry['source']!.toLowerCase()] = entry;
-    }
-    return merged.values
-        .take(EpubChapterTranslator._memoryGlossaryLimit)
-        .toList(growable: false);
-  }
-}
-
-class _ChapterMemory {
-  const _ChapterMemory({
-    required this.title,
-    required this.summary,
-    this.continuityNotes = const <String>[],
-    this.glossary = const <Map<String, String>>[],
-  });
-
-  factory _ChapterMemory.fromJson(Map<String, Object?> json) {
-    return _ChapterMemory(
-      title: _BookMemory._stringValue(json['title']),
-      summary: _BookMemory._stringValue(json['summary']),
-      continuityNotes: _BookMemory._stringList(
-        json['continuityNotes'],
-        limit: EpubChapterTranslator._memoryListLimit,
-      ),
-      glossary: _BookMemory._glossaryList(json['glossary']),
-    );
-  }
-
-  final String title;
-  final String summary;
-  final List<String> continuityNotes;
-  final List<Map<String, String>> glossary;
-
-  bool get isEmpty =>
-      title.trim().isEmpty &&
-      summary.trim().isEmpty &&
-      continuityNotes.isEmpty &&
-      glossary.isEmpty;
-
-  Map<String, Object?> toJson() {
-    return <String, Object?>{
-      if (title.trim().isNotEmpty) 'title': title.trim(),
-      if (summary.trim().isNotEmpty) 'summary': summary.trim(),
-      'continuityNotes': continuityNotes,
-      'glossary': glossary,
-    };
-  }
-}
-
-class _ProtectedSlotRequest {
-  const _ProtectedSlotRequest({
-    required this.id,
-    required this.block,
-    required this.template,
-    required this.chapterPath,
-  });
-
-  final String id;
-  final ExtractedBlock block;
-  final ProtectedAnchorTextSlots template;
-
-  /// Scopes degraded-block tracking: block ids restart per chapter, so the
-  /// bare id would collide across chapters.
-  final String chapterPath;
-
-  List<String> get slotIds => List<String>.generate(
-    template.slotTexts.length,
-    (int index) => 's$index',
-    growable: false,
-  );
-
-  Map<String, Object?> toJson() {
-    return <String, Object?>{
-      'id': id,
-      'slots': <Map<String, String>>[
-        for (int index = 0; index < template.slotTexts.length; index += 1)
-          <String, String>{'id': 's$index', 'text': template.slotTexts[index]},
-      ],
-    };
-  }
-}
-
 class _TimedBatchResult {
   const _TimedBatchResult({
     required this.batch,
@@ -5873,13 +3551,4 @@ class _TimedBatchResult {
   final List<String> translatedBlocks;
   final int batchNumber;
   final Duration elapsed;
-}
-
-/// Outcome of parsing one translated batch: blocks that parsed cleanly and
-/// passed quality, plus the blocks that failed and need an individual retry.
-class _BatchParseOutcome {
-  const _BatchParseOutcome({required this.okById, required this.failedBlocks});
-
-  final Map<String, String> okById;
-  final List<ExtractedBlock> failedBlocks;
 }

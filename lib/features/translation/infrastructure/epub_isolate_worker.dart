@@ -99,19 +99,20 @@ class EpubIsolateWorker {
     return Isolate.run(() => _loadArchiveSnapshotSync(inputPath));
   }
 
-  /// Only the small title crosses the isolate boundary. The same guarded ZIP
-  /// loader and source fingerprint used by inspection apply to this read.
+  /// Only the small title crosses the isolate boundary. ZIP limits and source
+  /// identity still apply, but only container.xml and its OPF are inflated.
   static Future<String?> readBookTitle(
     String inputPath, {
     String? expectedSourceFingerprint,
   }) {
     return Isolate.run(() {
-      final snapshot = _loadArchiveSnapshotSync(inputPath);
-      checkEpubSourceHash(snapshot.fingerprint, expectedSourceFingerprint);
+      final archive = _decodeEpubArchive(inputPath, expectedSourceFingerprint);
       try {
+        final containerFile = archive.find('META-INF/container.xml');
+        if (containerFile == null || !containerFile.isFile) return null;
         final container = xml.XmlDocument.parse(
           decodeEpubText(
-            bytes: snapshot.files['META-INF/container.xml']!,
+            bytes: _fileBytes(containerFile),
             filePath: 'META-INF/container.xml',
             strict: true,
           ),
@@ -121,10 +122,12 @@ class EpubIsolateWorker {
             .where((e) => e.name.local == 'rootfile')
             .firstOrNull
             ?.getAttribute('full-path');
-        if (opfPath == null) return null;
+        if (opfPath == null || opfPath.isEmpty) return null;
+        final opfFile = archive.find(opfPath);
+        if (opfFile == null || !opfFile.isFile) return null;
         final opf = xml.XmlDocument.parse(
           decodeEpubText(
-            bytes: snapshot.files[opfPath]!,
+            bytes: _fileBytes(opfFile),
             filePath: opfPath,
             strict: true,
           ),

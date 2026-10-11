@@ -140,6 +140,7 @@ class FailingTranslator extends EpubChapterTranslator {
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
+    TranslationCancellationCheck? isCancelled,
   }) async => throw const FormatException('Real style failure');
   @override
   Future<TranslationRunResult> translateChapters({

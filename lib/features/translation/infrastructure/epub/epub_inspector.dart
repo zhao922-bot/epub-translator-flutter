@@ -170,35 +170,55 @@ class EpubInspector {
     final List<InspectedChapter> chapters = <InspectedChapter>[];
     final List<String> missingChapterFiles = <String>[];
     int totalBlocks = 0;
-    for (int index = 0; index < chapterPaths.length; index += 1) {
+    // Keep each transfer bounded and await it before starting the next batch:
+    // progress listeners can cancel without queuing the rest of the book.
+    const int batchSize = 4;
+    for (int start = 0; start < chapterPaths.length; start += batchSize) {
       throwIfCancelled();
-      final String chapterPath = chapterPaths[index];
-      final List<int>? chapterBytes = files[chapterPath];
-      if (chapterBytes == null) {
-        // A damaged EPUB may list spine entries whose files are absent from
-        // the archive. Skip them but remember them for the completion
-        // warning below; the remaining chapters are still translatable.
-        missingChapterFiles.add(chapterPath);
-        continue;
+      final int end = (start + batchSize < chapterPaths.length)
+          ? start + batchSize
+          : chapterPaths.length;
+      final Map<String, List<int>> batch = <String, List<int>>{};
+      for (int index = start; index < end; index += 1) {
+        final String chapterPath = chapterPaths[index];
+        final List<int>? chapterBytes = files[chapterPath];
+        if (chapterBytes == null) {
+          missingChapterFiles.add(chapterPath);
+        } else {
+          batch[chapterPath] = chapterBytes;
+        }
       }
-      final InspectedChapter chapter = _extractor
-          .inspectChapterBytes(chapterPath: chapterPath, bytes: chapterBytes)
-          .copyWith(sourceIdentity: sourceIdentity);
-      chapters.add(chapter);
-      totalBlocks += chapter.blocks.length;
-      final double progress = (index + 1) / chapterPaths.length;
-      final TranslationJob nextJob = currentJob.copyWith(
-        progress: progress,
-        currentChapter: path.basename(chapterPath),
-        completedFiles: index + 1,
-        totalFiles: chapterPaths.length,
-        totalBlocks: totalBlocks,
-        status: TranslationJobStatus.running,
-      );
-      emit(
-        nextJob,
-        s.inspectLogIndexedChapter(index + 1, chapterPaths.length, chapterPath),
-      );
+      final List<InspectedChapter> indexed = batch.isEmpty
+          ? const <InspectedChapter>[]
+          : await _extractor.inspectChapterBatch(chapters: batch);
+      throwIfCancelled();
+      int resultIndex = 0;
+      for (int index = start; index < end; index += 1) {
+        throwIfCancelled();
+        final String chapterPath = chapterPaths[index];
+        if (!batch.containsKey(chapterPath)) continue;
+        final InspectedChapter chapter = indexed[resultIndex++].copyWith(
+          sourceIdentity: sourceIdentity,
+        );
+        chapters.add(chapter);
+        totalBlocks += chapter.blocks.length;
+        emit(
+          currentJob.copyWith(
+            progress: (index + 1) / chapterPaths.length,
+            currentChapter: path.basename(chapterPath),
+            completedFiles: index + 1,
+            totalFiles: chapterPaths.length,
+            totalBlocks: totalBlocks,
+            status: TranslationJobStatus.running,
+          ),
+          s.inspectLogIndexedChapter(
+            index + 1,
+            chapterPaths.length,
+            chapterPath,
+          ),
+        );
+      }
+      throwIfCancelled();
     }
 
     final List<String> warnings = <String>[

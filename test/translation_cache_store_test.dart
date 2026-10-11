@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
@@ -6,6 +8,171 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 
 void main() {
+  group('incremental cache maintenance', () {
+    late Directory root;
+    late TranslationCacheStore store;
+    late DateTime now;
+    int scans = 0;
+
+    setUp(() async {
+      root = await Directory.systemTemp.createTemp('incremental_cache_');
+      now = DateTime(2026);
+      scans = 0;
+      store = TranslationCacheStore(
+        cacheRoot: root,
+        now: () => now,
+        onMaintenanceScan: () async {
+          scans++;
+        },
+      );
+    });
+    tearDown(() async {
+      await store.waitForMaintenanceForTest();
+      await root.delete(recursive: true);
+    });
+
+    test('overwrites and parallel keys count bytes once', () async {
+      final existing = File(path.join(root.path, 'blocks', 'ab', 'abkey.html'));
+      await existing.parent.create(recursive: true);
+      await existing.writeAsString('old' * 100);
+      await store.putBlockTranslation('abkey', '你');
+      await store.waitForMaintenanceForTest();
+      expect(store.estimatedCacheBytesForTest, 3);
+      await Future.wait([
+        for (int i = 0; i < 20; i++) store.putBlockTranslation('ab$i', '你好'),
+      ]);
+      expect(store.estimatedCacheBytesForTest, 123);
+      expect(scans, 1);
+    });
+
+    test('explicit maintenance passes share a serial queue', () async {
+      final entered = Completer<void>();
+      final release = Completer<void>();
+      store = TranslationCacheStore(
+        cacheRoot: root,
+        onMaintenanceScan: () async {
+          if (++scans == 1) {
+            entered.complete();
+            await release.future;
+          }
+        },
+      );
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      final first = store.pruneCacheDirectoryForTest(root);
+      await entered.future;
+      final second = store.pruneCacheDirectoryForTest(root);
+      await Future<void>.delayed(Duration.zero);
+      expect(scans, 1);
+      release.complete();
+      await Future.wait([first, second]);
+      expect(scans, 2);
+    });
+
+    test('time threshold finds external entries', () async {
+      await store.putBlockTranslation('abfirst', '你好');
+      await store.waitForMaintenanceForTest();
+      expect(store.estimatedCacheBytesForTest, utf8.encode('你好').length);
+      for (int i = 0; i < 130; i++) {
+        await store.putBlockTranslation('abfirst', 'x');
+      }
+      expect(scans, 1);
+      expect(store.estimatedCacheBytesForTest, 1);
+      final external = File(
+        path.join(root.path, 'blocks', 'ab', 'external.html'),
+      );
+      await external.writeAsString('external');
+      now = now.add(const Duration(minutes: 5));
+      await store.putBlockTranslation('abfirst', 'x');
+      await store.waitForMaintenanceForTest();
+      expect(scans, 2);
+      expect(store.estimatedCacheBytesForTest, 9);
+    });
+
+    test('capacity triggers oldest-first eviction', () async {
+      store = TranslationCacheStore(
+        cacheRoot: root,
+        maxCacheBytes: 25,
+        now: () => now,
+        onMaintenanceScan: () async {
+          scans++;
+        },
+      );
+      await store.putBlockTranslation('abold', 'a' * 10);
+      await store.waitForMaintenanceForTest();
+      final oldest = File(path.join(root.path, 'blocks', 'ab', 'abold.html'));
+      await oldest.setLastModified(
+        DateTime.now().subtract(const Duration(hours: 1)),
+      );
+      await store.putBlockTranslation('abmid', 'b' * 10);
+      expect(scans, 1);
+      await store.putBlockTranslation('abnew', 'c' * 10);
+      await store.waitForMaintenanceForTest();
+      expect(scans, 2);
+      expect(await store.getBlockTranslation('abold'), isNull);
+      expect(await store.getBlockTranslation('abmid'), 'b' * 10);
+      expect(await store.getBlockTranslation('abnew'), 'c' * 10);
+      expect(store.estimatedCacheBytesForTest, 20);
+    });
+
+    test('blocked scans allow puts and protect replacements', () async {
+      final entered = Completer<void>();
+      final release = Completer<void>();
+      store = TranslationCacheStore(
+        cacheRoot: root,
+        maxCacheBytes: 5,
+        onMaintenanceScan: () async {
+          scans++;
+          if (scans == 1) {
+            entered.complete();
+            await release.future;
+          }
+        },
+      );
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      await store.putBlockTranslation('abkey', 'old contents');
+      await entered.future;
+      await Future.wait(
+        List.generate(
+          20,
+          (i) => store.putBlockTranslation('abkey', '你' * (i + 1)),
+        ),
+      ).timeout(const Duration(seconds: 5));
+      await store.putBlockTranslation('abnew', 'z');
+      expect(scans, 1, reason: 'in-flight maintenance requests are coalesced');
+      release.complete();
+      await store.waitForMaintenanceForTest();
+      final value = (await store.getBlockTranslation('abkey'))!;
+      expect(value, '你' * 20);
+      expect(await store.getBlockTranslation('abnew'), 'z');
+      expect(store.estimatedCacheBytesForTest, utf8.encode(value).length + 1);
+      // A subsequent pass can evict these now-stable entries.
+      await store.putBlockTranslation('abtrigger', 'q');
+      await store.waitForMaintenanceForTest();
+      expect(store.estimatedCacheBytesForTest, lessThanOrEqualTo(5));
+    });
+
+    test('maintenance failure is isolated; later maintenance runs', () async {
+      store = TranslationCacheStore(
+        cacheRoot: root,
+        now: () => now,
+        onMaintenanceScan: () async {
+          if (++scans == 1) throw StateError('scan failure');
+        },
+      );
+      await store.putBlockTranslation('abkey', 'saved');
+      await store.waitForMaintenanceForTest();
+      expect(await store.getBlockTranslation('abkey'), 'saved');
+      now = now.add(const Duration(minutes: 5));
+      await store.putBlockTranslation('abkey', 'replacement');
+      await store.waitForMaintenanceForTest();
+      expect(scans, 2);
+      expect(store.estimatedCacheBytesForTest, 11);
+    });
+  });
   group('cleanStaleAtomicTempFiles', () {
     late Directory tempDir;
 

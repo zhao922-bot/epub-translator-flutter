@@ -185,7 +185,7 @@ void main() {
     });
 
     test('accepts bracketed IPv6 literals', () {
-      expect(TranslationApiClient.proxyHostPort('[::1]:7890'), '::1:7890');
+      expect(TranslationApiClient.proxyHostPort('[::1]:7890'), '[::1]:7890');
     });
 
     test('rejects empty, portless, and malformed values', () {
@@ -204,6 +204,63 @@ void main() {
       expect(TranslationApiClient.proxyHostPort('socks5://host:1080'), isNull);
       expect(TranslationApiClient.proxyHostPort('socks5h://host:1080'), isNull);
       expect(TranslationApiClient.proxyHostPort('ftp://host:21'), isNull);
+    });
+  });
+
+  group('shared proxy parsing', () {
+    final valid = <String, String>{
+      '[::1]:7890': '[::1]:7890',
+      'http://[::1]:7890': '[::1]:7890',
+      'https://[2001:db8::1]:8080/': '[2001:db8::1]:8080',
+      '  [2001:4860:4860::8888]:65535  ': '[2001:4860:4860::8888]:65535',
+      'http://proxy.lan:80': 'proxy.lan:80',
+      'https://proxy.lan:443/': 'proxy.lan:443',
+      'http://[::1]:80/': '[::1]:80',
+      'HTTP://proxy.lan:8080/': 'proxy.lan:8080',
+      'http://proxy.lan:8080/path?next=http://other.lan:9090': 'proxy.lan:8080',
+      'proxy.lan:00080': 'proxy.lan:80',
+    };
+    for (final entry in valid.entries) {
+      test('validates and formats ${entry.key}', () {
+        expect(TranslationApiClient.validateProxySetting(entry.key), isNull);
+        final proxy = TranslationApiClient.proxyHostPort(entry.key);
+        expect(proxy, entry.value);
+        expect(
+          TranslationApiClient.proxyForUri(
+            proxy!,
+            Uri.parse('https://example.com'),
+          ),
+          'PROXY ${entry.value}',
+        );
+      });
+    }
+    for (final value in <String>[
+      '::1:7890',
+      '[not-ipv6]:7890',
+      '[::1]:0',
+      'http://[::1]:65536',
+      'http://[::1]',
+      'http://[::1]:abc',
+      'http://[::1:7890',
+      'proxy host:8080',
+      'http://proxy host:8080',
+      'proxy.lan:8080/path',
+    ]) {
+      test('consistently rejects $value', () {
+        expect(
+          TranslationApiClient.validateProxySetting(value),
+          ProxySettingError.invalidFormat,
+        );
+        expect(TranslationApiClient.proxyHostPort(value), isNull);
+      });
+    }
+    test('unsupported IPv6 proxy schemes retain diagnostic category', () {
+      const value = 'socks5://[::1]:1080';
+      expect(TranslationApiClient.proxyHostPort(value), isNull);
+      expect(
+        TranslationApiClient.validateProxySetting(value),
+        ProxySettingError.unsupportedScheme,
+      );
     });
   });
 
