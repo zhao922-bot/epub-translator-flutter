@@ -930,10 +930,14 @@ class AppStrings {
 
   /// Log line when Android 12+ refuses the foreground-service start
   /// because the app is in the background. Translation continues without
-  /// the Doze keep-alive; returning to the foreground restores it.
+  /// the Doze keep-alive; advise keeping the app in the foreground.
   String get logForegroundServiceBackgroundDenied => isChinese
-      ? '系统拒绝在后台启动前台服务，翻译将在无保活的情况下继续；回到应用前台可恢复保活。'
-      : 'The system denied starting the foreground service from the background; translation continues without the keep-alive. Return to the app to restore it.';
+      ? '后台保活不可用：系统拒绝在后台启动前台服务。翻译将继续，请保持应用在前台。'
+      : 'Background keep-alive unavailable: the system denied starting the foreground service from the background. Translation continues; please keep the app in the foreground.';
+
+  String get logForegroundServiceStartFailed => isChinese
+      ? '后台保活不可用：前台服务启动失败。翻译将继续，请保持应用在前台。'
+      : 'Background keep-alive unavailable: the foreground service failed to start. Translation continues; please keep the app in the foreground.';
 
   /// Settings-page warning when the Android KeyStore key was invalidated
   /// (lock-screen/biometric change) and regenerated: previously saved API

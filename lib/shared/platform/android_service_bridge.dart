@@ -3,6 +3,27 @@ import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+enum ForegroundServiceStartStatus { success, backgroundDenied, failed }
+
+class ForegroundServiceStartResult {
+  const ForegroundServiceStartResult.success()
+    : status = ForegroundServiceStartStatus.success,
+      error = null,
+      stackTrace = null;
+
+  const ForegroundServiceStartResult._failure(
+    this.status,
+    this.error,
+    this.stackTrace,
+  );
+
+  final ForegroundServiceStartStatus status;
+  final Object? error;
+  final StackTrace? stackTrace;
+
+  bool get started => status == ForegroundServiceStartStatus.success;
+}
+
 /// Lightweight Android-only [MethodChannel] wrapper for the translation
 /// foreground service and the system app-settings deep link.
 ///
@@ -41,13 +62,9 @@ class AndroidServiceBridge {
   /// run token; the native side tags stashed notification updates with it
   /// so a start only consumes updates from its own run.
   ///
-  /// Returns false when the start was rejected because the app is in the
-  /// background (Android 12+ throws
-  /// ForegroundServiceStartNotAllowedException there): the caller should
-  /// warn the user that the keep-alive is missing. The translation itself
-  /// continues in Dart either way — a failed start must never take the run
-  /// down with it.
-  static Future<bool> startTranslationService({
+  /// Classifies failures and preserves the exception and stack trace so the
+  /// caller can warn about missing keep-alive without stopping translation.
+  static Future<ForegroundServiceStartResult> startTranslationService({
     required String title,
     required String text,
     required String stopLabel,
@@ -55,26 +72,36 @@ class AndroidServiceBridge {
     required String runId,
   }) async {
     if (!_isAndroid) {
-      return true;
+      return const ForegroundServiceStartResult.success();
     }
-    try {
-      await _channel.invokeMethod<void>('startTranslationService', {
+    return runStartRequest(
+      () => _channel.invokeMethod<void>('startTranslationService', {
         'title': title,
         'text': text,
         'stopLabel': stopLabel,
         'timeoutText': timeoutText,
         'runId': runId,
-      });
-    } on PlatformException catch (error) {
-      if (isBackgroundStartDenied(error)) {
-        return false;
-      }
-      // Other start failures keep the historical behavior: translation
-      // proceeds without the foreground service.
-    } catch (_) {
-      // Same: never let the keep-alive take the translation down.
+      }),
+    );
+  }
+
+  /// Executes the same error-handling path on and off Android.
+  @visibleForTesting
+  static Future<ForegroundServiceStartResult> runStartRequest(
+    Future<void> Function() request,
+  ) async {
+    try {
+      await request();
+      return const ForegroundServiceStartResult.success();
+    } catch (error, stackTrace) {
+      return ForegroundServiceStartResult._failure(
+        error is PlatformException && isBackgroundStartDenied(error)
+            ? ForegroundServiceStartStatus.backgroundDenied
+            : ForegroundServiceStartStatus.failed,
+        error,
+        stackTrace,
+      );
     }
-    return true;
   }
 
   /// Whether [error] is the distinct "background start denied" failure

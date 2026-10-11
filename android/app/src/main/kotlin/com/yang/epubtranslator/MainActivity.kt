@@ -1360,7 +1360,19 @@ class MainActivity : FlutterActivity() {
                 values.clear()
                 values.put(MediaStore.Downloads.IS_PENDING, 0)
                 contentResolver.update(uri, values, null, null)
-                return "Downloads/$safeName"
+                // MediaStore may rename a colliding file. Read the published
+                // entry rather than reporting the requested (possibly old) name.
+                return DownloadsSaveLocation.resolve(uri.toString()) {
+                    contentResolver.query(
+                        uri,
+                        arrayOf(MediaStore.Downloads.DISPLAY_NAME),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                }
             } catch (error: Exception) {
                 try {
                     contentResolver.delete(uri, null, null)

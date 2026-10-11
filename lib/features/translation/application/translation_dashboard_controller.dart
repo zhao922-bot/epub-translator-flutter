@@ -2226,22 +2226,24 @@ class TranslationDashboardController
       );
       await requestCancel();
     });
+    final serviceRunId = _fgServiceRunId;
     unawaited(
       AndroidServiceBridge.startTranslationService(
         title: _s.foregroundServiceTitle,
         text: path.basename(state.inputPath),
         stopLabel: _s.foregroundServiceStopAction,
         timeoutText: _s.foregroundServiceTimeoutText,
-        runId: _fgServiceRunId,
-      ).then((bool started) {
-        // Android 12+ can refuse the start when the app is in the
-        // background: the keep-alive is lost but the translation itself
-        // continues — warn instead of failing silently.
-        if (!started && mounted) {
+        runId: serviceRunId,
+      ).then((result) {
+        if (!result.started && mounted && _fgServiceRunId == serviceRunId) {
+          final warning =
+              result.status == ForegroundServiceStartStatus.backgroundDenied
+              ? _s.logForegroundServiceBackgroundDenied
+              : _s.logForegroundServiceStartFailed;
           state = state.copyWith(
             logs: <String>[
               ...state.logs,
-              _s.logForegroundServiceBackgroundDenied,
+              _safeLogText('$warning ${result.error}'),
             ],
           );
         }

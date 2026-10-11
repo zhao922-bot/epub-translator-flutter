@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 
@@ -405,28 +406,31 @@ class XhtmlHtmlCompatibility {
   static int _rawTextEnd(String source, int start, RegExp closing) {
     var cursor = start;
     while (cursor < source.length) {
-      final match = closing.allMatches(source, cursor).firstOrNull;
-      final end = match?.start ?? source.length;
-      final cdata = source.indexOf('<![CDATA[', cursor);
-      final comment = source.indexOf('<!--', cursor);
-      final special = cdata < 0
-          ? comment
-          : comment < 0
-          ? cdata
-          : cdata < comment
-          ? cdata
-          : comment;
-      if (special < 0 || special >= end) return end;
-      final terminator = special == cdata ? ']]>' : '-->';
-      final specialEnd = source.indexOf(
-        terminator,
-        special + (special == cdata ? 9 : 4),
-      );
+      // Scan forward once, stopping at the first real closing tag. Searching
+      // for absent CDATA/comments with indexOf scanned the whole document
+      // suffix for every raw-text element, making many small scripts O(n²).
+      if (source.codeUnitAt(cursor) != _lessThan) {
+        cursor++;
+        continue;
+      }
+      final cdata = source.startsWith('<![CDATA[', cursor);
+      final comment = source.startsWith('<!--', cursor);
+      if (!cdata && !comment) {
+        if (closing.matchAsPrefix(source, cursor) != null) return cursor;
+        cursor++;
+        continue;
+      }
+      final terminator = cdata ? ']]>' : '-->';
+      final specialEnd = source.indexOf(terminator, cursor + (cdata ? 9 : 4));
       if (specialEnd < 0) return source.length;
       cursor = specialEnd + terminator.length;
     }
     return source.length;
   }
+
+  @visibleForTesting
+  static int rawTextEndForTesting(String source, int start, RegExp closing) =>
+      _rawTextEnd(source, start, closing);
 
   static String _restoreRawText(String raw) {
     final match = RegExp(
