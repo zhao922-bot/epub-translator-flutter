@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 
 import 'package:archive/archive.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
@@ -18,6 +19,79 @@ void main() {
         await tempDir.delete(recursive: true);
       }
     });
+
+    test(
+      'cancelled competing process cannot restore A backup over A output',
+      () async {
+        final output = File(path.join(tempDir.path, 'race.epub'));
+        final temp = File('${output.path}.tmp.B');
+        await output.writeAsString('OLD');
+        await temp.writeAsString('B');
+        final dart = path.join(
+          path.dirname(Platform.resolvedExecutable),
+          '..',
+          '..',
+          '..',
+          'dart-sdk',
+          'bin',
+          Platform.isWindows ? 'dart.exe' : 'dart',
+        );
+        final process = await Process.start(dart, [
+          'test/fixtures/output_lock_process.dart',
+          output.path,
+        ]);
+        addTearDown(() => process.kill());
+        final errors = process.stderr.transform(utf8.decoder).join();
+        expect(
+          await process.stdout
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())
+              .first,
+          'backup-moved',
+        );
+        var finished = false;
+        final competing =
+            EpubIsolateWorker.commitTempFile(
+              temp,
+              output,
+              shouldCommit: () => false,
+            ).then((value) {
+              finished = true;
+              return value;
+            });
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        expect(finished, isFalse);
+        expect(await output.exists(), isFalse);
+        expect(await File('${output.path}.bak.process').readAsString(), 'OLD');
+        process.stdin.writeln('commit');
+        await process.stdin.flush();
+        expect(await process.exitCode, 0, reason: await errors);
+        expect(await competing, isFalse);
+        expect(await output.readAsString(), 'A_COMMITTED');
+      },
+    );
+
+    test(
+      'same-isolate competing cancellation preserves successful output',
+      () async {
+        final output = File(path.join(tempDir.path, 'local.epub'));
+        final a = File('${output.path}.tmp.A');
+        final b = File('${output.path}.tmp.B');
+        await output.writeAsString('OLD');
+        await a.writeAsString('A');
+        await b.writeAsString('B');
+        final results = await Future.wait([
+          EpubIsolateWorker.commitTempFile(a, output),
+          EpubIsolateWorker.commitTempFile(
+            b,
+            output,
+            shouldCommit: () => false,
+          ),
+        ]);
+        expect(results, [true, false]);
+        expect(await output.readAsString(), 'A');
+      },
+    );
 
     test(
       'writes via temp file and replaces without corrupting existing output',

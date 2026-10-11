@@ -74,6 +74,34 @@ class TranslationConfig {
   /// Local and private destinations always bypass it (no_proxy semantics).
   final String httpProxy;
 
+  /// Persistence separates the proxy endpoint from its entire authentication
+  /// component. Keep the combined URL in memory for the existing UI/client.
+  /// Split textually so even a malformed URL cannot leak credentials to JSON.
+  String get httpProxyAddress {
+    final value = httpProxy.trim();
+    final schemeEnd = value.indexOf('://');
+    final start = schemeEnd < 0 ? 0 : schemeEnd + 3;
+    final at = value.lastIndexOf('@');
+    return at < start
+        ? value
+        : value.substring(0, start) + value.substring(at + 1);
+  }
+
+  String get httpProxyAuthentication {
+    final value = httpProxy.trim();
+    final schemeEnd = value.indexOf('://');
+    final start = schemeEnd < 0 ? 0 : schemeEnd + 3;
+    final at = value.lastIndexOf('@');
+    return at < start ? '' : value.substring(start, at);
+  }
+
+  static String authenticatedProxy(String address, String authentication) {
+    if (authentication.isEmpty || address.isEmpty) return address;
+    final schemeEnd = address.indexOf('://');
+    final start = schemeEnd < 0 ? 0 : schemeEnd + 3;
+    return '${address.substring(0, start)}$authentication@${address.substring(start)}';
+  }
+
   factory TranslationConfig.defaults() {
     return const TranslationConfig(
       apiBaseUrl: 'https://api.deepseek.com',
@@ -175,7 +203,7 @@ class TranslationConfig {
       'styleProfileEnabled': styleProfileEnabled,
       'textScale': textScale,
       'lockedGlossary': lockedGlossary,
-      'httpProxy': httpProxy,
+      'httpProxy': httpProxyAddress,
     };
   }
 

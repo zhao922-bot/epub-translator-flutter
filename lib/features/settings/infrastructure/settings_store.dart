@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../shared/logging/app_logger.dart';
@@ -31,9 +32,13 @@ abstract class SettingsSecretStore {
   Future<void> writeCustomApiKey(String value);
 
   Future<void> deleteCustomApiKey();
+
+  Future<String?> readProxyAuthentication();
+  Future<void> writeProxyAuthentication(String value);
+  Future<void> deleteProxyAuthentication();
 }
 
-enum SettingsSecretSlot { legacy, deepSeek, custom }
+enum SettingsSecretSlot { legacy, deepSeek, custom, proxy }
 
 /// settings.json could not be written because another program holds a
 /// Windows file lock (sharing violation) on it — e.g. a second app instance,
@@ -63,6 +68,20 @@ class NativeSettingsSecretStore implements SettingsSecretStore {
   static const String _apiKeyName = 'api_key';
   static const String _deepSeekApiKeyName = 'deepseek_api_key';
   static const String _customApiKeyName = 'custom_api_key';
+  static const _secureStorage = FlutterSecureStorage();
+  static const _proxyAuthenticationName = 'http_proxy_authentication';
+
+  @override
+  Future<String?> readProxyAuthentication() =>
+      _secureStorage.read(key: _proxyAuthenticationName);
+
+  @override
+  Future<void> writeProxyAuthentication(String value) =>
+      _secureStorage.write(key: _proxyAuthenticationName, value: value);
+
+  @override
+  Future<void> deleteProxyAuthentication() =>
+      _secureStorage.delete(key: _proxyAuthenticationName);
 
   @override
   Future<void> deleteApiKey() {
@@ -203,6 +222,7 @@ class SettingsStore {
       apiKey: resolvedApiKey,
       deepseekApiKey: deepSeekKey,
       customApiKey: customKey,
+      httpProxy: _resolveProxy(config, storedKeys[3].value),
     );
     _secretSnapshot = _secretValues(resolvedConfig);
     final providerSlot =
@@ -212,6 +232,9 @@ class SettingsStore {
     // Keep the original provider association even if the user switches providers
     // while the secure backend is unavailable.
     _pendingPlaintextKeys.clear();
+    if (config.httpProxyAuthentication.isNotEmpty) {
+      _pendingPlaintextKeys[SettingsSecretSlot.proxy] = _proxySecret(config);
+    }
     if (config.deepseekApiKey.isNotEmpty) {
       _pendingPlaintextKeys[SettingsSecretSlot.deepSeek] =
           config.deepseekApiKey;
@@ -252,7 +275,7 @@ class SettingsStore {
         // for nothing.
         _legacyMigrationFailed = true;
         AppLogger.error(
-          'Legacy API key migration is not supported on this backend; will not retry.',
+          'Legacy credential migration is not supported on this backend; will not retry.',
           tag: 'settings',
           error: error,
         );
@@ -262,7 +285,7 @@ class SettingsStore {
         // later load (up to _maxLegacyMigrationAttempts attempts) instead
         // of being abandoned forever.
         AppLogger.error(
-          'Legacy API key migration failed (attempt '
+          'Legacy credential migration failed (attempt '
           '$_legacyMigrationAttempts/$_maxLegacyMigrationAttempts); '
           'will retry on a later load.',
           tag: 'settings',
@@ -288,6 +311,10 @@ class SettingsStore {
             _secretStore.readDeepSeekApiKey,
           ),
           _readSecret(SettingsSecretSlot.custom, _secretStore.readCustomApiKey),
+          _readSecret(
+            SettingsSecretSlot.proxy,
+            _secretStore.readProxyAuthentication,
+          ),
         ]);
     _didLoad = true;
     return storedKeys;
@@ -478,7 +505,37 @@ class SettingsStore {
     SettingsSecretSlot.legacy: config.apiKey.trim(),
     SettingsSecretSlot.deepSeek: config.deepseekApiKey.trim(),
     SettingsSecretSlot.custom: config.customApiKey.trim(),
+    SettingsSecretSlot.proxy: _proxySecret(config),
   };
+
+  // Bind authentication to its endpoint: a stale instance changing the proxy
+  // address must never send credentials belonging to a different proxy.
+  static String _proxySecret(TranslationConfig config) =>
+      config.httpProxyAuthentication.isEmpty
+      ? ''
+      : jsonEncode({
+          'address': config.httpProxyAddress,
+          'authentication': config.httpProxyAuthentication,
+        });
+
+  static String _resolveProxy(TranslationConfig config, String? secret) {
+    if (secret != null && secret.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(secret);
+        if (decoded is Map &&
+            decoded['address'] == config.httpProxyAddress &&
+            decoded['authentication'] is String) {
+          return TranslationConfig.authenticatedProxy(
+            config.httpProxyAddress,
+            decoded['authentication'] as String,
+          );
+        }
+      } catch (_) {
+        // Invalid secure data does not replace a usable legacy URL.
+      }
+    }
+    return config.httpProxy;
+  }
 
   Future<void> _saveSecrets(
     TranslationConfig config, {
@@ -489,6 +546,20 @@ class SettingsStore {
     // each write spawns a PowerShell process, so run them concurrently rather
     // than serially. _saveSecret touches only its own slot's read status.
     final List<Future<void>> pending = <Future<void>>[];
+    if (slotsToSave.contains(SettingsSecretSlot.proxy)) {
+      pending.add(
+        _saveSecretTagged(
+          SettingsSecretSlot.proxy,
+          _saveSecret(
+            SettingsSecretSlot.proxy,
+            _proxySecret(config),
+            explicit: explicit,
+            write: _secretStore.writeProxyAuthentication,
+            delete: _secretStore.deleteProxyAuthentication,
+          ),
+        ),
+      );
+    }
     if (slotsToSave.contains(SettingsSecretSlot.legacy)) {
       pending.add(
         _saveSecretTagged(
@@ -549,7 +620,11 @@ class SettingsStore {
     try {
       await save;
     } catch (error) {
-      throw StateError('Failed to save ${_slotLabel(slot)}: $error');
+      // Proxy backend exceptions may contain the value passed to write.
+      final detail = slot == SettingsSecretSlot.proxy
+          ? error.runtimeType
+          : error;
+      throw StateError('Failed to save ${_slotLabel(slot)}: $detail');
     }
   }
 
@@ -561,6 +636,8 @@ class SettingsStore {
         return 'DeepSeek key';
       case SettingsSecretSlot.custom:
         return 'custom key';
+      case SettingsSecretSlot.proxy:
+        return 'proxy authentication';
     }
   }
 

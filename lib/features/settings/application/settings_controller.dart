@@ -296,8 +296,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<bool> setLockedGlossary(String value) =>
       _update((config) => config.copyWith(lockedGlossary: value));
 
-  Future<bool> setHttpProxy(String value) =>
-      _update((config) => config.copyWith(httpProxy: value.trim()));
+  Future<bool> setHttpProxy(String value) => _update(
+    (config) => config.copyWith(httpProxy: value.trim()),
+    explicitSecretMutations: const {SettingsSecretSlot.proxy},
+  );
 
   Future<void> applyApiProviderPreset(ApiProviderPreset preset) =>
       _update((config) {

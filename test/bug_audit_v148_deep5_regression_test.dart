@@ -27,6 +27,12 @@ import 'bug_audit_round4_regression_test.dart' show writeBook;
 import 'package:epub_translator_flutter/features/preview/presentation/pages/preview_page.dart';
 
 class SharedSecrets implements SettingsSecretStore {
+  @override
+  Future<String?> readProxyAuthentication() async => null;
+  @override
+  Future<void> writeProxyAuthentication(String value) async {}
+  @override
+  Future<void> deleteProxyAuthentication() async {}
   String? legacy = 'key-old';
   String? custom = 'key-old';
   String? deep = 'deep-old';

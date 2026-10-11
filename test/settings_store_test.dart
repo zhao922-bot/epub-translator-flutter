@@ -6,8 +6,28 @@ import 'package:epub_translator_flutter/features/settings/infrastructure/setting
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class _FakeSettingsSecretStore implements SettingsSecretStore {
+  String? proxyAuthentication;
+  @override
+  Future<String?> readProxyAuthentication() async {
+    if (failReads) throw StateError('secret store unavailable');
+    return proxyAuthentication;
+  }
+
+  @override
+  Future<void> writeProxyAuthentication(String value) async {
+    if (failWrites) throw StateError('secret store unavailable');
+    proxyAuthentication = value;
+  }
+
+  @override
+  Future<void> deleteProxyAuthentication() async {
+    if (failDeletes) throw StateError('secret store unavailable');
+    proxyAuthentication = null;
+  }
+
   String? apiKey;
   String? deepSeekApiKey;
   String? customApiKey;
@@ -98,6 +118,181 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  test('native proxy authentication uses flutter secure storage', () async {
+    FlutterSecureStorage.setMockInitialValues({});
+    const store = NativeSettingsSecretStore();
+    await store.writeProxyAuthentication('encoded-credentials');
+    expect(await store.readProxyAuthentication(), 'encoded-credentials');
+    expect(
+      await const FlutterSecureStorage().read(key: 'http_proxy_authentication'),
+      'encoded-credentials',
+    );
+    await store.deleteProxyAuthentication();
+    expect(await store.readProxyAuthentication(), isNull);
+  });
+  test(
+    'proxy credentials migrate to secure storage and survive reload',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('proxy_migration_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      const proxy = 'http://alice:p%40ss%3Aword@127.0.0.1:8080';
+      await file.writeAsString(
+        jsonEncode({
+          ...TranslationConfig.defaults().toJson(),
+          'httpProxy': proxy,
+        }),
+      );
+      SettingsStore store() => SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      expect((await store().load()).httpProxy, proxy);
+      expect(secrets.proxyAuthentication, contains('p%40ss%3Aword'));
+      final disk = await file.readAsString();
+      expect(disk, isNot(contains('alice')));
+      expect(disk, isNot(contains('p%40ss')));
+      expect(jsonDecode(disk)['httpProxy'], 'http://127.0.0.1:8080');
+      expect((await store().load()).httpProxy, proxy);
+      final loadedStore = store();
+      final loaded = await loadedStore.load();
+      await loadedStore.save(loaded.copyWith(httpProxy: 'http://other:8080'));
+      expect(secrets.proxyAuthentication, isNull);
+      expect((await store().load()).httpProxy, 'http://other:8080');
+    },
+  );
+
+  test(
+    'failed proxy migration retains legacy URL and retries securely',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('proxy_retry_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      const proxy = 'user:password@localhost:8080';
+      final original = jsonEncode({'httpProxy': proxy});
+      await file.writeAsString(original);
+      final secrets = _FakeSettingsSecretStore()..failWrites = true;
+      final store = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      expect((await store.load()).httpProxy, proxy);
+      expect(await file.readAsString(), original);
+      secrets.failWrites = false;
+      expect((await store.load()).httpProxy, proxy);
+      expect(await file.readAsString(), isNot(contains('password')));
+      expect(
+        (await SettingsStore(
+          settingsFileProvider: () async => file,
+          secretStore: secrets,
+        ).load()).httpProxy,
+        proxy,
+      );
+    },
+  );
+
+  test('new proxy saves never write authentication to settings json', () async {
+    final temp = await Directory.systemTemp.createTemp('proxy_save_');
+    addTearDown(() => temp.delete(recursive: true));
+    final file = File('${temp.path}/settings.json');
+    final secrets = _FakeSettingsSecretStore();
+    final store = SettingsStore(
+      settingsFileProvider: () async => file,
+      secretStore: secrets,
+    );
+    final config = await store.load();
+    await store.save(
+      config.copyWith(httpProxy: 'http://user:secret@host:8080'),
+    );
+    expect(await file.readAsString(), isNot(contains('secret')));
+    expect(secrets.proxyAuthentication, contains('user:secret'));
+    // Secure data for a previous endpoint cannot authenticate a new address.
+    await file.writeAsString(
+      jsonEncode(config.copyWith(httpProxy: 'http://new:8080').toJson()),
+    );
+    expect(
+      (await SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      ).load()).httpProxy,
+      'http://new:8080',
+    );
+  });
+
+  test('proxy toJson strips credentials even from malformed addresses', () {
+    for (final proxy in [
+      'http://user:password@[broken',
+      'user:password@host:8080',
+    ]) {
+      final json = TranslationConfig.defaults()
+          .copyWith(httpProxy: proxy)
+          .toJson();
+      expect(jsonEncode(json), isNot(contains('password')));
+    }
+  });
+
+  test(
+    'unreadable proxy secret is protected until an explicit proxy edit',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('proxy_unreadable_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      final first = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      await first.save(
+        TranslationConfig.defaults().copyWith(
+          httpProxy: 'http://user:secret@host:8080',
+        ),
+      );
+      final stored = secrets.proxyAuthentication;
+      secrets.failReads = true;
+      final second = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      final loaded = await second.load();
+      expect(loaded.httpProxy, 'http://host:8080');
+      await second.save(loaded.copyWith(bilingual: true));
+      expect(secrets.proxyAuthentication, stored);
+      await second.save(
+        loaded.copyWith(httpProxy: ''),
+        explicitSecretMutations: {SettingsSecretSlot.proxy},
+      );
+      expect(secrets.proxyAuthentication, isNull);
+    },
+  );
+
+  test(
+    'failed new proxy save exposes failure without plaintext fallback',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'proxy_write_failure_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      final store = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      final loaded = await store.load();
+      secrets.failWrites = true;
+      final updated = loaded.copyWith(
+        httpProxy: 'http://user:secret@host:8080',
+      );
+      await expectLater(store.save(updated), throwsStateError);
+      expect(await file.readAsString(), isNot(contains('secret')));
+      secrets.failWrites = false;
+      await store.save(updated);
+      expect(secrets.proxyAuthentication, contains('user:secret'));
+    },
+  );
+
   test('saves API key outside settings json', () async {
     final Directory temp = await Directory.systemTemp.createTemp(
       'epub_settings_store_test_',

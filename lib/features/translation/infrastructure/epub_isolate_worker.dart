@@ -10,6 +10,7 @@ import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
 
 import '../../../shared/logging/app_logger.dart';
+import '../../../shared/io/output_file_lock.dart';
 import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
 import 'epub/epub_source_guard.dart';
@@ -693,6 +694,22 @@ class EpubIsolateWorker {
   /// [lockedMessage] builds the localized lock message from the output and
   /// temp paths; when omitted a plain English message is used.
   static Future<bool> commitTempFile(
+    File tempFile,
+    File finalFile, {
+    bool Function()? shouldCommit,
+    String Function(String outputPath, String tempPath)? lockedMessage,
+  }) => OutputFileLock.run(
+    finalFile,
+    () => _commitTempFileLocked(
+      tempFile,
+      finalFile,
+      shouldCommit: shouldCommit,
+      lockedMessage: lockedMessage,
+    ),
+  );
+
+  // Recovery, promotion and rollback are one transaction under the same lock.
+  static Future<bool> _commitTempFileLocked(
     File tempFile,
     File finalFile, {
     bool Function()? shouldCommit,

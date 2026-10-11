@@ -57,6 +57,12 @@ class SequenceConnection implements TranslationRepository {
 
 class EmptySecrets implements SettingsSecretStore {
   @override
+  Future<String?> readProxyAuthentication() async => null;
+  @override
+  Future<void> writeProxyAuthentication(String value) async {}
+  @override
+  Future<void> deleteProxyAuthentication() async {}
+  @override
   Future<String?> readApiKey() async => null;
   @override
   Future<String?> readDeepSeekApiKey() async => null;

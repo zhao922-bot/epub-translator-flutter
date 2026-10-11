@@ -25,6 +25,7 @@ import '../cache_restoration_scanner.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_repacker.dart';
 import 'epub_html_extractor.dart';
+import 'chapter_source_restorer.dart';
 import 'epub_source_guard.dart';
 import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
@@ -507,7 +508,11 @@ class EpubChapterTranslator {
     late final Dio dio;
     bool dioReady = false;
     try {
-      chapters = chapters.map(_restoreChapterSources).toList();
+      chapters = await ChapterSourceRestorer.restore(
+        chapters: chapters,
+        isCancelled: () =>
+            cancelToken.isCancelled || (isCancelled?.call() ?? false),
+      );
       final List<InspectedChapter> selectedChapters = chapters
           .where((InspectedChapter chapter) => chapter.includeInTranslation)
           .map(
@@ -1689,6 +1694,7 @@ class EpubChapterTranslator {
       // finished EPUB's dc:title / NCX docTitle show the target language.
       // Fail-safe: null keeps the original title.
       String? translatedTitle;
+      bool titleTranslationFailed = false;
       if (dioReady) {
         final String? originalTitle = await EpubIsolateWorker.readBookTitle(
           inputPath,
@@ -1697,12 +1703,28 @@ class EpubChapterTranslator {
           )?.sha256,
         );
         if (originalTitle != null) {
-          translatedTitle = await _translateBookTitle(
-            dio: dio,
-            config: config,
-            originalTitle: originalTitle,
-            cancelToken: cancelToken,
-          );
+          try {
+            translatedTitle = await _translateBookTitle(
+              dio: dio,
+              config: config,
+              originalTitle: originalTitle,
+              cancelToken: cancelToken,
+            );
+          } catch (error) {
+            if (error is TranslationCancelledException ||
+                _isCancelError(error)) {
+              rethrow;
+            }
+            throwIfCancelled();
+            titleTranslationFailed = true;
+            // Log only the error category, never HTTP payloads, credentials or
+            // request headers embedded in a transport exception.
+            AppLogger.warn(
+              'Book title translation failed (${error.runtimeType}); kept original title.',
+              tag: 'translate',
+            );
+            emit(currentJob, s.runLogBookTitleTranslationFailed);
+          }
         }
       }
       await _repacker.writeTranslatedEpub(
@@ -1729,9 +1751,10 @@ class EpubChapterTranslator {
 
       final bool allBlocksDegraded =
           totalBlocks > 0 && degradedBlockCount >= totalBlocks;
+      final bool hasWarnings = degradedBlockCount > 0 || titleTranslationFailed;
       final TranslationJobStatus terminalStatus = allBlocksDegraded
           ? TranslationJobStatus.failed
-          : degradedBlockCount > 0
+          : hasWarnings
           ? TranslationJobStatus.completedWithWarnings
           : TranslationJobStatus.completed;
       final TranslationJob terminalJob = currentJob.copyWith(
@@ -1740,7 +1763,7 @@ class EpubChapterTranslator {
         progress: 1,
         currentChapter: allBlocksDegraded
             ? s.runProgressTranslationFailed
-            : degradedBlockCount > 0
+            : hasWarnings
             ? s.runProgressEpubReadyWithWarnings
             : s.runProgressEpubReady,
         currentBlock: null,
@@ -1765,7 +1788,7 @@ class EpubChapterTranslator {
         terminalJob,
         allBlocksDegraded
             ? s.runLogRunFailedAllDegraded
-            : degradedBlockCount > 0
+            : hasWarnings
             ? s.runLogRunCompletedWithWarnings(outputFilePath)
             : s.runLogRunComplete(outputFilePath),
       );
@@ -1952,33 +1975,6 @@ class EpubChapterTranslator {
         for (final ExtractedBlock block in chapter.blocks)
           block.copyWith(sourceHtml: '', sourceText: ''),
       ],
-    );
-  }
-
-  static InspectedChapter _restoreChapterSources(InspectedChapter chapter) {
-    final bool legacyPreview =
-        chapter.translatedBody == null && chapter.translatedBlockCount > 0;
-    if (!legacyPreview &&
-        !chapter.blocks.any((block) => block.sourceHtml.isEmpty)) {
-      return chapter;
-    }
-    final inspected = const EpubHtmlExtractor().inspectChapterBytes(
-      chapterPath: chapter.path,
-      bytes: utf8.encode(chapter.originalHtml),
-    );
-    final restored = inspected.blocks;
-    if (restored.length != chapter.blocks.length ||
-        List.generate(restored.length, (i) => i).any(
-          (i) =>
-              restored[i].id != chapter.blocks[i].id ||
-              restored[i].tagName != chapter.blocks[i].tagName,
-        ) ||
-        restored.any((block) => block.sourceHtml.isEmpty)) {
-      throw FormatException('Source block order changed: ${chapter.path}');
-    }
-    return chapter.copyWith(
-      blocks: restored,
-      body: legacyPreview ? inspected.body : chapter.body,
     );
   }
 
@@ -2871,8 +2867,8 @@ class EpubChapterTranslator {
   }
 
   /// Translates the book's metadata title with a single lightweight API call.
-  /// Returns null when translation is unnecessary or fails (fail-safe: the
-  /// original title is kept by the repacker).
+  /// Returns null when translation is unnecessary. Failures are handled by the
+  /// caller as a non-fatal warning, keeping the original title in the repacker.
   Future<String?> _translateBookTitle({
     required Dio dio,
     required TranslationConfig config,
@@ -2882,34 +2878,33 @@ class EpubChapterTranslator {
     if (titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
       return null;
     }
-    try {
-      final Map<String, dynamic> requestData = <String, dynamic>{
-        'model': config.model,
-        'temperature': 0.2,
-        'messages': <Map<String, String>>[
-          <String, String>{
-            'role': 'system',
-            'content':
-                'Translate the book title into ${config.targetLanguage}. Return only the translated title, with no explanation, quotes, or formatting.',
-          },
-          <String, String>{'role': 'user', 'content': originalTitle},
-        ],
-      };
-      final Response<dynamic> response = await _postChatCompletions(
-        dio: dio,
-        data: requestData,
-        cancelToken: cancelToken,
-      );
-      final String translated = _apiClient
-          .extractMessageContent(response.data)
-          .trim();
-      if (translated.isEmpty || translated == originalTitle.trim()) {
-        return null;
-      }
-      return translated;
-    } catch (_) {
+    final Map<String, dynamic> requestData = <String, dynamic>{
+      'model': config.model,
+      'temperature': 0.2,
+      'messages': <Map<String, String>>[
+        <String, String>{
+          'role': 'system',
+          'content':
+              'Translate the book title into ${config.targetLanguage}. Return only the translated title, with no explanation, quotes, or formatting.',
+        },
+        <String, String>{'role': 'user', 'content': originalTitle},
+      ],
+    };
+    final Response<dynamic> response = await _postChatCompletions(
+      dio: dio,
+      data: requestData,
+      cancelToken: cancelToken,
+    );
+    final String translated = _apiClient
+        .extractMessageContent(response.data)
+        .trim();
+    if (translated.isEmpty) {
+      throw const FormatException('Empty translated book title');
+    }
+    if (translated == originalTitle.trim()) {
       return null;
     }
+    return translated;
   }
 
   String _linePreview(String value) {

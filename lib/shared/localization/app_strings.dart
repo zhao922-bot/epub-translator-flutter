@@ -612,6 +612,10 @@ class AppStrings {
   String get runErrorAllBlocksDegraded => isChinese
       ? '所有选中的文本块在翻译失败后都使用了回退内容。'
       : 'Every selected text block fell back after translation failures.';
+  String get runLogBookTitleTranslationFailed => isChinese
+      ? '书名翻译失败，已保留原名。'
+      : 'Book title translation failed; the original title was kept.';
+
   String runLogRunCompletedWithWarnings(String path) => isChinese
       ? '翻译完成（有警告）。已将部分 EPUB 写入 $path'
       : 'Translation completed with warnings. Wrote partial EPUB to $path';
