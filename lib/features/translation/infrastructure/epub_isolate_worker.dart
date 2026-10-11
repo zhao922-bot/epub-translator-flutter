@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -12,6 +13,24 @@ import '../../../shared/logging/app_logger.dart';
 import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
 import 'epub/epub_source_guard.dart';
+import '../domain/repositories/translation_repository.dart';
+
+class _ProgressWork<T> {
+  const _ProgressWork(this.operation, this.messages);
+  final T Function(void Function(int, int)) operation;
+  final SendPort messages;
+}
+
+void _progressWorkEntry<T>(_ProgressWork<T> work) {
+  try {
+    final result = work.operation((done, total) {
+      work.messages.send(['progress', done, total]);
+    });
+    Isolate.exit(work.messages, ['result', result]);
+  } catch (error, stack) {
+    work.messages.send(['error', error, stack]);
+  }
+}
 
 /// A `.tmp.*` file counts as a stale orphan only when older than this. The
 /// temp file of a live commit is always seconds old; orphans from a dead
@@ -86,6 +105,73 @@ class EpubDecompressionLimitException implements Exception {
 /// Heavy ZIP work off the UI isolate (Windows/Android).
 class EpubIsolateWorker {
   const EpubIsolateWorker._();
+
+  /// Runs CPU-only preparation with progress messages. Cancellation sends an
+  /// immediate isolate control message, so even a single huge DOM parse can
+  /// be stopped. Do not use this for work that creates files: killing such a
+  /// worker could leave temporary output behind.
+  static Future<T> prepareWithProgress<T>({
+    required T Function(void Function(int, int)) operation,
+    required bool Function() isCancelled,
+    void Function(int, int)? onProgress,
+  }) async {
+    if (isCancelled()) throw const TranslationCancelledException();
+    final messages = ReceivePort();
+    final completed = Completer<T>();
+    Isolate? worker;
+    Timer? cancellationPoll;
+    final subscription = messages.listen((dynamic message) {
+      if (completed.isCompleted) return;
+      try {
+        if (isCancelled()) throw const TranslationCancelledException();
+        if (message == null) {
+          throw StateError('EPUB preparation worker exited without a result.');
+        }
+        final values = message as List<dynamic>;
+        switch (values[0]) {
+          case 'progress':
+            onProgress?.call(values[1] as int, values[2] as int);
+          case 'result':
+            completed.complete(values[1] as T);
+          case 'error':
+            completed.completeError(
+              values[1] as Object,
+              values[2] as StackTrace,
+            );
+          default:
+            // Uncaught isolate errors use the VM's [error, stack] envelope.
+            completed.completeError(
+              StateError(values[0].toString()),
+              StackTrace.fromString(values[1].toString()),
+            );
+        }
+      } catch (error, stack) {
+        completed.completeError(error, stack);
+      }
+    });
+    try {
+      worker = await Isolate.spawn<_ProgressWork<T>>(
+        _progressWorkEntry<T>,
+        _ProgressWork(operation, messages.sendPort),
+        onError: messages.sendPort,
+        onExit: messages.sendPort,
+      );
+      cancellationPoll = Timer.periodic(const Duration(milliseconds: 10), (_) {
+        if (completed.isCompleted) return;
+        try {
+          if (isCancelled()) throw const TranslationCancelledException();
+        } catch (error, stack) {
+          completed.completeError(error, stack);
+        }
+      });
+      return await completed.future;
+    } finally {
+      cancellationPoll?.cancel();
+      worker?.kill(priority: Isolate.immediate);
+      await subscription.cancel();
+      messages.close();
+    }
+  }
 
   /// Reads and decodes an EPUB into a name -> bytes map on a background isolate.
   static Future<Map<String, Uint8List>> loadArchiveFiles(String inputPath) {

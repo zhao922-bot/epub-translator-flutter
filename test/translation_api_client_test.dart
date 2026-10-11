@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:dio/dio.dart';
@@ -7,6 +9,54 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   const TranslationApiClient client = TranslationApiClient();
+
+  test(
+    'authenticates a proxy challenge with decoded URI credentials',
+    () async {
+      final proxy = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      final credentials =
+          'Basic ${base64Encode(utf8.encode('user@name:p:a ss'))}';
+      final received = <String?>[];
+      final subscription = proxy.listen((request) async {
+        received.add(
+          request.headers.value(HttpHeaders.proxyAuthorizationHeader),
+        );
+        expect(
+          request.headers.value(HttpHeaders.authorizationHeader),
+          'Bearer key',
+        );
+        if (received.last != credentials) {
+          request.response.statusCode = HttpStatus.proxyAuthenticationRequired;
+          request.response.headers.set(
+            'proxy-authenticate',
+            'Basic realm="proxy"',
+          );
+        } else {
+          request.response.write('OK');
+        }
+        await request.response.close();
+      });
+      final config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://api.example.com',
+        apiKey: 'key',
+        httpProxy: 'http://user%40name:p%3Aa%20ss@127.0.0.1:${proxy.port}',
+      );
+      expect(
+        TranslationApiClient.validateProxySetting(config.httpProxy),
+        isNull,
+      );
+      final dio = client.buildDio(config);
+      try {
+        final response = await dio.get<String>('http://api.example.com/probe');
+        expect(response.data, 'OK');
+        expect(received, [null, credentials]);
+      } finally {
+        dio.close(force: true);
+        await subscription.cancel();
+        await proxy.close(force: true);
+      }
+    },
+  );
 
   test('repairs unescaped quotes inside model JSON strings', () {
     final Map<String, dynamic> decoded = client.decodeJsonObject(

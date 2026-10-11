@@ -76,6 +76,34 @@ class TranslationApiClient {
         final String? proxy = proxyHostPort(config.httpProxy);
         if (proxy != null) {
           client.findProxy = (Uri uri) => proxyForUri(proxy, uri);
+          final String value = config.httpProxy.trim();
+          final Uri proxyUri = Uri.parse(
+            value.contains('://') ? value : 'http://$value',
+          );
+          if (proxyUri.userInfo.isNotEmpty) {
+            final int separator = proxyUri.userInfo.indexOf(':');
+            final String username = Uri.decodeComponent(
+              separator < 0
+                  ? proxyUri.userInfo
+                  : proxyUri.userInfo.substring(0, separator),
+            );
+            final String password = separator < 0
+                ? ''
+                : Uri.decodeComponent(
+                    proxyUri.userInfo.substring(separator + 1),
+                  );
+            client.authenticateProxy = (host, port, scheme, realm) async {
+              // Credentials belong to this proxy, never the API origin.
+              if (scheme.toLowerCase() != 'basic') return false;
+              client.addProxyCredentials(
+                host,
+                port,
+                realm ?? '',
+                HttpClientBasicCredentials(username, password),
+              );
+              return true;
+            };
+          }
         }
         return client;
       },

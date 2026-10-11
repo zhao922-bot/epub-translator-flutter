@@ -97,10 +97,15 @@ class TranslationCacheStore {
 
   Future<String?> getBlockTranslation(String cacheKey) async {
     final File file = await _blockCacheFile(cacheKey);
-    if (!await file.exists()) {
-      return null;
+    try {
+      return await file.readAsString();
+    } on FileSystemException catch (error) {
+      // ENOENT on POSIX; ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on
+      // Windows. Other failures remain unreadable-cache errors to callers.
+      final code = error.osError?.errorCode;
+      if (code == 2 || (Platform.isWindows && code == 3)) return null;
+      rethrow;
     }
-    return file.readAsString();
   }
 
   Future<void> putBlockTranslation(

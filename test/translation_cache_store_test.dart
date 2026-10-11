@@ -31,6 +31,24 @@ void main() {
       await root.delete(recursive: true);
     });
 
+    test(
+      'direct reads distinguish missing files from other IO errors',
+      () async {
+        expect(await store.getBlockTranslation('abmissing'), isNull);
+        final file = File(path.join(root.path, 'blocks', 'ab', 'abkey.html'));
+        await file.parent.create(recursive: true);
+        await file.writeAsString('<p>cached</p>');
+        expect(await store.getBlockTranslation('abkey'), '<p>cached</p>');
+        await file.delete();
+        expect(await store.getBlockTranslation('abkey'), isNull);
+        await Directory(file.path).create();
+        await expectLater(
+          store.getBlockTranslation('abkey'),
+          throwsA(isA<FileSystemException>()),
+        );
+      },
+    );
+
     test('overwrites and parallel keys count bytes once', () async {
       final existing = File(path.join(root.path, 'blocks', 'ab', 'abkey.html'));
       await existing.parent.create(recursive: true);

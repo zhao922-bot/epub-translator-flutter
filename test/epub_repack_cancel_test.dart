@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
@@ -23,6 +24,77 @@ void main() {
         await tempDir.delete(recursive: true);
       }
     });
+
+    for (final useToken in [true, false]) {
+      test('large render yields to UI cancellation (token=$useToken)', () async {
+        final input = File(path.join(tempDir.path, 'book.epub'));
+        final output = File(path.join(tempDir.path, 'book_out.epub'));
+        await _writeMinimalEpub(input, body: 'source');
+        await output.writeAsString('KEEP_ME');
+        final token = CancelToken();
+        bool cancelled = false;
+        int lastCompleted = 0;
+        Stopwatch? cancelWatch;
+        final chapters = List.generate(
+          1000,
+          (i) => InspectedChapter(
+            path: 'OEBPS/chapter_$i.xhtml',
+            title: 'Chapter $i',
+            body: 'source',
+            originalHtml:
+                '<html><body>${List.filled(100, '<p>source</p>').join()}</body></html>',
+            blocks: List.generate(
+              100,
+              (j) => ExtractedBlock(
+                id: 'p-$j',
+                tagName: 'p',
+                sourceHtml: '<p>source</p>',
+                sourceText: 'source',
+                translatedHtml: '<p>译文</p>',
+              ),
+            ),
+            category: ChapterCategory.content,
+            recommendedForTranslation: true,
+            includeInTranslation: true,
+          ),
+        );
+        await expectLater(
+          EpubRepacker()
+              .writeTranslatedEpub(
+                inputPath: input.path,
+                outputFilePath: output.path,
+                config: TranslationConfig.defaults(),
+                chapters: chapters,
+                cancelToken: useToken ? token : null,
+                isCancelled: useToken ? null : () => cancelled,
+                onProgress: (done, total) {
+                  expect(total, chapters.length);
+                  expect(done, greaterThanOrEqualTo(lastCompleted));
+                  lastCompleted = done;
+                  if (done == 1) {
+                    // Simulates a UI click delivered on the main event loop,
+                    // after actual rendering has begun in the worker.
+                    Timer.run(() {
+                      cancelWatch = Stopwatch()..start();
+                      cancelled = true;
+                      token.cancel();
+                    });
+                  }
+                },
+              )
+              .timeout(const Duration(seconds: 10)),
+          throwsA(isA<TranslationCancelledException>()),
+        );
+        expect(cancelWatch, isNotNull);
+        expect(cancelWatch!.elapsed, lessThan(const Duration(seconds: 2)));
+        expect(lastCompleted, lessThan(chapters.length));
+        expect(await output.readAsString(), 'KEEP_ME');
+        expect(
+          tempDir.listSync().where((e) => e.path.contains('.tmp.')),
+          isEmpty,
+        );
+      });
+    }
 
     test(
       'cancelled token refuses commit and preserves existing output',

@@ -1714,6 +1714,16 @@ class EpubChapterTranslator {
         isCancelled: isCancelled,
         degradedBlockIds: _degradedBlocks,
         translatedTitle: translatedTitle,
+        onProgress: (done, total) {
+          if (done % 20 != 0 && done != total) return;
+          emit(
+            currentJob.copyWith(
+              currentChapter: '${s.runProgressRepacking} ($done/$total)',
+              currentBlock: null,
+            ),
+            s.runLogRepacking,
+          );
+        },
       );
       repackStopwatch.stop();
 
@@ -1890,6 +1900,22 @@ class EpubChapterTranslator {
       chapters: chapters,
       cancelToken: cancelToken,
       isCancelled: isCancelled,
+      onProgress: (done, total) {
+        if (done % 20 != 0 && done != total) return;
+        try {
+          onProgress?.call(
+            repackingJob.copyWith(
+              currentChapter: 'Repacking EPUB ($done/$total)',
+            ),
+            repackingLog,
+          );
+        } catch (error) {
+          AppLogger.warn(
+            'Progress callback failed (${error.runtimeType}); continuing.',
+            tag: 'translate',
+          );
+        }
+      },
     );
 
     final TranslationJob completedJob = repackingJob.copyWith(

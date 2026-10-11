@@ -26,6 +26,7 @@ class _CommittedRepacker extends EpubRepacker {
     bool Function()? isCancelled,
     Set<String> degradedBlockIds = const <String>{},
     String? translatedTitle,
+    void Function(int completedChapters, int totalChapters)? onProgress,
   }) async {
     await File(outputFilePath).writeAsString('committed');
     onCommitted();

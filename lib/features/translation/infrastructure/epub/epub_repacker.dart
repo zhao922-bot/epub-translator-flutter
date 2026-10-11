@@ -130,6 +130,7 @@ body.epub-translator-cjk [data-translation="true"] {
     bool Function()? isCancelled,
     Set<String> degradedBlockIds = const <String>{},
     String? translatedTitle,
+    void Function(int completedChapters, int totalChapters)? onProgress,
   }) async {
     void throwIfCancelled() {
       if (cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)) {
@@ -138,16 +139,63 @@ body.epub-translator-cjk [data-translation="true"] {
     }
 
     throwIfCancelled();
+    final prepared = await EpubIsolateWorker.prepareWithProgress(
+      operation: _preparationOperation(chapters, config, degradedBlockIds),
+      isCancelled: () =>
+          cancelToken?.isCancelled == true || (isCancelled?.call() ?? false),
+      onProgress: onProgress,
+    );
+    throwIfCancelled();
+    final bool committed;
+    try {
+      committed = await EpubIsolateWorker.writeTranslatedEpub(
+        inputPath: inputPath,
+        outputFilePath: outputFilePath,
+        translatedHtmlByPath: prepared.html,
+        navigationLabelsByPath: prepared.labels,
+        navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
+        bilingual: config.bilingual,
+        expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
+        translatedTitle: translatedTitle,
+        shouldCommit: () =>
+            !(cancelToken?.isCancelled == true ||
+                (isCancelled?.call() ?? false)),
+        lockedMessage: (String outputPath, String tempPath) => AppStrings(
+          config.uiLanguage,
+        ).outputFileLockedAtCommit(outputPath, tempPath),
+      );
+    } on InputFileLockedException catch (error) {
+      throw StateError(
+        AppStrings(config.uiLanguage).inputFileLocked(error.inputPath),
+      );
+    } on EpubDecompressionLimitException {
+      throw StateError(
+        AppStrings(config.uiLanguage).epubDecompressionLimit(inputPath),
+      );
+    }
+    if (!committed) {
+      throw const TranslationCancelledException();
+    }
+    // Cancellation after commit must not report visible output as aborted.
+  }
+
+  // Construct the sendable closure in a scope without UI callbacks/tokens.
+  ({Map<String, String> html, Map<String, String> labels}) Function(
+    void Function(int, int),
+  )
+  _preparationOperation(
+    List<InspectedChapter> chapters,
+    TranslationConfig config,
+    Set<String> degradedBlockIds,
+  ) => (reportProgress) {
     final ProperNameBookState properNameState =
         ProperNameNormalizer.bookState();
-    // Rendered chapter by chapter (not in one collection literal) so a
-    // pending cancellation is honored between chapters instead of only
-    // before the isolate ZIP step. Repacking makes no API calls, so this is
-    // purely about cancel responsiveness on large books.
     final Map<String, String> translatedHtmlByPath = <String, String>{};
+    int completedChapters = 0;
+    reportProgress(0, chapters.length);
     for (final InspectedChapter chapter in chapters) {
-      throwIfCancelled();
       if (!chapter.includeInTranslation) {
+        reportProgress(++completedChapters, chapters.length);
         continue;
       }
       translatedHtmlByPath[chapter.path] = renderTranslatedChapter(
@@ -158,6 +206,7 @@ body.epub-translator-cjk [data-translation="true"] {
         properNameState: properNameState,
         degradedBlockIds: degradedBlockIds,
       );
+      reportProgress(++completedChapters, chapters.length);
     }
     _synchronizeHtmlTocLabels(
       translatedHtmlByPath,
@@ -170,47 +219,8 @@ body.epub-translator-cjk [data-translation="true"] {
     // never loaded into the main isolate just to read three small XML files.
     final navigationLabelsByPath = _navigationLabels(chapters);
     _validateXmlReplacements(translatedHtmlByPath);
-    throwIfCancelled();
-    final bool committed;
-    try {
-      committed = await EpubIsolateWorker.writeTranslatedEpub(
-        inputPath: inputPath,
-        outputFilePath: outputFilePath,
-        translatedHtmlByPath: translatedHtmlByPath,
-        navigationLabelsByPath: navigationLabelsByPath,
-        navigationLanguageTag: _languageTagForTarget(config.targetLanguage),
-        bilingual: config.bilingual,
-        expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
-        translatedTitle: translatedTitle,
-        // Isolate cannot be hard-interrupted; refuse final commit on cancel.
-        shouldCommit: () =>
-            !(cancelToken?.isCancelled == true ||
-                (isCancelled?.call() ?? false)),
-        // A lock probe before translation cannot close the TOCTOU window, so
-        // the commit failure itself carries the localized message (with the
-        // preserved temp path) instead of a raw FileSystemException.
-        lockedMessage: (String outputPath, String tempPath) => AppStrings(
-          config.uiLanguage,
-        ).outputFileLockedAtCommit(outputPath, tempPath),
-      );
-    } on InputFileLockedException catch (error) {
-      // The user opened the source EPUB in a reader mid-run (Windows sharing
-      // violation): fail loudly with an actionable message instead of a raw
-      // English OS error. The block cache is intact, so the retry is cheap.
-      throw StateError(
-        AppStrings(config.uiLanguage).inputFileLocked(error.inputPath),
-      );
-    } on EpubDecompressionLimitException {
-      throw StateError(
-        AppStrings(config.uiLanguage).epubDecompressionLimit(inputPath),
-      );
-    }
-    if (!committed) {
-      throw const TranslationCancelledException();
-    }
-    // The final EPUB is already visible. Cancellation after this point must
-    // not report the committed output as an aborted translation.
-  }
+    return (html: translatedHtmlByPath, labels: navigationLabelsByPath);
+  };
 
   String renderTranslatedChapter({
     required InspectedChapter chapter,

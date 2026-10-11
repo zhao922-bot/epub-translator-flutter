@@ -50,6 +50,7 @@ class _Repacker extends EpubRepacker {
     bool Function()? isCancelled,
     Set<String> degradedBlockIds = const {},
     String? translatedTitle,
+    void Function(int completedChapters, int totalChapters)? onProgress,
   }) async {
     await File(outputFilePath).writeAsString('output');
   }
