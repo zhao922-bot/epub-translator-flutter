@@ -580,8 +580,13 @@ class _ControlledSessionPathStore extends SessionPathStore {
       Completer<({String inputPath, String outputDirectory})>();
 
   @override
-  Future<({String inputPath, String outputDirectory})> load() =>
-      loadCompleter.future;
+  Future<SessionPathResult> load() async {
+    final paths = await loadCompleter.future;
+    return SessionPathResult(
+      inputPath: paths.inputPath,
+      outputDirectory: paths.outputDirectory,
+    );
+  }
 
   @override
   Future<void> save({
@@ -594,8 +599,7 @@ class _RecordingSessionPathStore extends SessionPathStore {
   final List<({String inputPath, String outputDirectory})> saves = [];
 
   @override
-  Future<({String inputPath, String outputDirectory})> load() async =>
-      (inputPath: '', outputDirectory: '');
+  Future<SessionPathResult> load() async => const SessionPathResult();
 
   @override
   Future<void> save({
@@ -617,8 +621,7 @@ class _DelayedSessionPathStore extends SessionPathStore {
   String savedInputPath = '';
 
   @override
-  Future<({String inputPath, String outputDirectory})> load() async =>
-      (inputPath: '', outputDirectory: '');
+  Future<SessionPathResult> load() async => const SessionPathResult();
 
   @override
   Future<void> save({

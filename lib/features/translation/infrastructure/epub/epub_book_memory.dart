@@ -214,8 +214,7 @@ class _EpubBookMemory {
     final List<InspectedChapter> substantialContent = contentCandidates
         .where(
           (InspectedChapter chapter) =>
-              _representativeStyleText(chapter.blocks).length >=
-              _minimumRepresentativeStyleCharacters,
+              _hasRepresentativeStyleText(chapter.blocks),
         )
         .toList(growable: false);
     final int desiredRepresentativeCount = min(3, contentCandidates.length);
@@ -335,47 +334,133 @@ class _EpubBookMemory {
   }
 
   static String _representativeStyleText(List<ExtractedBlock> blocks) {
-    final List<String> texts = blocks
-        .map((ExtractedBlock block) => block.sourceText.trim())
-        .where((String value) => value.isNotEmpty)
+    final List<ExtractedBlock> texts = blocks
+        .where(
+          (ExtractedBlock block) =>
+              _styleNonWhitespace.hasMatch(block.sourceText),
+        )
         .toList(growable: false);
     if (texts.isEmpty) {
       return '';
     }
     if (texts.length <= 12) {
-      return _trimMemoryText(texts.join('\n'));
+      return _boundedStyleText(texts, _memoryChapterTextLimit);
     }
 
     const int segmentBlocks = 4;
     const int segmentCharacterLimit = _memoryChapterTextLimit ~/ 3;
     final int middleStart = max(0, (texts.length - segmentBlocks) ~/ 2);
     final int endingStart = max(0, texts.length - segmentBlocks);
-    final List<String> opening = texts.take(segmentBlocks).toList();
-    final List<String> middle = texts
+    final List<ExtractedBlock> opening = texts.take(segmentBlocks).toList();
+    final List<ExtractedBlock> middle = texts
         .skip(middleStart)
         .take(segmentBlocks)
         .toList();
-    final List<String> ending = texts
+    final List<ExtractedBlock> ending = texts
         .skip(endingStart)
         .take(segmentBlocks)
         .toList();
 
     return <String>[
-      '[Opening]\n${_trimStyleSegment(opening, segmentCharacterLimit)}',
-      '[Middle]\n${_trimStyleSegment(middle, segmentCharacterLimit)}',
-      '[Ending]\n${_trimStyleSegment(ending, segmentCharacterLimit)}',
+      '[Opening]\n${_boundedStyleText(opening, segmentCharacterLimit)}',
+      '[Middle]\n${_boundedStyleText(middle, segmentCharacterLimit)}',
+      '[Ending]\n${_boundedStyleText(ending, segmentCharacterLimit)}',
     ].join('\n');
   }
 
-  static String _trimStyleSegment(List<String> texts, int limit) {
-    final String collapsed = texts
-        .join('\n')
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
-    if (collapsed.length <= limit) {
-      return collapsed;
+  static bool _hasRepresentativeStyleText(List<ExtractedBlock> blocks) {
+    // The opening four nonempty blocks occur in either sampling layout.
+    // Stop as soon as their normalized prefix meets the threshold. For thin
+    // openings retain the historical middle/ending and label length rules.
+    const threshold = _minimumRepresentativeStyleCharacters;
+    final nonempty = blocks.where(
+      (block) => _styleNonWhitespace.hasMatch(block.sourceText),
+    );
+    if (_normalizedStyleLength(nonempty.take(4), threshold) >= threshold) {
+      return true;
     }
-    return '${collapsed.substring(0, limit - 3)}...';
+    final texts = nonempty.toList(growable: false);
+    if (texts.length <= 12) {
+      return _normalizedStyleLength(texts, threshold) >= threshold;
+    }
+    int length = '[Opening]\n\n[Middle]\n\n[Ending]\n'.length;
+    for (final start in [0, (texts.length - 4) ~/ 2, texts.length - 4]) {
+      length += _normalizedStyleLength(
+        texts.skip(start).take(4),
+        threshold - length,
+      );
+      if (length >= threshold) return true;
+    }
+    return false;
+  }
+
+  static int _normalizedStyleLength(
+    Iterable<ExtractedBlock> blocks,
+    int stopAt,
+  ) {
+    final whitespace = RegExp(r'\s');
+    int length = 0;
+    bool pendingSpace = false;
+    for (final block in blocks) {
+      final text = block.sourceText;
+      final (start, end) = _styleTextBounds(text);
+      for (int index = start; index < end; index++) {
+        if (whitespace.hasMatch(text[index])) {
+          pendingSpace = length > 0;
+          continue;
+        }
+        if (pendingSpace) length++;
+        pendingSpace = false;
+        length++;
+        if (length >= stopAt) return stopAt;
+      }
+      pendingSpace = length > 0;
+    }
+    return length;
+  }
+
+  static String _boundedStyleText(Iterable<ExtractedBlock> blocks, int limit) {
+    final buffer = StringBuffer();
+    final whitespace = RegExp(r'\s');
+    bool pendingSpace = false;
+    for (final block in blocks) {
+      final text = block.sourceText;
+      final (start, end) = _styleTextBounds(text);
+      for (int index = start; index < end; index++) {
+        final character = text[index];
+        if (whitespace.hasMatch(character)) {
+          pendingSpace = buffer.isNotEmpty;
+          continue;
+        }
+        if (pendingSpace) buffer.write(' ');
+        pendingSpace = false;
+        buffer.write(character);
+        // Read one extra normalized character to preserve the old <= limit
+        // boundary (an exactly-full sample must not acquire an ellipsis).
+        if (buffer.length > limit) {
+          return '${buffer.toString().substring(0, limit - 3)}...';
+        }
+      }
+      pendingSpace = buffer.isNotEmpty;
+    }
+    return buffer.toString();
+  }
+
+  // String.trim additionally removes NEXT LINE (U+0085), unlike RegExp \s.
+  // Preserve block-edge trimming without allocating whole-block substrings.
+  static final RegExp _styleTrimWhitespace = RegExp(r'[\s\u0085]');
+  static final RegExp _styleNonWhitespace = RegExp(r'[^\s\u0085]');
+
+  static (int, int) _styleTextBounds(String text) {
+    int start = 0;
+    int end = text.length;
+    while (start < end && _styleTrimWhitespace.hasMatch(text[start])) {
+      start++;
+    }
+    while (end > start && _styleTrimWhitespace.hasMatch(text[end - 1])) {
+      end--;
+    }
+    return (start, end);
   }
 
   static TranslationStyleProfile _parseStyleProfileResponse(
@@ -526,14 +611,6 @@ class _EpubBookMemory {
 
   static String _plainTextFromHtmlFragment(String value) {
     return XhtmlHtmlCompatibility.parseFragment(value).text ?? '';
-  }
-
-  static String _trimMemoryText(String value) {
-    final String collapsed = value.replaceAll(RegExp(r'\s+'), ' ').trim();
-    if (collapsed.length <= _memoryChapterTextLimit) {
-      return collapsed;
-    }
-    return '${collapsed.substring(0, _memoryChapterTextLimit - 3)}...';
   }
 
   static TranslationStyleProfile _styleProfileFromBookMemoryJson(

@@ -1,10 +1,12 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:async';
 
 import 'package:archive/archive.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
+import 'package:epub_translator_flutter/shared/io/output_file_lock.dart';
 
 void main() {
   group('atomic EPUB write', () {
@@ -50,11 +52,12 @@ void main() {
           'backup-moved',
         );
         var finished = false;
+        var cancelled = false;
         final competing =
             EpubIsolateWorker.commitTempFile(
               temp,
               output,
-              shouldCommit: () => false,
+              shouldCommit: () => !cancelled,
             ).then((value) {
               finished = true;
               return value;
@@ -63,11 +66,118 @@ void main() {
         expect(finished, isFalse);
         expect(await output.exists(), isFalse);
         expect(await File('${output.path}.bak.process').readAsString(), 'OLD');
+        cancelled = true;
+        expect(await competing.timeout(const Duration(seconds: 2)), isFalse);
+        expect(await temp.exists(), isFalse);
+        expect(await output.exists(), isFalse);
+        final timeoutTemp = File('${output.path}.tmp.timeout');
+        await timeoutTemp.writeAsString('timeout');
+        await expectLater(
+          EpubIsolateWorker.commitTempFile(
+            timeoutTemp,
+            output,
+            lockTimeout: const Duration(milliseconds: 200),
+          ),
+          throwsA(isA<TimeoutException>()),
+        );
+        expect(await timeoutTemp.exists(), isFalse);
+        expect(await File('${output.path}.bak.process').readAsString(), 'OLD');
         process.stdin.writeln('commit');
         await process.stdin.flush();
         expect(await process.exitCode, 0, reason: await errors);
         expect(await competing, isFalse);
         expect(await output.readAsString(), 'A_COMMITTED');
+      },
+    );
+
+    test('process lock release lets retry commit successfully', () async {
+      final output = File(path.join(tempDir.path, 'release.epub'));
+      final temp = File('${output.path}.tmp.B');
+      await output.writeAsString('OLD');
+      await temp.writeAsString('B');
+      final dart = path.join(
+        path.dirname(Platform.resolvedExecutable),
+        '..',
+        '..',
+        '..',
+        'dart-sdk',
+        'bin',
+        Platform.isWindows ? 'dart.exe' : 'dart',
+      );
+      final process = await Process.start(dart, [
+        'test/fixtures/output_lock_process.dart',
+        output.path,
+      ]);
+      addTearDown(() => process.kill());
+      final errors = process.stderr.transform(utf8.decoder).join();
+      expect(
+        await process.stdout
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())
+            .first,
+        'backup-moved',
+      );
+      var finished = false;
+      final commit = EpubIsolateWorker.commitTempFile(temp, output).then((
+        value,
+      ) {
+        finished = true;
+        return value;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(finished, isFalse);
+      process.stdin.writeln('release');
+      await process.stdin.flush();
+      expect(await process.exitCode, 0, reason: await errors);
+      expect(await commit.timeout(const Duration(seconds: 2)), isTrue);
+      expect(await output.readAsString(), 'B');
+      expect(await temp.exists(), isFalse);
+    });
+
+    test(
+      'queued cancellation keeps successors behind owner; timeout cleans temp',
+      () async {
+        final output = File(path.join(tempDir.path, 'queue.epub'));
+        final entered = Completer<void>();
+        final release = Completer<void>();
+        final owner = OutputFileLock.run(output, () async {
+          entered.complete();
+          await release.future;
+        });
+        await entered.future;
+        var cancelled = false;
+        final cancelledTemp = File('${output.path}.tmp.cancel');
+        await cancelledTemp.writeAsString('cancel');
+        final waiter = EpubIsolateWorker.commitTempFile(
+          cancelledTemp,
+          output,
+          shouldCommit: () => !cancelled,
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        cancelled = true;
+        expect(await waiter.timeout(const Duration(seconds: 2)), isFalse);
+        expect(await cancelledTemp.exists(), isFalse);
+        final timeoutTemp = File('${output.path}.tmp.timeout');
+        await timeoutTemp.writeAsString('timeout');
+        await expectLater(
+          EpubIsolateWorker.commitTempFile(
+            timeoutTemp,
+            output,
+            lockTimeout: const Duration(milliseconds: 100),
+          ),
+          throwsA(isA<TimeoutException>()),
+        );
+        expect(await timeoutTemp.exists(), isFalse);
+        var successorEntered = false;
+        final successor = OutputFileLock.run(output, () async {
+          successorEntered = true;
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+        expect(successorEntered, isFalse);
+        release.complete();
+        await owner;
+        await successor;
+        expect(successorEntered, isTrue);
       },
     );
 

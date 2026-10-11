@@ -49,8 +49,10 @@ class History extends JobHistoryStore {
 
 class RememberedPaths extends SessionPathStore {
   @override
-  Future<({String inputPath, String outputDirectory})> load() async =>
-      (inputPath: 'remembered.epub', outputDirectory: 'remembered-output');
+  Future<SessionPathResult> load() async => const SessionPathResult(
+    inputPath: 'remembered.epub',
+    outputDirectory: 'remembered-output',
+  );
   @override
   Future<void> save({
     required String inputPath,

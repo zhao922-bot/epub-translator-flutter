@@ -698,15 +698,28 @@ class EpubIsolateWorker {
     File finalFile, {
     bool Function()? shouldCommit,
     String Function(String outputPath, String tempPath)? lockedMessage,
-  }) => OutputFileLock.run(
-    finalFile,
-    () => _commitTempFileLocked(
-      tempFile,
-      finalFile,
-      shouldCommit: shouldCommit,
-      lockedMessage: lockedMessage,
-    ),
-  );
+    Duration lockTimeout = const Duration(seconds: 45),
+  }) async {
+    try {
+      return await OutputFileLock.run(
+        finalFile,
+        () => _commitTempFileLocked(
+          tempFile,
+          finalFile,
+          shouldCommit: shouldCommit,
+          lockedMessage: lockedMessage,
+        ),
+        isCancelled: () => shouldCommit != null && !shouldCommit(),
+        timeout: lockTimeout,
+      );
+    } on OutputLockCancelledException {
+      await _deleteQuietly(tempFile);
+      return false;
+    } on TimeoutException {
+      await _deleteQuietly(tempFile);
+      rethrow;
+    }
+  }
 
   // Recovery, promotion and rollback are one transaction under the same lock.
   static Future<bool> _commitTempFileLocked(

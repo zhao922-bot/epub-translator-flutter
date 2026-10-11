@@ -240,6 +240,9 @@ class EpubChapterTranslator {
     return _EpubBookMemory._styleProfileSourceChapters(chapters);
   }
 
+  static bool hasRepresentativeStyleTextForTest(List<ExtractedBlock> blocks) =>
+      _EpubBookMemory._hasRepresentativeStyleText(blocks);
+
   static String outputFilePathForTest({
     required String inputPath,
     required String outputDirectory,

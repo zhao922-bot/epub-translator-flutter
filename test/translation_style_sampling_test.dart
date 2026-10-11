@@ -3,6 +3,98 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('eligibility stops at the first oversized block', () {
+    final blocks = List<_CountingBlock>.generate(
+      100,
+      (_) => _CountingBlock('prose ' * 100000),
+    );
+    expect(
+      EpubChapterTranslator.hasRepresentativeStyleTextForTest(blocks),
+      isTrue,
+    );
+    expect(blocks.first.reads, lessThanOrEqualTo(2));
+    expect(blocks.skip(1).every((block) => block.reads == 0), isTrue);
+  });
+
+  test('bounded sampling matches the previous sampler exactly', () {
+    for (final values in <List<String>>[
+      ['\u0085 prose \u0085', '\uFEFF text \uFEFF', '\u00a0more\u00a0'],
+      [for (int i = 0; i < 20; i++) i == 5 ? 'x' * 100000 : 'a'],
+      [for (int i = 0; i < 13; i++) i == 0 ? 'x' * 800 : 'b'],
+    ]) {
+      final chapter = _chapter(
+        path: 'edge.xhtml',
+        title: 'Edge',
+        category: ChapterCategory.content,
+        prefix: '',
+      ).copyWith(blocks: values.map(_CountingBlock.new).toList());
+      expect(
+        EpubChapterTranslator.styleProfileSourceChaptersForTest([
+          chapter,
+        ]).single['text'],
+        _legacySample(chapter.blocks),
+      );
+      expect(
+        EpubChapterTranslator.hasRepresentativeStyleTextForTest(chapter.blocks),
+        _legacySample(chapter.blocks).length >= 240,
+      );
+    }
+    for (final count in [1, 12, 13, 20]) {
+      for (final size in [10, 239, 240, 800, 2400, 100000]) {
+        final chapter =
+            _chapter(
+              path: 'chapter.xhtml',
+              title: 'Chapter',
+              category: ChapterCategory.content,
+              prefix: 'text',
+            ).copyWith(
+              blocks: List.generate(
+                count,
+                (i) => ExtractedBlock(
+                  id: '$i',
+                  tagName: 'p',
+                  sourceHtml: '',
+                  sourceText: i % 5 == 3
+                      ? ' \n\t '
+                      : ' \t$i ${'word\n\t ' * size} end  ',
+                ),
+              ),
+            );
+        final samples = EpubChapterTranslator.styleProfileSourceChaptersForTest(
+          [chapter],
+        );
+        expect(
+          samples.single['text'],
+          _legacySample(chapter.blocks),
+          reason: 'count=$count size=$size',
+        );
+        expect(
+          EpubChapterTranslator.hasRepresentativeStyleTextForTest(
+            chapter.blocks,
+          ),
+          _legacySample(chapter.blocks).length >= 240,
+        );
+      }
+    }
+    for (final length in [239, 240, 799, 800, 801, 2399, 2400, 2401]) {
+      final chapter = _chapter(
+        path: 'boundary.xhtml',
+        title: 'Boundary',
+        category: ChapterCategory.content,
+        prefix: '',
+      ).copyWith(blocks: [_CountingBlock('x' * length)]);
+      expect(
+        EpubChapterTranslator.styleProfileSourceChaptersForTest([
+          chapter,
+        ]).single['text'],
+        _legacySample(chapter.blocks),
+      );
+      expect(
+        EpubChapterTranslator.hasRepresentativeStyleTextForTest(chapter.blocks),
+        length >= 240,
+      );
+    }
+  });
   test('samples preface plus early, middle and late content', () {
     final List<InspectedChapter> chapters = <InspectedChapter>[
       _chapter(
@@ -167,6 +259,34 @@ void main() {
       );
     },
   );
+}
+
+class _CountingBlock implements ExtractedBlock {
+  _CountingBlock(this.text);
+  final String text;
+  int reads = 0;
+  @override
+  String get sourceText {
+    reads++;
+    return text;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+String _legacySample(List<ExtractedBlock> blocks) {
+  final texts = blocks
+      .map((b) => b.sourceText.trim())
+      .where((s) => s.isNotEmpty)
+      .toList();
+  String trim(List<String> values, int limit) {
+    final text = values.join('\n').replaceAll(RegExp(r'\s+'), ' ').trim();
+    return text.length <= limit ? text : '${text.substring(0, limit - 3)}...';
+  }
+
+  if (texts.length <= 12) return trim(texts, 2400);
+  return '[Opening]\n${trim(texts.take(4).toList(), 800)}\n[Middle]\n${trim(texts.skip((texts.length - 4) ~/ 2).take(4).toList(), 800)}\n[Ending]\n${trim(texts.skip(texts.length - 4).toList(), 800)}';
 }
 
 InspectedChapter _chapter({

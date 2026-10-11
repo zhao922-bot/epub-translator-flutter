@@ -1,10 +1,25 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../shared/io/atomic_file_writer.dart';
 import '../../../shared/platform/platform_utils.dart';
+
+enum SessionPathStatus { missing, corrupt, unreadable, ok }
+
+class SessionPathResult {
+  const SessionPathResult({
+    this.status = SessionPathStatus.ok,
+    this.inputPath = '',
+    this.outputDirectory = '',
+  });
+
+  final SessionPathStatus status;
+  final String inputPath;
+  final String outputDirectory;
+}
 
 /// Remembers the last EPUB input path and output directory across sessions.
 class SessionPathStore {
@@ -12,22 +27,35 @@ class SessionPathStore {
 
   final Future<File> Function()? fileProvider;
 
-  Future<({String inputPath, String outputDirectory})> load() async {
+  Future<SessionPathResult> load() async {
+    final String contents;
     try {
       final File file = await _file();
       if (!await file.exists()) {
-        return (inputPath: '', outputDirectory: '');
+        return const SessionPathResult(status: SessionPathStatus.missing);
       }
-      final Object? decoded = jsonDecode(await file.readAsString());
-      if (decoded is! Map<String, dynamic>) {
-        return (inputPath: '', outputDirectory: '');
+      contents = await file.readAsString();
+    } catch (error) {
+      debugPrint('SessionPathStore unreadable: $error');
+      return const SessionPathResult(status: SessionPathStatus.unreadable);
+    }
+    try {
+      final Object? decoded = jsonDecode(contents);
+      if (decoded is! Map<String, dynamic> ||
+          (decoded['inputPath'] != null && decoded['inputPath'] is! String) ||
+          (decoded['outputDirectory'] != null &&
+              decoded['outputDirectory'] is! String)) {
+        throw const FormatException(
+          'Expected an object with string path fields',
+        );
       }
-      return (
+      return SessionPathResult(
         inputPath: (decoded['inputPath'] as String?)?.trim() ?? '',
         outputDirectory: (decoded['outputDirectory'] as String?)?.trim() ?? '',
       );
-    } catch (_) {
-      return (inputPath: '', outputDirectory: '');
+    } on FormatException catch (error) {
+      debugPrint('SessionPathStore corrupt: $error');
+      return const SessionPathResult(status: SessionPathStatus.corrupt);
     }
   }
 

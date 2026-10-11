@@ -2375,12 +2375,12 @@ class TranslationDashboardController
       return;
     }
     final int revisionBeforeLoad = _sessionPathRevision;
-    final ({String inputPath, String outputDirectory}) paths = await store
-        .load();
+    final SessionPathResult paths = await store.load();
     if (!mounted) {
       return;
     }
-    if (_sessionPathRevision != revisionBeforeLoad ||
+    if (paths.status != SessionPathStatus.ok ||
+        _sessionPathRevision != revisionBeforeLoad ||
         (paths.inputPath.isEmpty && paths.outputDirectory.isEmpty)) {
       return;
     }
