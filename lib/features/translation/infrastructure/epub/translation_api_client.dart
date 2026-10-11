@@ -10,7 +10,7 @@ import '../../../../shared/localization/app_strings.dart';
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 
-/// Thrown when a batch translation reply cannot be parsed as JSON at all
+/// Thrown when a translation, style, or memory reply cannot be parsed as JSON
 /// (the message content is missing or is not a JSON object).
 ///
 /// Unlike a well-formed reply that fails validation (wrong block ids, a
@@ -32,10 +32,10 @@ class MissingApiConfigurationException extends FormatException {
 
 /// Why a user-typed proxy setting cannot be used as an HTTP proxy.
 enum ProxySettingError {
-  /// The value is not shaped like `host:port` or `http(s)://host:port`.
+  /// The value is not shaped like `host:port` or `http://host:port`.
   invalidFormat,
 
-  /// An explicit scheme other than `http://`/`https://` (e.g. `socks5://`).
+  /// An explicit scheme other than `http://` (including `https://`).
   unsupportedScheme,
 }
 
@@ -47,6 +47,17 @@ class TranslationApiClient {
       port != null && port >= 1 && port <= 65535;
 
   Dio buildDio(TranslationConfig config) {
+    final ProxySettingError? proxyError = validateProxySetting(
+      config.httpProxy,
+    );
+    if (proxyError != null) {
+      final AppStrings strings = AppStrings(config.uiLanguage);
+      throw FormatException(
+        proxyError == ProxySettingError.unsupportedScheme
+            ? strings.httpProxyUnsupportedScheme
+            : strings.httpProxyInvalidFormat,
+      );
+    }
     final Dio dio = Dio(
       BaseOptions(
         baseUrl: normalizedBaseUrl(config.apiBaseUrl),
@@ -113,11 +124,11 @@ class TranslationApiClient {
   }
 
   /// Normalizes a user-typed proxy setting into `"host:port"`, or null when
-  /// it is empty or malformed. Accepts `host:port`, `http://host:port`, and
-  /// `https://host:port` (IPv6 literals need brackets: `[::1]:8080`).
-  /// Other schemes (e.g. `socks5://`) are rejected: Dart's HttpClient only
-  /// speaks HTTP proxies, so silently treating a SOCKS address as an HTTP
-  /// proxy would fail later with a confusing connection error. Use
+  /// it is empty or malformed. Accepts `host:port` and `http://host:port`
+  /// (IPv6 literals need brackets: `[::1]:8080`). HTTPS proxies are rejected:
+  /// Dart's HttpClient PROXY transport does not establish TLS to the proxy,
+  /// and stripping that scheme would expose proxy credentials in plaintext.
+  /// Other schemes (e.g. `socks5://`) are also rejected. Use
   /// [validateProxySetting] to tell the user why a value is invalid.
   static String? proxyHostPort(String value) {
     return _parseProxySetting(value).hostPort;
@@ -163,7 +174,7 @@ class TranslationApiClient {
         !_isValidProxyPort(port)) {
       return invalid;
     }
-    if (parsed.scheme != 'http' && parsed.scheme != 'https') {
+    if (parsed.scheme != 'http') {
       return (hostPort: null, error: ProxySettingError.unsupportedScheme);
     }
     final String host = parsed.host;
@@ -524,9 +535,9 @@ class TranslationApiClient {
   }
 
   /// Extracts the message content from a chat-completions response and
-  /// decodes it as a JSON object for a batch request. Any failure to even
-  /// parse the reply becomes a [TranslationParseException] so the batch
-  /// retry policy can tell "the model did not return JSON" apart from
+  /// decodes it as a JSON object for translation, style, and memory requests.
+  /// Any failure to parse the reply becomes a [TranslationParseException]
+  /// so the shared retry policy can tell "the model did not return JSON" from
   /// "the JSON failed validation".
   Map<String, dynamic> decodeBatchJsonPayload(dynamic responseData) {
     try {

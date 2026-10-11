@@ -156,9 +156,7 @@ class _EpubBookMemory {
           cancelToken: cancelToken,
         );
         throwIfCancelled?.call();
-        return owner._apiClient.decodeJsonObject(
-          owner._apiClient.extractMessageContent(response.data),
-        );
+        return owner._apiClient.decodeBatchJsonPayload(response.data);
       },
     );
   }
@@ -489,19 +487,41 @@ class _EpubBookMemory {
     InspectedChapter chapter, {
     bool preferTranslated = false,
   }) {
-    final String text = chapter.blocks
-        .map<String>((ExtractedBlock block) {
-          final String? translatedHtml = block.translatedHtml;
-          if (preferTranslated &&
+    final StringBuffer excerpt = StringBuffer();
+    final RegExp whitespace = RegExp(r'\s');
+    bool pendingSpace = false;
+    // Only parse blocks needed for this excerpt. Collapse whitespace while
+    // copying into a bounded buffer, rather than joining the entire chapter
+    // and allocating another whole-chapter string to normalize it.
+    for (final ExtractedBlock block in chapter.blocks) {
+      final String? translatedHtml = block.translatedHtml;
+      final String text =
+          preferTranslated &&
               translatedHtml != null &&
-              translatedHtml.trim().isNotEmpty) {
-            return _plainTextFromHtmlFragment(translatedHtml);
-          }
-          return block.sourceText;
-        })
-        .where((String value) => value.trim().isNotEmpty)
-        .join('\n');
-    return _trimMemoryText(text);
+              translatedHtml.trim().isNotEmpty
+          ? _plainTextFromHtmlFragment(translatedHtml)
+          : block.sourceText;
+      for (int index = 0; index < text.length; index += 1) {
+        final String character = text[index];
+        if (whitespace.hasMatch(character)) {
+          pendingSpace = excerpt.isNotEmpty;
+          continue;
+        }
+        if (pendingSpace) {
+          excerpt.write(' ');
+          pendingSpace = false;
+        }
+        if (excerpt.length < _memoryChapterTextLimit) {
+          excerpt.write(character);
+        }
+        if (excerpt.length >= _memoryChapterTextLimit) {
+          return '${excerpt.toString().substring(0, _memoryChapterTextLimit - 3)}...';
+        }
+      }
+      // The old newline between nonempty blocks collapses to one space.
+      pendingSpace = excerpt.isNotEmpty;
+    }
+    return excerpt.toString();
   }
 
   static String _plainTextFromHtmlFragment(String value) {

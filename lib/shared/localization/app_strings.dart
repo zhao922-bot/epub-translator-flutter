@@ -302,11 +302,11 @@ class AppStrings {
       ? '如 127.0.0.1:7890；留空则不使用代理。本地地址不会走代理。'
       : 'e.g. 127.0.0.1:7890; leave empty for no proxy. Local addresses bypass it.';
   String get httpProxyInvalidFormat => isChinese
-      ? '代理地址格式不正确，应为 host:port 或 http(s)://host:port。'
-      : 'Invalid proxy address. Expected host:port or http(s)://host:port.';
+      ? '代理地址格式不正确，应为 host:port 或 http://host:port。'
+      : 'Invalid proxy address. Expected host:port or http://host:port.';
   String get httpProxyUnsupportedScheme => isChinese
-      ? '仅支持 HTTP/HTTPS 代理，不支持 SOCKS 等其他协议。'
-      : 'Only HTTP/HTTPS proxies are supported, not SOCKS or other protocols.';
+      ? '仅支持 HTTP 代理。暂不支持到代理的 TLS 连接，已拒绝 HTTPS 代理地址，不会降级为明文 HTTP；也不支持 SOCKS 等其他协议。'
+      : 'Only HTTP proxies are supported. TLS connections to proxies are not supported yet; HTTPS proxy addresses are rejected and will not be downgraded to plaintext HTTP. SOCKS and other protocols are also unsupported.';
   String get translationSection => isChinese ? '翻译' : 'Translation';
   String get advancedTuning => isChinese ? '高级参数' : 'Advanced parameters';
   String get tuningPresets => isChinese ? '速度预设' : 'Speed presets';

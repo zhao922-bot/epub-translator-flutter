@@ -10,6 +10,49 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   const TranslationApiClient client = TranslationApiClient();
 
+  test('rejects HTTPS proxy credentials before any connection', () async {
+    final proxy = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    int connections = 0;
+    final subscription = proxy.listen((socket) {
+      connections += 1;
+      socket.destroy();
+    });
+    try {
+      for (final value in <String>[
+        'https://proxy.example:443',
+        'HTTPS://[::1]:443/',
+        'https://user:secret@127.0.0.1:${proxy.port}',
+      ]) {
+        final config = TranslationConfig.defaults().copyWith(
+          apiBaseUrl: 'https://api.example.com',
+          apiKey: 'key',
+          model: 'model',
+          httpProxy: value,
+        );
+        expect(
+          TranslationApiClient.validateProxySetting(value),
+          ProxySettingError.unsupportedScheme,
+        );
+        expect(TranslationApiClient.proxyHostPort(value), isNull);
+        final diagnostic = isA<FormatException>().having(
+          (error) => error.message,
+          'explicit HTTPS rejection',
+          contains('HTTPS'),
+        );
+        expect(() => client.buildDio(config), throwsA(diagnostic));
+        await expectLater(
+          client.testConnection(config: config),
+          throwsA(diagnostic),
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(connections, 0);
+    } finally {
+      await subscription.cancel();
+      await proxy.close();
+    }
+  });
+
   test(
     'authenticates a proxy challenge with decoded URI credentials',
     () async {
@@ -223,14 +266,14 @@ void main() {
       );
     });
 
-    test('accepts http(s)://host:port and strips the scheme', () {
+    test('accepts http://host:port and rejects HTTPS proxies', () {
       expect(
         TranslationApiClient.proxyHostPort('http://proxy.lan:8080'),
         'proxy.lan:8080',
       );
       expect(
         TranslationApiClient.proxyHostPort('https://proxy.lan:8080/'),
-        'proxy.lan:8080',
+        isNull,
       );
     });
 
@@ -261,10 +304,8 @@ void main() {
     final valid = <String, String>{
       '[::1]:7890': '[::1]:7890',
       'http://[::1]:7890': '[::1]:7890',
-      'https://[2001:db8::1]:8080/': '[2001:db8::1]:8080',
       '  [2001:4860:4860::8888]:65535  ': '[2001:4860:4860::8888]:65535',
       'http://proxy.lan:80': 'proxy.lan:80',
-      'https://proxy.lan:443/': 'proxy.lan:443',
       'http://[::1]:80/': '[::1]:80',
       'HTTP://proxy.lan:8080/': 'proxy.lan:8080',
       'http://proxy.lan:8080/path?next=http://other.lan:9090': 'proxy.lan:8080',
@@ -328,7 +369,7 @@ void main() {
       );
       expect(
         TranslationApiClient.validateProxySetting('https://proxy.lan:8080/'),
-        isNull,
+        ProxySettingError.unsupportedScheme,
       );
       expect(TranslationApiClient.validateProxySetting('[::1]:7890'), isNull);
     });
