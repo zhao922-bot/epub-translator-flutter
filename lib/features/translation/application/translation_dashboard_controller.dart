@@ -833,6 +833,14 @@ class TranslationDashboardController
         state = state.copyWith(isGeneratingStyleProfile: false);
         return;
       }
+      if (profile.isEmpty) {
+        state = state.copyWith(
+          isGeneratingStyleProfile: false,
+          styleProfileConfirmed: false,
+          logs: <String>[...state.logs, _s.logStyleProfileEmpty],
+        );
+        return;
+      }
       // The user may have hand-edited fields while the generation was in
       // flight (the card stays editable). Keep those edits: take the
       // generated profile as the base and overlay the user-touched fields
@@ -863,8 +871,7 @@ class TranslationDashboardController
       _styleFieldsEditedDuringGeneration.clear();
       state = state.copyWith(
         styleProfile: merged,
-        // Empty means generic style; keep unconfirmed only when there is content to review.
-        styleProfileConfirmed: merged.isEmpty,
+        styleProfileConfirmed: false,
         isGeneratingStyleProfile: false,
         logs: <String>[
           ...state.logs,
@@ -1524,10 +1531,11 @@ class TranslationDashboardController
           _s.logTranslationFailed(safeError),
           if (savedBlocks > 0) _s.logCheckpointed(savedBlocks),
         ],
-        actionableError: ActionableErrorFactory.fromMessage(
-          _s.logTranslationFailed(safeError),
+        actionableError: ActionableErrorFactory.fromError(
+          error,
+          message: _s.logTranslationFailed(safeError),
           isChinese: state.config.uiLanguage == UiLanguage.chinese,
-          preferredKind: ActionableErrorKind.retryTranslation,
+          fallbackKind: ActionableErrorKind.retryTranslation,
         ),
       );
       _clearActiveTranslationHistory();

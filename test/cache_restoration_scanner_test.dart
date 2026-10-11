@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
@@ -6,6 +7,76 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/cach
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'fully cached 2000-chapter suffix queries never revisit cache entries',
+    () async {
+      const count = 2000;
+      int reads = 0;
+      final result =
+          await CacheRestorationScanner(
+            readTranslation: (_) async {
+              reads++;
+              return '<p>Cached</p>';
+            },
+          ).scan(
+            chapters: [
+              for (int i = 0; i < count; i++)
+                _chapterWithTwoBlocks().copyWith(path: 'c$i'),
+            ],
+            cacheKeyFor: (chapter, block) => '${chapter.path}:${block.id}',
+            throwIfCancelled: () {},
+          );
+      expect(result.lastPendingChapterIndex, -1);
+      expect(reads, count * 2);
+      // The cache map is deliberately inaccessible after restoration. Any
+      // reintroduced per-chapter/per-block scan fails instead of a flaky timer.
+      final indexed = CacheRestorationResult(
+        translationsByChapter: _NoReadTranslations(),
+        scannedBlocks: result.scannedBlocks,
+        cachedBlocks: result.cachedBlocks,
+        unreadableBlocks: result.unreadableBlocks,
+        lastPendingChapterIndex: result.lastPendingChapterIndex,
+      );
+      for (int i = 0; i <= count; i++) {
+        expect(indexed.hasPendingBlocksFromChapter(i), isFalse);
+      }
+      expect(reads, count * 2);
+    },
+  );
+
+  for (final miss in ['absent', 'blank', 'unreadable']) {
+    test(
+      'last pending index handles $miss with zero-block chapters and a cached tail',
+      () async {
+        final result =
+            await CacheRestorationScanner(
+              readTranslation: (key) async {
+                if (key == 'c2:p2') {
+                  if (miss == 'unreadable') {
+                    throw const FileSystemException('broken');
+                  }
+                  return miss == 'blank' ? '  ' : null;
+                }
+                return '<p>Cached</p>';
+              },
+            ).scan(
+              chapters: [
+                _chapterWithTwoBlocks().copyWith(path: 'c0', blocks: []),
+                for (int i = 1; i <= 3; i++)
+                  _chapterWithTwoBlocks().copyWith(path: 'c$i'),
+                _chapterWithTwoBlocks().copyWith(path: 'c4', blocks: []),
+              ],
+              cacheKeyFor: (chapter, block) => '${chapter.path}:${block.id}',
+              throwIfCancelled: () {},
+            );
+        expect(result.lastPendingChapterIndex, 2);
+        for (int i = 0; i <= 5; i++) {
+          expect(result.hasPendingBlocksFromChapter(i), i <= 2);
+        }
+      },
+    );
+  }
+
   test('prefetches at most four reads and merges in source order', () async {
     final gates = List.generate(24, (_) => Completer<void>());
     final requested = <int>[];
@@ -186,6 +257,22 @@ void main() {
 
     expect(reads, 1);
   });
+}
+
+class _NoReadTranslations extends MapBase<String, Map<String, String>> {
+  @override
+  Map<String, String>? operator [](Object? key) =>
+      throw StateError('Cache revisited');
+  @override
+  Iterable<String> get keys => throw StateError('Cache traversed');
+  @override
+  void operator []=(String key, Map<String, String> value) =>
+      throw UnsupportedError('read only');
+  @override
+  void clear() => throw UnsupportedError('read only');
+  @override
+  Map<String, String>? remove(Object? key) =>
+      throw UnsupportedError('read only');
 }
 
 InspectedChapter _chapterWithTwoBlocks() {

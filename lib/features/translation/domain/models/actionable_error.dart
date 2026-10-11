@@ -1,3 +1,5 @@
+import 'package:dio/dio.dart';
+
 /// User-facing error with a primary recovery action.
 class ActionableError {
   const ActionableError({
@@ -26,8 +28,32 @@ class ActionableErrorFactory {
 
   /// Builds a recovery banner from [message].
   ///
-  /// Prefer [preferredKind] for known failures so localization cannot break
-  /// keyword matching. Otherwise classifies via English **and** Chinese cues.
+  /// Uses structured HTTP status before display text; [message] must already
+  /// be sanitized by the caller, so response bodies never enter the banner.
+  static ActionableError? fromError(
+    Object error, {
+    required String message,
+    bool isChinese = false,
+    ActionableErrorKind? fallbackKind,
+  }) {
+    if (message.trim().isEmpty) return null;
+    if (error is DioException) {
+      final kind = switch (error.response?.statusCode) {
+        401 || 403 => ActionableErrorKind.openSettings,
+        429 => ActionableErrorKind.reduceConcurrency,
+        _ => null,
+      };
+      if (kind != null) return _forKind(kind, message, isChinese);
+    }
+    return fromMessage(
+      message,
+      isChinese: isChinese,
+      preferredKind: fallbackKind,
+    );
+  }
+
+  /// Classifies English and Chinese cues before using [preferredKind] as the
+  /// phase default for an otherwise unrecognized failure.
   static ActionableError? fromMessage(
     String message, {
     bool isChinese = false,
@@ -49,7 +75,7 @@ class ActionableErrorFactory {
     }
 
     final ActionableErrorKind kind =
-        preferredKind ?? _classify(message) ?? ActionableErrorKind.dismiss;
+        _classify(message) ?? preferredKind ?? ActionableErrorKind.dismiss;
     return _forKind(kind, message, isChinese);
   }
 
@@ -79,6 +105,7 @@ class ActionableErrorFactory {
 
     // Auth / config
     if (lower.contains('api key') ||
+        lower.contains('api_key') ||
         lower.contains('401') ||
         lower.contains('unauthorized') ||
         lower.contains('403') ||

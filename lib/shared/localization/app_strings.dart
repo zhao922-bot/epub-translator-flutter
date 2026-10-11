@@ -866,8 +866,11 @@ class AppStrings {
       ? '请先检查 EPUB，再生成风格档案。'
       : 'Inspect an EPUB before generating a style profile.';
   String get logStyleProfileEmpty => isChinese
-      ? '未能从前言/前几章抽出稳定风格，可手动填写。'
-      : 'No stable style signal found; you can fill the profile manually.';
+      ? '未生成有效风格画像，已保留原有画像；请检查所选章节或手动填写。'
+      : 'No valid style profile generated; the existing profile was preserved. Check selected chapters or fill it manually.';
+  String get logStyleProfileNoSamples => isChinese
+      ? '所选章节没有可用于风格分析的采样原文，已保留原有画像；请选择正文章节后重试。'
+      : 'No source samples are available for style analysis in the selected chapters. The existing profile was preserved; select content chapters and try again.';
   String logStyleProfileFailed(String error) =>
       isChinese ? '风格档案生成失败：$error' : 'Style profile generation failed: $error';
   String get logStyleProfileNeedContent => isChinese

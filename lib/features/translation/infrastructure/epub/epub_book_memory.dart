@@ -20,7 +20,9 @@ class _EpubBookMemory {
     final List<Map<String, String>> sourceChapters =
         _styleProfileSourceChapters(chapters);
     if (sourceChapters.isEmpty) {
-      return TranslationStyleProfile.empty;
+      throw FormatException(
+        AppStrings(config.uiLanguage).logStyleProfileNoSamples,
+      );
     }
     final Map<String, dynamic> payload = <String, dynamic>{
       'kind': 'styleProfile',

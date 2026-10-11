@@ -14,6 +14,66 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/tran
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test(
+    'regenerates style from source after completed translation released blocks',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'epub_style_regeneration_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final kinds = <String>[];
+      final payloads = <Map<String, dynamic>>[];
+      final server = await _startFakeTranslationServer(
+        kinds,
+        payloads: payloads,
+      );
+      addTearDown(() => server.close(force: true));
+      final file = File('${temp.path}/style.epub');
+      await _writeTestEpub(
+        file,
+        chapters: {
+          'OPS/Text/chapter.xhtml':
+              '<p>Original prose to analyze after translation.</p>',
+        },
+      );
+      final config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        model: 'style-regeneration-${server.port}',
+        styleProfileEnabled: true,
+      );
+      final repository = EpubTranslationRepository();
+      final inspection = await repository.startJob(
+        inputPath: file.path,
+        outputDirectory: temp.path,
+        config: config,
+      );
+      final completed = await repository.translateChapters(
+        inputPath: file.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+      );
+      expect(completed.job.status, TranslationJobStatus.completed);
+      expect(completed.chapters.single.blocks.single.sourceText, isEmpty);
+      expect(completed.chapters.single.blocks.single.sourceHtml, isEmpty);
+      final profile = await repository.generateStyleProfile(
+        config: config,
+        chapters: completed.chapters,
+      );
+      expect(profile.primaryGenre, 'Literary fiction');
+      final payload = payloads.singleWhere(
+        (payload) => payload['kind'] == 'styleProfile',
+      );
+      final sample = (payload['chapters'] as List).single as Map;
+      expect(
+        sample['text'],
+        contains('Original prose to analyze after translation.'),
+      );
+      expect(sample['text'], isNot(contains('Translated')));
+    },
+  );
+
   test('repackages selected chapters with zero translatable blocks', () async {
     final Directory temp = await Directory.systemTemp.createTemp(
       'epub_repository_zero_blocks_test_',
@@ -164,7 +224,7 @@ void main() {
   });
 
   test(
-    'reuses cached translations without extra memory or translation requests',
+    'reuses 64 cached chapters without extra memory or translation requests',
     () async {
       final Directory temp = await Directory.systemTemp.createTemp(
         'epub_repository_cached_performance_test_',
@@ -178,8 +238,9 @@ void main() {
       final File epubFile = File('${temp.path}/cached_run.epub');
       await _writeTestEpub(
         epubFile,
-        chapters: const <String, String>{
-          'OPS/Text/chapter.xhtml': '<p>Hello.</p><p>World.</p>',
+        chapters: <String, String>{
+          for (int i = 0; i < 64; i++)
+            'OPS/Text/chapter_$i.xhtml': '<p>Hello $i.</p><p>World $i.</p>',
         },
       );
 
@@ -218,6 +279,8 @@ void main() {
       expect(requestKinds, isEmpty);
       expect(secondRun.job.phase, TranslationJobPhase.translation);
       expect(secondRun.job.hasExportableEpub, isTrue);
+      expect(secondRun.job.completedBlocks, 128);
+      expect(secondRun.job.status, TranslationJobStatus.completed);
     },
   );
 
@@ -1261,8 +1324,9 @@ class _FootnoteFakeServer {
 }
 
 Future<HttpServer> _startFakeTranslationServer(
-  List<String> requestKinds,
-) async {
+  List<String> requestKinds, {
+  List<Map<String, dynamic>>? payloads,
+}) async {
   final HttpServer server = await HttpServer.bind(
     InternetAddress.loopbackIPv4,
     0,
@@ -1277,8 +1341,10 @@ Future<HttpServer> _startFakeTranslationServer(
             as Map<String, dynamic>;
     final String kind = payload['kind'] as String? ?? 'blocks';
     requestKinds.add(kind);
+    payloads?.add(payload);
 
     final Object responsePayload = switch (kind) {
+      'styleProfile' => <String, Object?>{'primaryGenre': 'Literary fiction'},
       'initialBookMemory' => <String, Object?>{
         'bookSummary': 'A tiny test book.',
         'styleGuide': <Object?>[],

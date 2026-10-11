@@ -6,6 +6,7 @@ import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -101,6 +102,66 @@ void main() {
     retryDelaySeconds: 0,
     styleProfileEnabled: true,
   );
+
+  test(
+    'style regeneration restores released originals, not translations',
+    () async {
+      final original = const EpubHtmlExtractor().inspectChapterBytes(
+        chapterPath: 'chapter.xhtml',
+        bytes: utf8.encode(
+          '<body><p>Original prose for style analysis.</p></body>',
+        ),
+      );
+      final released = original.copyWith(
+        translatedBody: '已完成的译文',
+        blocks: [
+          for (final block in original.blocks)
+            block.copyWith(
+              sourceHtml: '',
+              sourceText: '',
+              translatedHtml: '<p>译文</p>',
+            ),
+        ],
+      );
+      final adapter = _ReplyAdapter('{"primaryGenre":"Literary fiction"}');
+      final dio = Dio(BaseOptions(baseUrl: 'https://example.test/v1'))
+        ..httpClientAdapter = adapter;
+      addTearDown(() => dio.close(force: true));
+      final profile = await EpubChapterTranslator().generateStyleProfileForTest(
+        dio: dio,
+        config: config,
+        chapters: [released],
+      );
+      expect(profile.primaryGenre, 'Literary fiction');
+      final sample =
+          (adapter.payloads.single['chapters'] as List).single as Map;
+      expect(sample['text'], contains('Original prose for style analysis.'));
+      expect(sample['text'], isNot(contains('译文')));
+      expect(released.blocks.single.sourceText, isEmpty);
+    },
+  );
+
+  test('empty style samples fail explicitly without a paid request', () async {
+    final adapter = _ReplyAdapter('{}');
+    final dio = Dio(BaseOptions(baseUrl: 'https://example.test/v1'))
+      ..httpClientAdapter = adapter;
+    addTearDown(() => dio.close(force: true));
+    await expectLater(
+      EpubChapterTranslator().generateStyleProfileForTest(
+        dio: dio,
+        config: config,
+        chapters: [_chapter.copyWith(includeInTranslation: false)],
+      ),
+      throwsA(
+        isA<FormatException>().having(
+          (error) => error.message,
+          'hint',
+          contains('No source samples'),
+        ),
+      ),
+    );
+    expect(adapter.payloads, isEmpty);
+  });
 
   for (final kind in ['styleProfile', 'initialBookMemory', 'chapterMemory']) {
     for (final content in ['not JSON', '{"summary":', '[]', '']) {

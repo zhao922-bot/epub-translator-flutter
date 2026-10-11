@@ -30,12 +30,20 @@ class CacheRestorationResult {
     required this.scannedBlocks,
     required this.cachedBlocks,
     required this.unreadableBlocks,
+    required this.lastPendingChapterIndex,
   });
 
   final Map<String, Map<String, String>> translationsByChapter;
   final int scannedBlocks;
   final int cachedBlocks;
   final int unreadableBlocks;
+
+  /// Last cache miss in source order, or -1 for a fully cached run. Chapters
+  /// are processed monotonically, so later work is an O(1) comparison.
+  final int lastPendingChapterIndex;
+
+  bool hasPendingBlocksFromChapter(int startChapterIndex) =>
+      lastPendingChapterIndex >= startChapterIndex;
 
   String? translationFor(String chapterPath, String blockId) {
     return translationsByChapter[chapterPath]?[blockId];
@@ -62,12 +70,16 @@ class CacheRestorationScanner {
     int scannedBlocks = 0;
     int cachedBlocks = 0;
     int unreadableBlocks = 0;
+    int lastPendingChapterIndex = -1;
 
-    Iterable<({InspectedChapter chapter, ExtractedBlock block})>
+    Iterable<
+      ({int chapterIndex, InspectedChapter chapter, ExtractedBlock block})
+    >
     entries() sync* {
-      for (final chapter in chapters) {
+      for (int index = 0; index < chapters.length; index++) {
+        final chapter = chapters[index];
         for (final block in chapter.blocks) {
-          yield (chapter: chapter, block: block);
+          yield (chapterIndex: index, chapter: chapter, block: block);
         }
       }
     }
@@ -90,6 +102,7 @@ class CacheRestorationScanner {
     final pending =
         Queue<
           ({
+            int chapterIndex,
             InspectedChapter chapter,
             ExtractedBlock block,
             Future<({String? html, bool unreadable})> result,
@@ -103,6 +116,7 @@ class CacheRestorationScanner {
         if (!iterator.moveNext()) break;
         final entry = iterator.current;
         pending.add((
+          chapterIndex: entry.chapterIndex,
           chapter: entry.chapter,
           block: entry.block,
           result: read(entry.chapter, entry.block),
@@ -127,6 +141,8 @@ class CacheRestorationScanner {
           () => <String, String>{},
         )[block.id] = translatedHtml!;
         cachedBlocks += 1;
+      } else {
+        lastPendingChapterIndex = entry.chapterIndex;
       }
       scannedBlocks += 1;
       if (scannedBlocks % 20 == 0 || scannedBlocks == totalBlocks) {
@@ -147,6 +163,7 @@ class CacheRestorationScanner {
       scannedBlocks: scannedBlocks,
       cachedBlocks: cachedBlocks,
       unreadableBlocks: unreadableBlocks,
+      lastPendingChapterIndex: lastPendingChapterIndex,
     );
   }
 }

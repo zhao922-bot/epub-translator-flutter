@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dio/dio.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/actionable_error.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspection_result.dart';
@@ -1197,6 +1199,42 @@ void main() {
     expect(controller.state.job?.errorMessage, contains('401'));
   });
 
+  for (final status in [401, 429]) {
+    test(
+      'translation failure HTTP $status exposes the classified recovery action',
+      () async {
+        final repository = _ErrorTranslationRepository(blockCount: 1);
+        final controller = TranslationDashboardController(
+          repository: repository,
+          historyStore: _MemoryJobHistoryStore(),
+        );
+        addTearDown(controller.dispose);
+        controller.syncSettings(
+          TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+        );
+        controller.setInputPath('book.epub');
+        await controller.startInspection();
+        final translation = controller.startTranslation();
+        await repository.translationStarted.future;
+        final request = RequestOptions(path: '/chat/completions');
+        repository.releaseTranslation.complete(
+          DioException(
+            requestOptions: request,
+            response: Response(requestOptions: request, statusCode: status),
+          ),
+        );
+        await translation;
+        expect(controller.state.job?.status, TranslationJobStatus.failed);
+        expect(
+          controller.state.actionableError?.actionKind,
+          status == 401
+              ? ActionableErrorKind.openSettings
+              : ActionableErrorKind.reduceConcurrency,
+        );
+      },
+    );
+  }
+
   test('ignores duplicate inspection requests while a run is active', () async {
     final _BlockingRepository repository = _BlockingRepository();
     final TranslationDashboardController controller =
@@ -1927,6 +1965,40 @@ void main() {
     },
   );
 
+  test(
+    'empty regeneration preserves an existing profile without auto-confirming',
+    () async {
+      final repository = _SuccessfulInspectionRepository();
+      final controller = TranslationDashboardController(
+        repository: repository,
+        historyStore: _MemoryJobHistoryStore(),
+      );
+      addTearDown(controller.dispose);
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: true),
+      );
+      await Future<void>.delayed(Duration.zero);
+      controller.setInputPath('book.epub');
+      await controller.startInspection(generateStyle: false);
+      const previous = TranslationStyleProfile(
+        primaryGenre: 'Literary fiction',
+        tone: 'Measured',
+      );
+      controller.state = controller.state.copyWith(
+        styleProfile: previous,
+        styleProfileConfirmed: true,
+      );
+      await controller.generateStyleProfile();
+      expect(controller.state.styleProfile, previous);
+      expect(controller.state.styleProfileConfirmed, isFalse);
+      expect(controller.state.isGeneratingStyleProfile, isFalse);
+      expect(
+        controller.state.logs.last,
+        contains('existing profile was preserved'),
+      );
+    },
+  );
+
   test('retries completed-with-warnings history items', () async {
     final _SuccessfulInspectionRepository repository =
         _SuccessfulInspectionRepository();
@@ -2399,7 +2471,8 @@ void main() {
       await controller.retryJob('style-disabled-job');
 
       expect(repository.styleGenerateCount, 1);
-      expect(repository.translateCount, 1);
+      expect(repository.translateCount, 0);
+      expect(controller.state.styleProfileConfirmed, isFalse);
     },
   );
 

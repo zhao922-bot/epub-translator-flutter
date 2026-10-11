@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/actionable_error.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -23,14 +24,68 @@ void main() {
       expect(error.actionLabel, '继续翻译');
     });
 
-    test('preferredKind wins over message keywords', () {
+    test('classification wins over the phase default', () {
       final ActionableError? error = ActionableErrorFactory.fromMessage(
         '检查失败：无关文案',
         isChinese: true,
         preferredKind: ActionableErrorKind.retryTranslation,
       );
       expect(error, isNotNull);
-      expect(error!.actionKind, ActionableErrorKind.retryTranslation);
+      expect(error!.actionKind, ActionableErrorKind.retryInspection);
+    });
+
+    for (final status in [401, 403, 429]) {
+      test('structured HTTP $status overrides retry and misleading text', () {
+        final request = RequestOptions(path: '/chat/completions');
+        final raw = DioException(
+          requestOptions: request,
+          response: Response(requestOptions: request, statusCode: status),
+        );
+        final banner = ActionableErrorFactory.fromError(
+          raw,
+          message: 'Translation failed: API key detail was redacted',
+          fallbackKind: ActionableErrorKind.retryTranslation,
+        )!;
+        expect(
+          banner.actionKind,
+          status == 429
+              ? ActionableErrorKind.reduceConcurrency
+              : ActionableErrorKind.openSettings,
+        );
+      });
+    }
+
+    for (final text in [
+      'HTTP 401',
+      'invalid_api_key',
+      'API 密钥错误',
+      'HTTP 429',
+      '触发限流',
+    ]) {
+      test('$text overrides retry fallback', () {
+        final banner = ActionableErrorFactory.fromMessage(
+          '翻译失败：$text',
+          isChinese: true,
+          preferredKind: ActionableErrorKind.retryTranslation,
+        )!;
+        expect(
+          banner.actionKind,
+          text.contains('429') || text.contains('限流')
+              ? ActionableErrorKind.reduceConcurrency
+              : ActionableErrorKind.openSettings,
+        );
+      });
+    }
+
+    test('unknown error uses phase default', () {
+      expect(
+        ActionableErrorFactory.fromError(
+          StateError('boom'),
+          message: 'boom',
+          fallbackKind: ActionableErrorKind.retryTranslation,
+        )!.actionKind,
+        ActionableErrorKind.retryTranslation,
+      );
     });
 
     test('still classifies English inspection failure', () {

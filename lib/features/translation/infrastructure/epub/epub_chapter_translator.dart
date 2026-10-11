@@ -387,6 +387,11 @@ class EpubChapterTranslator {
     Dio? dio;
     try {
       await validateInspectedSource(chapters);
+      chapters = await ChapterSourceRestorer.restore(
+        chapters: chapters,
+        isCancelled: () =>
+            run.cancelToken.isCancelled || (isCancelled?.call() ?? false),
+      );
       run.throwIfCancelled();
       dio = _apiClient.buildDio(config);
       return await _invocation(run)._memory.generateStyleProfile(
@@ -418,6 +423,11 @@ class EpubChapterTranslator {
     );
     run.watchCancellation();
     try {
+      chapters = await ChapterSourceRestorer.restore(
+        chapters: chapters,
+        isCancelled: () =>
+            run.cancelToken.isCancelled || (isCancelled?.call() ?? false),
+      );
       return await _invocation(run)._memory.generateStyleProfile(
         dio: dio,
         config: config,
@@ -847,7 +857,6 @@ class EpubChapterTranslator {
               styleProfileConfirmed: true,
             );
       bool initialBookMemoryAttempted = userStyleProfile != null;
-      final Map<int, bool> chapterPendingCache = <int, bool>{};
 
       if (userStyleProfile != null && !userStyleProfile.isEmpty) {
         emit(
@@ -943,41 +952,6 @@ class EpubChapterTranslator {
         }
       }
 
-      Future<bool> hasPendingBlocksInChapter(int chapterIndex) async {
-        final bool? cached = chapterPendingCache[chapterIndex];
-        if (cached != null) {
-          return cached;
-        }
-        final InspectedChapter chapter = selectedChapters[chapterIndex];
-        for (final ExtractedBlock block in chapter.blocks) {
-          throwIfCancelled();
-          final String? cachedTranslation = restoration.translationFor(
-            chapter.path,
-            block.id,
-          );
-          if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
-            chapterPendingCache[chapterIndex] = true;
-            return true;
-          }
-        }
-        chapterPendingCache[chapterIndex] = false;
-        return false;
-      }
-
-      Future<bool> hasPendingBlocksFromChapter(int startChapterIndex) async {
-        for (
-          int index = startChapterIndex;
-          index < selectedChapters.length;
-          index += 1
-        ) {
-          if (await hasPendingBlocksInChapter(index)) {
-            throwIfCancelled();
-            return true;
-          }
-        }
-        return false;
-      }
-
       final footnoteClassificationByChapter = <int, bool>{};
       bool isFootnoteChapter(int index) =>
           footnoteClassificationByChapter.putIfAbsent(
@@ -1042,7 +1016,6 @@ class EpubChapterTranslator {
           }
           translatedByChapterIndex[chapterIndex] = translatedById;
           pendingBlocksByChapter[chapterIndex] = pendingBlocks;
-          chapterPendingCache[chapterIndex] = pendingBlocks.isNotEmpty;
 
           if (chapterCacheHits > 0) {
             final TranslationJob cachedJob = currentJob.copyWith(
@@ -1272,7 +1245,6 @@ class EpubChapterTranslator {
               fallback: '',
             ),
           );
-          chapterPendingCache[chapterIndex] = false;
           completedFiles += 1;
           final TranslationJob chapterDoneJob = currentJob.copyWith(
             progress: completedBlocks / totalBlocks,
@@ -1374,7 +1346,6 @@ class EpubChapterTranslator {
               s.runLogReusedChapterCache(chapterCacheHits, chapter.title),
             );
           }
-          chapterPendingCache[chapterIndex] = pendingBlocks.isNotEmpty;
 
           if (pendingBlocks.isNotEmpty) {
             await ensureInitialBookMemory();
@@ -1566,9 +1537,8 @@ class EpubChapterTranslator {
             ),
           );
           throwIfCancelled();
-          final bool futurePendingBlocks = await hasPendingBlocksFromChapter(
-            chapterIndex + 1,
-          );
+          final bool futurePendingBlocks = restoration
+              .hasPendingBlocksFromChapter(chapterIndex + 1);
           if (futurePendingBlocks) {
             await ensureInitialBookMemory();
             try {
