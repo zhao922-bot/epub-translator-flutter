@@ -8,10 +8,12 @@ class PreviewChapter {
     required this.includeInTranslation,
     required this.blockCount,
     required this.translatedBlockCount,
+    this.translatedBody,
   });
 
   final String title;
   final String body;
+  final String? translatedBody;
   final String path;
   final String category;
   final bool recommendedForTranslation;

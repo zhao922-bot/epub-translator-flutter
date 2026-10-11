@@ -19,11 +19,15 @@ class InspectedChapter {
     required this.recommendedForTranslation,
     required this.includeInTranslation,
     this.sourceIdentity,
+    this.translatedBody,
   });
 
   final String path;
   final String title;
   final String body;
+
+  /// Translation excerpt; [body] always retains the source excerpt.
+  final String? translatedBody;
   final String originalHtml;
   final List<ExtractedBlock> blocks;
   final ChapterCategory category;
@@ -39,6 +43,7 @@ class InspectedChapter {
     String? path,
     String? title,
     String? body,
+    String? translatedBody,
     String? originalHtml,
     List<ExtractedBlock>? blocks,
     ChapterCategory? category,
@@ -50,6 +55,7 @@ class InspectedChapter {
       path: path ?? this.path,
       title: title ?? this.title,
       body: body ?? this.body,
+      translatedBody: translatedBody ?? this.translatedBody,
       originalHtml: originalHtml ?? this.originalHtml,
       blocks: blocks ?? this.blocks,
       category: category ?? this.category,

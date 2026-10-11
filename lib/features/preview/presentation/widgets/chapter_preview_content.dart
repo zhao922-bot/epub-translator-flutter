@@ -6,12 +6,10 @@ class ChapterPreviewContent extends StatelessWidget {
   const ChapterPreviewContent({
     super.key,
     required this.chapter,
-    required this.translated,
     required this.strings,
     required this.parallel,
   });
   final PreviewChapter chapter;
-  final String? translated;
   final AppStrings strings;
   final bool parallel;
 
@@ -37,7 +35,9 @@ class ChapterPreviewContent extends StatelessWidget {
     final original = passage(strings.sourcePreview, chapter.body);
     final translation = passage(
       strings.translatedPreview,
-      translated ?? strings.noTranslationYet,
+      chapter.translatedBody?.isNotEmpty == true
+          ? chapter.translatedBody!
+          : strings.noTranslationYet,
     );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,

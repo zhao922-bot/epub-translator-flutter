@@ -4,9 +4,7 @@ import 'package:go_router/go_router.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
-import '../../../translation/domain/models/inspected_chapter.dart';
 import '../../application/preview_provider.dart';
-import '../../domain/models/preview_chapter.dart';
 import '../widgets/chapter_checklist.dart';
 import '../widgets/chapter_preview_content.dart';
 
@@ -98,10 +96,6 @@ class PreviewPage extends ConsumerWidget {
                   padding: const EdgeInsets.only(bottom: 28),
                   child: ChapterPreviewContent(
                     chapter: selected,
-                    translated: _translatedExcerpt(
-                      previewState.inspectedChapters,
-                      selected,
-                    ),
                     strings: strings,
                     parallel: parallel,
                   ),
@@ -147,23 +141,4 @@ class PreviewPage extends ConsumerWidget {
             ),
     );
   }
-}
-
-String? _translatedExcerpt(
-  List<InspectedChapter> inspectedChapters,
-  PreviewChapter selected,
-) {
-  for (final chapter in inspectedChapters) {
-    if (chapter.path != selected.path) continue;
-    final text = chapter.blocks
-        .map((b) => b.translatedHtml)
-        .whereType<String>()
-        .map((html) => html.replaceAll(RegExp(r'<[^>]+>'), ' '))
-        .map((text) => text.replaceAll(RegExp(r'\s+'), ' ').trim())
-        .where((text) => text.isNotEmpty)
-        .take(8)
-        .join('\n\n');
-    return text.isEmpty ? null : text;
-  }
-  return null;
 }

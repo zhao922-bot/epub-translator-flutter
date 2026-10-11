@@ -970,12 +970,19 @@ class EpubChapterTranslator {
         return false;
       }
 
+      final footnoteClassificationByChapter = <int, bool>{};
+      bool isFootnoteChapter(int index) =>
+          footnoteClassificationByChapter.putIfAbsent(
+            index,
+            () => FootnoteBatchPlanner.isStandaloneFootnoteChapter(
+              selectedChapters[index],
+            ),
+          );
+
       Future<int> translateFootnoteRun(int startChapterIndex) async {
         int endChapterIndex = startChapterIndex;
         while (endChapterIndex + 1 < selectedChapters.length &&
-            FootnoteBatchPlanner.isStandaloneFootnoteChapter(
-              selectedChapters[endChapterIndex + 1],
-            )) {
+            isFootnoteChapter(endChapterIndex + 1)) {
           endChapterIndex += 1;
         }
 
@@ -1060,6 +1067,7 @@ class EpubChapterTranslator {
             .plan(
               chapters: selectedChapters,
               pendingBlocksByChapter: pendingBlocksByChapter,
+              footnoteClassificationByChapter: footnoteClassificationByChapter,
               chunkSize: config.chunkSize,
               bookMemory: bookMemory?.toJson(),
             );
@@ -1251,9 +1259,9 @@ class EpubChapterTranslator {
               .toList();
           updatedByPath[chapter.path] = chapter.copyWith(
             blocks: translatedBlocks,
-            body: _previewBodyFromBlocks(
+            translatedBody: _previewBodyFromBlocks(
               translatedBlocks,
-              fallback: chapter.body,
+              fallback: '',
             ),
           );
           chapterPendingCache[chapterIndex] = false;
@@ -1298,7 +1306,7 @@ class EpubChapterTranslator {
         ) {
           throwIfCancelled();
           final InspectedChapter chapter = selectedChapters[chapterIndex];
-          if (FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter)) {
+          if (isFootnoteChapter(chapterIndex)) {
             chapterIndex = await translateFootnoteRun(chapterIndex);
             continue;
           }
@@ -1509,9 +1517,9 @@ class EpubChapterTranslator {
               .toList();
           updatedByPath[chapter.path] = chapter.copyWith(
             blocks: translatedBlocks,
-            body: _previewBodyFromBlocks(
+            translatedBody: _previewBodyFromBlocks(
               translatedBlocks,
-              fallback: chapter.body,
+              fallback: '',
             ),
           );
           final TranslationJob chapterDoneJob = currentJob.copyWith(
@@ -1922,15 +1930,17 @@ class EpubChapterTranslator {
   }
 
   static InspectedChapter _restoreChapterSources(InspectedChapter chapter) {
-    if (!chapter.blocks.any((block) => block.sourceHtml.isEmpty)) {
+    final bool legacyPreview =
+        chapter.translatedBody == null && chapter.translatedBlockCount > 0;
+    if (!legacyPreview &&
+        !chapter.blocks.any((block) => block.sourceHtml.isEmpty)) {
       return chapter;
     }
-    final restored = const EpubHtmlExtractor()
-        .inspectChapterBytes(
-          chapterPath: chapter.path,
-          bytes: utf8.encode(chapter.originalHtml),
-        )
-        .blocks;
+    final inspected = const EpubHtmlExtractor().inspectChapterBytes(
+      chapterPath: chapter.path,
+      bytes: utf8.encode(chapter.originalHtml),
+    );
+    final restored = inspected.blocks;
     if (restored.length != chapter.blocks.length ||
         List.generate(restored.length, (i) => i).any(
           (i) =>
@@ -1940,7 +1950,10 @@ class EpubChapterTranslator {
         restored.any((block) => block.sourceHtml.isEmpty)) {
       throw FormatException('Source block order changed: ${chapter.path}');
     }
-    return chapter.copyWith(blocks: restored);
+    return chapter.copyWith(
+      blocks: restored,
+      body: legacyPreview ? inspected.body : chapter.body,
+    );
   }
 
   static String _lockTranslatedHtmlStructure(

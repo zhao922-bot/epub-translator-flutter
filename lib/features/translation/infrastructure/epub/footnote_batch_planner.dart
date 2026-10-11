@@ -26,6 +26,7 @@ class FootnoteBatchPlanner {
     required Map<int, List<ExtractedBlock>> pendingBlocksByChapter,
     required int chunkSize,
     Map<String, Object?>? bookMemory,
+    Map<int, bool>? footnoteClassificationByChapter,
   }) {
     final int safeChunkSize = max(1, chunkSize);
     final int safeMaxReferences = max(1, maxReferencesPerBatch);
@@ -33,23 +34,33 @@ class FootnoteBatchPlanner {
     List<FootnoteBlockReference> current = <FootnoteBlockReference>[];
     int currentBudget = 0;
 
-    for (
-      int chapterIndex = 0;
-      chapterIndex < chapters.length;
-      chapterIndex += 1
-    ) {
+    // Keep original indices (checkpoint/cache request IDs depend on them),
+    // but visit only this run, never the rest of the book. Empty entries keep
+    // cached chapters within a contiguous run without changing batching.
+    final chapterIndices = pendingBlocksByChapter.keys.toList()..sort();
+    int? previousChapterIndex;
+    for (final int chapterIndex in chapterIndices) {
       final InspectedChapter chapter = chapters[chapterIndex];
-      if (!isStandaloneFootnoteChapter(chapter)) {
+      final bool isFootnote =
+          footnoteClassificationByChapter?.putIfAbsent(
+            chapterIndex,
+            () => isStandaloneFootnoteChapter(chapter),
+          ) ??
+          isStandaloneFootnoteChapter(chapter);
+      if (!isFootnote ||
+          (previousChapterIndex != null &&
+              chapterIndex != previousChapterIndex + 1)) {
         if (current.isNotEmpty) {
           batches.add(_createBatch(current, bookMemory: bookMemory));
           current = <FootnoteBlockReference>[];
           currentBudget = 0;
         }
-        continue;
       }
+      previousChapterIndex = chapterIndex;
+      if (!isFootnote) continue;
 
       for (final ExtractedBlock block
-          in pendingBlocksByChapter[chapterIndex] ?? const <ExtractedBlock>[]) {
+          in pendingBlocksByChapter[chapterIndex]!) {
         final int blockBudget = batchPlanner.blockBudgetFor(block);
         final bool exceedsBudget =
             current.isNotEmpty && currentBudget + blockBudget > safeChunkSize;

@@ -99,6 +99,70 @@ class EpubIsolateWorker {
     return Isolate.run(() => _loadArchiveSnapshotSync(inputPath));
   }
 
+  /// Inflate only package metadata and the entries selected from its OPF.
+  /// The selector runs in the worker; binary resources never cross isolates.
+  static Future<({Map<String, Uint8List> files, String fingerprint})>
+  loadInspectionSnapshot(
+    String inputPath, {
+    required Set<String> Function(Map<String, List<int>> files, String opfPath)
+    selectEntries,
+  }) {
+    return Isolate.run(() {
+      final bytes = _readSourceBytesGuarded(inputPath);
+      final archive = _decodeArchiveWithLimits(inputPath, bytes);
+      final files = <String, Uint8List>{};
+      void read(String name) {
+        if (files.containsKey(name)) return;
+        final file = archive.find(name);
+        if (file == null || !file.isFile) return;
+        final content = _fileBytes(file);
+        // Stored ZIP entries are views into the entire source archive. Detach
+        // those views so transferring a tiny OPF cannot retain the whole ZIP.
+        // Inflated entries with an exact-sized buffer need no second copy.
+        files[name] =
+            content is Uint8List &&
+                content.buffer.lengthInBytes == content.lengthInBytes
+            ? content
+            : Uint8List.fromList(content);
+      }
+
+      read('META-INF/container.xml');
+      final containerBytes = files['META-INF/container.xml'];
+      if (containerBytes == null) {
+        throw const FormatException(
+          'Invalid EPUB: META-INF/container.xml is missing.',
+        );
+      }
+      final container = xml.XmlDocument.parse(
+        decodeEpubText(
+          bytes: containerBytes,
+          filePath: 'META-INF/container.xml',
+          strict: true,
+        ),
+      );
+      final rootfile = container.descendants
+          .whereType<xml.XmlElement>()
+          .where((e) => e.name.local == 'rootfile')
+          .firstOrNull;
+      if (rootfile == null) {
+        throw const FormatException(
+          'Invalid EPUB: META-INF/container.xml is missing a rootfile entry.',
+        );
+      }
+      final opfPath = rootfile.getAttribute('full-path');
+      if (opfPath == null || opfPath.isEmpty) {
+        throw const FormatException(
+          'Invalid EPUB: package document path is empty.',
+        );
+      }
+      read(opfPath);
+      for (final name in selectEntries(files, opfPath)) {
+        read(name);
+      }
+      return (files: files, fingerprint: sha256.convert(bytes).toString());
+    });
+  }
+
   /// Only the small title crosses the isolate boundary. ZIP limits and source
   /// identity still apply, but only container.xml and its OPF are inflated.
   static Future<String?> readBookTitle(

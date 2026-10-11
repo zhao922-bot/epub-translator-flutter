@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
@@ -11,6 +13,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_inspector.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _WorkerCheckingExtractor extends EpubHtmlExtractor {
@@ -69,6 +72,123 @@ void main() {
     temp = await Directory.systemTemp.createTemp('epub_inspector_batches_');
   });
   tearDown(() => temp.delete(recursive: true));
+
+  test(
+    'illustrated book transfers only inspection entries and never inflates binary resources',
+    () async {
+      final random = Random(42);
+      final resource = Uint8List.fromList(
+        List.generate(1024 * 1024, (_) => random.nextInt(256)),
+      );
+      final archive = Archive()
+        ..addFile(
+          ArchiveFile.string(
+            'META-INF/container.xml',
+            '<container><rootfile full-path="OPS/book.opf"/></container>',
+          ),
+        )
+        ..addFile(
+          ArchiveFile.string(
+            'OPS/book.opf',
+            '''
+<package><manifest>
+<item id="c" href="chapter%20one.xhtml" media-type="application/xhtml+xml"/>
+<item id="nav" href="nav.xhtml" properties="nav" media-type="application/xhtml+xml"/>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="image" href="image0.jpg" media-type="image/jpeg"/>
+<item id="font" href="font.ttf" media-type="font/ttf"/>
+</manifest><spine toc="ncx"><itemref idref="c"/><itemref idref="image"/></spine></package>''',
+          ),
+        )
+        ..addFile(
+          ArchiveFile.string(
+            'OPS/chapter one.xhtml',
+            '<html><body><p>Source text.</p></body></html>',
+          ),
+        )
+        ..addFile(
+          ArchiveFile.string(
+            'OPS/nav.xhtml',
+            '<html><body><nav/></body></html>',
+          ),
+        )
+        ..addFile(ArchiveFile.string('OPS/toc.ncx', '<ncx/>'))
+        ..addFile(ArchiveFile('OPS/font.ttf', resource.length, resource));
+      for (int i = 0; i < 16; i++) {
+        archive.addFile(
+          ArchiveFile('OPS/image$i.jpg', resource.length, resource),
+        );
+      }
+      archive.find('META-INF/container.xml')!.compression =
+          CompressionType.none;
+      archive.find('OPS/nav.xhtml')!.compression = CompressionType.none;
+      final bytes = ZipEncoder().encodeBytes(archive);
+      final file = File('${temp.path}/illustrated.epub')
+        ..writeAsBytesSync(bytes);
+      final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
+        file.path,
+        selectEntries: EpubInspector.inspectionEntryPaths,
+      );
+      expect(
+        snapshot.files.keys,
+        unorderedEquals([
+          'META-INF/container.xml',
+          'OPS/book.opf',
+          'OPS/chapter one.xhtml',
+          'OPS/nav.xhtml',
+          'OPS/toc.ncx',
+        ]),
+      );
+      final transferred = snapshot.files.values.fold<int>(
+        0,
+        (n, b) => n + b.length,
+      );
+      expect(transferred, lessThan(1024));
+      expect(
+        snapshot.files.values.fold<int>(
+          0,
+          (n, b) => n + b.buffer.lengthInBytes,
+        ),
+        lessThan(1024),
+      );
+      expect(transferred / (17 * resource.length), lessThan(0.0001));
+      expect(snapshot.fingerprint, sha256.convert(bytes).toString());
+
+      // Invalid DEFLATE block: an attempted read of the image must fail. Keeping
+      // headers intact distinguishes selective inflation from directory checks.
+      final decoder = ZipDecoder()..decodeBytes(bytes);
+      final header = decoder.directory.fileHeaders.firstWhere(
+        (h) => h.filename == 'OPS/image0.jpg',
+      );
+      expect(header.compressionMethod, 8);
+      final offset = header.localHeaderOffset;
+      int u16(int at) => bytes[at] | (bytes[at + 1] << 8);
+      final payload = offset + 30 + u16(offset + 26) + u16(offset + 28);
+      bytes[payload] = 0x07; // BTYPE=3 (reserved).
+      file.writeAsBytesSync(bytes);
+      await expectLater(
+        EpubIsolateWorker.loadArchiveFiles(file.path),
+        throwsA(anything),
+      );
+      final result = await EpubInspector().inspect(
+        inputPath: file.path,
+        outputDirectory: temp.path,
+        cancelToken: CancelToken(),
+      );
+      expect(result.chapters.single.body, 'Source text.');
+      // The existing ZIP directory integrity guard is still exercised.
+      bytes[bytes.length - 22] = 0;
+      file.writeAsBytesSync(bytes);
+      await expectLater(
+        EpubInspector().inspect(
+          inputPath: file.path,
+          outputDirectory: temp.path,
+          cancelToken: CancelToken(),
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    },
+  );
 
   test(
     'multiple worker batches preserve chapter order, progress and identity',

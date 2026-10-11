@@ -80,7 +80,10 @@ class EpubInspector {
     emit(currentJob, s.inspectLogOpeningEpub(path.basename(inputPath)));
     throwIfCancelled();
 
-    final snapshot = await EpubIsolateWorker.loadArchiveSnapshot(inputPath);
+    final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
+      inputPath,
+      selectEntries: inspectionEntryPaths,
+    );
     final Map<String, List<int>> files = snapshot.files;
     final sourceIdentity = EpubSourceIdentity(
       inputPath: path.absolute(inputPath),
@@ -270,6 +273,33 @@ class EpubInspector {
       chapters: chapters,
       warnings: warnings,
     );
+  }
+
+  /// Selects inspection payloads in the ZIP worker using the same manifest
+  /// resolution rules as the chapter and navigation validators below.
+  static Set<String> inspectionEntryPaths(
+    Map<String, List<int>> files,
+    String opfPath,
+  ) {
+    final spine = chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
+    final ncx = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
+    final paths = <String>{...spine.chapterPaths, ?ncx};
+    final opf = XmlDocument.parse(
+      decodeEpubText(bytes: files[opfPath]!, filePath: opfPath, strict: true),
+    );
+    for (final item in opf.descendants.whereType<XmlElement>().where(
+      (e) =>
+          e.name.local == 'item' &&
+          (e.getAttribute('properties') ?? '')
+              .split(RegExp(r'\s+'))
+              .contains('nav'),
+    )) {
+      final href = item.getAttribute('href');
+      if (href != null) {
+        paths.add(_resolveManifestHref(path.posix.dirname(opfPath), href));
+      }
+    }
+    return paths;
   }
 
   /// Public for stress tests and reuse by translator fingerprinting paths.

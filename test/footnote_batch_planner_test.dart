@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/footnote_batch_planner.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +8,57 @@ void main() {
   const FootnoteBatchPlanner planner = FootnoteBatchPlanner();
 
   group('FootnoteBatchPlanner', () {
+    test(
+      'many separated runs visit only pending indices and classify HTML once',
+      () {
+        final chapters = _CountingChapters(
+          List.generate(3000, (index) => _CountingChapter(index)),
+        );
+        final classifications = <int, bool>{};
+        for (int run = 0; run < 100; run++) {
+          final index = run * 30 + 17;
+          for (int repeat = 0; repeat < 2; repeat++) {
+            final batches = planner.plan(
+              chapters: chapters,
+              pendingBlocksByChapter: {
+                index: [_block('p-1')],
+              },
+              chunkSize: 500,
+              footnoteClassificationByChapter: classifications,
+            );
+            expect(batches.single.references.single.requestId, 'f$index:p-1');
+          }
+        }
+        expect(chapters.reads, 200); // Previously 600,000 chapter visits.
+        expect(chapters.items.fold<int>(0, (n, c) => n + c.htmlReads), 100);
+        expect(classifications, hasLength(100));
+      },
+    );
+
+    test(
+      'sorts original indices and retains cached empty chapters in a run',
+      () {
+        final chapters = List.generate(
+          6,
+          (index) => _chapter(path: 'notes/$index-fn.xhtml', title: 'Notes'),
+        );
+        final batches = planner.plan(
+          chapters: chapters,
+          pendingBlocksByChapter: {
+            5: [_block('p-2')],
+            3: [_block('p-1')],
+            4: [],
+          },
+          chunkSize: 5000,
+        );
+        expect(batches, hasLength(1));
+        expect(batches.single.references.map((r) => r.requestId), [
+          'f3:p-1',
+          'f5:p-2',
+        ]);
+      },
+    );
+
     test('does not include ordinary body chapters', () {
       final List<FootnoteTranslationBatch> batches = planner.plan(
         chapters: <InspectedChapter>[
@@ -268,6 +321,46 @@ void main() {
       expect(batches[1].references.single.requestId, 'f1:p-1');
     });
   });
+}
+
+class _CountingChapter extends InspectedChapter {
+  _CountingChapter(int index)
+    : super(
+        path: 'text/chapter-$index.xhtml',
+        title: 'Notes',
+        body: 'Note.',
+        originalHtml:
+            '<html><body><aside role="doc-footnote">Note.</aside></body></html>',
+        blocks: const [],
+        category: ChapterCategory.reference,
+        recommendedForTranslation: true,
+        includeInTranslation: true,
+      );
+  int htmlReads = 0;
+  @override
+  String get originalHtml {
+    htmlReads++;
+    return super.originalHtml;
+  }
+}
+
+class _CountingChapters extends ListBase<InspectedChapter> {
+  _CountingChapters(this.items);
+  final List<_CountingChapter> items;
+  int reads = 0;
+  @override
+  int get length => items.length;
+  @override
+  set length(int value) => throw UnsupportedError('read only');
+  @override
+  InspectedChapter operator [](int index) {
+    reads++;
+    return items[index];
+  }
+
+  @override
+  void operator []=(int index, InspectedChapter value) =>
+      throw UnsupportedError('read only');
 }
 
 InspectedChapter _chapter({

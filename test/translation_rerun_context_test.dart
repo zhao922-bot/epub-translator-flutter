@@ -15,6 +15,10 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_batch_planner.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
+import 'package:epub_translator_flutter/features/preview/application/preview_provider.dart';
+import 'package:epub_translator_flutter/features/preview/presentation/widgets/chapter_preview_content.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 
 class _Cache extends TranslationCacheStore {
   final values = <String, String>{};
@@ -53,6 +57,7 @@ class _Repacker extends EpubRepacker {
 
 class _Api extends TranslationApiClient {
   final sourceRequests = <String>[];
+  final blockRequestIds = <String>[];
   final glossaryRequests = <String>[];
   @override
   Future<Response<dynamic>> postChatCompletions({
@@ -91,6 +96,7 @@ class _Api extends TranslationApiClient {
             for (final block in payload['blocks'] as List)
               (() {
                 final source = block['html'] as String;
+                blockRequestIds.add(block['id'] as String);
                 sourceRequests.add(source);
                 expect(source, isNotEmpty);
                 return {'id': block['id'], 'html': '<p>$target</p>'};
@@ -317,6 +323,104 @@ void main() {
     );
   });
   tearDown(() => temp.delete(recursive: true));
+
+  test(
+    'separated footnote runs keep original request IDs and source-to-result mapping',
+    () async {
+      final api = _Api();
+      final selected = [
+        chapters[0],
+        chapters[0].copyWith(path: 'first-fn.xhtml'),
+        chapters[1].copyWith(path: 'second-fn.xhtml'),
+        chapters[1],
+        chapters[0].copyWith(path: 'third-fn.xhtml'),
+      ];
+      final result =
+          await EpubChapterTranslator(
+            cacheStore: _Cache(),
+            apiClient: api,
+            repacker: _Repacker(),
+          ).translateChapters(
+            inputPath: input,
+            outputDirectory: temp.path,
+            config: config,
+            chapters: selected,
+            cancelToken: CancelToken(),
+          );
+      expect(api.blockRequestIds.where((id) => id.startsWith('f')), [
+        'f1:p-1',
+        'f2:p-1',
+        'f4:p-1',
+      ]);
+      expect(result.chapters.map((c) => c.path), selected.map((c) => c.path));
+      expect(result.chapters.map((c) => c.body), selected.map((c) => c.body));
+      expect(result.chapters.every((c) => c.translatedBody == '河岸'), isTrue);
+      expect(
+        result.chapters.every(
+          (c) => c.blocks.single.translatedHtml == '<p>河岸</p>',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  for (final footnote in [false, true]) {
+    testWidgets(
+      'completed ${footnote ? 'footnote' : 'body'} preview retains source and migrates legacy data',
+      (tester) async {
+        final source = chapters.first.copyWith(
+          path: footnote ? 'one-fn.xhtml' : 'one.xhtml',
+        );
+        final result = await tester.runAsync(
+          () =>
+              EpubChapterTranslator(
+                cacheStore: _Cache(),
+                apiClient: _Api(),
+                repacker: _Repacker(),
+              ).translateChapters(
+                inputPath: input,
+                outputDirectory: temp.path,
+                config: config,
+                chapters: [source],
+                cancelToken: CancelToken(),
+              ),
+        );
+        final completed = result!.chapters.single;
+        final translation = footnote ? '无上下文' : '银行';
+        expect(completed.body, 'bank');
+        expect(completed.translatedBody, translation);
+        expect(completed.blocks.single.sourceText, isEmpty);
+        // Simulate pre-fix data, including released block source strings.
+        final legacy = InspectedChapter(
+          path: completed.path,
+          title: completed.title,
+          body: translation,
+          originalHtml: completed.originalHtml,
+          blocks: completed.blocks,
+          category: completed.category,
+          recommendedForTranslation: true,
+          includeInTranslation: true,
+        );
+        for (final chapter in [completed, legacy]) {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: SingleChildScrollView(
+                  child: ChapterPreviewContent(
+                    chapter: previewChapterFromInspected(chapter),
+                    strings: const AppStrings(UiLanguage.english),
+                    parallel: true,
+                  ),
+                ),
+              ),
+            ),
+          );
+          expect(find.text('bank'), findsOneWidget);
+          expect(find.text(translation), findsOneWidget);
+        }
+      },
+    );
+  }
 
   for (final limit in [1, 2, 3]) {
     for (final payloadTooLarge in [false, true]) {
