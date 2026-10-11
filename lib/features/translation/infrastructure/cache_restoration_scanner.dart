@@ -1,4 +1,8 @@
 import 'dart:collection';
+import 'dart:io';
+
+import '../../../shared/logging/app_logger.dart';
+import '../../../shared/security/sensitive_text.dart';
 
 import '../domain/models/inspected_chapter.dart';
 
@@ -9,6 +13,22 @@ typedef CacheKeyResolver =
 
 typedef CacheRestorationProgressCallback =
     void Function(CacheRestorationProgress progress);
+
+class CacheReadDiagnostic {
+  const CacheReadDiagnostic({required this.error, required this.stackTrace});
+
+  /// Redacted text, not the original exception (which may contain secrets).
+  final String error;
+  final StackTrace stackTrace;
+}
+
+class _CacheReadResult {
+  const _CacheReadResult({this.html, this.error, this.stackTrace});
+
+  final String? html;
+  final Object? error;
+  final StackTrace? stackTrace;
+}
 
 class CacheRestorationProgress {
   const CacheRestorationProgress({
@@ -31,12 +51,18 @@ class CacheRestorationResult {
     required this.cachedBlocks,
     required this.unreadableBlocks,
     required this.lastPendingChapterIndex,
+    this.fileSystemFailures = 0,
+    this.formatFailures = 0,
+    this.firstReadError,
   });
 
   final Map<String, Map<String, String>> translationsByChapter;
   final int scannedBlocks;
   final int cachedBlocks;
   final int unreadableBlocks;
+  final int fileSystemFailures;
+  final int formatFailures;
+  final CacheReadDiagnostic? firstReadError;
 
   /// Last cache miss in source order, or -1 for a fully cached run. Chapters
   /// are processed monotonically, so later work is an O(1) comparison.
@@ -51,9 +77,24 @@ class CacheRestorationResult {
 }
 
 class CacheRestorationScanner {
-  const CacheRestorationScanner({required this.readTranslation});
+  const CacheRestorationScanner({
+    required this.readTranslation,
+    this.configuredApiKey,
+    this.onReadError,
+  });
 
   final CacheTranslationReader readTranslation;
+  final String? configuredApiKey;
+  final void Function(CacheReadDiagnostic)? onReadError;
+
+  String _redact(String text) =>
+      SensitiveText.redact(
+        text,
+        configuredApiKey: configuredApiKey,
+      ).replaceAllMapped(
+        RegExp(r'(https?://)[^\s/]+@', caseSensitive: false),
+        (match) => '${match.group(1)}[redacted]@',
+      );
 
   Future<CacheRestorationResult> scan({
     required List<InspectedChapter> chapters,
@@ -70,6 +111,9 @@ class CacheRestorationScanner {
     int scannedBlocks = 0;
     int cachedBlocks = 0;
     int unreadableBlocks = 0;
+    int fileSystemFailures = 0;
+    int formatFailures = 0;
+    CacheReadDiagnostic? firstReadError;
     int lastPendingChapterIndex = -1;
 
     Iterable<
@@ -84,17 +128,13 @@ class CacheRestorationScanner {
       }
     }
 
-    Future<({String? html, bool unreadable})> read(
-      InspectedChapter chapter,
-      ExtractedBlock block,
-    ) async {
+    Future<_CacheReadResult> read(String cacheKey) async {
       try {
-        return (
-          html: await readTranslation(cacheKeyFor(chapter, block)),
-          unreadable: false,
-        );
-      } catch (_) {
-        return (html: null, unreadable: true);
+        return _CacheReadResult(html: await readTranslation(cacheKey));
+      } catch (error, stackTrace) {
+        // Capture prefetched failures as values to avoid unhandled async errors.
+        // Only filesystem/format failures are downgraded when consumed below.
+        return _CacheReadResult(error: error, stackTrace: stackTrace);
       }
     }
 
@@ -105,7 +145,7 @@ class CacheRestorationScanner {
             int chapterIndex,
             InspectedChapter chapter,
             ExtractedBlock block,
-            Future<({String? html, bool unreadable})> result,
+            Future<_CacheReadResult> result,
           })
         >();
     // Sliding prefetch window bounds both disk I/O and retained results.
@@ -115,11 +155,13 @@ class CacheRestorationScanner {
         throwIfCancelled();
         if (!iterator.moveNext()) break;
         final entry = iterator.current;
+        // Resolver bugs must escape directly, outside the disk-read boundary.
+        final cacheKey = cacheKeyFor(entry.chapter, entry.block);
         pending.add((
           chapterIndex: entry.chapterIndex,
           chapter: entry.chapter,
           block: entry.block,
-          result: read(entry.chapter, entry.block),
+          result: read(cacheKey),
         ));
       }
     }
@@ -133,7 +175,35 @@ class CacheRestorationScanner {
       final chapter = entry.chapter;
       final block = entry.block;
       final translatedHtml = result.html;
-      if (result.unreadable) unreadableBlocks += 1;
+      final error = result.error;
+      if (error != null) {
+        if (error is FileSystemException) {
+          fileSystemFailures += 1;
+        } else if (error is FormatException) {
+          formatFailures += 1;
+        } else {
+          Error.throwWithStackTrace(error, result.stackTrace!);
+        }
+        unreadableBlocks += 1;
+        if (firstReadError == null) {
+          firstReadError = CacheReadDiagnostic(
+            error: _redact(error.toString()),
+            stackTrace: StackTrace.fromString(
+              _redact(result.stackTrace.toString()),
+            ),
+          );
+          if (onReadError != null) {
+            onReadError!(firstReadError);
+          } else {
+            AppLogger.error(
+              'Cache read failed; treating entry as a miss',
+              tag: 'cache-restoration',
+              error: firstReadError.error,
+              stackTrace: firstReadError.stackTrace,
+            );
+          }
+        }
+      }
       final String cachedTranslation = translatedHtml?.trim() ?? '';
       if (cachedTranslation.isNotEmpty) {
         translationsByChapter.putIfAbsent(
@@ -164,6 +234,9 @@ class CacheRestorationScanner {
       cachedBlocks: cachedBlocks,
       unreadableBlocks: unreadableBlocks,
       lastPendingChapterIndex: lastPendingChapterIndex,
+      fileSystemFailures: fileSystemFailures,
+      formatFailures: formatFailures,
+      firstReadError: firstReadError,
     );
   }
 }

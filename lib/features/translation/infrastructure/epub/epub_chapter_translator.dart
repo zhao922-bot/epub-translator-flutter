@@ -243,6 +243,17 @@ class EpubChapterTranslator {
   static bool hasRepresentativeStyleTextForTest(List<ExtractedBlock> blocks) =>
       _EpubBookMemory._hasRepresentativeStyleText(blocks);
 
+  static Future<List<Map<String, String>>>
+  restoredStyleProfileSourceChaptersForTest(
+    List<InspectedChapter> chapters, {
+    required bool Function() isCancelled,
+    void Function(int, int)? onProgress,
+  }) => _EpubBookMemory.restoredStyleProfileSourceChapters(
+    chapters,
+    isCancelled: isCancelled,
+    onProgress: onProgress,
+  );
+
   static String outputFilePathForTest({
     required String inputPath,
     required String outputDirectory,
@@ -387,11 +398,6 @@ class EpubChapterTranslator {
     Dio? dio;
     try {
       await validateInspectedSource(chapters);
-      chapters = await ChapterSourceRestorer.restore(
-        chapters: chapters,
-        isCancelled: () =>
-            run.cancelToken.isCancelled || (isCancelled?.call() ?? false),
-      );
       run.throwIfCancelled();
       dio = _apiClient.buildDio(config);
       return await _invocation(run)._memory.generateStyleProfile(
@@ -423,11 +429,6 @@ class EpubChapterTranslator {
     );
     run.watchCancellation();
     try {
-      chapters = await ChapterSourceRestorer.restore(
-        chapters: chapters,
-        isCancelled: () =>
-            run.cancelToken.isCancelled || (isCancelled?.call() ?? false),
-      );
       return await _invocation(run)._memory.generateStyleProfile(
         dio: dio,
         config: config,
@@ -776,6 +777,7 @@ class EpubChapterTranslator {
       final CacheRestorationResult restoration =
           await CacheRestorationScanner(
             readTranslation: _cacheStore.getBlockTranslation,
+            configuredApiKey: config.apiKey,
           ).scan(
             chapters: selectedChapters,
             cacheKeyFor: (InspectedChapter chapter, ExtractedBlock block) =>

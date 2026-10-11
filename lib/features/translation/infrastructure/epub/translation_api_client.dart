@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:dio/io.dart';
@@ -28,6 +30,38 @@ class MissingApiConfigurationException extends FormatException {
     : super(
         'API base URL, API key, and model are required before testing the connection.',
       );
+}
+
+class ProxyAuthenticationException implements Exception {
+  const ProxyAuthenticationException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+// Some Dart SDKs retry cached Basic proxy credentials without invoking
+// authenticateProxy again. Scope the transport guard to each adapter fetch,
+// so concurrent requests and later successful requests have separate budgets.
+final Object _proxyAttemptZoneKey = Object();
+
+class _ProxyAttempt {
+  final Set<Uri> credentialDestinations = <Uri>{};
+}
+
+class _ProxyAwareAdapter extends IOHttpClientAdapter {
+  _ProxyAwareAdapter({required super.createHttpClient});
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) => runZoned(
+    () => super.fetch(options, requestStream, cancelFuture),
+    zoneValues: {_proxyAttemptZoneKey: _ProxyAttempt()},
+  );
 }
 
 /// Why a user-typed proxy setting cannot be used as an HTTP proxy.
@@ -73,7 +107,10 @@ class TranslationApiClient {
       ),
     );
 
-    dio.httpClientAdapter = IOHttpClientAdapter(
+    final proxyFailureMessage = config.uiLanguage == UiLanguage.chinese
+        ? '代理认证失败（HTTP 407），请检查代理用户名和密码。'
+        : 'Proxy authentication failed (HTTP 407). Check the proxy username and password.';
+    dio.httpClientAdapter = _ProxyAwareAdapter(
       createHttpClient: () {
         final HttpClient client = HttpClient()
           ..connectionTimeout = Duration(seconds: config.timeoutSeconds)
@@ -103,9 +140,31 @@ class TranslationApiClient {
                 : Uri.decodeComponent(
                     proxyUri.userInfo.substring(separator + 1),
                   );
+            final attemptedChallenges = <(String, int, String, String)>{};
+            client.findProxy = (uri) {
+              final selection = proxyForUri(proxy, uri);
+              final attempt =
+                  Zone.current[_proxyAttemptZoneKey] as _ProxyAttempt?;
+              if (selection != 'DIRECT' &&
+                  attemptedChallenges.isNotEmpty &&
+                  attempt != null) {
+                if (!attempt.credentialDestinations.add(uri)) {
+                  throw ProxyAuthenticationException(proxyFailureMessage);
+                }
+              }
+              return selection;
+            };
             client.authenticateProxy = (host, port, scheme, realm) async {
               // Credentials belong to this proxy, never the API origin.
               if (scheme.toLowerCase() != 'basic') return false;
+              if (!attemptedChallenges.add((
+                host.toLowerCase(),
+                port,
+                scheme.toLowerCase(),
+                realm ?? '',
+              ))) {
+                return false;
+              }
               client.addProxyCredentials(
                 host,
                 port,
@@ -120,6 +179,30 @@ class TranslationApiClient {
       },
     );
 
+    dio.interceptors.add(
+      InterceptorsWrapper(
+        onError: (error, handler) {
+          // HTTPS CONNECT failures have no Response; HttpClient reports the 407
+          // as an HttpException instead. Normalize both transports identically.
+          if (error.error is ProxyAuthenticationException ||
+              error.response?.statusCode ==
+                  HttpStatus.proxyAuthenticationRequired ||
+              (error.error is HttpException &&
+                  RegExp(
+                    r'\b407\b',
+                  ).hasMatch((error.error as HttpException).message))) {
+            handler.next(
+              error.copyWith(
+                message: proxyFailureMessage,
+                error: ProxyAuthenticationException(proxyFailureMessage),
+              ),
+            );
+            return;
+          }
+          handler.next(error);
+        },
+      ),
+    );
     return dio;
   }
 
@@ -759,10 +842,16 @@ class TranslationApiClient {
   /// limiting / quota exhaustion, the error counts as a rate limit
   /// ([isRateLimitError]) and takes the retry path instead of failing fast.
   static bool isDeterministicHttpError(Object error) {
+    if (error is DioException && error.error is ProxyAuthenticationException) {
+      return true;
+    }
     final int? statusCode = error is DioException
         ? error.response?.statusCode
         : null;
-    if (statusCode == 400 || statusCode == 401 || statusCode == 404) {
+    if (statusCode == 400 ||
+        statusCode == 401 ||
+        statusCode == 404 ||
+        statusCode == 407) {
       return true;
     }
     return statusCode == 403 && !isRateLimitError(error);
@@ -775,6 +864,9 @@ class TranslationApiClient {
     Object error,
     TranslationConfig config,
   ) {
+    if (error is DioException && error.error is ProxyAuthenticationException) {
+      return error.error.toString();
+    }
     final int? statusCode = error is DioException
         ? error.response?.statusCode
         : null;
@@ -789,6 +881,10 @@ class TranslationApiClient {
         return strings.httpForbiddenError(host, config.model);
       case 404:
         return strings.httpNotFoundError(host, config.model);
+      case 407:
+        return config.uiLanguage == UiLanguage.chinese
+            ? '代理认证失败（HTTP 407），请检查代理用户名和密码。'
+            : 'Proxy authentication failed (HTTP 407). Check the proxy username and password.';
       default:
         return 'HTTP $statusCode from $host. The provider rejected the request; check the Base URL, API key, and model name.';
     }
@@ -863,6 +959,12 @@ class TranslationApiClient {
   }
 
   static int maxAttemptsForError(TranslationConfig config, Object error) {
+    if (error is DioException &&
+        (error.error is ProxyAuthenticationException ||
+            error.response?.statusCode ==
+                HttpStatus.proxyAuthenticationRequired)) {
+      return 1;
+    }
     final int normalMaxAttempts = max(1, config.maxRetries);
     if (isRateLimitError(error)) {
       return max(normalMaxAttempts, 8);

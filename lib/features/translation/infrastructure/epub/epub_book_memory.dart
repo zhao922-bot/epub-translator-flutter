@@ -18,7 +18,13 @@ class _EpubBookMemory {
   }) async {
     throwIfCancelled?.call();
     final List<Map<String, String>> sourceChapters =
-        _styleProfileSourceChapters(chapters);
+        await restoredStyleProfileSourceChapters(
+          chapters,
+          isCancelled: () {
+            throwIfCancelled?.call();
+            return cancelToken?.isCancelled ?? false;
+          },
+        );
     if (sourceChapters.isEmpty) {
       throw FormatException(
         AppStrings(config.uiLanguage).logStyleProfileNoSamples,
@@ -178,7 +184,48 @@ class _EpubBookMemory {
   /// opaque filenames or generic document titles.
   static List<Map<String, String>> _styleProfileSourceChapters(
     List<InspectedChapter> chapters,
-  ) {
+  ) => [
+    for (final entry in _styleProfileCandidates(chapters))
+      _styleSample(entry.chapter, entry.role),
+  ].where((sample) => sample['text']!.isNotEmpty).toList(growable: false);
+
+  static Map<String, String> _styleSample(
+    InspectedChapter chapter,
+    String role,
+  ) => {
+    'path': chapter.path,
+    'title': chapter.title,
+    'category': chapter.category.name,
+    'role': role,
+    'text': _representativeStyleText(chapter.blocks),
+  };
+
+  static Future<List<Map<String, String>>> restoredStyleProfileSourceChapters(
+    List<InspectedChapter> chapters, {
+    required bool Function() isCancelled,
+    void Function(int, int)? onProgress,
+  }) async {
+    if (isCancelled()) throw const TranslationCancelledException();
+    // Selection uses retained chapter metadata/source excerpts. Do not parse
+    // all released HTML just to decide which three body chapters to sample.
+    final candidates = _styleProfileCandidates(chapters);
+    final samples = <Map<String, String>>[];
+    for (final entry in candidates) {
+      final chapter = await ChapterSourceRestorer.restoreChapter(
+        chapter: entry.chapter,
+        isCancelled: isCancelled,
+        onProgress: onProgress,
+      );
+      final sample = _styleSample(chapter, entry.role);
+      if (sample['text']!.isNotEmpty) samples.add(sample);
+      // Only the bounded text survives this iteration, not restored blocks.
+    }
+    if (isCancelled()) throw const TranslationCancelledException();
+    return samples;
+  }
+
+  static List<({InspectedChapter chapter, String role})>
+  _styleProfileCandidates(List<InspectedChapter> chapters) {
     final List<InspectedChapter> eligible = chapters
         .where((InspectedChapter chapter) => chapter.includeInTranslation)
         .where((InspectedChapter chapter) => chapter.blocks.isNotEmpty)
@@ -187,7 +234,7 @@ class _EpubBookMemory {
         )
         .toList(growable: false);
     if (eligible.isEmpty) {
-      return const <Map<String, String>>[];
+      return const [];
     }
 
     final List<InspectedChapter> selected = <InspectedChapter>[];
@@ -216,7 +263,17 @@ class _EpubBookMemory {
     final List<InspectedChapter> substantialContent = contentCandidates
         .where(
           (InspectedChapter chapter) =>
-              _hasRepresentativeStyleText(chapter.blocks),
+              chapter.blocks.every((block) => block.sourceText.isEmpty)
+              ? _normalizedStyleLength([
+                      ExtractedBlock(
+                        id: '',
+                        tagName: '',
+                        sourceHtml: '',
+                        sourceText: chapter.body,
+                      ),
+                    ], _minimumRepresentativeStyleCharacters) >=
+                    _minimumRepresentativeStyleCharacters
+              : _hasRepresentativeStyleText(chapter.blocks),
         )
         .toList(growable: false);
     final int desiredRepresentativeCount = min(3, contentCandidates.length);
@@ -245,18 +302,10 @@ class _EpubBookMemory {
       }
     }
 
-    return selected
-        .map((InspectedChapter chapter) {
-          return <String, String>{
-            'path': chapter.path,
-            'title': chapter.title,
-            'category': chapter.category.name,
-            'role': rolesByPath[chapter.path] ?? 'fallback',
-            'text': _representativeStyleText(chapter.blocks),
-          };
-        })
-        .where((Map<String, String> chapter) => chapter['text']!.isNotEmpty)
-        .toList(growable: false);
+    return [
+      for (final chapter in selected)
+        (chapter: chapter, role: rolesByPath[chapter.path] ?? 'fallback'),
+    ];
   }
 
   static List<InspectedChapter> _representativeContentChapters(

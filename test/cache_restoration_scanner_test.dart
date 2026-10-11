@@ -8,6 +8,107 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   test(
+    'resolver failures escape before disk reads, including format errors',
+    () async {
+      for (final error in [
+        StateError('resolver bug'),
+        const FormatException('bad key'),
+      ]) {
+        int reads = 0;
+        await expectLater(
+          CacheRestorationScanner(
+            readTranslation: (_) async {
+              reads++;
+              return null;
+            },
+          ).scan(
+            chapters: [_chapterWithTwoBlocks()],
+            cacheKeyFor: (_, _) => throw error,
+            throwIfCancelled: () {},
+          ),
+          throwsA(same(error)),
+        );
+        expect(reads, 0);
+      }
+    },
+  );
+
+  test(
+    'permission and encoding failures retain counts and one redacted diagnostic',
+    () async {
+      final diagnostics = <CacheReadDiagnostic>[];
+      final stack = StackTrace.fromString(
+        'cache_reader.dart:42 SECRET_KEY http://user:password@proxy:80',
+      );
+      final result =
+          await CacheRestorationScanner(
+            configuredApiKey: 'SECRET_KEY',
+            onReadError: diagnostics.add,
+            readTranslation: (key) async {
+              Error.throwWithStackTrace(
+                key == 'p1'
+                    ? const FileSystemException(
+                        'Permission denied SECRET_KEY',
+                        '/cache',
+                        OSError('Permission denied', 13),
+                      )
+                    : const FormatException('Invalid UTF-8'),
+                stack,
+              );
+            },
+          ).scan(
+            chapters: [_chapterWithTwoBlocks()],
+            cacheKeyFor: (_, block) => block.id,
+            throwIfCancelled: () {},
+          );
+      expect(result.unreadableBlocks, 2);
+      expect(result.fileSystemFailures, 1);
+      expect(result.formatFailures, 1);
+      expect(result.cachedBlocks, 0);
+      expect(diagnostics, hasLength(1));
+      expect(result.firstReadError, same(diagnostics.single));
+      expect(diagnostics.single.error, contains('Permission denied'));
+      expect(diagnostics.single.error, isNot(contains('SECRET_KEY')));
+      expect(
+        diagnostics.single.stackTrace.toString(),
+        contains('cache_reader.dart:42'),
+      );
+      expect(
+        diagnostics.single.stackTrace.toString(),
+        isNot(contains('SECRET_KEY')),
+      );
+      expect(
+        diagnostics.single.stackTrace.toString(),
+        isNot(contains('password')),
+      );
+    },
+  );
+
+  test('prefetched programming failures rethrow with original stack', () async {
+    final error = StateError('reader bug');
+    final stack = StackTrace.fromString('reader.dart:123');
+    final scan =
+        CacheRestorationScanner(
+          readTranslation: (key) async {
+            if (key == 'p1') await Future<void>.delayed(Duration.zero);
+            Error.throwWithStackTrace(error, stack);
+          },
+        ).scan(
+          chapters: [_chapterWithTwoBlocks()],
+          cacheKeyFor: (_, block) => block.id,
+          throwIfCancelled: () {},
+        );
+    try {
+      await scan;
+      fail('Programming errors must not be downgraded');
+    } catch (caught, caughtStack) {
+      expect(caught, same(error));
+      expect(caughtStack.toString(), stack.toString());
+    }
+    await Future<void>.delayed(Duration.zero);
+  });
+
+  test(
     'fully cached 2000-chapter suffix queries never revisit cache entries',
     () async {
       const count = 2000;

@@ -7,6 +7,17 @@ import 'epub_html_extractor.dart';
 
 /// Reconstructs released source strings without parsing on the UI isolate.
 class ChapterSourceRestorer {
+  /// Restore a sampling candidate without retaining sources for other chapters.
+  static Future<InspectedChapter> restoreChapter({
+    required InspectedChapter chapter,
+    required bool Function() isCancelled,
+    void Function(int, int)? onProgress,
+  }) async => (await restore(
+    chapters: [chapter],
+    isCancelled: isCancelled,
+    onProgress: onProgress,
+  )).single;
+
   static Future<List<InspectedChapter>> restore({
     required List<InspectedChapter> chapters,
     required bool Function() isCancelled,

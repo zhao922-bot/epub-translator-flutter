@@ -10,6 +10,65 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   const TranslationApiClient client = TranslationApiClient();
 
+  for (final scheme in ['http', 'https']) {
+    test(
+      '$scheme rejected proxy credentials stop after one challenge retry',
+      () async {
+        final proxy = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        final received = <String?>[];
+        final subscription = proxy.listen((request) async {
+          received.add(
+            request.headers.value(HttpHeaders.proxyAuthorizationHeader),
+          );
+          request.response.statusCode = HttpStatus.proxyAuthenticationRequired;
+          request.response.contentLength = 0;
+          request.response.headers.set(
+            'proxy-authenticate',
+            'Basic realm="proxy"',
+          );
+          await request.response.close();
+        });
+        final config = TranslationConfig.defaults().copyWith(
+          apiBaseUrl: '$scheme://api.example.com',
+          apiKey: 'key',
+          httpProxy: 'http://user:wrong@127.0.0.1:${proxy.port}',
+          uiLanguage: UiLanguage.chinese,
+          maxRetries: 5,
+        );
+        final dio = client.buildDio(config);
+        try {
+          await expectLater(
+            client
+                .runRetried(
+                  config: config,
+                  retryDelayOverride: Duration.zero,
+                  operation: () =>
+                      dio.get<String>('$scheme://api.example.com/probe'),
+                )
+                .timeout(const Duration(seconds: 5)),
+            throwsA(
+              isA<DioException>()
+                  .having((e) => e.message, 'diagnostic', contains('代理认证失败'))
+                  .having(
+                    (e) => TranslationApiClient.shouldRetryBatchError(e),
+                    'retryable',
+                    isFalse,
+                  ),
+            ),
+          );
+          expect(received, [
+            null,
+            'Basic ${base64Encode(utf8.encode('user:wrong'))}',
+          ]);
+        } finally {
+          dio.close(force: true);
+          await subscription.cancel();
+          await proxy.close(force: true);
+        }
+      },
+    );
+  }
+
   test('rejects HTTPS proxy credentials before any connection', () async {
     final proxy = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     int connections = 0;
@@ -74,6 +133,12 @@ void main() {
             'proxy-authenticate',
             'Basic realm="proxy"',
           );
+        } else if (request.uri.path == '/redirect') {
+          request.response.statusCode = HttpStatus.found;
+          request.response.headers.set(
+            'location',
+            'http://api.example.com/probe',
+          );
         } else {
           request.response.write('OK');
         }
@@ -93,6 +158,16 @@ void main() {
         final response = await dio.get<String>('http://api.example.com/probe');
         expect(response.data, 'OK');
         expect(received, [null, credentials]);
+        final redirected = await dio.get<String>(
+          'http://api.example.com/redirect',
+        );
+        expect(redirected.data, 'OK');
+        final subsequent = await Future.wait([
+          dio.get<String>('http://api.example.com/probe'),
+          dio.get<String>('http://api.example.com/probe'),
+        ]);
+        expect(subsequent.map((response) => response.data), ['OK', 'OK']);
+        expect(received.skip(2).every((value) => value == credentials), isTrue);
       } finally {
         dio.close(force: true);
         await subscription.cancel();
