@@ -97,3 +97,4 @@ coverage/
 # Build artifacts and test residue (never commit)
 *.apk
 settings.json.lock
+*live_fullbook_stress_*.txt
