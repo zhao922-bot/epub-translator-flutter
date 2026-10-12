@@ -32,7 +32,7 @@ void main() {
 
     expect(estimate.selectedChapters, 2);
     expect(estimate.totalBlocks, 3);
-    expect(estimate.estimatedApiBatches, 2);
+    expect(estimate.estimatedApiBatches, 3);
   });
 
   test('estimates speed and remaining time from runtime progress', () {

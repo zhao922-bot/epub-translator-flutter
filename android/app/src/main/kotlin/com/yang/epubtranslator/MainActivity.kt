@@ -42,6 +42,39 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+/**
+ * The service needs a process-wide channel without retaining an Activity.
+ * Use an atomic identity check when clearing: an old Activity's teardown
+ * must never remove a newer engine's binding. Any keeps this lifecycle
+ * primitive testable on the JVM without an Android messenger.
+ */
+internal class ExportChannelHolder {
+    private val channel = AtomicReference<Any?>(null)
+    val current: Any? get() = channel.get()
+
+    fun bind(channel: Any) {
+        this.channel.set(channel)
+    }
+
+    fun clearIfBound(channel: Any) {
+        this.channel.compareAndSet(channel, null)
+    }
+}
+
+/**
+ * Writing bytes does not publish a MediaStore entry: IS_PENDING must also
+ * be cleared on an existing row. Retry a zero-row update once, but never
+ * report an invisible/missing download as saved. Provider exceptions are
+ * deliberately propagated to the caller's existing delete/error path.
+ */
+internal fun clearPendingFlag(update: () -> Int, maxAttempts: Int = 2): Boolean {
+    require(maxAttempts > 0) { "At least one pending-flag update is required." }
+    repeat(maxAttempts) {
+        if (update() > 0) return true
+    }
+    return false
+}
+
 class MainActivity : FlutterActivity() {
     /**
      * One pickEpubFile import attempt: the watchdog is armed per attempt and
@@ -108,6 +141,10 @@ class MainActivity : FlutterActivity() {
      * exists.
      */
     private var pendingStopIntent: Intent? = null
+
+    /** Remember our exact binding so teardown cannot clear a replacement
+     * Activity's channel, or retain this engine's messenger after destroy. */
+    private var boundExportChannel: MethodChannel? = null
 
     /**
      * Absolute paths of import targets that have been claimed (via
@@ -235,7 +272,8 @@ class MainActivity : FlutterActivity() {
             flutterEngine.dartExecutor.binaryMessenger,
             "epub_translator_flutter/android_export"
         )
-        exportChannel = channel
+        boundExportChannel = channel
+        exportChannelHolder.bind(channel)
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "appDocumentsDirectory" -> result.success(filesDir.absolutePath)
@@ -891,6 +929,11 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        // Remove the static route before engine teardown: a service timeout
+        // between destroy and recreation must not target a dead messenger.
+        // Identity-based clearing leaves a newer Activity's binding intact.
+        boundExportChannel?.let { exportChannelHolder.clearIfBound(it) }
+        boundExportChannel = null
         // If the activity is destroyed while a picker/permission dialog is
         // open ("Don't keep activities", extreme memory pressure), the
         // recreated activity has no reference to the pending Dart call and
@@ -957,28 +1000,6 @@ class MainActivity : FlutterActivity() {
         super.onDestroy()
     }
 
-    /**
-     * Whether [file] sits under one of the roots declared in
-     * res/xml/file_paths.xml (<files-path> translated_epubs/ or
-     * <cache-path> share_staging/). FileProvider.getUriForFile() throws
-     * IllegalArgumentException for anything outside those roots, so
-     * shareFile() must stage such files into share_staging/ first instead
-     * of sharing them directly.
-     */
-    private fun isFileProviderExposed(context: Context, file: File): Boolean {
-        return try {
-            val path = file.canonicalPath
-            val translated = File(context.filesDir, "translated_epubs").canonicalPath
-            val staging = File(context.cacheDir, "share_staging").canonicalPath
-            path == translated || path.startsWith(translated + File.separator) ||
-                path == staging || path.startsWith(staging + File.separator)
-        } catch (_: Exception) {
-            // If the path can't even be resolved, don't hand it to
-            // FileProvider: stage a copy instead.
-            false
-        }
-    }
-
     private fun shareFile(call: MethodCall, result: MethodChannel.Result) {
         // Capture the application context up front: the worker thread must
         // not hold the Activity, which may be destroyed while a large book
@@ -1001,48 +1022,31 @@ class MainActivity : FlutterActivity() {
                 // don't accumulate forever.
                 val stagingDir = File(appContext.cacheDir, "share_staging").apply { mkdirs() }
                 cleanupOldShareStaging(stagingDir)
-                // FileProvider only serves the roots declared in
-                // file_paths.xml (files/translated_epubs/ and
-                // cache/share_staging/): handing it any other file throws
-                // IllegalArgumentException at share time. So a source that
-                // needs no rename is shared directly ONLY when it already
-                // sits under a served root; anything else goes through a
-                // staging copy — even when the display name already
-                // matches.
-                val needsStaging = (displayName.isNotBlank() && source.name != displayName) ||
-                    !isFileProviderExposed(appContext, source)
-                val shareFile = if (!needsStaging) {
-                    source
-                } else {
-                    // Claim a uniquely-named staging file per share. The
-                    // chooser stays open after this worker thread finishes
-                    // and the target app reads the file asynchronously
-                    // afterwards; a later share of the same display name
-                    // claims a different name, so it can never overwrite
-                    // this file mid-read. createNewFile() is atomic
-                    // (O_CREAT|O_EXCL), so two racing shares can never
-                    // claim the same path.
-                    // A blank display name falls back to the source's own
-                    // name: the staging branch also runs when the source
-                    // isn't FileProvider-served even with no rename needed.
-                    val target = claimUniqueImportTarget(
-                        stagingDir,
-                        displayName.ifBlank { source.name }
-                    )
-                    // Mark the claim as in-flight: it is legitimately zero
-                    // bytes until the first chunk lands, and the sweep above
-                    // must not mistake it for an orphan.
-                    activeShareTargets.add(target.absolutePath)
-                    try {
-                        source.copyTo(target, overwrite = true)
-                    } catch (error: Exception) {
-                        // Don't leave a truncated staging file behind.
-                        target.delete()
-                        throw error
-                    } finally {
-                        activeShareTargets.remove(target.absolutePath)
-                    }
-                    target
+                // ALWAYS share a snapshot, even when the source is already
+                // FileProvider-served and its name matches. Export paths are
+                // deterministic: commitTempFile replaces that live path on
+                // the next export, while the receiver may open the URI much
+                // later. Exposing source directly would let an earlier share
+                // read a later export's bytes. The dedicated staging root is
+                // FileProvider-served regardless of the source's location.
+                // createNewFile() claims each snapshot atomically
+                // (O_CREAT|O_EXCL), so racing/same-name shares cannot overwrite
+                // one another. A blank display name keeps the source's name.
+                val shareFile = claimUniqueImportTarget(
+                    stagingDir,
+                    displayName.ifBlank { source.name }
+                )
+                // The claim is legitimately zero bytes until copying starts;
+                // preserve the existing in-flight protection and sweep quotas.
+                activeShareTargets.add(shareFile.absolutePath)
+                try {
+                    source.copyTo(shareFile, overwrite = true)
+                } catch (error: Exception) {
+                    // Don't leave a truncated staging file behind.
+                    shareFile.delete()
+                    throw error
+                } finally {
+                    activeShareTargets.remove(shareFile.absolutePath)
                 }
                 mainHandler.post {
                     try {
@@ -1369,7 +1373,12 @@ class MainActivity : FlutterActivity() {
                 }
                 values.clear()
                 values.put(MediaStore.Downloads.IS_PENDING, 0)
-                contentResolver.update(uri, values, null, null)
+                // A zero-row update did not publish the download. Retry once
+                // before failing; the enclosing catch removes the partial
+                // entry and the channel reports SAVE_FAILED instead of success.
+                check(clearPendingFlag({ contentResolver.update(uri, values, null, null) })) {
+                    "Unable to publish Downloads entry after two attempts."
+                }
                 // MediaStore may rename a colliding file. Read the published
                 // entry rather than reporting the requested (possibly old) name.
                 return DownloadsSaveLocation.resolve(uri.toString()) {
@@ -2030,8 +2039,9 @@ class MainActivity : FlutterActivity() {
          * TranslationForegroundService can reach back into Dart (e.g. the
          * Android 15+ onTimeout callback) without an activity reference.
          */
-        @Volatile
-        private var exportChannel: MethodChannel? = null
+        private val exportChannelHolder = ExportChannelHolder()
+        private val exportChannel: MethodChannel?
+            get() = exportChannelHolder.current as? MethodChannel
 
         /**
          * Notifies Dart that the foreground service lost its foreground

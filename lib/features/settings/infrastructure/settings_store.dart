@@ -41,6 +41,24 @@ abstract class SettingsSecretStore {
 
 enum SettingsSecretSlot { legacy, deepSeek, custom, proxy }
 
+/// Original errors remain available for classification, never for display.
+class SettingsSecretSaveException extends StateError {
+  SettingsSecretSaveException(Map<SettingsSecretSlot, Object> failures)
+    : failures = Map.unmodifiable(failures),
+      super(
+        failures.entries
+            .map(
+              (entry) =>
+                  'Failed to save ${SettingsStore._slotLabel(entry.key)}: ${entry.value.runtimeType}',
+            )
+            .join('; '),
+      );
+
+  final Map<SettingsSecretSlot, Object> failures;
+  bool get isUnsupported =>
+      failures.values.any((error) => error is UnsupportedError);
+}
+
 class SettingsWriteConflict implements Exception {
   @override
   String toString() =>
@@ -159,11 +177,15 @@ class SettingsStore {
   /// are unrecoverable and the user must re-enter them. Surfaced to the
   /// settings page via [SettingsController].
   bool _secretKeyRotated = false;
+  final Set<SettingsSecretSlot> _rotatedSlots = {};
 
   /// Whether the Android KeyStore key was rotated (invalidated and
   /// regenerated) during the last secret load. The settings page shows a
   /// warning banner when true.
   bool get secretKeyRotated => _secretKeyRotated;
+
+  bool secretReadFailed(SettingsSecretSlot slot) =>
+      _secretReadStatuses[slot] == _SecretReadStatus.readFailure;
 
   /// Whether the secret read statuses are populated (via [load] or a
   /// read-first [save]). Guards [_saveSecret] against deleting keys whose
@@ -304,6 +326,16 @@ class SettingsStore {
           error: error,
         );
       } catch (error) {
+        if (error is SettingsSecretSaveException && error.isUnsupported) {
+          _legacyMigrationFailed = true;
+          AppLogger.error(
+            'Legacy credential migration is not supported on this backend; will not retry.',
+            tag: 'settings',
+            error: error,
+          );
+          _loadedConfig = resolvedConfig;
+          return resolvedConfig;
+        }
         // Transient (D-Bus not ready, keyring locked, timeout): loading
         // settings must still succeed, and the migration is retried on a
         // later load (up to _maxLegacyMigrationAttempts attempts) instead
@@ -487,6 +519,7 @@ class SettingsStore {
       // Record it distinctly from a generic read failure so the UI can
       // tell the user to re-enter their keys.
       _secretKeyRotated = true;
+      _rotatedSlots.add(slot);
       _secretReadStatuses[slot] = _SecretReadStatus.readFailure;
       return const _SecretReadResult(_SecretReadStatus.readFailure, null);
     } catch (_) {
@@ -635,10 +668,12 @@ class SettingsStore {
     // each write spawns a PowerShell process, so run them concurrently rather
     // than serially. _saveSecret touches only its own slot's read status.
     final List<Future<void>> pending = <Future<void>>[];
+    final failures = <SettingsSecretSlot, Object>{};
     if (slotsToSave.contains(SettingsSecretSlot.proxy)) {
       pending.add(
         _saveSecretTagged(
           SettingsSecretSlot.proxy,
+          failures,
           _saveSecret(
             SettingsSecretSlot.proxy,
             _proxySecret(config),
@@ -653,6 +688,7 @@ class SettingsStore {
       pending.add(
         _saveSecretTagged(
           SettingsSecretSlot.legacy,
+          failures,
           _saveSecret(
             SettingsSecretSlot.legacy,
             config.apiKey,
@@ -667,6 +703,7 @@ class SettingsStore {
       pending.add(
         _saveSecretTagged(
           SettingsSecretSlot.deepSeek,
+          failures,
           _saveSecret(
             SettingsSecretSlot.deepSeek,
             config.deepseekApiKey,
@@ -681,6 +718,7 @@ class SettingsStore {
       pending.add(
         _saveSecretTagged(
           SettingsSecretSlot.custom,
+          failures,
           _saveSecret(
             SettingsSecretSlot.custom,
             config.customApiKey,
@@ -696,6 +734,10 @@ class SettingsStore {
     // the caller sees every failure (each names its own slot) instead of
     // just the first one.
     await Future.wait(pending, eagerError: false);
+    if (failures.isNotEmpty) throw SettingsSecretSaveException(failures);
+    if (slotsToSave.isNotEmpty && _rotatedSlots.isEmpty) {
+      _secretKeyRotated = false;
+    }
   }
 
   /// Tags a secret-slot save with a human-readable slot name so a failed
@@ -704,14 +746,14 @@ class SettingsStore {
   /// naming the exact slot matters for the "save failed" message.
   Future<void> _saveSecretTagged(
     SettingsSecretSlot slot,
+    Map<SettingsSecretSlot, Object> failures,
     Future<void> save,
   ) async {
     try {
       await save;
     } catch (error) {
       // Secret backend exceptions may contain the value passed to write.
-      final detail = error.runtimeType;
-      throw StateError('Failed to save ${_slotLabel(slot)}: $detail');
+      failures[slot] = error;
     }
   }
 
@@ -757,6 +799,10 @@ class SettingsStore {
           // A failed legacy deletion can never migrate into another provider.
           'credentialSchemaVersion': 2,
           'settingsRevision': _settingsRevision + 1,
+          // Only retain an existing legacy value while migration is pending.
+          // Its original endpoint binding must survive unrelated saves.
+          if (_pendingPlaintextKeys[SettingsSecretSlot.proxy] case final proxy?)
+            'httpProxy': _pendingProxyUrl(proxy),
           if (_pendingPlaintextKeys.containsKey(SettingsSecretSlot.deepSeek))
             'deepseekApiKey':
                 _pendingPlaintextKeys[SettingsSecretSlot.deepSeek],
@@ -794,6 +840,15 @@ class SettingsStore {
     }
     _secretSnapshot?[slot] = trimmed;
     _pendingPlaintextKeys.remove(slot);
+    _rotatedSlots.remove(slot);
+  }
+
+  static String _pendingProxyUrl(String secret) {
+    final value = jsonDecode(secret) as Map<String, dynamic>;
+    return TranslationConfig.authenticatedProxy(
+      value['address'] as String,
+      value['authentication'] as String,
+    );
   }
 
   Future<File> _settingsFile() async {

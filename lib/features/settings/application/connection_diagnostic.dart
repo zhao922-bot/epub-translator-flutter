@@ -17,6 +17,7 @@ class ConnectionDiagnostic {
       configuredApiKey: config.apiKey,
     );
     final String lower = raw.toLowerCase();
+    final strings = AppStrings(config.uiLanguage);
     final String host = _hostFromConfig(config);
 
     if (error is TranslationParseException) {
@@ -34,68 +35,52 @@ class ConnectionDiagnostic {
 
     if (error is MissingApiConfigurationException ||
         lower.contains('required before testing the connection')) {
-      return const ConnectionDiagnostic(
-        'Fill in the Base URL, API key, and model before testing the connection.',
-      );
+      return ConnectionDiagnostic(strings.connectionMissingConfiguration);
     }
 
     final int? statusCode = _httpStatusCode(raw);
     if (statusCode == 401) {
-      return ConnectionDiagnostic(
-        'HTTP 401 authentication failed for $host. Check that the API key is valid, active, and copied without extra spaces.',
-      );
+      return ConnectionDiagnostic(strings.connectionAuthError(host));
     }
     if (statusCode == 403) {
       return ConnectionDiagnostic(
-        'HTTP 403 permission denied for $host. Check whether this API key can use ${config.model} and whether the account has access.',
+        strings.connectionForbiddenError(host, config.model),
       );
     }
     if (statusCode == 404) {
       return ConnectionDiagnostic(
-        'HTTP 404 from $host. Check the Base URL, keep only the provider root or /v1 path, and verify that ${config.model} exists.',
+        strings.connectionNotFoundError(host, config.model),
       );
     }
     if (statusCode == 429) {
-      return ConnectionDiagnostic(
-        'HTTP 429 rate limit from $host. Lower concurrency, wait for quota to recover, or check the provider billing/rate limit page.',
-      );
+      return ConnectionDiagnostic(strings.connectionRateLimitError(host));
     }
     if (statusCode != null && statusCode >= 500) {
       return ConnectionDiagnostic(
-        'HTTP $statusCode from $host. The provider is returning a server error; retry later or test the same key in the provider console.',
+        strings.connectionServerError(host, statusCode),
       );
     }
 
     if (lower.contains('tls handshake') || lower.contains('handshake')) {
-      return ConnectionDiagnostic(
-        'TLS handshake failed for $host. Check the endpoint, proxy/VPN, device date, and whether this network intercepts certificates.',
-      );
+      return ConnectionDiagnostic(strings.connectionTlsError(host));
     }
     if (lower.contains('failed host lookup') ||
         lower.contains('nodename nor servname') ||
         lower.contains('dns')) {
-      return ConnectionDiagnostic(
-        'DNS lookup failed for $host. Check the Base URL spelling and whether the current network or VPN can resolve the provider host.',
-      );
+      return ConnectionDiagnostic(strings.connectionDnsError(host));
     }
     if (lower.contains('timeout') ||
         lower.contains('connection timed out') ||
         lower.contains('receive timeout') ||
         lower.contains('send timeout')) {
-      return ConnectionDiagnostic(
-        'Connection to $host timed out. Try a longer timeout, a more stable network, or a reachable proxy/VPN.',
-      );
+      return ConnectionDiagnostic(strings.connectionTimeoutError(host));
     }
     if (lower.contains('model') &&
         (lower.contains('not found') || lower.contains('does not exist'))) {
-      return ConnectionDiagnostic(
-        'The provider did not recognize ${config.model}. Check the model name exactly as listed by the API provider.',
-      );
+      return ConnectionDiagnostic(strings.connectionModelError(config.model));
     }
 
-    return ConnectionDiagnostic(
-      'Connection test failed for $host. Details: $raw',
-    );
+    return ConnectionDiagnostic(strings.connectionFallbackError(host, raw));
   }
 
   static int? _httpStatusCode(String raw) {
@@ -107,14 +92,15 @@ class ConnectionDiagnostic {
   }
 
   static String _hostFromConfig(TranslationConfig config) {
+    final fallback = AppStrings(config.uiLanguage).connectionApiHost;
     try {
       final String value = config.apiBaseUrl.trim();
       final Uri uri = Uri.parse(
         value.contains('://') ? value : 'https://$value',
       );
-      return uri.host.isEmpty ? 'the API host' : uri.host;
+      return uri.host.isEmpty ? fallback : uri.host;
     } catch (_) {
-      return 'the API host';
+      return fallback;
     }
   }
 }

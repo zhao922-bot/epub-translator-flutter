@@ -15,6 +15,7 @@ import '../../../translation/domain/models/translation_config.dart';
 import '../../../translation/infrastructure/epub/translation_api_client.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../application/settings_controller.dart';
+import '../../infrastructure/settings_store.dart';
 
 class SettingsPage extends ConsumerStatefulWidget {
   const SettingsPage({super.key});
@@ -56,7 +57,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   }
 
   Future<void> _testConnection() async {
-    if (_committingConnectionFields) return;
+    if (_committingConnectionFields ||
+        !ref.read(settingsProvider.notifier).canTestConnection) {
+      return;
+    }
     setState(() => _committingConnectionFields = true);
     try {
       if (!await _commitConnectionFields()) return;
@@ -78,6 +82,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ),
     );
     final controller = ref.read(settingsProvider.notifier);
+    final settingsLoaded =
+        ref.watch(settingsLoadedProvider).hasValue &&
+        controller.canTestConnection;
     final connectionTestState = ref.watch(connectionTestProvider);
     final strings = ref.watch(appStringsProvider);
     final bool secretKeyRotated =
@@ -122,6 +129,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             trailing: FilledButton.tonalIcon(
               onPressed:
                   connectionTestState.isLoading ||
+                      !settingsLoaded ||
                       isRunActive ||
                       _committingConnectionFields
                   ? null
@@ -188,6 +196,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.apiKey,
+                    helperText:
+                        controller.secretReadFailed(
+                          config.apiProviderSelection ==
+                                  ApiProviderSelection.deepseek
+                              ? SettingsSecretSlot.deepSeek
+                              : SettingsSecretSlot.custom,
+                        )
+                        ? strings.credentialReadFailed
+                        : null,
                     prefixIcon: const Icon(Icons.key_outlined),
                     isDense: true,
                   ),
@@ -218,9 +235,20 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   value: config.httpProxy,
                   onChanged: controller.setHttpProxy,
                   onCommit: controller.setHttpProxy,
+                  showSecretTooltip: strings.showProxyCredentials,
+                  hideSecretTooltip: strings.hideProxyCredentials,
+                  obscureText: true,
+                  canToggleObscureText: true,
+                  visibilityToggleKey: const ValueKey<String>(
+                    'toggleProxyVisibility',
+                  ),
                   enabled: !isRunActive,
                   decoration: InputDecoration(
                     labelText: strings.httpProxy,
+                    helperText:
+                        controller.secretReadFailed(SettingsSecretSlot.proxy)
+                        ? strings.credentialReadFailed
+                        : null,
                     hintText: strings.httpProxyHint,
                     prefixIcon: const Icon(Icons.vpn_lock_outlined),
                     isDense: true,
@@ -307,6 +335,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       divisions: 11,
                       value: config.chunkSize.toDouble(),
                       onChanged: isRunActive ? null : controller.setChunkSize,
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
                     ),
                     Align(
                       alignment: Alignment.centerLeft,
@@ -319,6 +350,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       max: 8,
                       divisions: 7,
                       value: config.maxConcurrent.toDouble(),
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
                       onChanged: isRunActive
                           ? null
                           : controller.setMaxConcurrent,
@@ -332,6 +366,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       max: 300,
                       divisions: 9,
                       value: config.timeoutSeconds.toDouble(),
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
                       onChanged: isRunActive
                           ? null
                           : controller.setTimeoutSeconds,
@@ -345,6 +382,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       max: 6,
                       divisions: 5,
                       value: config.maxRetries.toDouble(),
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
                       onChanged: isRunActive ? null : controller.setMaxRetries,
                     ),
                     Align(
@@ -358,6 +398,9 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       max: 15,
                       divisions: 14,
                       value: config.retryDelaySeconds.toDouble(),
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
                       onChanged: isRunActive
                           ? null
                           : controller.setRetryDelaySeconds,
@@ -474,6 +517,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                   divisions: 8,
                   value: config.textScale.clamp(0.9, 1.3),
                   onChanged: controller.setTextScale,
+                  onChangeEnd: (_) => controller.flushSliderChanges(),
                 ),
               ],
             ),

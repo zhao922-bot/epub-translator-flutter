@@ -343,45 +343,30 @@ class _EpubBookMemory {
         }.contains(normalizedTitle)) {
       return true;
     }
-    final String token = '$normalizedPath $normalizedTitle';
-    return <String>[
-      'index',
-      '_ind_',
-      'table of contents',
-      'contents',
-      '_toc_',
-      'copyright',
-      '_cop_',
-      'cover',
-      '_cvi_',
-      'title page',
-      '_tp_',
-      'acknowledg',
-      '_ack_',
-      'illustration',
-      '_ill_',
-      'about the author',
-      '_ata_',
-      'bibliography',
-      'endnote',
-      'about the publisher',
-      'book perk',
-      'card page',
-      'advertisement',
-      'also by',
-      'books by',
-    ].any(token.contains);
+    // Match title and basename independently: directory names and words such
+    // as discovery/recovery must not turn a body chapter into a cover page.
+    final excludedWords = RegExp(
+      r'\b(?:index|table[\s_-]+of[\s_-]+contents|contents|copyright|cover|'
+      r'title[\s_-]+page|acknowledg(?:e?ments?|ement)?|illustrations?|'
+      r'about[\s_-]+the[\s_-]+author|bibliography|endnotes?|'
+      r'about[\s_-]+the[\s_-]+publisher|book[\s_-]+perk|card[\s_-]+page|'
+      r'advertisements?|also[\s_-]+by|books[\s_-]+by)\b',
+      caseSensitive: false,
+    );
+    return excludedWords.hasMatch(fileName) ||
+        excludedWords.hasMatch(normalizedTitle) ||
+        const ['_ind_', '_toc_', '_cop_', '_cvi_', '_tp_', '_ack_', '_ill_', '_ata_']
+            .any(normalizedPath.contains);
   }
 
   static bool _isMeaningfulFrontMatter(InspectedChapter chapter) {
-    final String token = '${chapter.path} ${chapter.title}'.toLowerCase();
-    return <String>[
-      'preface',
-      '_prf_',
-      'foreword',
-      'introduction',
-      'prologue',
-    ].any(token.contains);
+    final words = RegExp(
+      r'\b(?:preface|foreword|introduction|prologue)\b',
+      caseSensitive: false,
+    );
+    final fileName = chapter.path.replaceAll('\\', '/').split('/').last;
+    return words.hasMatch(chapter.title) || words.hasMatch(fileName) ||
+        chapter.path.toLowerCase().contains('_prf_');
   }
 
   static String _representativeStyleText(List<ExtractedBlock> blocks) {
@@ -727,7 +712,7 @@ class _BookMemory {
         json['styleGuide'],
         limit: _EpubBookMemory._memoryListLimit,
       ),
-      glossary: _glossaryList(json['glossary']),
+      glossary: _mergeGlossary(_glossaryList(json['glossary']), const []),
       recentChapters: _chapterMemoryList(json['recentChapters']),
       styleProfile: styleProfile,
       styleProfileConfirmed: json['styleProfileConfirmed'] == true,
@@ -834,10 +819,15 @@ class _BookMemory {
           if (source.isEmpty || target.isEmpty) {
             return null;
           }
-          return <String, String>{'source': source, 'target': target};
+           return <String, String>{
+             'source': source,
+             'target': target,
+             if (item['locked'] == true || item['locked'] == 'true') 'locked': 'true',
+             if (int.tryParse('${item['lastUsed']}') != null)
+               'lastUsed': '${item['lastUsed']}',
+           };
         })
         .whereType<Map<String, String>>()
-        .take(_EpubBookMemory._memoryGlossaryLimit)
         .toList(growable: false);
   }
 
@@ -864,17 +854,55 @@ class _BookMemory {
     List<Map<String, String>> existing,
     List<Map<String, String>> incoming,
   ) {
-    final Map<String, Map<String, String>> merged =
-        <String, Map<String, String>>{};
-    for (final Map<String, String> entry in <Map<String, String>>[
-      ...existing,
-      ...incoming,
-    ]) {
-      merged[entry['source']!.toLowerCase()] = entry;
+    // Logical monotonic timestamps are deterministic and survive checkpoints;
+    // an incoming mention is a use, not merely a newly inserted mapping.
+    final merged = <String, Map<String, String>>{};
+    int clock = 0;
+    for (final entry in existing) {
+      clock = max(clock, int.tryParse(entry['lastUsed'] ?? '') ?? 0);
     }
-    return merged.values
-        .take(_EpubBookMemory._memoryGlossaryLimit)
-        .toList(growable: false);
+    for (final entry in existing) {
+      merged[entry['source']!.toLowerCase()] = {
+        ...entry,
+        'lastUsed': entry['lastUsed'] ?? '${++clock}',
+      };
+    }
+    for (final entry in incoming) {
+      final key = entry['source']!.toLowerCase();
+      final previous = merged[key];
+      merged[key] = {
+        ...entry,
+        if (previous?['locked'] == 'true') ...previous!,
+        'lastUsed': '${++clock}',
+      };
+    }
+    while (merged.length > _EpubBookMemory._memoryGlossaryLimit) {
+      final candidates = merged.entries.where((entry) => entry.value['locked'] != 'true').toList();
+      // Locked entries are exempt even when the user locks more than 32 terms.
+      if (candidates.isEmpty) break;
+      candidates.sort((a, b) {
+        final age = int.parse(a.value['lastUsed']!).compareTo(int.parse(b.value['lastUsed']!));
+        return age != 0 ? age : a.key.compareTo(b.key);
+      });
+      final evicted = candidates.first;
+      merged.remove(evicted.key);
+      AppLogger.warn('Rolling glossary LRU evicted: ${evicted.value['source']}', tag: 'book-memory');
+    }
+    return merged.values.toList(growable: false);
+  }
+
+  /// LRU by last incoming mention, with lexical ties; user locks never expire.
+  static const String glossaryEvictionPolicy = 'lru-unlocked-last-mention-v1';
+
+  _BookMemory withLockedGlossary(String mappings) {
+    final locked = <Map<String, String>>[];
+    for (final line in mappings.split('\n')) {
+      final match = RegExp(r'^\s*(.+?)\s*(?:=>|=|→|：|:)\s*(.+?)\s*$').firstMatch(line);
+      if (match != null) {
+        locked.add({'source': match[1]!, 'target': match[2]!, 'locked': 'true'});
+      }
+    }
+    return copyWith(glossary: _mergeGlossary(glossary, locked));
   }
 }
 
@@ -916,5 +944,177 @@ class _ChapterMemory {
       'continuityNotes': continuityNotes,
       'glossary': glossary,
     };
+  }
+}
+
+/// A companion in the non-evictable jobs directory, saved before progress.
+/// Reuses the cache store's atomic checkpoint writer without modifying its
+/// third-batch implementation or the public JobResumeState schema. The JSON
+/// memory envelope lives in currentChapter on this internal-only checkpoint.
+class _BookMemoryCheckpoint {
+  _BookMemoryCheckpoint(this.cacheStore, this.jobKey, this.chunkSize);
+  final TranslationCacheStore cacheStore;
+  final String jobKey;
+  final int chunkSize;
+
+  String get key => sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
+
+  Future<({ _BookMemory memory, Set<String> completedChapterPaths })?> load() async {
+    try {
+      final state = await cacheStore.loadJobState(key);
+      if (state == null) {
+        AppLogger.info('No compatible memory checkpoint for chunkSize=$chunkSize; older identities are not reused.', tag: 'book-memory');
+        return null;
+      }
+      final decoded = jsonDecode(state.currentChapter);
+      if (decoded is! Map<String, dynamic> ||
+          decoded['schema'] != EpubChapterTranslator.qualityCacheSchemaVersion ||
+          decoded['chunkSize'] != chunkSize || decoded['jobKey'] != jobKey ||
+          decoded['memory'] is! Map<String, dynamic>) {
+        AppLogger.warn('Book memory checkpoint schema/chunkSize mismatch; discarding.', tag: 'book-memory');
+        return null;
+      }
+      return (
+        memory: _BookMemory.fromJson(decoded['memory'] as Map<String, dynamic>),
+        completedChapterPaths: (decoded['completedChapterPaths'] as List<dynamic>? ?? [])
+            .whereType<String>().toSet(),
+      );
+    } catch (error) {
+      AppLogger.warn('Book memory checkpoint unreadable (${error.runtimeType}); discarding.', tag: 'book-memory');
+      return null;
+    }
+  }
+
+  Future<void> save(_BookMemory memory, {
+    Set<String> completedChapterPaths = const {},
+    String schema = EpubChapterTranslator.qualityCacheSchemaVersion,
+  }) => cacheStore.saveJobState(JobResumeState(
+    jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
+    status: 'book-memory', completedFiles: completedChapterPaths.length,
+    totalFiles: 0, completedBlocks: 0, totalBlocks: 0, cachedBlocks: 0,
+    resumedBlocks: 0,
+    currentChapter: jsonEncode({
+      'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
+      'memory': memory.toJson(), 'completedChapterPaths': completedChapterPaths.toList(),
+      'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
+    }),
+    updatedAtIso8601: DateTime.now().toIso8601String(),
+  ));
+}
+
+/// Source strings are spooled before clearing every invocation-owned list.
+/// The exact prepared sources are available for retries even after release.
+class _ChapterSourceSpool {
+  // Publicly named test injection, privately held lazy directory.
+  // ignore: prefer_initializing_formals
+  _ChapterSourceSpool({Directory? directory}) : _directory = directory;
+  Directory? _directory;
+  bool _ownsDirectory = false;
+
+  Future<File> _file(String chapterPath) async {
+    if (_directory == null) {
+      _directory = await Directory.systemTemp.createTemp('epub-chapter-sources-');
+      _ownsDirectory = true;
+    }
+    return File(path.join(_directory!.path, '${sha256.convert(utf8.encode(chapterPath))}.json'));
+  }
+
+  Future<InspectedChapter> release(InspectedChapter chapter) async {
+    try {
+      await writeFileAtomically(await _file(chapter.path), jsonEncode({
+        'originalHtml': chapter.originalHtml, 'body': chapter.body,
+        'blocks': [for (final block in chapter.blocks) {
+          'id': block.id, 'sourceHtml': block.sourceHtml, 'sourceText': block.sourceText,
+        }],
+      }));
+      return chapter.copyWith(originalHtml: '', body: '', blocks: [
+        for (final block in chapter.blocks) block.copyWith(sourceHtml: '', sourceText: ''),
+      ]);
+    } catch (error) {
+      // A disk-full spool must not discard the only retry/repack source.
+      AppLogger.warn('Source release skipped (${error.runtimeType}); keeping retry sources.', tag: 'translate');
+      return chapter;
+    }
+  }
+
+  Future<InspectedChapter> restore(InspectedChapter chapter, {bool blocks = true}) async {
+    if (chapter.originalHtml.isNotEmpty &&
+        (!blocks || chapter.blocks.every((b) => b.sourceHtml.isNotEmpty))) {
+      return chapter;
+    }
+    final file = await _file(chapter.path);
+    if (!await file.exists()) {
+      // Reload from the guarded archive when the spool is unavailable. Legacy
+      // releases still carry originalHtml and only need reparsing.
+      var source = chapter;
+      if (source.originalHtml.isEmpty) {
+        final identity = source.sourceIdentity;
+        if (identity == null) {
+          throw FormatException('Released chapter has no recoverable source: ${chapter.path}');
+        }
+        final chapterPath = chapter.path;
+        final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
+          identity.inputPath, selectEntries: (_, _) => {chapterPath},
+        );
+        checkEpubSourceHash(snapshot.fingerprint, identity.sha256);
+        final bytes = snapshot.files[chapterPath];
+        if (bytes == null) throw FormatException('Source chapter not found: $chapterPath');
+        source = source.copyWith(originalHtml: utf8.decode(bytes));
+      }
+      final restored = await ChapterSourceRestorer.restoreChapter(chapter: source, isCancelled: () => false);
+      final translations = {for (final block in chapter.blocks) block.id: block.translatedHtml};
+      return restored.copyWith(blocks: [for (final block in restored.blocks)
+        block.copyWith(translatedHtml: translations[block.id]),
+      ]);
+    }
+    final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    final sources = {for (final item in json['blocks'] as List<dynamic>)
+      (item as Map<String, dynamic>)['id'] as String: item};
+    return chapter.copyWith(
+      originalHtml: json['originalHtml'] as String,
+      // Final preview needs the extractor's bounded source excerpt, while
+      // full per-block sources stay on disk until an actual retry needs them.
+      body: json['body'] as String,
+      blocks: blocks ? [for (final block in chapter.blocks) block.copyWith(
+        sourceHtml: sources[block.id]?['sourceHtml'] as String?,
+        sourceText: sources[block.id]?['sourceText'] as String?,
+      )] : chapter.blocks,
+    );
+  }
+
+  Future<void> dispose() async {
+    if (!_ownsDirectory) return;
+    try {
+      await _directory?.delete(recursive: true);
+    } catch (error) {
+      AppLogger.warn('Source spool cleanup failed (${error.runtimeType}).', tag: 'translate');
+    }
+  }
+}
+
+/// UTF-8 byte/4 is a common Latin-text token estimate. Byte counts also avoid
+/// undercounting non-Latin text; 1.2 headroom covers markup and JSON escaping.
+class _TranslationRequestBudget {
+  static const int bytesPerToken = 4;
+  static const double conservativeFactor = 1.2;
+  static int estimateTokens(String value) =>
+      (utf8.encode(value).length / bytesPerToken * conservativeFactor).ceil();
+
+  static ({int fixedTokens, int payloadTokens, int totalTokens}) forRequest(Map<String, dynamic> data) {
+    final messages = data['messages'] as List<Map<String, String>>;
+    final fixed = messages.where((m) => m['role'] != 'user').map((m) => m['content'] ?? '').join('\n');
+    final payload = messages.where((m) => m['role'] == 'user').map((m) => m['content'] ?? '').join('\n');
+    final fixedTokens = estimateTokens(fixed);
+    final payloadTokens = estimateTokens(payload);
+    return (fixedTokens: fixedTokens, payloadTokens: payloadTokens,
+      totalTokens: fixedTokens + payloadTokens);
+  }
+
+  static void apply(Map<String, dynamic> data) {
+    final budget = forRequest(data);
+    // Equivalent upward budget: the HTML/JSON baseline plus every fixed
+    // instruction, including style, locks and idiomatic rules. No private
+    // accounting fields are sent to OpenAI-compatible gateways.
+    data['max_tokens'] = max(256, budget.totalTokens);
   }
 }

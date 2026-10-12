@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -494,6 +495,13 @@ class TranslationDashboardController
         outputDirectory: outputDirectory,
         logs: <String>[...state.logs, _s.logAndroidOutputDir(outputDirectory)],
       );
+      // The fallback is a user-selected session destination too: changing only
+      // UI state would restore the previous directory on the next launch.
+      // Use the same coalesced, fire-and-forget write as manual entry.
+      _persistSessionPaths(
+        inputPath: state.inputPath,
+        outputDirectory: outputDirectory,
+      );
       return;
     }
 
@@ -535,6 +543,12 @@ class TranslationDashboardController
       outputDirectory: selectedDirectory,
       logs: <String>[...state.logs, _s.logSelectedOutput(selectedDirectory)],
     );
+    // Picker and manual entry must remember the same session paths; otherwise
+    // a successful native selection disappears as soon as the app restarts.
+    _persistSessionPaths(
+      inputPath: state.inputPath,
+      outputDirectory: selectedDirectory,
+    );
   }
 
   void setInputPath(String value) {
@@ -553,6 +567,13 @@ class TranslationDashboardController
     // drop the edit markers too, or the next merge would overlay fields from
     // the discarded profile.
     _styleFieldsEditedDuringGeneration.clear();
+    // Clearing state.inspectedChapters alone does not release the old book:
+    // the identity-memoization key still strongly owns every originalHtml.
+    // Drop all static estimate inputs/results now, even if no new inspection
+    // follows, so a manual input change can release the entire source text.
+    _estimateStaticChaptersKey = null;
+    _estimateStaticChunkSizeKey = -1;
+    _estimateStaticCache = null;
     state = state.copyWith(
       inputPath: value,
       job: null,
@@ -615,6 +636,11 @@ class TranslationDashboardController
     // Same as setInputPath: a newly picked/dropped book discards the profile
     // and any in-flight generation, so the edit markers go too.
     _styleFieldsEditedDuringGeneration.clear();
+    // Pick/drop must release the same strong chapter-list reference as manual
+    // entry; waiting for the next estimate retains the previous whole book.
+    _estimateStaticChaptersKey = null;
+    _estimateStaticChunkSizeKey = -1;
+    _estimateStaticCache = null;
     state = state.copyWith(
       inputPath: normalizedPath,
       outputDirectory: outputDirectory,
@@ -1456,7 +1482,13 @@ class TranslationDashboardController
           : null;
       final TranslationJob terminalJob = _translationHistoryJob(
         result.job.copyWith(
-          phase: TranslationJobPhase.translation,
+          // Exported results already report translation in the repository.
+          // An explicit cacheRestoration result has not entered that phase
+          // (e.g. a cache-only terminal path); do not invent a transition or
+          // turn its unverified checkpoint into confirmed translation work.
+          phase: result.job.phase == TranslationJobPhase.cacheRestoration
+              ? TranslationJobPhase.cacheRestoration
+              : TranslationJobPhase.translation,
           errorMessage: safeResultError,
         ),
       );
@@ -1502,10 +1534,17 @@ class TranslationDashboardController
       }
       final String safeError = _safeErrorText(error);
       AppLogger.error('Translation failed', tag: 'dashboard', error: safeError);
+      // Cache scanning can throw before any translation starts. Keep that
+      // failure location truthful: completedBlocks still holds an unverified
+      // checkpoint in this phase, whereas cachedBlocks is confirmed on disk.
+      final bool failedDuringCacheRestoration =
+          state.job?.phase == TranslationJobPhase.cacheRestoration;
       final TranslationJob failedJob = _translationHistoryJob(
         state.job?.copyWith(
               status: TranslationJobStatus.failed,
-              phase: TranslationJobPhase.translation,
+              phase: failedDuringCacheRestoration
+                  ? TranslationJobPhase.cacheRestoration
+                  : TranslationJobPhase.translation,
               currentChapter: _s.jobStatusTranslationFailed,
               currentBlock: null,
               errorMessage: safeError,
@@ -1521,8 +1560,10 @@ class TranslationDashboardController
               errorMessage: safeError,
             ),
       );
-      // completedBlocks already includes cache hits and newly translated blocks.
-      final int savedBlocks = failedJob.completedBlocks;
+      // Only claim verified saved work. During translation completedBlocks
+      // includes cache hits/new output; during restoration it is merely the
+      // old checkpoint and must not be advertised as successfully saved.
+      final int savedBlocks = _confirmedProgressBlocks(failedJob);
       state = state.copyWith(
         job: failedJob,
         jobHistory: _jobHistoryWith(failedJob),
@@ -2022,7 +2063,17 @@ class TranslationDashboardController
           for (var attempt = 0; attempt < 3; attempt++) {
             final result = await store.saveMerged(
               clearedAtEpochMs: candidate,
-              merge: (_, _) => const <TranslationJob>[],
+              // The lock-protected read can see runs added by another instance
+              // after this clear began. Preserve them rather than erasing the
+              // latest file wholesale. runStartedAt is microseconds, clearMs
+              // is milliseconds: align units before comparing. Legacy zero
+              // timestamps predate any clear and are intentionally removed.
+              // candidate may rebase on another tombstone during retries, but
+              // the deletion watermark must remain this clear's original
+              // clearMs, or a retry would also delete newly started runs.
+              merge: (fileJobs, _) => fileJobs
+                  .where((job) => job.runStartedAt > clearMs * 1000)
+                  .toList(growable: false),
             );
             if (result.written) {
               return (written: true, fileClearedAt: candidate);
@@ -2565,6 +2616,15 @@ class TranslationDashboardController
           ? currentJob?.totalBlocks ?? staticPart.totalBlocks
           : staticPart.totalBlocks,
       elapsed: reuseProgress ? _translationStopwatch?.elapsed : null,
+      // Only blocks translated via the real API count toward speed/ETA —
+      // cache-restored blocks would otherwise distort the estimate (C-19).
+      apiTranslatedBlocks: reuseProgress
+          ? max(
+              0,
+              (currentJob?.completedBlocks ?? 0) -
+                  (currentJob?.cachedBlocks ?? 0),
+            )
+          : 0,
     );
   }
 

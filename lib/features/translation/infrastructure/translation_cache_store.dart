@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path/path.dart' as path;
@@ -21,6 +22,7 @@ class TranslationCacheStore {
     this.pruneInterval = const Duration(minutes: 5),
     DateTime Function()? now,
     @visibleForTesting this.onMaintenanceScan,
+    @visibleForTesting this.resolveCacheRoot,
   }) : _rootOverride = cacheRoot,
        _capacity = maxCacheBytes,
        _now = now ?? DateTime.now;
@@ -31,6 +33,9 @@ class TranslationCacheStore {
   final DateTime Function() _now;
   @visibleForTesting
   final Future<void> Function()? onMaintenanceScan;
+  @visibleForTesting
+  final Future<Directory> Function()? resolveCacheRoot;
+  Future<Directory>? _rootFuture;
 
   /// Parent directories already swept for stale `.tmp.*` files. Atomic
   /// writes can leave orphans if the process is killed between the temp
@@ -57,12 +62,28 @@ class TranslationCacheStore {
   DateTime? _lastPrune;
   bool _maintenancePending = false;
   Future<void> _maintenanceTail = Future<void>.value();
+  int _writeGeneration = 0;
+  int _ineffectivePrunes = 0;
+  DateTime? _retryAfter;
+
+  static const String _envelopePrefix = 'epub-translation-cache-v1:sha256:';
 
   @visibleForTesting
   int get estimatedCacheBytesForTest => _estimatedBytes;
 
   @visibleForTesting
-  Future<void> waitForMaintenanceForTest() => _maintenanceTail;
+  Future<void> waitForMaintenanceForTest() async {
+    Future<void> tail;
+    do {
+      tail = _maintenanceTail;
+      await tail;
+    } while (!identical(tail, _maintenanceTail));
+  }
+
+  void _resetBackoff() {
+    _ineffectivePrunes = 0;
+    _retryAfter = null;
+  }
 
   // Writes and eviction share a per-file gate; unrelated keys stay parallel.
   Future<void> _withFileGate(File file, Future<void> Function() action) {
@@ -86,6 +107,7 @@ class TranslationCacheStore {
     _estimatedBytes += size - (_sizes[key] ?? 0);
     _sizes[key] = size;
     _scanChanges?[key] = size;
+    if (_estimatedBytes <= _capacity) _resetBackoff();
   }
 
   Future<void> _sweepStaleTempFiles(Directory directory) async {
@@ -98,7 +120,17 @@ class TranslationCacheStore {
   Future<String?> getBlockTranslation(String cacheKey) async {
     final File file = await _blockCacheFile(cacheKey);
     try {
-      return await file.readAsString();
+      final String raw = await file.readAsString();
+      // Legacy entries have no checksum. Trust them to preserve paid progress;
+      // all new writes use the versioned integrity envelope below.
+      if (!raw.startsWith(_envelopePrefix)) return raw;
+      final int newline = raw.indexOf('\n');
+      if (newline < 0) return null;
+      final String digest = raw.substring(_envelopePrefix.length, newline);
+      final String payload = raw.substring(newline + 1);
+      return sha256.convert(utf8.encode(payload)).toString() == digest
+          ? payload
+          : null;
     } on FileSystemException catch (error) {
       // ENOENT on POSIX; ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on
       // Windows. Other failures remain unreadable-cache errors to callers.
@@ -128,8 +160,12 @@ class TranslationCacheStore {
           stat.type == FileSystemEntityType.file ? stat.size : 0,
         );
       }
-      await writeFileAtomically(file, translatedHtml);
-      _recordSize(file.path, utf8.encode(translatedHtml).length);
+      final String envelope =
+          '$_envelopePrefix'
+          '${sha256.convert(utf8.encode(translatedHtml))}\n$translatedHtml';
+      await writeFileAtomically(file, envelope);
+      _writeGeneration++;
+      _recordSize(file.path, utf8.encode(envelope).length);
     });
     _pruneIfNeeded();
   }
@@ -137,9 +173,11 @@ class TranslationCacheStore {
   /// Schedules an initial baseline scan, then maintenance on writes when the
   /// time interval expires or estimated capacity is exceeded. Pending requests
   /// are coalesced; failures cannot break a translation run.
-  void _pruneIfNeeded() {
+  void _pruneIfNeeded({bool capacityFollowUp = false}) {
     final DateTime now = _now();
+    if (_estimatedBytes <= _capacity) _resetBackoff();
     if (_maintenancePending ||
+        (_retryAfter != null && now.isBefore(_retryAfter!)) ||
         (_lastPrune != null &&
             now.difference(_lastPrune!) < pruneInterval &&
             _estimatedBytes <= _capacity)) {
@@ -150,12 +188,33 @@ class TranslationCacheStore {
     // Start on a separate event turn, and never join this future from put.
     _maintenanceTail = _maintenanceTail.then(
       (_) => Future<void>(() async {
+        final int generation = _writeGeneration;
+        bool scanned = false;
+        int deletedBytes = 0;
         try {
-          await _scanAndPrune(await _cacheRoot(), _capacity);
+          deletedBytes = await _scanAndPrune(await _cacheRoot(), _capacity);
+          scanned = true;
         } catch (_) {
           // Cache maintenance must never break translation.
         } finally {
+          if (_estimatedBytes <= _capacity || deletedBytes > 0) {
+            _resetBackoff();
+          } else if (!scanned ||
+              generation == _writeGeneration ||
+              capacityFollowUp) {
+            // No reclaimable space (or a failed pass): don't rescan on every
+            // put. Concurrent writes get one immediate follow-up pass first,
+            // but cannot keep no-effect scans spinning indefinitely.
+            _ineffectivePrunes++;
+            final int minutes = _ineffectivePrunes >= 5
+                ? 60
+                : 5 * (1 << (_ineffectivePrunes - 1));
+            _retryAfter = _now().add(Duration(minutes: minutes));
+          }
           _maintenancePending = false;
+          if (_estimatedBytes > _capacity) {
+            _pruneIfNeeded(capacityFollowUp: true);
+          }
         }
       }),
     );
@@ -174,18 +233,18 @@ class TranslationCacheStore {
     Directory root, {
     int maxBytes = _maxCacheBytes,
   }) {
-    final Future<void> pass = _maintenanceTail.then(
-      (_) => _scanAndPrune(root, maxBytes),
-    );
+    final Future<void> pass = _maintenanceTail.then((_) async {
+      await _scanAndPrune(root, maxBytes);
+    });
     _maintenanceTail = pass.catchError((Object _) {});
     return pass;
   }
 
-  Future<void> _scanAndPrune(Directory root, int maxBytes) async {
+  Future<int> _scanAndPrune(Directory root, int maxBytes) async {
     final Map<String, int> changes = <String, int>{};
     _scanChanges = changes;
     try {
-      if (!await root.exists()) return;
+      if (!await root.exists()) return 0;
       // Sweep every shard, including ones no longer receiving writes. Do not
       // memoize this maintenance pass: a previously fresh orphan can age out.
       await cleanStaleAtomicTempFiles(root);
@@ -199,7 +258,8 @@ class TranslationCacheStore {
       }
       final List<_CacheEntry> entries = <_CacheEntry>[];
       final Map<String, int> scannedSizes = <String, int>{};
-      int tempBytes = 0;
+      final Map<String, FileStat> temps = <String, FileStat>{};
+      int deletedBytes = 0;
       await for (final FileSystemEntity entity in root.list(
         recursive: true,
         followLinks: false,
@@ -217,7 +277,7 @@ class TranslationCacheStore {
           // Fresh temps count toward the cap but cannot be evicted: they may
           // belong to another live writer. Stale ones were swept above.
           if (isAtomicTemp) {
-            tempBytes += stat.size;
+            temps[entity.path] = stat;
           } else {
             scannedSizes[entity.path] = stat.size;
             entries.add(
@@ -233,6 +293,35 @@ class TranslationCacheStore {
         }
       }
       await onMaintenanceScan?.call();
+      // Reconcile the temporary paths, not just their original byte sum. A
+      // rename may have promoted a listed temp during this scan, including in
+      // another store/process. Size+mtime identifies that promotion. This
+      // synchronous reconciliation and the overlay below cannot interleave
+      // with this isolate's completed-write accounting.
+      int reconcileTemps() {
+        int bytes = 0;
+        for (final temp in temps.entries) {
+          final FileStat current = FileStat.statSync(temp.key);
+          if (current.type == FileSystemEntityType.file) {
+            bytes += current.size;
+          } else {
+            final String target = temp.key.substring(
+              0,
+              temp.key.lastIndexOf('.tmp.'),
+            );
+            final FileStat promoted = FileStat.statSync(target);
+            if (promoted.type == FileSystemEntityType.file &&
+                promoted.size == temp.value.size &&
+                promoted.modified == temp.value.modified &&
+                !changes.containsKey(target)) {
+              scannedSizes[target] = promoted.size;
+            }
+          }
+        }
+        return bytes;
+      }
+
+      int tempBytes = reconcileTemps();
       // Overlay writes completed during listing, including newly created keys.
       scannedSizes.addAll(changes);
       int totalBytes = tempBytes + scannedSizes.values.fold(0, (a, b) => a + b);
@@ -255,6 +344,7 @@ class TranslationCacheStore {
               }
               await entry.file.delete();
               totalBytes -= entry.size;
+              deletedBytes += entry.size;
               _recordSize(entry.file.path, 0);
             });
           } catch (_) {
@@ -262,12 +352,14 @@ class TranslationCacheStore {
           }
         }
       }
+      tempBytes = reconcileTemps();
       scannedSizes.addAll(changes);
       scannedSizes.removeWhere((_, size) => size == 0);
       _sizes
         ..clear()
         ..addAll(scannedSizes);
       _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
+      return deletedBytes;
     } finally {
       _scanChanges = null;
     }
@@ -304,9 +396,9 @@ class TranslationCacheStore {
   static const int _maxJobCheckpoints = 20;
 
   /// Deletes the oldest checkpoints beyond [_maxJobCheckpoints]. Best
-  /// effort: checkpoint maintenance must never break a translation run. The
-  /// checkpoint just written is always the newest, so it can never be pruned
-  /// by its own save.
+  /// effort: checkpoint maintenance must never break a translation run. All
+  /// recently active checkpoints (including the one just saved) are protected
+  /// for five minutes, even when this temporarily exceeds the count cap.
   Future<void> _pruneOldJobStates() async {
     try {
       final Directory root = await _cacheRoot();
@@ -350,9 +442,21 @@ class TranslationCacheStore {
         ({File file, DateTime modified}) b,
       ) => a.modified.compareTo(b.modified),
     );
-    for (int i = 0; i < entries.length - maxCheckpoints; i++) {
+    int remaining = entries.length;
+    final DateTime activeSince = _now().subtract(const Duration(minutes: 5));
+    for (final entry in entries) {
+      if (remaining <= maxCheckpoints) break;
+      if (!entry.modified.isBefore(activeSince)) continue;
       try {
-        await entries[i].file.delete();
+        // A resume/save may have refreshed it since listing. Recheck before
+        // deletion; active checkpoints may temporarily exceed the count cap.
+        final FileStat current = await entry.file.stat();
+        if (current.modified != entry.modified ||
+            !current.modified.isBefore(activeSince)) {
+          continue;
+        }
+        await entry.file.delete();
+        remaining--;
       } catch (_) {
         // Best effort; a locked file is left for the next pass.
       }
@@ -385,6 +489,10 @@ class TranslationCacheStore {
 
   Future<Directory> _cacheRoot() async {
     if (_rootOverride != null) return _rootOverride;
+    return _rootFuture ??= (resolveCacheRoot ?? _resolveCacheRoot)();
+  }
+
+  Future<Directory> _resolveCacheRoot() async {
     final Directory appDirectory = Directory(
       await PlatformUtils.appDocumentsDirectory(),
     );

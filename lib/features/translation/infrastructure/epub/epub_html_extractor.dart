@@ -13,6 +13,21 @@ import 'xhtml_html_compatibility.dart';
 class EpubHtmlExtractor {
   const EpubHtmlExtractor();
 
+  /// A block-count limit alone still admits a multi-megabyte single paragraph,
+  /// making SelectableText lay out the whole chapter. Limit preview data only;
+  /// translation/export continue to use the complete blocks and originalHtml.
+  /// The ellipsis is included in this UTF-16 code-unit budget.
+  static const int previewCharacterLimit = 6000;
+
+  static String limitPreviewText(String text) {
+    if (text.length <= previewCharacterLimit) return text;
+    int end = previewCharacterLimit - 1;
+    // Do not split a supplementary Unicode character at the excerpt boundary.
+    final int last = text.codeUnitAt(end - 1);
+    if (last >= 0xD800 && last <= 0xDBFF) end -= 1;
+    return '${text.substring(0, end)}…';
+  }
+
   /// Decode and build DOMs away from the caller isolate. Only this batch's
   /// bytes and the extractor cross the boundary, never the full archive or
   /// progress/cancellation callbacks. The synchronous API remains shared by
@@ -90,15 +105,17 @@ class EpubHtmlExtractor {
       chapterPath: chapterPath,
       detectAuthorSignatures: category == ChapterCategory.frontMatter,
     );
-    final String bodyText = blocks.isNotEmpty
-        ? blocks
-              .take(12)
-              .map((ExtractedBlock block) => block.sourceText)
-              .join('\n\n')
-              .trim()
-        : (document.body?.text ?? document.documentElement?.text ?? '')
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim();
+    final String bodyText = limitPreviewText(
+      blocks.isNotEmpty
+          ? blocks
+                .take(12)
+                .map((ExtractedBlock block) => block.sourceText)
+                .join('\n\n')
+                .trim()
+          : (document.body?.text ?? document.documentElement?.text ?? '')
+                .replaceAll(RegExp(r'\s+'), ' ')
+                .trim(),
+    );
 
     final bool recommendedForTranslation =
         blocks.isNotEmpty && category != ChapterCategory.ancillary;
@@ -457,6 +474,43 @@ class EpubHtmlExtractor {
   /// together; the DOM itself is never mutated, so `sourceHtml` (what is sent
   /// to the translation API) is unaffected.
   String elementText(dom.Element element) {
+    // Structural boundaries separate words even without source whitespace.
+    // span/a are translatable but inline: spacing those would corrupt split
+    // words such as foo<b>bar</b>baz. Extra block spaces normalize below.
+    const Set<String> blockTags = <String>{
+      'p',
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'li',
+      'td',
+      'th',
+      'blockquote',
+      'dt',
+      'dd',
+      'figcaption',
+      'caption',
+      'summary',
+      'div',
+      'section',
+      'article',
+      'header',
+      'footer',
+      'nav',
+      'main',
+      'aside',
+      'figure',
+      'table',
+      'tr',
+      'ul',
+      'ol',
+      'dl',
+      'pre',
+      'hr',
+    };
     final StringBuffer buffer = StringBuffer();
     void visit(dom.Node node) {
       if (node is dom.Text) {
@@ -466,9 +520,12 @@ class EpubHtmlExtractor {
         if (node.localName == 'br') {
           buffer.write(' ');
         } else {
+          final bool isBlock = blockTags.contains(node.localName);
+          if (isBlock) buffer.write(' ');
           for (final dom.Node child in node.nodes) {
             visit(child);
           }
+          if (isBlock) buffer.write(' ');
         }
       }
     }
@@ -687,7 +744,10 @@ class EpubHtmlExtractor {
   /// do not. Word-boundary matching misfires on the latter two.
   bool _matchesAncillaryTitle(String title, List<String> needles) {
     final String stripped = title.replaceAll(
-      RegExp(r'^[^a-z0-9]+|[^a-z0-9]+$'),
+      // ASCII-only stripping erased CJK prose ("Cover 封面故事" -> "cover")
+      // and silently excluded real chapters. All Unicode letters/numbers
+      // must survive; the trailing-colophon check must use the same alphabet.
+      RegExp(r'^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$', unicode: true),
       '',
     );
     return needles.any((String needle) {
@@ -701,7 +761,7 @@ class EpubHtmlExtractor {
       // whitespace and punctuation — no letters, so "Copyright and Fair
       // Use" (rest = " and fair use") does not match.
       final String rest = stripped.substring(needle.length);
-      return !RegExp(r'[a-z]').hasMatch(rest);
+      return !RegExp(r'\p{L}', unicode: true).hasMatch(rest);
     });
   }
 }

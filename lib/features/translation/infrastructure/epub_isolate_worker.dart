@@ -3,10 +3,12 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
+import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
 
@@ -16,6 +18,9 @@ import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
 import 'epub/epub_source_guard.dart';
 import '../domain/repositories/translation_repository.dart';
+import '../domain/models/inspected_chapter.dart';
+import 'epub/epub_html_extractor.dart';
+import 'epub/xhtml_html_compatibility.dart';
 
 /// Navigation only looks up container, OPF and manifest-selected nav/NCX
 /// entries. Indexing names must not inflate unrelated chapter/media payloads.
@@ -152,8 +157,9 @@ class EpubIsolateWorker {
 
   /// Runs CPU-only preparation with progress messages. Cancellation sends an
   /// immediate isolate control message, so even a single huge DOM parse can
-  /// be stopped. Do not use this for work that creates files: killing such a
-  /// worker could leave temporary output behind.
+  /// be stopped. File-producing work must reserve its temp path in the parent
+  /// and clean it after termination (as writeTranslatedEpub does); killing an
+  /// isolate cannot run its finally blocks or report a newly created path.
   static Future<T> prepareWithProgress<T>({
     required T Function(void Function(int, int)) operation,
     required bool Function() isCancelled,
@@ -162,9 +168,11 @@ class EpubIsolateWorker {
     if (isCancelled()) throw const TranslationCancelledException();
     final messages = ReceivePort();
     final completed = Completer<T>();
+    final exited = Completer<void>();
     Isolate? worker;
     Timer? cancellationPoll;
     final subscription = messages.listen((dynamic message) {
+      if (message == null && !exited.isCompleted) exited.complete();
       if (completed.isCompleted) return;
       try {
         if (isCancelled()) throw const TranslationCancelledException();
@@ -212,6 +220,9 @@ class EpubIsolateWorker {
     } finally {
       cancellationPoll?.cancel();
       worker?.kill(priority: Isolate.immediate);
+      // Await termination, not just the kill request. File-producing callers
+      // can then clean their owned temp without racing a still-running writer.
+      if (worker != null) await exited.future;
       await subscription.cancel();
       messages.close();
     }
@@ -236,8 +247,24 @@ class EpubIsolateWorker {
     String inputPath, {
     required Set<String> Function(Map<String, List<int>> files, String opfPath)
     selectEntries,
+    bool Function()? isCancelled,
   }) {
-    return Isolate.run(() {
+    return prepareWithProgress(
+      operation: _inspectionOperation(inputPath, selectEntries),
+      isCancelled: isCancelled ?? () => false,
+    );
+  }
+
+  // Build sendable closures in scopes containing only worker data, never UI
+  // cancellation callbacks/tokens (which can capture unsendable state).
+  static ({Map<String, Uint8List> files, String fingerprint}) Function(
+    void Function(int, int),
+  )
+  _inspectionOperation(
+    String inputPath,
+    Set<String> Function(Map<String, List<int>>, String) selectEntries,
+  ) {
+    return (_) {
       final bytes = _readSourceBytesGuarded(inputPath);
       final archive = _decodeArchiveWithLimits(inputPath, bytes);
       final files = <String, Uint8List>{};
@@ -290,8 +317,32 @@ class EpubIsolateWorker {
         read(name);
       }
       return (files: files, fingerprint: sha256.convert(bytes).toString());
-    });
+    };
   }
+
+  /// Same synchronous extractor semantics, but the outer isolate is killable;
+  /// nesting the extractor's Isolate.run would leave that child unmanaged.
+  static Future<List<InspectedChapter>> inspectChapterBatchCancellable({
+    required Map<String, List<int>> chapters,
+    required EpubHtmlExtractor extractor,
+    required bool Function() isCancelled,
+  }) => prepareWithProgress(
+    operation: _chapterOperation(chapters, extractor),
+    isCancelled: isCancelled,
+  );
+
+  static List<InspectedChapter> Function(void Function(int, int))
+  _chapterOperation(
+    Map<String, List<int>> chapters,
+    EpubHtmlExtractor extractor,
+  ) =>
+      (_) => [
+        for (final entry in chapters.entries)
+          extractor.inspectChapterBytes(
+            chapterPath: entry.key,
+            bytes: entry.value,
+          ),
+      ];
 
   /// Only the small title crosses the isolate boundary. ZIP limits and source
   /// identity still apply, but only container.xml and its OPF are inflated.
@@ -346,9 +397,10 @@ class EpubIsolateWorker {
   /// Repacks an EPUB, replacing selected XHTML payloads, on a background isolate.
   ///
   /// Writes to a same-directory temp file first, then commits to [outputFilePath]
-  /// only after encoding succeeds. Callers should re-check cancellation after this
-  /// returns if they need to discard an uncommitted temp (this method commits
-  /// only when [shouldCommit] returns true, default always commit).
+  /// only after encoding succeeds. [shouldCommit] is also polled during ZIP
+  /// work; refusal kills the worker and cleans its temp. Legacy shouldCommit
+  /// callers receive false (the repacker converts it to cancellation); explicit
+  /// [isCancelled] callers receive [TranslationCancelledException].
   ///
   /// [navigationLabelsByPath] / [navigationLanguageTag] let the isolate render
   /// OPF/NCX navigation metadata from the same decoded archive in one pass, so
@@ -371,25 +423,36 @@ class EpubIsolateWorker {
     String? navigationLanguageTag,
     bool bilingual = false,
     bool Function()? shouldCommit,
+    bool Function()? isCancelled,
     String Function(String outputPath, String tempPath)? lockedMessage,
     String? expectedSourceFingerprint,
     String? translatedTitle,
   }) async {
-    final String tempPath = await Isolate.run(
-      () => _writeTranslatedEpubToTempSync(
-        inputPath: inputPath,
-        outputFilePath: outputFilePath,
-        translatedHtmlByPath: translatedHtmlByPath,
-        navigationLabelsByPath: navigationLabelsByPath,
-        navigationLanguageTag: navigationLanguageTag,
-        bilingual: bilingual,
-        expectedSourceFingerprint: expectedSourceFingerprint,
-        translatedTitle: translatedTitle,
-      ),
-    );
-
+    // Reserve a unique path in the parent before spawning. A killed worker
+    // cannot report its path or run finally; parent ownership enables cleanup.
+    final String tempPath =
+        '$outputFilePath.tmp.${DateTime.now().microsecondsSinceEpoch}';
     final File tempFile = File(tempPath);
     try {
+      await prepareWithProgress(
+        operation: _exportOperation(
+          inputPath,
+          outputFilePath,
+          tempPath,
+          translatedHtmlByPath,
+          navigationLabelsByPath,
+          navigationLanguageTag,
+          bilingual,
+          expectedSourceFingerprint,
+          translatedTitle,
+        ),
+        isCancelled: () =>
+            (isCancelled?.call() ?? false) ||
+            (shouldCommit != null && !shouldCommit()),
+      );
+      if (isCancelled?.call() ?? false) {
+        throw const TranslationCancelledException();
+      }
       if (shouldCommit != null && !shouldCommit()) {
         await _deleteQuietly(tempFile);
         return false;
@@ -397,7 +460,8 @@ class EpubIsolateWorker {
       return await commitTempFile(
         tempFile,
         File(outputFilePath),
-        shouldCommit: shouldCommit,
+        shouldCommit: () =>
+            !(isCancelled?.call() ?? false) && (shouldCommit?.call() ?? true),
         lockedMessage: lockedMessage,
       );
     } catch (error) {
@@ -407,9 +471,37 @@ class EpubIsolateWorker {
       if (error is! OutputFileLockedException) {
         await _deleteQuietly(tempFile);
       }
+      // Keep the established bool contract for commit-veto-only callers;
+      // the repacker already turns false into TranslationCancelledException.
+      if (error is TranslationCancelledException && isCancelled == null) {
+        return false;
+      }
       rethrow;
     }
   }
+
+  static String Function(void Function(int, int)) _exportOperation(
+    String inputPath,
+    String outputFilePath,
+    String tempPath,
+    Map<String, String> html,
+    Map<String, String> labels,
+    String? language,
+    bool bilingual,
+    String? fingerprint,
+    String? title,
+  ) =>
+      (_) => _writeTranslatedEpubToTempSync(
+        inputPath: inputPath,
+        outputFilePath: outputFilePath,
+        translatedHtmlByPath: html,
+        navigationLabelsByPath: labels,
+        navigationLanguageTag: language,
+        bilingual: bilingual,
+        expectedSourceFingerprint: fingerprint,
+        translatedTitle: title,
+        ownedTempPath: tempPath,
+      );
 
   /// Test seam: write only the temp payload without committing.
   static Future<String> writeTranslatedEpubToTempForTest({
@@ -443,15 +535,8 @@ class EpubIsolateWorker {
     Map<String, String> renderedHtmlByPath = const <String, String>{},
     String? translatedTitle,
   }) {
-    if (languageTag == null) {
-      // The target language is unknown: OPF/NCX navigation metadata is left
-      // untouched rather than guessing a language tag.
-      AppLogger.info(
-        'renderNavigationMetadata: no target language tag; skipping OPF/NCX navigation updates.',
-        tag: 'repack',
-      );
-      return const <String, String>{};
-    }
+    // Unknown language only prevents language annotations, not already-paid
+    // title/label translations. Preserve existing language metadata verbatim.
     final List<int>? containerBytes = archiveFiles['META-INF/container.xml'];
     if (containerBytes == null) {
       return const <String, String>{};
@@ -494,26 +579,28 @@ class EpubIsolateWorker {
                   element.namespaceUri == 'http://purl.org/dc/elements/1.1/',
             )
             .toList(growable: false);
-    if (bilingual && languages.isNotEmpty) {
-      final seen = <String>{};
-      for (final language in languages) {
-        final value = language.innerText.trim().toLowerCase();
-        if (value.isEmpty || !seen.add(value)) {
-          language.parent?.children.remove(language);
+    if (languageTag != null) {
+      if (bilingual && languages.isNotEmpty) {
+        final seen = <String>{};
+        for (final language in languages) {
+          final value = language.innerText.trim().toLowerCase();
+          if (value.isEmpty || !seen.add(value)) {
+            language.parent?.children.remove(language);
+          }
         }
-      }
-      if (!seen.contains(languageTag.toLowerCase())) {
-        metadata?.children.add(_dcLanguageElement(opf, languageTag));
-      }
-    } else if (languages.isEmpty) {
-      // No dc:language present: append one instead of skipping, so the
-      // finished book still carries the target language.
-      if (metadata != null) {
-        metadata.children.add(_dcLanguageElement(opf, languageTag));
-      }
-    } else {
-      for (final xml.XmlElement language in languages) {
-        language.innerText = languageTag;
+        if (!seen.contains(languageTag.toLowerCase())) {
+          metadata?.children.add(_dcLanguageElement(opf, languageTag));
+        }
+      } else if (languages.isEmpty) {
+        // No dc:language present: append one instead of skipping, so the
+        // finished book still carries the target language.
+        if (metadata != null) {
+          metadata.children.add(_dcLanguageElement(opf, languageTag));
+        }
+      } else {
+        for (final xml.XmlElement language in languages) {
+          language.innerText = languageTag;
+        }
       }
     }
 
@@ -532,7 +619,9 @@ class EpubIsolateWorker {
             .firstOrNull;
         if (titleElement != null) {
           titleElement.innerText = newTitle;
-          titleElement.setAttribute('xml:lang', languageTag);
+          if (languageTag != null) {
+            titleElement.setAttribute('xml:lang', languageTag);
+          }
         }
       } catch (_) {
         // Keep the original title on any XML manipulation failure.
@@ -576,7 +665,7 @@ class EpubIsolateWorker {
             filePath: navPath,
             strict: true,
           );
-      replacements[navPath] = synchronizeEpub3Navigation(
+      replacements[navPath] = _synchronizeNavigation(
         markup: markup,
         documentPath: navPath,
         labelsByPath: labelsByPath,
@@ -632,7 +721,9 @@ class EpubIsolateWorker {
     final xml.XmlDocument ncx = xml.XmlDocument.parse(
       decodeEpubText(bytes: ncxBytes, filePath: ncxPath, strict: true),
     );
-    ncx.rootElement.setAttribute('xml:lang', languageTag);
+    if (languageTag != null) {
+      ncx.rootElement.setAttribute('xml:lang', languageTag);
+    }
     // Translated book title: keep NCX docTitle in sync with OPF dc:title.
     final String? ncxTitle = translatedTitle?.trim();
     if (ncxTitle != null && ncxTitle.isNotEmpty) {
@@ -647,11 +738,13 @@ class EpubIsolateWorker {
             .firstOrNull;
         if (docTitleText != null) {
           docTitleText.innerText = ncxTitle;
-          docTitleText.setAttribute('xml:lang', languageTag);
-          (docTitleText.parent as xml.XmlElement).setAttribute(
-            'xml:lang',
-            languageTag,
-          );
+          if (languageTag != null) {
+            docTitleText.setAttribute('xml:lang', languageTag);
+            (docTitleText.parent as xml.XmlElement).setAttribute(
+              'xml:lang',
+              languageTag,
+            );
+          }
         }
       } catch (_) {
         // Keep the original docTitle on any XML manipulation failure.
@@ -688,6 +781,50 @@ class EpubIsolateWorker {
     }
     replacements[ncxPath] = ncx.toXmlString();
     return replacements;
+  }
+
+  // The shared EPUB 3 helper requires a known tag. For unknown targets use
+  // its same TOC/link protections and nullable label primitive, without
+  // inventing a tag or removing source language attributes.
+  static String _synchronizeNavigation({
+    required String markup,
+    required String documentPath,
+    required Map<String, String> labelsByPath,
+    required String? languageTag,
+    required bool preserveSourceLabels,
+  }) {
+    if (languageTag != null) {
+      return synchronizeEpub3Navigation(
+        markup: markup,
+        documentPath: documentPath,
+        labelsByPath: labelsByPath,
+        languageTag: languageTag,
+        preserveSourceLabels: preserveSourceLabels,
+      );
+    }
+    final document = html_parser.parse(
+      XhtmlHtmlCompatibility.normalizeForHtmlParser(markup),
+    );
+    var changed = false;
+    for (final nav in document.querySelectorAll('nav')) {
+      if (!isEpubTocElement(nav)) continue;
+      for (final anchor in nav.querySelectorAll('a[href]')) {
+        if (preserveSourceLabels && !isTranslatedNavigationAnchor(anchor)) {
+          continue;
+        }
+        final href = anchor.attributes['href'] ?? '';
+        final uri = Uri.tryParse(href);
+        if (href.isEmpty || uri == null || uri.hasScheme || uri.hasAuthority) {
+          continue;
+        }
+        final label = labelsByPath[navigationTargetKey(documentPath, href)];
+        if (label == null || anchor.text.trim().isEmpty) continue;
+        changed = replaceNavigationAnchorLabel(anchor, label) || changed;
+      }
+    }
+    return changed
+        ? XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml)
+        : markup;
   }
 
   /// Declare the namespace on the new element itself: a declaration on a
@@ -836,11 +973,15 @@ class EpubIsolateWorker {
         // closes the locking program and retries — the block cache makes
         // the retry fast with no extra API cost — or renames the temp file
         // manually.
+        final recoveryFile = await preserveRecoveryTempForTest(
+          tempFile,
+          finalFile,
+        );
         throw OutputFileLockedException(
-          lockedMessage?.call(finalFile.path, tempFile.path) ??
+          lockedMessage?.call(finalFile.path, recoveryFile.path) ??
               'The output file is locked by another program: ${finalFile.path}. '
-                  'The translated file was kept at: ${tempFile.path}',
-          tempFile.path,
+                  'The translated file was kept at: ${recoveryFile.path}',
+          recoveryFile.path,
         );
       }
       await _deleteQuietly(tempFile);
@@ -927,8 +1068,9 @@ class EpubIsolateWorker {
   /// the isolate wrote the temp EPUB but before [commitTempFile] promoted
   /// it. Only files older than [_kStaleTempAge] are touched, and the temp
   /// file this commit is about to promote is always excluded — so a live
-  /// commit (or a temp deliberately kept by an [OutputFileLockedException]
-  /// recovery, or a second app instance's temp) can never be deleted.
+  /// commit is protected. Recovery files use a separate `.recovery.*`
+  /// prefix: no TTL, since user retrieval may happen days later. They are
+  /// user-managed and may accumulate until manually retrieved/deleted.
   /// Best effort; never throws.
   static Future<void> _reclaimStaleTempFiles(
     File finalFile,
@@ -952,6 +1094,22 @@ class EpubIsolateWorker {
       // Best effort: stale temps must never break a commit.
     }
   }
+
+  @visibleForTesting
+  static Future<void> reclaimStaleTempFilesForTest(
+    File finalFile,
+    File tempFile,
+  ) => _reclaimStaleTempFiles(finalFile, tempFile);
+
+  /// Rename before reporting the path so automatic orphan sweeping cannot
+  /// destroy the sole translated copy deliberately retained for recovery.
+  @visibleForTesting
+  static Future<File> preserveRecoveryTempForTest(
+    File tempFile,
+    File finalFile,
+  ) => tempFile.rename(
+    '${finalFile.path}.recovery.${DateTime.now().microsecondsSinceEpoch}',
+  );
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
@@ -1021,9 +1179,8 @@ class EpubIsolateWorker {
   /// tens of megabytes at most; these caps only trip on malicious or
   /// degenerate archives.
   ///
-  /// The compressed cap exists because `readAsBytesSync` materializes the
-  /// whole file first: without it, a multi-GB fake "EPUB" would OOM the
-  /// read itself before decoding even starts.
+  /// Enforced while reading, before appending each chunk, so even a source
+  /// growing after stat cannot make the accumulated payload exceed the cap.
   static const int _kMaxEpubCompressedBytes = 256 * 1024 * 1024;
 
   /// Cap on the header-declared uncompressed total across all entries.
@@ -1047,17 +1204,17 @@ class EpubIsolateWorker {
   /// [FileSystemException].
   static List<int> _readSourceBytesGuarded(String inputPath) {
     final File file = File(inputPath);
-    final int compressedLength = file.lengthSync();
-    if (compressedLength > _kMaxEpubCompressedBytes) {
-      throw EpubDecompressionLimitException(
-        inputPath: inputPath,
-        compressedBytes: compressedLength,
-        uncompressedBytes: -1,
-        limitBytes: _kMaxEpubCompressedBytes,
-      );
-    }
     try {
-      return file.readAsBytesSync();
+      final handle = file.openSync();
+      try {
+        return _readChunksGuarded(
+          inputPath,
+          () => handle.readSync(64 * 1024),
+          _kMaxEpubCompressedBytes,
+        );
+      } finally {
+        handle.closeSync();
+      }
     } on FileSystemException catch (error) {
       if (isFileLockError(error)) {
         throw InputFileLockedException(inputPath);
@@ -1065,6 +1222,36 @@ class EpubIsolateWorker {
       rethrow;
     }
   }
+
+  static Uint8List _readChunksGuarded(
+    String inputPath,
+    List<int> Function() nextChunk,
+    int limitBytes,
+  ) {
+    final bytes = BytesBuilder(copy: false);
+    while (true) {
+      final chunk = nextChunk();
+      if (chunk.isEmpty) return bytes.takeBytes();
+      final actualLength = bytes.length + chunk.length;
+      // Check and accumulation are one operation; no stat/read TOCTOU gap.
+      if (actualLength > limitBytes) {
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: actualLength,
+          uncompressedBytes: -1,
+          limitBytes: limitBytes,
+        );
+      }
+      bytes.add(chunk);
+    }
+  }
+
+  @visibleForTesting
+  static Uint8List readChunksGuardedForTest({
+    required String inputPath,
+    required List<int> Function() nextChunk,
+    required int limitBytes,
+  }) => _readChunksGuarded(inputPath, nextChunk, limitBytes);
 
   /// Decodes ZIP bytes with zip-bomb guards. `archive` decodes lazily, so
   /// the header-declared entry sizes are accumulated BEFORE any entry
@@ -1220,6 +1407,7 @@ class EpubIsolateWorker {
     bool bilingual = false,
     String? expectedSourceFingerprint,
     String? translatedTitle,
+    String? ownedTempPath,
   }) {
     // Keep source payloads compressed and share their ArchiveFile objects.
     // Only navigation metadata is inflated; output goes straight to disk.
@@ -1239,25 +1427,19 @@ class EpubIsolateWorker {
     final Map<String, String> replacements = Map<String, String>.of(
       translatedHtmlByPath,
     );
-    // Render navigation metadata whenever a target language is known, even
-    // when no chapter produced a navigation label: the OPF <dc:language>
-    // rewrite must still happen (renderNavigationMetadata handles empty
-    // labels by only updating the language tag).
-    if (navigationLanguageTag != null) {
-      final Map<String, List<int>> archiveView = _LazyArchiveView(
-        sourceArchive,
-      );
-      replacements.addAll(
-        renderNavigationMetadata(
-          archiveFiles: archiveView,
-          labelsByPath: navigationLabelsByPath,
-          languageTag: navigationLanguageTag,
-          bilingual: bilingual,
-          renderedHtmlByPath: translatedHtmlByPath,
-          translatedTitle: translatedTitle,
-        ),
-      );
-    }
+    // Title/label translations remain useful even for unknown language tags;
+    // the renderer independently guards language-only changes.
+    final Map<String, List<int>> archiveView = _LazyArchiveView(sourceArchive);
+    replacements.addAll(
+      renderNavigationMetadata(
+        archiveFiles: archiveView,
+        labelsByPath: navigationLabelsByPath,
+        languageTag: navigationLanguageTag,
+        bilingual: bilingual,
+        renderedHtmlByPath: translatedHtmlByPath,
+        translatedTitle: translatedTitle,
+      ),
+    );
 
     // The EPUB spec requires the mimetype entry to exist, be first,
     // uncompressed, and contain exactly "application/epub+zip". A missing
@@ -1334,10 +1516,12 @@ class EpubIsolateWorker {
     final File outputFile = File(outputFilePath);
     outputFile.parent.createSync(recursive: true);
 
-    final String tempPath = path.join(
-      outputFile.parent.path,
-      '${path.basename(outputFilePath)}.tmp.${DateTime.now().microsecondsSinceEpoch}',
-    );
+    final String tempPath =
+        ownedTempPath ??
+        path.join(
+          outputFile.parent.path,
+          '${path.basename(outputFilePath)}.tmp.${DateTime.now().microsecondsSinceEpoch}',
+        );
     final File tempFile = File(tempPath);
     try {
       final output = OutputFileStream(tempPath);

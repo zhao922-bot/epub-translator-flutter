@@ -7,6 +7,8 @@ import 'package:epub_translator_flutter/shared/io/atomic_file_writer.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
 
+final int _envelopeBytes = 'epub-translation-cache-v1:sha256:'.length + 65;
+
 void main() {
   group('incremental cache maintenance', () {
     late Directory root;
@@ -55,11 +57,11 @@ void main() {
       await existing.writeAsString('old' * 100);
       await store.putBlockTranslation('abkey', '你');
       await store.waitForMaintenanceForTest();
-      expect(store.estimatedCacheBytesForTest, 3);
+      expect(store.estimatedCacheBytesForTest, 3 + _envelopeBytes);
       await Future.wait([
         for (int i = 0; i < 20; i++) store.putBlockTranslation('ab$i', '你好'),
       ]);
-      expect(store.estimatedCacheBytesForTest, 123);
+      expect(store.estimatedCacheBytesForTest, 123 + 21 * _envelopeBytes);
       expect(scans, 1);
     });
 
@@ -91,12 +93,15 @@ void main() {
     test('time threshold finds external entries', () async {
       await store.putBlockTranslation('abfirst', '你好');
       await store.waitForMaintenanceForTest();
-      expect(store.estimatedCacheBytesForTest, utf8.encode('你好').length);
+      expect(
+        store.estimatedCacheBytesForTest,
+        utf8.encode('你好').length + _envelopeBytes,
+      );
       for (int i = 0; i < 130; i++) {
         await store.putBlockTranslation('abfirst', 'x');
       }
       expect(scans, 1);
-      expect(store.estimatedCacheBytesForTest, 1);
+      expect(store.estimatedCacheBytesForTest, 1 + _envelopeBytes);
       final external = File(
         path.join(root.path, 'blocks', 'ab', 'external.html'),
       );
@@ -105,13 +110,13 @@ void main() {
       await store.putBlockTranslation('abfirst', 'x');
       await store.waitForMaintenanceForTest();
       expect(scans, 2);
-      expect(store.estimatedCacheBytesForTest, 9);
+      expect(store.estimatedCacheBytesForTest, 9 + _envelopeBytes);
     });
 
     test('capacity triggers oldest-first eviction', () async {
       store = TranslationCacheStore(
         cacheRoot: root,
-        maxCacheBytes: 25,
+        maxCacheBytes: ((20 + 2 * _envelopeBytes) / 0.9).ceil(),
         now: () => now,
         onMaintenanceScan: () async {
           scans++;
@@ -131,7 +136,7 @@ void main() {
       expect(await store.getBlockTranslation('abold'), isNull);
       expect(await store.getBlockTranslation('abmid'), 'b' * 10);
       expect(await store.getBlockTranslation('abnew'), 'c' * 10);
-      expect(store.estimatedCacheBytesForTest, 20);
+      expect(store.estimatedCacheBytesForTest, 20 + 2 * _envelopeBytes);
     });
 
     test('blocked scans allow puts and protect replacements', () async {
@@ -163,13 +168,11 @@ void main() {
       expect(scans, 1, reason: 'in-flight maintenance requests are coalesced');
       release.complete();
       await store.waitForMaintenanceForTest();
-      final value = (await store.getBlockTranslation('abkey'))!;
-      expect(value, '你' * 20);
-      expect(await store.getBlockTranslation('abnew'), 'z');
-      expect(store.estimatedCacheBytesForTest, utf8.encode(value).length + 1);
-      // A subsequent pass can evict these now-stable entries.
-      await store.putBlockTranslation('abtrigger', 'q');
-      await store.waitForMaintenanceForTest();
+      // The first pass protects concurrent replacements; its immediate
+      // follow-up evicts the now-stable over-cap entries without another put.
+      expect(scans, 2);
+      expect(await store.getBlockTranslation('abkey'), isNull);
+      expect(await store.getBlockTranslation('abnew'), isNull);
       expect(store.estimatedCacheBytesForTest, lessThanOrEqualTo(5));
     });
 
@@ -188,7 +191,7 @@ void main() {
       await store.putBlockTranslation('abkey', 'replacement');
       await store.waitForMaintenanceForTest();
       expect(scans, 2);
-      expect(store.estimatedCacheBytesForTest, 11);
+      expect(store.estimatedCacheBytesForTest, 11 + _envelopeBytes);
     });
   });
   group('cleanStaleAtomicTempFiles', () {

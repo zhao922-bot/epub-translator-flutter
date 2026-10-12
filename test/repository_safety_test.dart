@@ -1382,6 +1382,7 @@ void main() {
             utf8.encode(
               <Object>[
                 'v15-second-person-and-idiom',
+                EpubChapterTranslator.qualityCacheSchemaVersion,
                 'https://api.example.test/v1',
                 config.model.trim(),
                 config.targetLanguage.trim(),
@@ -2132,7 +2133,9 @@ void main() {
         ],
       );
 
-      expect(adapter.strictRequestCount, 2);
+      // A8: the strict response has a deterministic schema error. Individual
+      // quality-round retries below are still exercised, without JSON rebills.
+      expect(adapter.strictRequestCount, 1);
       expect(adapter.plainInputs, hasLength(4));
       expect(adapter.plainInputs[0], 'Read this sentence right now.');
       expect(adapter.plainInputs[1], 'Translate this tail too.');
@@ -2295,7 +2298,8 @@ void main() {
       ]),
     );
 
-    expect(adapter.strictRequestCount, 3);
+    // A8: strict schema failure immediately enters the individual fallback.
+    expect(adapter.strictRequestCount, 1);
     expect(adapter.plainRequestCount, 1);
   });
 

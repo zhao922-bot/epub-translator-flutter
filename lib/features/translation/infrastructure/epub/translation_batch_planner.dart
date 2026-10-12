@@ -1,25 +1,71 @@
 import 'dart:convert';
 import 'dart:math';
 
+import '../../../../shared/logging/app_logger.dart';
 import '../../domain/models/inspected_chapter.dart';
 
 /// Plans block batches and neighboring read-only context for API calls.
 class TranslationBatchPlanner {
   const TranslationBatchPlanner({
-    this.contextBeforeBlockCount = 2,
-    this.contextAfterBlockCount = 1,
-    this.contextTextLimit = 240,
-    this.tinyBlockTextThreshold = 80,
-    this.tinyBlockHtmlThreshold = 360,
-    this.tinyBlockBudget = 48,
-  });
+    int contextBeforeBlockCount = 2,
+    int contextAfterBlockCount = 1,
+    int contextTextLimit = 240,
+    int tinyBlockTextThreshold = 80,
+    int tinyBlockHtmlThreshold = 360,
+    int tinyBlockBudget = 48,
+  // Keep the public named parameters and private raw storage for const callers.
+  // ignore: prefer_initializing_formals
+  }) : _contextBeforeBlockCount = contextBeforeBlockCount,
+       // ignore: prefer_initializing_formals
+       _contextAfterBlockCount = contextAfterBlockCount,
+       // ignore: prefer_initializing_formals
+       _contextTextLimit = contextTextLimit,
+       // ignore: prefer_initializing_formals
+       _tinyBlockTextThreshold = tinyBlockTextThreshold,
+       // ignore: prefer_initializing_formals
+       _tinyBlockHtmlThreshold = tinyBlockHtmlThreshold,
+       // ignore: prefer_initializing_formals
+       _tinyBlockBudget = tinyBlockBudget;
 
-  final int contextBeforeBlockCount;
-  final int contextAfterBlockCount;
-  final int contextTextLimit;
-  final int tinyBlockTextThreshold;
-  final int tinyBlockHtmlThreshold;
-  final int tinyBlockBudget;
+  // chunkSize is a character budget, not a block count. Existing callers use
+  // 1 (single blocks) through 100000 (large-batch throughput tests).
+  static const int minChunkSize = 1;
+  static const int maxChunkSize = 100000;
+  static const int defaultChunkSize = 3000;
+  static const int minContextCount = 0;
+  static const int maxContextCount = 16;
+  static const int minContextTextLimit = 3;
+  static const int maxContextTextLimit = 4096;
+  static const int minTinyThreshold = 0;
+  static const int maxTinyThreshold = 16384;
+  static const int minTinyBudget = 1;
+  static const int maxTinyBudget = 16384;
+
+  final int _contextBeforeBlockCount;
+  final int _contextAfterBlockCount;
+  final int _contextTextLimit;
+  final int _tinyBlockTextThreshold;
+  final int _tinyBlockHtmlThreshold;
+  final int _tinyBlockBudget;
+
+  // Lazy normalization preserves const callers while making every public
+  // operation safe (including direct buildContext/trimContextText calls).
+  static final Expando<Set<String>> _warned = Expando<Set<String>>();
+  int _bounded(String name, int value, int low, int high, int fallback) {
+    if (value >= low && value <= high) return value;
+    final warned = _warned[this] ??= <String>{};
+    if (warned.add(name)) {
+      AppLogger.warn('Invalid $name=$value; using $fallback (range $low..$high).', tag: 'batch-planner');
+    }
+    return fallback;
+  }
+
+  int get contextBeforeBlockCount => _bounded('contextBeforeBlockCount', _contextBeforeBlockCount, minContextCount, maxContextCount, 2);
+  int get contextAfterBlockCount => _bounded('contextAfterBlockCount', _contextAfterBlockCount, minContextCount, maxContextCount, 1);
+  int get contextTextLimit => _bounded('contextTextLimit', _contextTextLimit, minContextTextLimit, maxContextTextLimit, 240);
+  int get tinyBlockTextThreshold => _bounded('tinyBlockTextThreshold', _tinyBlockTextThreshold, minTinyThreshold, maxTinyThreshold, 80);
+  int get tinyBlockHtmlThreshold => _bounded('tinyBlockHtmlThreshold', _tinyBlockHtmlThreshold, minTinyThreshold, maxTinyThreshold, 360);
+  int get tinyBlockBudget => _bounded('tinyBlockBudget', _tinyBlockBudget, minTinyBudget, maxTinyBudget, 48);
 
   List<TranslationBlockBatch> plan({
     required List<ExtractedBlock> pendingBlocks,
@@ -31,7 +77,7 @@ class TranslationBatchPlanner {
     final List<TranslationBlockBatch> batches = <TranslationBlockBatch>[];
     List<ExtractedBlock> current = <ExtractedBlock>[];
     int currentBudget = 0;
-    final int safeChunkSize = max(1, chunkSize);
+    final int safeChunkSize = _bounded('chunkSize:$chunkSize', chunkSize, minChunkSize, maxChunkSize, defaultChunkSize);
     // The read-only context appended to every batch (chapter title,
     // bookMemory summary, before/after snippets) shares the request window
     // with the blocks, so it must come out of the same budget. The title

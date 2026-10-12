@@ -204,7 +204,7 @@ class TranslationOverview extends StatelessWidget {
               if (estimate case final TranslationRunEstimate e
                   when e.hasSelection && !canExport)
                 _MetaText(
-                  strings.estimateSummary(
+                  strings.approximateEstimateSummary(
                     e.estimatedApiBatches,
                     e.estimatedInputTokens,
                   ),

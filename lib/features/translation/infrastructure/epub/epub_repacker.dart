@@ -727,7 +727,9 @@ body.epub-translator-cjk [data-translation="true"] {
   ///
   /// Models sometimes emit multiple consecutive spaces; renderers collapse
   /// them visually, but the redundant whitespace litters the EPUB source.
-  /// `<pre>` content is left untouched, and non-breaking spaces (U+00A0,
+  /// Literal-content subtrees are left untouched: code, scripts, styles and
+  /// textarea values can give whitespace semantic meaning just like pre.
+  /// Non-breaking spaces (U+00A0,
   /// e.g. from `&nbsp;`) are preserved — only ASCII whitespace runs are
   /// collapsed.
   String _collapseRedundantWhitespace(String translatedHtml) {
@@ -735,11 +737,12 @@ body.epub-translator-cjk [data-translation="true"] {
       XhtmlHtmlCompatibility.normalizeForHtmlParser(translatedHtml),
     );
     bool changed = false;
-    void collapseNode(dom.Node node, bool insidePre) {
-      final bool inPre =
-          insidePre || (node is dom.Element && node.localName == 'pre');
+    void collapseNode(dom.Node node, bool insideLiteralContent) {
+      final bool inLiteralContent =
+          insideLiteralContent ||
+          (node is dom.Element && _literalContentTags.contains(node.localName));
       if (node is dom.Text) {
-        if (!inPre) {
+        if (!inLiteralContent) {
           final String collapsed = node.text.replaceAll(
             RegExp(r'[ \t\n\r\f\v]+'),
             ' ',
@@ -752,7 +755,7 @@ body.epub-translator-cjk [data-translation="true"] {
         return;
       }
       for (final dom.Node child in node.nodes.toList()) {
-        collapseNode(child, inPre);
+        collapseNode(child, inLiteralContent);
       }
     }
 
@@ -771,9 +774,27 @@ body.epub-translator-cjk [data-translation="true"] {
     return false;
   }
 
+  static const Set<String> _literalContentTags = <String>{
+    'pre',
+    'code',
+    'script',
+    'style',
+    'textarea',
+  };
+
   bool _isNonProseElement(dom.Element element) {
-    return EpubHtmlExtractor.nonTextAncestors.contains(element.localName) ||
-        _extractor.isInsideSkippedAncestor(element);
+    // CJK dropcap/small-caps cleanup already protects skipped ancestors; use
+    // the literal-content set too so textarea and all its descendants retain
+    // their classes/content rather than being mistaken for prose decoration.
+    dom.Node? current = element;
+    while (current is dom.Element) {
+      if (_literalContentTags.contains(current.localName) ||
+          EpubHtmlExtractor.nonTextAncestors.contains(current.localName)) {
+        return true;
+      }
+      current = current.parentNode;
+    }
+    return false;
   }
 
   bool _containsFootnoteMarkerClass(dom.Element element) {
@@ -909,7 +930,11 @@ body.epub-translator-cjk [data-translation="true"] {
   // Matches both `class="…"` and `class='…'` (older EPUBs use single
   // quotes); group 2 is the class value, group 1 the quote character.
   static final RegExp _classAttributePattern = RegExp(
-    'class=(["\'])([\\s\\S]*?)\\1',
+    '(?<![-\\w])class=(["\'])([\\s\\S]*?)\\1',
+  );
+  static final RegExp _nonMarkupTocContentPattern = RegExp(
+    r'<!--[\s\S]*?(?:-->|$)|<(script|style)\b[^>]*>[\s\S]*?(?:</\1\s*>|$)',
+    caseSensitive: false,
   );
   static final RegExp _whitespaceRunPattern = RegExp(r'\s+');
 
@@ -919,7 +944,11 @@ body.epub-translator-cjk [data-translation="true"] {
   /// misclassifying a body chapter as a TOC document — its cross-reference
   /// anchor texts would then be rewritten into chapter titles.
   bool _hasTocClassToken(String html) {
-    for (final RegExpMatch match in _classAttributePattern.allMatches(html)) {
+    // Comments and raw-text script/style strings are not class attributes;
+    // data-class/other word-prefixed names must not identify a TOC either.
+    // Keep the legacy class= spelling (no whitespace before '=') and quotes.
+    final String markup = html.replaceAll(_nonMarkupTocContentPattern, '');
+    for (final RegExpMatch match in _classAttributePattern.allMatches(markup)) {
       if (match.group(2)!.split(_whitespaceRunPattern).contains('toc')) {
         return true;
       }

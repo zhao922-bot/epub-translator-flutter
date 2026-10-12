@@ -45,8 +45,13 @@ PreviewChapter projectPreviewChapter(
   required String? translated,
 }) => PreviewChapter(
   title: chapter.title,
-  body: source,
-  translatedBody: translated,
+  // Limit both recovery joins and already cached excerpts at the shared data
+  // projection. Twelve blocks can still be one enormous block; bounding here
+  // also protects the provider's direct path without changing the renderer.
+  body: EpubHtmlExtractor.limitPreviewText(source),
+  translatedBody: translated == null
+      ? null
+      : EpubHtmlExtractor.limitPreviewText(translated),
   path: chapter.path,
   category: chapter.categoryLabel,
   recommendedForTranslation: chapter.recommendedForTranslation,

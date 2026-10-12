@@ -1,3 +1,5 @@
+import '../../../../shared/logging/app_logger.dart';
+
 enum UiLanguage { english, chinese }
 
 enum AppThemeMode { system, light, dark }
@@ -252,11 +254,10 @@ class TranslationConfig {
       (AppThemeMode value) => value.name == json['themeMode'],
       orElse: () => AppThemeMode.dark,
     );
-    final double textScale = switch (json['textScale']) {
-      num value => value.toDouble().clamp(0.9, 1.3),
-      String value => double.tryParse(value.trim())?.clamp(0.9, 1.3) ?? 1.0,
-      _ => 1.0,
-    };
+    final double textScale =
+        (_readFiniteNumber(json['textScale'], field: 'textScale') ?? 1.0)
+            .clamp(0.9, 1.3)
+            .toDouble();
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl,
       apiKey: _readTrimmedString(json['apiKey']),
@@ -350,14 +351,24 @@ class TranslationConfig {
     required int min,
     required int max,
   }) {
-    final int? parsed = switch (value) {
-      int value => value,
-      num value => value.round(),
-      String value =>
-        int.tryParse(value.trim()) ?? double.tryParse(value.trim())?.round(),
-      _ => null,
-    };
+    final int? parsed = _readFiniteNumber(
+      value,
+      field: 'integer setting',
+    )?.round();
     return (parsed ?? fallback).clamp(min, max).toInt();
+  }
+
+  static num? _readFiniteNumber(Object? value, {required String field}) {
+    final parsed = value is num
+        ? value
+        : value is String
+        ? num.tryParse(value.trim())
+        : null;
+    if (parsed != null && !parsed.isFinite) {
+      AppLogger.warn('Non-finite $field; using default.', tag: 'settings');
+      return null;
+    }
+    return parsed;
   }
 }
 

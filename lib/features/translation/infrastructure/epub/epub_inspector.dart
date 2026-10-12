@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
@@ -54,7 +56,12 @@ class EpubInspector {
       resumedBlocks: 0,
     );
 
+    double lastProgress = 0;
     void emit(TranslationJob job, String logLine) {
+      // Defense in depth: future phase emissions must not rewind the UI even
+      // if their local progress scale differs from the chapter scale.
+      lastProgress = math.max(lastProgress, job.progress);
+      job = job.copyWith(progress: lastProgress);
       currentJob = job;
       try {
         onProgress?.call(job, logLine);
@@ -83,6 +90,8 @@ class EpubInspector {
     final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
       inputPath,
       selectEntries: inspectionEntryPaths,
+      isCancelled: () =>
+          cancelToken.isCancelled || (isCancelled?.call() ?? false),
     );
     final Map<String, List<int>> files = snapshot.files;
     final sourceIdentity = EpubSourceIdentity(
@@ -193,7 +202,12 @@ class EpubInspector {
       }
       final List<InspectedChapter> indexed = batch.isEmpty
           ? const <InspectedChapter>[]
-          : await _extractor.inspectChapterBatch(chapters: batch);
+          : await EpubIsolateWorker.inspectChapterBatchCancellable(
+              chapters: batch,
+              extractor: _extractor,
+              isCancelled: () =>
+                  cancelToken.isCancelled || (isCancelled?.call() ?? false),
+            );
       throwIfCancelled();
       int resultIndex = 0;
       for (int index = start; index < end; index += 1) {
@@ -207,7 +221,8 @@ class EpubInspector {
         totalBlocks += chapter.blocks.length;
         emit(
           currentJob.copyWith(
-            progress: (index + 1) / chapterPaths.length,
+            // Opening/package discovery already consumed the first 20%.
+            progress: 0.2 + 0.8 * (index + 1) / chapterPaths.length,
             currentChapter: path.basename(chapterPath),
             completedFiles: index + 1,
             totalFiles: chapterPaths.length,
@@ -230,6 +245,29 @@ class EpubInspector {
       for (final String missing in missingChapterFiles)
         'Chapter file missing from archive, skipped: $missing.',
     ];
+    // A damaged spine with no surviving files is not a usable inspection;
+    // partial loss still permits translating the surviving chapters below.
+    if (chapterPaths.isNotEmpty && chapters.isEmpty) {
+      const message =
+          'All chapter files referenced by the spine are missing. / '
+          '所有 spine 引用的章节文件均缺失。';
+      warnings.add(message);
+      inspectionStopwatch.stop();
+      AppLogger.warn(message, tag: 'inspect');
+      emit(
+        currentJob.copyWith(
+          status: TranslationJobStatus.failed,
+          progress: 1,
+          currentChapter: s.inspectProgressNoChapters,
+        ),
+        message,
+      );
+      return InspectionResult(
+        job: currentJob,
+        chapters: chapters,
+        warnings: warnings,
+      );
+    }
     final TranslationJob inspectedJob = currentJob.copyWith(
       status: TranslationJobStatus.inspected,
       progress: 1,

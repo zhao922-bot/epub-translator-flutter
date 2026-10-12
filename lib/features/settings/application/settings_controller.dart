@@ -1,9 +1,13 @@
+import 'dart:async';
+
+import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../translation/domain/models/api_provider_preset.dart';
 import '../../translation/domain/models/translation_config.dart';
 import '../../translation/domain/repositories/translation_repository.dart';
 import '../../translation/infrastructure/repositories/epub_translation_repository.dart';
+import '../../translation/infrastructure/epub/translation_api_client.dart';
 import 'connection_diagnostic.dart';
 import '../infrastructure/settings_store.dart';
 
@@ -47,6 +51,8 @@ final settingsProvider =
             ref.read(secretKeyRotatedNoticeProvider.notifier).state = (
               id: DateTime.now().microsecondsSinceEpoch,
             ),
+        onSecretsRecovered: () =>
+            ref.read(secretKeyRotatedNoticeProvider.notifier).state = null,
       ),
     );
 
@@ -87,6 +93,10 @@ final secretKeyRotatedNoticeProvider = StateProvider<({int id})?>(
   (ref) => null,
 );
 
+final settingsLoadedProvider = FutureProvider<void>((ref) async {
+  await ref.watch(settingsProvider.notifier).ready;
+});
+
 final connectionTestProvider =
     StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>((ref) {
       final controller = ConnectionTestController(
@@ -111,6 +121,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     this.onSaveError,
     this.onCorruptReset,
     this.onSecretKeyRotated,
+    this.onSecretsRecovered,
   }) : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
@@ -130,12 +141,20 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// (lock-screen/biometric change) and regenerated: the stored secrets
   /// are unrecoverable, so the UI warns the user to re-enter them.
   final void Function()? onSecretKeyRotated;
+  final void Function()? onSecretsRecovered;
+  final Set<SettingsSecretSlot> _unresolvedSecretFailures = {};
+  Timer? _sliderTimer;
+  Completer<bool>? _sliderCompletion;
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
   Future<void>? _recoveryLoad;
   int providerSelectionRevision = 0;
 
   Future<void> get ready => _initialLoad;
+  bool get canTestConnection => _loaded && _store.configLoadError == null;
+  bool _loaded = false;
+  bool secretReadFailed(SettingsSecretSlot slot) =>
+      _store.secretReadFailed(slot);
 
   Future<void> _load() async {
     final TranslationConfig loaded;
@@ -148,6 +167,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (!mounted) {
       return;
     }
+    _loaded = true;
     state = loaded;
     if (_store.didCorruptReset) {
       onCorruptReset?.call(_store.lastCorruptBackupPath);
@@ -188,23 +208,68 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     Set<SettingsSecretSlot> explicitSecretMutations =
         const <SettingsSecretSlot>{},
     Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
+    bool debounce = false,
   }) async {
-    await _initialLoad;
+    if (!_loaded) await _initialLoad;
     if (!mounted) {
       return false;
     }
-    if (!await _ensureConfigLoaded()) return false;
+    if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
+      return false;
+    }
     final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
     final TranslationConfig next = update(state);
     if (!mounted) {
       return false;
     }
     state = next;
+    if (debounce) {
+      _sliderTimer?.cancel();
+      final completion = _sliderCompletion ??= Completer<bool>();
+      _sliderTimer = Timer(
+        const Duration(milliseconds: 400),
+        () => unawaited(flushSliderChanges()),
+      );
+      return completion.future;
+    }
+    final pendingSlider = _sliderCompletion;
+    _sliderCompletion = null;
+    _sliderTimer?.cancel();
+    final result = await _saveUpdate(next, slots);
+    pendingSlider?.complete(result);
+    return result;
+  }
+
+  Future<void> flushSliderChanges() async {
+    _sliderTimer?.cancel();
+    final completion = _sliderCompletion;
+    _sliderCompletion = null;
+    if (completion == null) return;
+    completion.complete(await _saveUpdate(state, const {}));
+  }
+
+  Future<bool> _saveUpdate(
+    TranslationConfig next,
+    Set<SettingsSecretSlot> slots,
+  ) async {
     try {
       await _persist(next, explicitSecretMutations: slots);
-      if (mounted) onSaveError?.call(null);
+      _unresolvedSecretFailures.removeAll(slots);
+      if (mounted) {
+        // Secret read status can change even when the displayed value doesn't.
+        if (slots.isNotEmpty) state = state.copyWith();
+        if (_unresolvedSecretFailures.isEmpty) onSaveError?.call(null);
+        if (slots.isNotEmpty && !_store.secretKeyRotated) {
+          onSecretsRecovered?.call();
+        }
+      }
       return true;
     } catch (error) {
+      if (error is SettingsSecretSaveException) {
+        _unresolvedSecretFailures.addAll(error.failures.keys);
+      } else {
+        _unresolvedSecretFailures.addAll(slots);
+      }
       // The UI already shows the new value, so a silent failure would leave
       // it lying about what is actually persisted. Surface it instead of
       // letting the future go unhandled at the call site.
@@ -266,20 +331,30 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> applyTuningPreset(TranslationTuningPreset preset) =>
       _update(preset.applyTo);
 
-  Future<void> setChunkSize(double value) =>
-      _update((config) => config.copyWith(chunkSize: value.round()));
+  Future<void> setChunkSize(double value) => _update(
+    (config) => config.copyWith(chunkSize: value.round()),
+    debounce: true,
+  );
 
-  Future<void> setMaxConcurrent(double value) =>
-      _update((config) => config.copyWith(maxConcurrent: value.round()));
+  Future<void> setMaxConcurrent(double value) => _update(
+    (config) => config.copyWith(maxConcurrent: value.round()),
+    debounce: true,
+  );
 
-  Future<void> setTimeoutSeconds(double value) =>
-      _update((config) => config.copyWith(timeoutSeconds: value.round()));
+  Future<void> setTimeoutSeconds(double value) => _update(
+    (config) => config.copyWith(timeoutSeconds: value.round()),
+    debounce: true,
+  );
 
-  Future<void> setMaxRetries(double value) =>
-      _update((config) => config.copyWith(maxRetries: value.round()));
+  Future<void> setMaxRetries(double value) => _update(
+    (config) => config.copyWith(maxRetries: value.round()),
+    debounce: true,
+  );
 
-  Future<void> setRetryDelaySeconds(double value) =>
-      _update((config) => config.copyWith(retryDelaySeconds: value.round()));
+  Future<void> setRetryDelaySeconds(double value) => _update(
+    (config) => config.copyWith(retryDelaySeconds: value.round()),
+    debounce: true,
+  );
 
   Future<bool> setOutputSuffix(String value) =>
       _update((config) => config.copyWith(outputSuffix: value.trim()));
@@ -290,8 +365,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> setStyleProfileEnabled(bool value) =>
       _update((config) => config.copyWith(styleProfileEnabled: value));
 
-  Future<void> setTextScale(double value) =>
-      _update((config) => config.copyWith(textScale: value.clamp(0.9, 1.3)));
+  Future<void> setTextScale(double value) => _update(
+    (config) => config.copyWith(textScale: value.clamp(0.9, 1.3)),
+    debounce: true,
+  );
 
   Future<bool> setLockedGlossary(String value) =>
       _update((config) => config.copyWith(lockedGlossary: value));
@@ -311,6 +388,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final int next = (config.maxConcurrent - 1).clamp(1, 8);
     return config.copyWith(maxConcurrent: next);
   });
+
+  @override
+  void dispose() {
+    unawaited(flushSliderChanges());
+    super.dispose();
+  }
 }
 
 class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
@@ -319,15 +402,21 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
 
   final TranslationRepository _repository;
   int _revision = 0;
+  CancelToken? _probeCancelToken;
 
   Future<void> run(TranslationConfig config) async {
     if (!mounted) {
       return;
     }
     final revision = ++_revision;
+    _probeCancelToken?.cancel();
+    final token = _probeCancelToken = CancelToken();
     state = const AsyncLoading<String?>();
     try {
-      final String result = await _repository.testConnection(config: config);
+      final String result = await TranslationApiClient.runWithProbeCancelToken(
+        token,
+        () => _repository.testConnection(config: config),
+      );
       if (!mounted || revision != _revision) {
         return;
       }
@@ -341,6 +430,8 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
         config: config,
       );
       state = AsyncError<String?>(diagnostic.message, stackTrace);
+    } finally {
+      if (identical(_probeCancelToken, token)) _probeCancelToken = null;
     }
   }
 
@@ -349,6 +440,16 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
       return;
     }
     _revision++;
+    _probeCancelToken?.cancel();
+    _probeCancelToken = null;
     state = const AsyncData<String?>(null);
+  }
+
+  @override
+  void dispose() {
+    _revision++;
+    _probeCancelToken?.cancel();
+    _probeCancelToken = null;
+    super.dispose();
   }
 }

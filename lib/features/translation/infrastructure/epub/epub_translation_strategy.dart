@@ -1,5 +1,11 @@
 part of 'epub_chapter_translator.dart';
 
+/// Legal JSON with a deterministic shape mismatch: no identical retry, but a
+/// smaller protected-slot payload can still use the established bisect path.
+class _DeterministicBatchStructureException extends TranslationParseException {
+  const _DeterministicBatchStructureException(super.message);
+}
+
 /// Only rebuilt-block validation may trigger a whole individual-slot round.
 class _ProtectedSlotRenderException extends FormatException {
   const _ProtectedSlotRenderException(super.message);
@@ -13,6 +19,60 @@ class _EpubTranslationStrategy {
   _EpubTranslationStrategy(this.owner);
 
   final EpubChapterTranslator owner;
+
+  /// Preserve the shared exception contract: structural replies use
+  /// TranslationParseException (no retry), syntax jitter uses FormatException.
+  /// Validate before the legacy decoder wraps every syntax failure as final.
+  void _validateBatchReply(dynamic response, Set<String> ids, {
+    Map<String, Set<String>>? slotIds,
+  }) {
+    final content = owner._apiClient.extractMessageContent(response);
+    late final Map<String, dynamic> json;
+    try {
+      json = owner._apiClient.decodeJsonObject(content);
+    } on FormatException catch (error) {
+      // A legal JSON scalar/array is a deterministic schema mismatch. Broken
+      // JSON beginning with an object/fence is transport/model format jitter.
+      Object? decoded;
+      bool validJson = false;
+      try { decoded = jsonDecode(content); validJson = true; } on FormatException { /* syntax jitter */ }
+      if (!validJson && (content.startsWith('{') || content.startsWith('```')) &&
+          !error.message.contains('duplicate object key')) {
+        throw const FormatException('Retryable JSON syntax jitter.');
+      }
+      throw TranslationParseException('Deterministic JSON schema failure (${decoded.runtimeType}).');
+    }
+    final blocks = json['blocks'];
+    if (blocks is! List || blocks.length != ids.length) {
+      throw const _DeterministicBatchStructureException('Response must contain all requested blocks.');
+    }
+    final seen = <String>{};
+    for (final item in blocks) {
+      if (item is! Map<String, dynamic> || item['id'] is! String ||
+          !ids.contains(item['id']) || !seen.add(item['id'] as String)) {
+        throw const _DeterministicBatchStructureException('Response block structure/id mismatch.');
+      }
+      if (slotIds == null) {
+        if (item['html'] is! String) {
+          throw const _DeterministicBatchStructureException('Response block is missing string html.');
+        }
+      } else {
+        final slots = item['slots'];
+        final expected = slotIds[item['id']]!;
+        final seenSlots = <String>{};
+        if (item.keys.length != 2 || slots is! List || slots.length != expected.length) {
+          throw const _DeterministicBatchStructureException('Response slot structure/count mismatch.');
+        }
+        for (final slot in slots) {
+          if (slot is! Map<String, dynamic> || slot.keys.length != 2 ||
+              slot['id'] is! String || slot['text'] is! String ||
+              !expected.contains(slot['id']) || !seenSlots.add(slot['id'] as String)) {
+            throw const _DeterministicBatchStructureException('Response slot structure/id mismatch.');
+          }
+        }
+      }
+    }
+  }
 
   // Strategy workers never hold HTTP permits while waiting for child work.
   // Every leaf request acquires the invocation's shared budget via the owner.
@@ -151,7 +211,7 @@ class _EpubTranslationStrategy {
               <String, String>{
                 'role': 'system',
                 'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
+                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
               },
               <String, String>{'role': 'user', 'content': payload},
             ],
@@ -162,6 +222,7 @@ class _EpubTranslationStrategy {
             cancelToken: cancelToken,
           );
 
+          _validateBatchReply(response.data, batch.blocks.map((b) => b.id).toSet());
           final Map<String, dynamic> jsonPayload = owner._apiClient
               .decodeBatchJsonPayload(response.data);
           final Object? blocksJson = jsonPayload['blocks'];
@@ -447,7 +508,7 @@ class _EpubTranslationStrategy {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleInstructionFragment(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
             },
             if (!context.isEmpty)
               EpubChapterTranslator._fallbackContextMessage(context),
@@ -804,6 +865,22 @@ class _EpubTranslationStrategy {
         // on its own; one that still comes back malformed degrades to its
         // source HTML and is reported with the run instead of aborting the
         // whole book.
+        if (htmlReferences.length > 1) {
+          // Deterministic schema errors immediately lower payload complexity.
+          // Binary splitting preserves the existing verified split contract,
+          // with no identical whole-batch retry.
+          final middle = htmlReferences.length ~/ 2;
+          translatedById.addAll(await _mapTranslations(
+            [htmlReferences.sublist(0, middle), htmlReferences.sublist(middle)],
+            config: config, cancelToken: cancelToken,
+            process: (List<FootnoteBlockReference> part) => _translateFootnoteBatch(
+              dio: dio, config: config,
+              batch: FootnoteTranslationBatch(part, context: batch.context),
+              retryDelayOverride: retryDelayOverride, cancelToken: cancelToken,
+              onRequestAttempt: onRequestAttempt, onValidated: onValidated,
+            ),
+          ));
+        } else {
         translatedById.addAll(
           await _mapTranslations(
             htmlReferences,
@@ -833,6 +910,7 @@ class _EpubTranslationStrategy {
             },
           ),
         );
+        }
       }
     }
     if (slotRequests.isNotEmpty) {
@@ -904,17 +982,19 @@ class _EpubTranslationStrategy {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
         };
         onRequestAttempt?.call();
+        _TranslationRequestBudget.apply(requestData);
         final Response<dynamic> response = await owner._postChatCompletions(
           dio: dio,
           data: requestData,
           cancelToken: cancelToken,
         );
+        _validateBatchReply(response.data, requestedIds);
         final Map<String, dynamic> jsonPayload = owner._apiClient
             .decodeBatchJsonPayload(response.data);
         final Object? rawBlocks = jsonPayload['blocks'];
@@ -1087,6 +1167,19 @@ class _EpubTranslationStrategy {
           rethrow;
         }
       }
+      if (error is _DeterministicBatchStructureException) {
+        final midpoint = requests.length ~/ 2;
+        return _mapTranslations(
+          [requests.sublist(0, midpoint), requests.sublist(midpoint)],
+          config: config, cancelToken: cancelToken,
+          process: (List<_ProtectedSlotRequest> half) => _translateProtectedSlotBatch(
+            dio: dio, config: config, requests: half, context: context,
+            retryDelayOverride: retryDelayOverride, cancelToken: cancelToken,
+            onRequestAttempt: onRequestAttempt, maxBatchAttempts: 1,
+            apiCounted: apiCounted, onValidated: onValidated,
+          ),
+        );
+      }
       if (error is TranslationParseException) {
         // Deterministic failure: the model did not return JSON for this
         // prompt shape, so bisecting would just re-bill the same broken
@@ -1255,17 +1348,21 @@ class _EpubTranslationStrategy {
             <String, String>{
               'role': 'system',
               'content':
-                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
         };
         onRequestAttempt?.call();
+        _TranslationRequestBudget.apply(requestData);
         final Response<dynamic> response = await owner._postChatCompletions(
           dio: dio,
           data: requestData,
           cancelToken: cancelToken,
         );
+        _validateBatchReply(response.data, requestedIds, slotIds: {
+          for (final request in requests) request.id: request.slotIds.toSet(),
+        });
         final Map<String, dynamic> jsonPayload = owner._apiClient
             .decodeBatchJsonPayload(response.data);
         final Object? rawBlocks = jsonPayload['blocks'];
@@ -1554,7 +1651,7 @@ class _EpubTranslationStrategy {
         <String, String>{
           'role': 'system',
           'content':
-              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleProfileInstruction(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_terminologyGlossInstruction(config: config)}${_chineseSecondPersonInstruction(config: config)}${_idiomaticTranslationInstruction()}',
+              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
         },
         if (!context.isEmpty)
           EpubChapterTranslator._fallbackContextMessage(context),
@@ -1736,6 +1833,25 @@ class _EpubTranslationStrategy {
     return profile.toPromptInstruction(targetLanguage: config.targetLanguage);
   }
 
+  /// Combined style-related system-prompt fragment: style profile,
+  /// terminology gloss, and second-person rule.
+  ///
+  /// Normalizes the target language once and reuses the result (C-30):
+  /// previously the terminology and second-person builders below each
+  /// normalized [config.targetLanguage] independently on every batch,
+  /// repeating identical regex work for an identical input.
+  String _styleInstructionFragment({
+    required TranslationConfig config,
+    TranslationStyleProfile? styleProfile,
+    bool confirmed = false,
+  }) {
+    final String normalizedTargetLanguage =
+        EpubChapterTranslator.normalizeTargetLanguage(config.targetLanguage);
+    return '${_styleProfileInstruction(config: config, styleProfile: styleProfile, confirmed: confirmed)}'
+        '${_terminologyGlossInstruction(config: config, normalizedTargetLanguage: normalizedTargetLanguage)}'
+        '${_chineseSecondPersonInstruction(config: config, normalizedTargetLanguage: normalizedTargetLanguage)}';
+  }
+
   /// Terminology gloss rule that applies to every translation path.
   ///
   /// For CJK targets (mainly Chinese), a term that is hard to transliterate and
@@ -1745,8 +1861,18 @@ class _EpubTranslationStrategy {
   /// occurrences use only the translated form. This helps preserve semantic
   /// precision without leaving bare source-language tokens flagged by the
   /// residual-quality check.
-  String _terminologyGlossInstruction({required TranslationConfig config}) {
-    if (!EpubChapterTranslator._isCjkTargetLanguage(config.targetLanguage)) {
+  String _terminologyGlossInstruction({
+    required TranslationConfig config,
+    String? normalizedTargetLanguage,
+  }) {
+    // CJK membership is tested against the already-normalized language when
+    // the caller provides it (see [_styleInstructionFragment], C-30);
+    // standalone callers fall back to normalizing here. The set mirrors
+    // EpubChapterTranslator._isCjkTargetLanguage.
+    final String normalized =
+        normalizedTargetLanguage ??
+        EpubChapterTranslator.normalizeTargetLanguage(config.targetLanguage);
+    if (normalized != 'zh' && normalized != 'ja' && normalized != 'ko') {
       return '';
     }
     return ' For a term that is hard to transliterate and carries real '
@@ -1766,11 +1892,16 @@ class _EpubTranslationStrategy {
   /// published Chinese translations conventionally use 您 throughout, so
   /// the rule is stated explicitly. Prompt-level only: a model can still
   /// deviate, but in practice the explicit instruction holds.
-  String _chineseSecondPersonInstruction({required TranslationConfig config}) {
-    final bool isChinese =
-        EpubChapterTranslator.normalizeTargetLanguage(config.targetLanguage) ==
-        'zh';
-    if (!isChinese) {
+  String _chineseSecondPersonInstruction({
+    required TranslationConfig config,
+    String? normalizedTargetLanguage,
+  }) {
+    // Reuses the caller's normalized value when provided (C-30); standalone
+    // callers fall back to normalizing here.
+    final String normalized =
+        normalizedTargetLanguage ??
+        EpubChapterTranslator.normalizeTargetLanguage(config.targetLanguage);
+    if (normalized != 'zh') {
       return '';
     }
     // Second-person formality is a pragmatic judgment, not a fixed rule: the

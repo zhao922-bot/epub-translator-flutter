@@ -31,7 +31,7 @@ class AppLogger {
     StackTrace? stackTrace,
   }) {
     _logger.e(
-      _format(tag, message),
+      _format(tag, stackTrace == null ? message : '$message\n$stackTrace'),
       error: safeError(error),
       stackTrace: stackTrace,
     );

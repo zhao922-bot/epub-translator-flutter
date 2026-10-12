@@ -24,6 +24,10 @@ class SensitiveText {
       RegExp(r'\bsk-[A-Za-z0-9_\-]{8,}\b'),
       'sk-[redacted]',
     );
+    redacted = redacted.replaceAllMapped(
+      RegExp(r'(https?://)[^\s/]+@', caseSensitive: false),
+      (Match match) => '${match.group(1)}[redacted]@',
+    );
     return redacted;
   }
 }

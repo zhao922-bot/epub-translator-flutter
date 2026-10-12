@@ -10,6 +10,7 @@ import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
+import '../../../../shared/io/atomic_file_writer.dart';
 import '../../../../shared/platform/native_platform_bridge.dart';
 import '../../../../shared/security/sensitive_text.dart';
 import '../../domain/models/inspected_chapter.dart';
@@ -146,6 +147,7 @@ class EpubChapterTranslator {
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
   }) {
+    if (!data.containsKey('max_tokens')) _TranslationRequestBudget.apply(data);
     return _run.requests.run(() {
       _run.throwIfCancelled();
       if (cancelToken?.isCancelled ?? false) {
@@ -161,11 +163,81 @@ class EpubChapterTranslator {
 
   static const String _cacheSchemaVersion = 'v15-second-person-and-idiom';
 
+  // Additive schema extension: both identities include v16, leaving the prior
+  // schema declaration and third-batch prompt/test hooks intact.
+  static const String qualityCacheSchemaVersion = 'v16-quality-memory-lru';
+
+  static int htmlBudgetTokensForTest(String html) =>
+      _TranslationRequestBudget.estimateTokens(html);
+
+  static ({int fixedTokens, int payloadTokens, int totalTokens}) requestBudgetForTest(
+    Map<String, dynamic> data,
+  ) => _TranslationRequestBudget.forRequest(data);
+
+  static Map<String, Object?> mergeBookMemoryForTest(
+    Map<String, Object?> memory,
+    Map<String, Object?> chapter,
+  ) => _BookMemory.fromJson(memory).mergeChapter(_ChapterMemory.fromJson(chapter)).toJson();
+
+  static Future<void> saveBookMemoryCheckpointForTest({
+    required TranslationCacheStore cacheStore,
+    required String jobKey,
+    required int chunkSize,
+    required Map<String, Object?> memory,
+    String schema = qualityCacheSchemaVersion,
+  }) => _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize).save(
+    _BookMemory.fromJson(memory), schema: schema,
+  );
+
+  static Future<Map<String, Object?>?> loadBookMemoryCheckpointForTest({
+    required TranslationCacheStore cacheStore,
+    required String jobKey,
+    required int chunkSize,
+  }) async => (await _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize).load())?.memory.toJson();
+
+  static Future<InspectedChapter> releaseChapterSourcesForTest(
+    InspectedChapter chapter, Directory directory,
+  ) => _ChapterSourceSpool(directory: directory).release(chapter);
+
+  static Future<InspectedChapter> restoreChapterSourcesForTest(
+    InspectedChapter chapter, Directory directory,
+  ) => _ChapterSourceSpool(directory: directory).restore(chapter);
+
   static String chineseSecondPersonInstructionForTest({
     required TranslationConfig config,
+    String? normalizedTargetLanguage,
   }) {
     return EpubChapterTranslator()._strategy._chineseSecondPersonInstruction(
       config: config,
+      normalizedTargetLanguage: normalizedTargetLanguage,
+    );
+  }
+
+  /// Test hook for the C-30 combined style fragment (style profile +
+  /// terminology gloss + second-person rule), which normalizes the target
+  /// language once and reuses the result.
+  static String styleInstructionFragmentForTest({
+    required TranslationConfig config,
+    TranslationStyleProfile? styleProfile,
+    bool confirmed = false,
+  }) {
+    return EpubChapterTranslator()._strategy._styleInstructionFragment(
+      config: config,
+      styleProfile: styleProfile,
+      confirmed: confirmed,
+    );
+  }
+
+  /// Test hook for the terminology gloss builder, exposing the
+  /// pre-normalized language override used by the combined style fragment
+  /// (C-30: normalize once, reuse).
+  static String terminologyGlossInstructionForTest({
+    required TranslationConfig config,
+    String? normalizedTargetLanguage,
+  }) {
+    return EpubChapterTranslator()._strategy._terminologyGlossInstruction(
+      config: config,
+      normalizedTargetLanguage: normalizedTargetLanguage,
     );
   }
 
@@ -482,6 +554,9 @@ class EpubChapterTranslator {
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
+    // Release the parent async frame's source references together with the
+    // worker's lists, without mutating an immutable caller inspection list.
+    chapters = chapters.toList(growable: false);
     final TranslationRunContext run = TranslationRunContext(
       concurrency: config.maxConcurrent,
       cancelToken: cancelToken,
@@ -530,12 +605,17 @@ class EpubChapterTranslator {
     // closed in the finally below so sockets/FDs do not accumulate (see M7).
     late final Dio dio;
     bool dioReady = false;
+    final sourceSpool = _ChapterSourceSpool();
+    final invocationChapters = chapters;
     try {
       chapters = await ChapterSourceRestorer.restore(
         chapters: chapters,
         isCancelled: () =>
             cancelToken.isCancelled || (isCancelled?.call() ?? false),
       );
+      // The invocation owns this list; replace completed entries in every
+      // retained list, rather than retaining the original restored chapters.
+      chapters = chapters.toList(growable: false);
       final List<InspectedChapter> selectedChapters = chapters
           .where((InspectedChapter chapter) => chapter.includeInTranslation)
           .map(
@@ -672,8 +752,14 @@ class EpubChapterTranslator {
       );
       JobResumeState? previousState;
       bool unreadableResumeState = false;
+      final memoryCheckpoint = _BookMemoryCheckpoint(_cacheStore, jobKey, config.chunkSize);
+      final restoredMemory = await memoryCheckpoint.load();
       try {
         previousState = await _cacheStore.loadJobState(jobKey);
+        if (previousState != null && restoredMemory == null) {
+          AppLogger.warn('Checkpoint has no compatible chunkSize/schema memory identity; discarding progress metadata.', tag: 'translate');
+          previousState = null;
+        }
       } catch (error) {
         unreadableResumeState = true;
         AppLogger.warn(
@@ -880,6 +966,23 @@ class EpubChapterTranslator {
               styleProfileConfirmed: true,
             );
       bool initialBookMemoryAttempted = false;
+      final memoryChapters = <String>{...?restoredMemory?.completedChapterPaths};
+      if (restoredMemory != null) {
+        bookMemory = restoredMemory.memory;
+        initialBookMemoryAttempted = true;
+        AppLogger.info('Restored book memory; skipping initial API generation.', tag: 'book-memory');
+      }
+
+      Future<void> persistBookMemory() async {
+        final memory = bookMemory;
+        if (memory == null) return;
+        bookMemory = memory.withLockedGlossary(config.lockedGlossary);
+        try {
+          await memoryCheckpoint.save(bookMemory!, completedChapterPaths: memoryChapters);
+        } catch (error) {
+          AppLogger.warn('Book memory checkpoint save failed (${error.runtimeType}).', tag: 'book-memory');
+        }
+      }
 
       if (userStyleProfile != null && !userStyleProfile.isEmpty) {
         emit(
@@ -912,6 +1015,7 @@ class EpubChapterTranslator {
                   styleProfileConfirmed: true,
                 );
           memoryStopwatch.stop();
+          await persistBookMemory();
           if (hasInitialMemorySources) {
             totalMemoryElapsed += memoryStopwatch.elapsed;
             memoryRequestCount += 1;
@@ -1317,6 +1421,19 @@ class EpubChapterTranslator {
           updatedByPath[chapter.path] = _releaseChapterSourceStrings(
             updatedByPath[chapter.path]!,
           );
+          final released = await sourceSpool.release(chapter.copyWith(
+            blocks: translatedBlocks,
+            translatedBody: updatedByPath[chapter.path]!.translatedBody,
+          ));
+          selectedChapters[chapterIndex] = released;
+          updatedByPath[chapter.path] = released;
+          final originalIndex = chapters.indexWhere((c) => c.path == chapter.path);
+          if (originalIndex >= 0) chapters[originalIndex] = released;
+          final invocationIndex = invocationChapters.indexWhere((c) => c.path == chapter.path);
+          if (invocationIndex >= 0) invocationChapters[invocationIndex] = released;
+          translatedByChapterIndex.remove(chapterIndex);
+          pendingBlocksByChapter.remove(chapterIndex);
+          restoration.translationsByChapter.remove(chapter.path);
         }
         return endChapterIndex;
       }
@@ -1604,6 +1721,7 @@ class EpubChapterTranslator {
               .hasPendingBlocksFromChapter(chapterIndex + 1);
           if (futurePendingBlocks) {
             await ensureInitialBookMemory();
+            if (!memoryChapters.contains(chapter.path)) {
             try {
               final Stopwatch memoryStopwatch = Stopwatch()..start();
               bookMemory = await _memory.updateBookMemoryAfterChapter(
@@ -1614,6 +1732,8 @@ class EpubChapterTranslator {
                 cancelToken: cancelToken,
               );
               memoryStopwatch.stop();
+              memoryChapters.add(chapter.path);
+              await persistBookMemory();
               totalMemoryElapsed += memoryStopwatch.elapsed;
               memoryRequestCount += 1;
               emit(
@@ -1632,6 +1752,7 @@ class EpubChapterTranslator {
                 ),
               );
             }
+            }
           } else {
             emit(
               chapterDoneJob,
@@ -1648,6 +1769,17 @@ class EpubChapterTranslator {
           updatedByPath[chapter.path] = _releaseChapterSourceStrings(
             updatedByPath[chapter.path]!,
           );
+          final released = await sourceSpool.release(chapter.copyWith(
+            blocks: translatedBlocks,
+            translatedBody: updatedByPath[chapter.path]!.translatedBody,
+          ));
+          selectedChapters[chapterIndex] = released;
+          updatedByPath[chapter.path] = released;
+          final originalIndex = chapters.indexWhere((c) => c.path == chapter.path);
+          if (originalIndex >= 0) chapters[originalIndex] = released;
+          final invocationIndex = invocationChapters.indexWhere((c) => c.path == chapter.path);
+          if (invocationIndex >= 0) invocationChapters[invocationIndex] = released;
+          restoration.translationsByChapter.remove(chapter.path);
         }
       } catch (error) {
         final bool cancelled =
@@ -1708,6 +1840,13 @@ class EpubChapterTranslator {
                 updatedByPath[chapter.path] ?? chapter,
           )
           .toList();
+      // Repack needs the original document skeleton. Reload only that string;
+      // block sources remain released. Retry on the next invocation restores
+      // from the inspected EPUB; within this invocation the spool is exact.
+      for (int index = 0; index < updatedChapters.length; index++) {
+        final restored = await sourceSpool.restore(updatedChapters[index], blocks: false);
+        updatedChapters[index] = restored;
+      }
       final int degradedBlockCount = _degradedBlocks.length;
       if (degradedBlockCount > 0) {
         // Scoped keys use \u0000 as the separator; render it readably.
@@ -1900,6 +2039,7 @@ class EpubChapterTranslator {
       }
       rethrow;
     } finally {
+      await sourceSpool.dispose();
       if (dioReady) {
         dio.close(force: true);
       }
@@ -3419,6 +3559,7 @@ class EpubChapterTranslator {
           utf8.encode(
             <Object>[
               _cacheSchemaVersion,
+              qualityCacheSchemaVersion,
               normalizedPath,
               contentHash.toString(),
             ].join('|'),
@@ -3438,6 +3579,8 @@ class EpubChapterTranslator {
           utf8.encode(
             <Object>[
               _cacheSchemaVersion,
+              qualityCacheSchemaVersion,
+              config.chunkSize,
               inputFingerprint,
               _apiClient.normalizedBaseUrl(config.apiBaseUrl),
               config.model.trim(),
@@ -3469,6 +3612,7 @@ class EpubChapterTranslator {
           utf8.encode(
             <Object>[
               _cacheSchemaVersion,
+              qualityCacheSchemaVersion,
               _apiClient.normalizedBaseUrl(config.apiBaseUrl),
               config.model.trim(),
               config.targetLanguage.trim(),

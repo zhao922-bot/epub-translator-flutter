@@ -103,6 +103,8 @@ class AppStrings {
   String get cancelRun => isChinese ? '取消' : 'Cancel';
   String get outputReady => isChinese ? '已完成' : 'Output ready';
   String get estimatedBatchesLabel => isChinese ? '预计批次' : 'Estimated batches';
+  String get approximateBatchesLabel =>
+      isChinese ? '预计批次（约）' : 'Approx. batches';
   String get speedLabel => isChinese ? '速度' : 'Speed';
   String get etaLabel => isChinese ? '剩余' : 'ETA';
   String get etaCalculating => isChinese ? '计算中' : 'Calculating';
@@ -121,6 +123,9 @@ class AppStrings {
   String estimateSummary(int batches, int tokens) => isChinese
       ? '$batches 批次 · $tokens tokens'
       : '$batches batches · $tokens tokens';
+  String approximateEstimateSummary(int batches, int tokens) => isChinese
+      ? '约 $batches 批次 · 约 $tokens tokens'
+      : 'Approx. $batches batches · approx. $tokens tokens';
 
   String jobStatusLabel(Object status) {
     final String name = status.toString().split('.').last;
@@ -231,6 +236,40 @@ class AppStrings {
   String get testConnection => isChinese ? '测试' : 'Test';
   String get testingConnection => isChinese ? '测试中…' : 'Testing…';
   String get connectionOk => isChinese ? '连接成功' : 'Connection OK';
+  String get connectionApiHost => isChinese ? 'API 主机' : 'the API host';
+  String get connectionMissingConfiguration => isChinese
+      ? '请先填写接口地址、API Key 和模型名称，再测试连接。'
+      : 'Fill in the Base URL, API key, and model before testing the connection.';
+  String connectionAuthError(String host) => isChinese
+      ? 'HTTP 401 认证失败（$host）：请检查 API Key 是否有效、可用，且复制时没有多余空格。'
+      : 'HTTP 401 authentication failed for $host. Check that the API key is valid, active, and copied without extra spaces.';
+  String connectionForbiddenError(String host, String model) => isChinese
+      ? 'HTTP 403 无访问权限（$host）：请检查该 API Key 是否可以使用 $model，以及账号是否具有访问权限。'
+      : 'HTTP 403 permission denied for $host. Check whether this API key can use $model and whether the account has access.';
+  String connectionNotFoundError(String host, String model) => isChinese
+      ? 'HTTP 404（$host）：请检查接口地址，只保留服务商根地址或 /v1 路径，并确认模型 $model 存在。'
+      : 'HTTP 404 from $host. Check the Base URL, keep only the provider root or /v1 path, and verify that $model exists.';
+  String connectionRateLimitError(String host) => isChinese
+      ? 'HTTP 429 请求受限（$host）：请降低并发数、等待配额恢复，或查看服务商的账单和限流设置。'
+      : 'HTTP 429 rate limit from $host. Lower concurrency, wait for quota to recover, or check the provider billing/rate limit page.';
+  String connectionServerError(String host, int statusCode) => isChinese
+      ? 'HTTP $statusCode（$host）：服务商返回服务器错误，请稍后重试，或在服务商控制台使用同一 API Key 测试。'
+      : 'HTTP $statusCode from $host. The provider is returning a server error; retry later or test the same key in the provider console.';
+  String connectionTlsError(String host) => isChinese
+      ? 'TLS 握手失败（$host）：请检查接口地址、代理或 VPN、设备日期，以及当前网络是否拦截证书。'
+      : 'TLS handshake failed for $host. Check the endpoint, proxy/VPN, device date, and whether this network intercepts certificates.';
+  String connectionDnsError(String host) => isChinese
+      ? 'DNS 解析失败（$host）：请检查接口地址的拼写，以及当前网络或 VPN 是否能解析服务商主机。'
+      : 'DNS lookup failed for $host. Check the Base URL spelling and whether the current network or VPN can resolve the provider host.';
+  String connectionTimeoutError(String host) => isChinese
+      ? '连接 $host 超时：请延长超时时间、使用更稳定的网络，或使用可连通的代理或 VPN。'
+      : 'Connection to $host timed out. Try a longer timeout, a more stable network, or a reachable proxy/VPN.';
+  String connectionModelError(String model) => isChinese
+      ? '服务商未识别模型 $model：请核对模型名称，确保与 API 服务商列出的名称完全一致。'
+      : 'The provider did not recognize $model. Check the model name exactly as listed by the API provider.';
+  String connectionFallbackError(String host, String detail) => isChinese
+      ? '连接测试失败（$host）。详细信息：$detail'
+      : 'Connection test failed for $host. Details: $detail';
   String get connectionFailed => isChinese ? '连接失败' : 'Connection failed';
   String get connectionResponseParseError => isChinese
       ? '响应解析错误：接口未返回有效的消息结构或非空文本内容。'
@@ -298,6 +337,13 @@ class AppStrings {
   String get baseUrl => isChinese ? '接口地址' : 'Base URL';
   String get apiKey => 'API Key';
   String get showApiKey => isChinese ? '显示 API key' : 'Show API key';
+  String get showProxyCredentials =>
+      isChinese ? '显示代理凭据' : 'Show proxy credentials';
+  String get hideProxyCredentials =>
+      isChinese ? '隐藏代理凭据' : 'Hide proxy credentials';
+  String get credentialReadFailed => isChinese
+      ? '凭据读取失败，请重试或重新配置'
+      : 'Credential read failed. Retry or configure it again.';
   String get hideApiKey => isChinese ? '隐藏 API key' : 'Hide API key';
   String get model => isChinese ? '模型' : 'Model';
   String get httpProxy => isChinese ? 'HTTP 代理（可选）' : 'HTTP proxy (optional)';

@@ -41,10 +41,15 @@ void main() {
         );
         expect(events[1]['error'], contains('disk unavailable'));
         expect(events[1]['stackTrace'], 'persistence stack');
+        expect(events[1]['lines'].join('\n'), contains('persistence stack'));
         // Verify the default console output as well as the filtered output events.
         expect(
           lines.take(lines.length - 1).join('\n'),
           contains('history failure'),
+        );
+        expect(
+          lines.take(lines.length - 1).join('\n'),
+          contains('persistence stack'),
         );
       },
     );

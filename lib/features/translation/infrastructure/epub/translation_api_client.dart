@@ -78,6 +78,14 @@ enum ProxySettingError {
 class TranslationApiClient {
   const TranslationApiClient();
 
+  /// Carries cancellation through the repository's unchanged probe API.
+  static final Object probeCancelTokenKey = Object();
+
+  static Future<T> runWithProbeCancelToken<T>(
+    CancelToken token,
+    Future<T> Function() body,
+  ) => runZoned(body, zoneValues: {probeCancelTokenKey: token});
+
   static bool _isValidProxyPort(int? port) =>
       port != null && port >= 1 && port <= 65535;
 
@@ -123,12 +131,12 @@ class TranslationApiClient {
         // to it, so an explicit user-configured proxy wins here. Local and
         // private destinations always bypass it (no_proxy semantics).
         final String? proxy = proxyHostPort(config.httpProxy);
+        // An empty setting means disabled, including environment proxies.
+        client.findProxy = (_) => 'DIRECT';
         if (proxy != null) {
           client.findProxy = (Uri uri) => proxyForUri(proxy, uri);
           final String value = config.httpProxy.trim();
-          final Uri proxyUri = Uri.parse(
-            value.contains('://') ? value : 'http://$value',
-          );
+          final Uri proxyUri = Uri.parse(_proxyUriValue(value));
           if (proxyUri.userInfo.isNotEmpty) {
             final int separator = proxyUri.userInfo.indexOf(':');
             final String username = Uri.decodeComponent(
@@ -228,6 +236,23 @@ class TranslationApiClient {
     return _parseProxySetting(value).error;
   }
 
+  static String _proxyUriValue(String value) {
+    final String uriValue = value.contains('://') ? value : 'http://$value';
+    final int authorityStart = uriValue.indexOf('://') + 3;
+    final int authorityEnd = uriValue.indexOf(RegExp(r'[/?#]'), authorityStart);
+    final int end = authorityEnd < 0 ? uriValue.length : authorityEnd;
+    final String authority = uriValue.substring(authorityStart, end);
+    final int separator = authority.lastIndexOf('@');
+    if (separator < 0) return uriValue;
+    // The last @ separates credentials from the host. Escape earlier literal
+    // @ characters so Uri parsing and transport agree on the same userinfo.
+    return uriValue.replaceRange(
+      authorityStart,
+      authorityStart + separator,
+      authority.substring(0, separator).replaceAll('@', '%40'),
+    );
+  }
+
   /// Validation and transport must agree, including explicit default ports
   /// (which Uri normalizes away) and brackets required by HttpClient for IPv6.
   static ({String? hostPort, ProxySettingError? error}) _parseProxySetting(
@@ -239,11 +264,12 @@ class TranslationApiClient {
     }
     const invalid = (hostPort: null, error: ProxySettingError.invalidFormat);
     final bool hasScheme = trimmed.contains('://');
+    final String hostPort = trimmed.substring(trimmed.lastIndexOf('@') + 1);
     if (!hasScheme &&
-        !RegExp(r'^(?:\[[^\]]+\]|[^:/?#\s]+):\d{1,5}$').hasMatch(trimmed)) {
+        !RegExp(r'^(?:\[[^\]]+\]|[^:/?#\s]+):\d{1,5}$').hasMatch(hostPort)) {
       return invalid;
     }
-    final String uriValue = hasScheme ? trimmed : 'http://$trimmed';
+    final String uriValue = _proxyUriValue(trimmed);
     final Uri? parsed = Uri.tryParse(uriValue);
     // Inspect the original authority so explicit :80 / :443 remain valid.
     final String authority = uriValue
@@ -276,7 +302,10 @@ class TranslationApiClient {
   }
 
   static bool _isProxyBypassHost(String host) {
-    final String name = host.trim().toLowerCase();
+    final String name = host.trim().toLowerCase().replaceFirst(
+      RegExp(r'\.$'),
+      '',
+    );
     if (name.isEmpty || name == 'localhost' || name.endsWith('.localhost')) {
       return true;
     }
@@ -394,6 +423,7 @@ class TranslationApiClient {
       final Response<dynamic> response = await postChatCompletions(
         dio: dio,
         data: requestData,
+        cancelToken: Zone.current[probeCancelTokenKey] as CancelToken?,
       );
       final String content = extractMessageContent(
         response.data,
@@ -406,6 +436,7 @@ class TranslationApiClient {
         '${AppStrings(config.uiLanguage).connectionResponseParseError} ${error.message}',
       );
     } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) rethrow;
       if (error.error is HandshakeException) {
         final String host = Uri.parse(
           normalizedBaseUrl(config.apiBaseUrl),

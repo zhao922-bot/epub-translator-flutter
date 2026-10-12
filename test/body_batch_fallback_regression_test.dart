@@ -85,10 +85,10 @@ void main() {
     },
   };
   for (final entry in malformedReplies.entries) {
-    test('${entry.key} retries then falls back without TypeError', () async {
+    test('${entry.key} falls back once without TypeError or JSON rebilling', () async {
       final adapter = _ContextAdapter(batchReply: jsonEncode(entry.value));
       expect(await _translate(adapter), <String>['<p>他们坐在河岸上。</p>']);
-      expect(adapter.batchRequests, 2);
+      expect(adapter.batchRequests, 1);
       expect(adapter.fallbackContexts, hasLength(1));
       _expectContext(adapter);
     });
