@@ -1151,6 +1151,8 @@ class MainActivity : FlutterActivity() {
             // PICK_TIMEOUT).
             throw ImportStaleException()
         }
+        val sizeLimit = ImportSizeLimit()
+        sizeLimit.checkKnownSize(sourceSize)
         if (sourceSize > 0 && importsDir.usableSpace < sourceSize + IMPORT_SPACE_MARGIN_BYTES) {
             throw ImportNoSpaceException(
                 "Not enough free space to import this EPUB " +
@@ -1211,6 +1213,7 @@ class MainActivity : FlutterActivity() {
                             if (n <= 0) {
                                 break
                             }
+                            sizeLimit.acceptChunk(n)
                             output.write(buffer, 0, n)
                         }
                     }
@@ -1226,8 +1229,7 @@ class MainActivity : FlutterActivity() {
             }
         } catch (error: Exception) {
             // Don't leave a truncated sidecar or a zero-byte claim behind.
-            partFile.delete()
-            target.delete()
+            removeFailedImport(partFile, target)
             throw error
         } finally {
             activeImportTargets.remove(target.absolutePath)
@@ -1242,7 +1244,7 @@ class MainActivity : FlutterActivity() {
             contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val index = cursor.getColumnIndex(OpenableColumns.SIZE)
-                    if (index >= 0) cursor.getLong(index) else -1L
+                    if (index >= 0 && !cursor.isNull(index)) cursor.getLong(index) else -1L
                 } else {
                     -1L
                 }

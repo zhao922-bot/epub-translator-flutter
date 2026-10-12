@@ -32,6 +32,7 @@ import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
 import 'epub_semantics.dart';
 import 'translation_api_client.dart';
+import 'cancellable_fingerprint.dart';
 import 'translation_batch_planner.dart';
 import 'translation_progress_persistence.dart';
 import 'translation_run_context.dart';
@@ -278,10 +279,12 @@ class EpubChapterTranslator {
   static String lockHtmlStructureForTest({
     required String sourceHtml,
     required String translatedHtml,
+    Map<String, int>? instrumentation,
   }) {
     return _lockHtmlStructure(
       sourceHtml: sourceHtml,
       translatedHtml: translatedHtml,
+      instrumentation: instrumentation,
     );
   }
 
@@ -659,6 +662,7 @@ class EpubChapterTranslator {
       final String inputFingerprint = await _inputFingerprint(
         inputPath,
         expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
+        cancelToken: cancelToken,
       );
       final String jobKey = _jobKey(
         inputFingerprint: inputFingerprint,
@@ -2013,34 +2017,72 @@ class EpubChapterTranslator {
     );
   }
 
-  static String _lockTranslatedHtmlStructure(
-    ExtractedBlock block,
-    String translatedHtml,
-  ) {
-    return _lockHtmlStructure(
-      sourceHtml: block.sourceHtml,
-      translatedHtml: translatedHtml,
+  static String _lockAndValidateTranslatedBlock({
+    required TranslationConfig config,
+    required ExtractedBlock block,
+    required String translatedHtml,
+    Map<String, int>? instrumentation,
+    bool rejectEmptyResponse = false,
+    void Function(String html)? onLocked,
+  }) {
+    final sourceDom = _ResponseHtml.parse(block.sourceHtml, instrumentation);
+    final replyDom = _cleanResponseDom(
+      translatedHtml,
+      sourceText: block.sourceText,
+      instrumentation: instrumentation,
+      rejectEmptyResponse: rejectEmptyResponse,
     );
+    final locked = _lockResponseDom(sourceDom, replyDom);
+    final html = locked.html;
+    // Single-block quality retries/degrades must retain the usable locked
+    // response even when validation below rejects residual source text.
+    onLocked?.call(html);
+    _validateTranslatedBlockQuality(
+      config: config,
+      block: block,
+      sourceDom: sourceDom,
+      translatedDom: locked,
+    );
+    return html;
   }
 
   static String _lockHtmlStructure({
     required String sourceHtml,
     required String translatedHtml,
+    Map<String, int>? instrumentation,
   }) {
-    translatedHtml = _EpubTranslationStrategy._cleanHtmlResponse(
+    final sourceDom = _ResponseHtml.parse(sourceHtml, instrumentation);
+    final replyDom = _cleanResponseDom(
       translatedHtml,
-      sourceText: _EpubBookMemory._plainTextFromHtmlFragment(sourceHtml),
+      sourceText: sourceDom.plainText,
+      instrumentation: instrumentation,
     );
-    _validateNonemptyBody(sourceHtml, translatedHtml);
+    return _lockResponseDom(sourceDom, replyDom).html;
+  }
+
+  static _ResponseHtml _lockResponseDom(
+    _ResponseHtml sourceDom,
+    _ResponseHtml replyDom,
+  ) {
+    _validateNonemptyDoms(sourceDom, replyDom);
+    // Anchor normalization and protected restoration mutate the working reply.
+    // Keep the model's original DOM for language alignment, without reparsing.
+    final modelDom = _ResponseHtml(
+      replyDom.fragment.clone(true),
+      replyDom.instrumentation,
+    );
     final locked = _lockHtmlStructureCore(
-      sourceHtml: sourceHtml,
-      translatedHtml: translatedHtml,
+      sourceDom: sourceDom,
+      translatedDom: replyDom,
     );
-    final source = _singleRootElement(sourceHtml);
-    final model = _singleRootElement(translatedHtml);
-    final result = _singleRootElement(locked);
+    final source = sourceDom.root;
+    final model = modelDom.root;
+    final result = locked.root;
     if (source == null || model == null || result == null) return locked;
-    bool changed = false;
+    late final textAlignment = _ResponseTextAlignment(
+      modelDom.facts,
+      locked.facts,
+    );
     void preserve(dom.Element original, dom.Element reply, dom.Element output) {
       if (original.localName != reply.localName ||
           original.localName != output.localName ||
@@ -2051,7 +2093,9 @@ class EpubChapterTranslator {
       // Source IDs, links and all other attributes remain source-owned.
       if (!original.attributes.containsKey('lang') &&
           !original.attributes.containsKey('xml:lang') &&
-          reply.text == output.text) {
+          (reply.attributes.containsKey('lang') ||
+              reply.attributes.containsKey('xml:lang')) &&
+          textAlignment.matches(reply, output)) {
         final language =
             reply.attributes['lang'] ?? reply.attributes['xml:lang'];
         final xmlLanguage = reply.attributes['xml:lang'];
@@ -2062,7 +2106,6 @@ class EpubChapterTranslator {
             (xmlLanguage == null || xmlLanguage == language)) {
           output.attributes['lang'] = language;
           output.attributes['xml:lang'] = language;
-          changed = true;
         }
       }
       if (original.children.length != reply.children.length ||
@@ -2075,36 +2118,77 @@ class EpubChapterTranslator {
     }
 
     preserve(source, model, result);
-    return changed ? result.outerHtml : locked;
+    return locked;
   }
 
-  static String _lockHtmlStructureCore({
-    required String sourceHtml,
-    required String translatedHtml,
+  /// Apply the strategy's wrapper rules using the same DOM that structure
+  /// handling will consume. Its string cleaner parses both markup and plain
+  /// text separately, so calling it here would hide two additional parses.
+  static _ResponseHtml _cleanResponseDom(
+    String response, {
+    required String sourceText,
+    Map<String, int>? instrumentation,
+    bool rejectEmptyResponse = false,
+  }) {
+    String value = response.trim();
+    final fence = RegExp(
+      r'^```(?:html|xhtml)?\s*\n([\s\S]*?)\n```$',
+      caseSensitive: false,
+    ).firstMatch(value);
+    if (fence != null) value = fence.group(1)!.trim();
+    if (rejectEmptyResponse && value.isEmpty) {
+      throw const FormatException(
+        'The translation API returned an empty block.',
+      );
+    }
+    _responseCount(instrumentation, 'replyParses');
+    final reply = _ResponseHtml.parse(value, instrumentation);
+    final hasMarkup = reply.fragment.nodes.any((node) => node is dom.Element);
+    final hasOutsideText = reply.fragment.nodes.any(
+      (node) => node is dom.Text && node.data.trim().isNotEmpty,
+    );
+    if (value.contains('```') ||
+        _EpubTranslationStrategy._hasTranslationExplanationPrefix(value) ||
+        (hasMarkup && hasOutsideText) ||
+        _EpubTranslationStrategy._hasTranslationExplanationPrefix(
+          reply.plainText,
+        ) ||
+        _EpubTranslationStrategy._hasMarkdownWrapper(value) ||
+        _EpubTranslationStrategy._hasUnexpectedJsonWrapper(
+          sourceText: sourceText,
+          translatedText: value,
+        )) {
+      throw const TranslationParseException(
+        'HTML translation contains wrapper content.',
+      );
+    }
+    return reply;
+  }
+
+  static _ResponseHtml _lockHtmlStructureCore({
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
   }) {
     final _NormalizedAnchorHtml normalizedTranslation =
         _normalizeProtectedAnchorMarkers(
-          sourceHtml: sourceHtml,
-          translatedHtml: translatedHtml,
+          sourceDom: sourceDom,
+          translatedDom: translatedDom,
         );
-    final String trimmedTranslation = normalizedTranslation.html.trim();
     if (normalizedTranslation.hasOverflow &&
         normalizedTranslation.root != null &&
-        _elementSkeletonMatches(
-          _singleRootElement(sourceHtml)!,
-          normalizedTranslation.root!,
-        ) &&
+        _elementSkeletonMatches(sourceDom.root!, normalizedTranslation.root!) &&
         _overflowTextFitsSourceSlots(
-          sourceRoot: _singleRootElement(sourceHtml)!,
-          translatedRoot: normalizedTranslation.root!,
+          sourceDom: sourceDom,
+          translatedDom: translatedDom,
           trustedOverflowTexts: normalizedTranslation.trustedOverflowTexts,
         )) {
-      return normalizedTranslation.root!.outerHtml;
+      translatedDom.invalidate();
+      return translatedDom;
     }
-    if (_htmlStructureMatches(sourceHtml, trimmedTranslation)) {
-      final String? restored = _restoreProtectedTexts(
-        sourceHtml: sourceHtml,
-        translatedHtml: trimmedTranslation,
+    if (_domStructureMatches(sourceDom, translatedDom)) {
+      final _ResponseHtml? restored = _restoreProtectedTexts(
+        sourceDom: sourceDom,
+        translatedDom: translatedDom,
       );
       if (restored != null) {
         return restored;
@@ -2116,28 +2200,30 @@ class EpubChapterTranslator {
     // structure-matching path above fails and the rebuild path misplaces
     // text. Flatten those spans on the source side; if the flattened source
     // skeleton now matches the translation, restore text into it and return.
-    if (sourceHtml.contains('smallcaps')) {
-      final String? flattenedRestored = _restoreWithFlattenedSmallcaps(
-        sourceHtml: sourceHtml,
-        translatedHtml: trimmedTranslation,
+    if (sourceDom.html.contains('smallcaps')) {
+      final _ResponseHtml? flattenedRestored = _restoreWithFlattenedSmallcaps(
+        sourceDom: sourceDom,
+        translatedDom: translatedDom,
       );
       if (flattenedRestored != null) {
         return flattenedRestored;
       }
     }
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
+    final dom.Element? sourceRoot = sourceDom.root;
     if (sourceRoot == null) {
-      return trimmedTranslation;
+      return translatedDom;
     }
     final dom.Element rebuiltRoot = sourceRoot.clone(true);
-    final List<_HtmlTextSlot> sourceSlots = _textSlots(rebuiltRoot);
+    final rebuilt = _ResponseHtml.fromRoot(
+      rebuiltRoot,
+      sourceDom.instrumentation,
+    );
+    final List<_HtmlTextSlot> sourceSlots = rebuilt.slots;
     if (sourceSlots.isEmpty) {
-      return rebuiltRoot.outerHtml;
+      return rebuilt;
     }
 
-    final List<_HtmlTextSlot> translatedSlots = _textSlotsInFragment(
-      trimmedTranslation,
-    );
+    final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
     // Positional mapping must pair unprotected slots with unprotected
     // slots: protected slots (footnote markers, page breaks, code) keep
     // their source text, so consuming translation texts across the
@@ -2163,11 +2249,11 @@ class EpubChapterTranslator {
       for (int index = 0; index < writableSourceSlots.length; index += 1) {
         writableSourceSlots[index].text = writableTranslatedTexts[index];
       }
-      return rebuiltRoot.outerHtml;
+      rebuilt.invalidate();
+      return rebuilt;
     }
 
-    final String translatedPlainText =
-        _EpubBookMemory._plainTextFromHtmlFragment(trimmedTranslation);
+    final String translatedPlainText = translatedDom.plainText;
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
         <({_HtmlTextSlot slot, String sourceText})>[];
@@ -2185,20 +2271,21 @@ class EpubChapterTranslator {
       }
     }
     _removeEmptiedInlineEmphasis(emptiedSlots);
-    return rebuiltRoot.outerHtml;
+    rebuilt.invalidate();
+    return rebuilt;
   }
 
-  /// If [sourceHtml] contains `<span class="smallcaps">` nodes that the
+  /// If [sourceDom] contains `<span class="smallcaps">` nodes that the
   /// translation folded into a single plain text run, return a version of the
   /// source with those spans flattened so the skeletons match and the
   /// translation text can be restored positionally. Returns null when the
   /// flattened source still does not align with the translation.
-  static String? _restoreWithFlattenedSmallcaps({
-    required String sourceHtml,
-    required String translatedHtml,
+  static _ResponseHtml? _restoreWithFlattenedSmallcaps({
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
   }) {
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
-    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    final dom.Element? sourceRoot = sourceDom.root;
+    final dom.Element? translatedRoot = translatedDom.root;
     if (sourceRoot == null || translatedRoot == null) {
       return null;
     }
@@ -2228,16 +2315,24 @@ class EpubChapterTranslator {
     if (!changed) {
       return null;
     }
-    if (!_htmlStructureMatches(flattened.outerHtml, translatedHtml)) {
+    // Unwrapping spans leaves adjacent Text nodes. The former serialize/parse
+    // round-trip merged these; do that directly so positional matching retains
+    // the same text-slot boundaries without another parse.
+    _mergeAdjacentTextNodes(flattened);
+    final flattenedDom = _ResponseHtml.fromRoot(
+      flattened,
+      sourceDom.instrumentation,
+    );
+    if (!_domStructureMatches(flattenedDom, translatedDom)) {
       if (!retainedSemanticSpan) return null;
       return _lockHtmlStructureCore(
-        sourceHtml: flattened.outerHtml,
-        translatedHtml: translatedHtml,
+        sourceDom: flattenedDom,
+        translatedDom: translatedDom,
       );
     }
-    final String? restored = _restoreProtectedTexts(
-      sourceHtml: flattened.outerHtml,
-      translatedHtml: translatedHtml,
+    final _ResponseHtml? restored = _restoreProtectedTexts(
+      sourceDom: flattenedDom,
+      translatedDom: translatedDom,
     );
     if (restored == null) {
       return null;
@@ -2247,6 +2342,23 @@ class EpubChapterTranslator {
     // (The authored small-caps spans are not re-introduced here; the content
     // and structure are correct, which is what downstream validation needs.)
     return restored;
+  }
+
+  static void _mergeAdjacentTextNodes(dom.Node parent) {
+    dom.Text? previous;
+    for (final node in parent.nodes.toList(growable: false)) {
+      if (node is dom.Text) {
+        if (previous == null) {
+          previous = node;
+        } else {
+          previous.data += node.data;
+          node.remove();
+        }
+      } else {
+        previous = null;
+        _mergeAdjacentTextNodes(node);
+      }
+    }
   }
 
   /// After rebuilding the source skeleton, inline emphasis wrappers whose
@@ -2282,20 +2394,19 @@ class EpubChapterTranslator {
   }
 
   static bool _overflowTextFitsSourceSlots({
-    required dom.Element sourceRoot,
-    required dom.Element translatedRoot,
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
     required List<dom.Text> trustedOverflowTexts,
   }) {
-    final int sourceTextSlots = _textSlots(
-      sourceRoot,
-    ).where((_HtmlTextSlot slot) => !slot.protected).length;
-    final List<_HtmlTextSlot> untrustedTranslatedSlots =
-        _textSlots(translatedRoot)
-            .where(
-              (_HtmlTextSlot slot) =>
-                  !slot.protected && !trustedOverflowTexts.contains(slot.node),
-            )
-            .toList(growable: false);
+    final int sourceTextSlots = sourceDom.slots
+        .where((_HtmlTextSlot slot) => !slot.protected)
+        .length;
+    final List<_HtmlTextSlot> untrustedTranslatedSlots = translatedDom.slots
+        .where(
+          (_HtmlTextSlot slot) =>
+              !slot.protected && !trustedOverflowTexts.contains(slot.node),
+        )
+        .toList(growable: false);
     if (untrustedTranslatedSlots.length <= sourceTextSlots) {
       return true;
     }
@@ -2308,18 +2419,18 @@ class EpubChapterTranslator {
     return true;
   }
 
-  static String? _restoreProtectedTexts({
-    required String sourceHtml,
-    required String translatedHtml,
+  static _ResponseHtml? _restoreProtectedTexts({
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
   }) {
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
-    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    final dom.Element? sourceRoot = sourceDom.root;
+    final dom.Element? translatedRoot = translatedDom.root;
     if (sourceRoot == null || translatedRoot == null) {
-      return translatedHtml;
+      return translatedDom;
     }
 
-    final List<_HtmlTextSlot> sourceSlots = _textSlots(sourceRoot);
-    final List<_HtmlTextSlot> translatedSlots = _textSlots(translatedRoot);
+    final List<_HtmlTextSlot> sourceSlots = sourceDom.slots;
+    final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
     if (sourceSlots.length != translatedSlots.length) {
       return null;
     }
@@ -2329,7 +2440,8 @@ class EpubChapterTranslator {
         translatedSlots[index].text = sourceSlots[index].text;
       }
     }
-    return translatedRoot.outerHtml;
+    translatedDom.invalidate();
+    return translatedDom;
   }
 
   static bool _elementSkeletonMatches(
@@ -2363,13 +2475,13 @@ class EpubChapterTranslator {
   }
 
   static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
-    required String sourceHtml,
-    required String translatedHtml,
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
   }) {
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
-    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    final dom.Element? sourceRoot = sourceDom.root;
+    final dom.Element? translatedRoot = translatedDom.root;
     if (sourceRoot == null || translatedRoot == null) {
-      return _NormalizedAnchorHtml(html: translatedHtml);
+      return const _NormalizedAnchorHtml();
     }
     final List<String> overflowTexts = <String>[];
     final List<dom.Text> trustedOverflowTexts = <dom.Text>[];
@@ -2378,9 +2490,10 @@ class EpubChapterTranslator {
       translatedRoot,
       overflowTexts,
       trustedOverflowTexts,
+      sourceDom,
     );
+    translatedDom.invalidate();
     return _NormalizedAnchorHtml(
-      html: translatedRoot.outerHtml,
       root: translatedRoot,
       hasOverflow: overflowTexts.isNotEmpty,
       trustedOverflowTexts: trustedOverflowTexts,
@@ -2392,20 +2505,20 @@ class EpubChapterTranslator {
     dom.Element translated,
     List<String> overflowTexts,
     List<dom.Text> trustedOverflowTexts,
+    _ResponseHtml sourceDom,
   ) {
     if (source.localName != translated.localName ||
         !_attributesMatch(source, translated)) {
       return;
     }
 
-    final String sourceMarker = source.text.trim();
     if (!EpubHtmlExtractor.nonTextAncestors.contains(source.localName) &&
-        _isProtectedTextElement(source) &&
-        _isProtectedMarkerText(sourceMarker)) {
+        sourceDom.isProtected(source) &&
+        _isProtectedMarkerText(sourceDom.textOf(source))) {
       _normalizeProtectedAnchor(
         source: source,
         translated: translated,
-        sourceMarker: sourceMarker,
+        sourceMarker: sourceDom.textOf(source).trim(),
         overflowTexts: overflowTexts,
         trustedOverflowTexts: trustedOverflowTexts,
       );
@@ -2427,6 +2540,7 @@ class EpubChapterTranslator {
         translatedChildren[index],
         overflowTexts,
         trustedOverflowTexts,
+        sourceDom,
       );
     }
   }
@@ -2676,18 +2790,25 @@ class EpubChapterTranslator {
   }
 
   static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) {
-    final dom.Element? sourceRoot = _singleRootElement(sourceHtml);
-    final dom.Element? translatedRoot = _singleRootElement(translatedHtml);
+    return _domStructureMatches(
+      _ResponseHtml.parse(sourceHtml),
+      _ResponseHtml.parse(translatedHtml),
+    );
+  }
+
+  static bool _domStructureMatches(
+    _ResponseHtml sourceDom,
+    _ResponseHtml translatedDom,
+  ) {
+    final dom.Element? sourceRoot = sourceDom.root;
+    final dom.Element? translatedRoot = translatedDom.root;
     if (sourceRoot == null || translatedRoot == null) {
       return false;
     }
     return _elementStructureMatches(sourceRoot, translatedRoot);
   }
 
-  static dom.Element? _singleRootElement(String fragmentHtml) {
-    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      fragmentHtml,
-    );
+  static dom.Element? _fragmentRoot(dom.DocumentFragment fragment) {
     final List<dom.Node> nodes = fragment.nodes
         .where((dom.Node node) => !_isIgnorableStructureNode(node))
         .toList(growable: false);
@@ -2754,27 +2875,11 @@ class EpubChapterTranslator {
     return node is dom.Text && node.data.trim().isEmpty;
   }
 
-  static List<_HtmlTextSlot> _textSlotsInFragment(String html) {
-    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      html,
-    );
-    final List<_HtmlTextSlot> slots = <_HtmlTextSlot>[];
-    for (final dom.Node node in fragment.nodes) {
-      _collectTextSlots(node, slots, protected: false);
-    }
-    return slots;
-  }
-
-  static List<_HtmlTextSlot> _textSlots(dom.Node root) {
-    final List<_HtmlTextSlot> slots = <_HtmlTextSlot>[];
-    _collectTextSlots(root, slots, protected: false);
-    return slots;
-  }
-
   static void _collectTextSlots(
     dom.Node node,
     List<_HtmlTextSlot> slots, {
     required bool protected,
+    required _ResponseNodeFacts facts,
   }) {
     if (node is dom.Text) {
       if (node.data.trim().isNotEmpty) {
@@ -2785,25 +2890,34 @@ class EpubChapterTranslator {
     if (node is! dom.Element) {
       return;
     }
-    final bool childProtected = protected || _isProtectedTextElement(node);
+    final bool childProtected = protected || facts.isProtected(node);
     for (final dom.Node child in node.nodes) {
-      _collectTextSlots(child, slots, protected: childProtected);
+      _collectTextSlots(child, slots, protected: childProtected, facts: facts);
     }
   }
 
-  static bool _isProtectedTextElement(dom.Element element) {
+  static bool _isProtectedTextElement(dom.Element element, {String? text}) {
     final String tag = element.localName ?? '';
     if (EpubHtmlExtractor.nonTextAncestors.contains(tag)) return true;
     final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
-    final bool protectedMarkerText = _isProtectedMarkerText(element.text);
+    // Ordinary wrappers cannot protect text; do not read their descendants.
+    if (tag != 'a' &&
+        !roles.contains('doc-noteref') &&
+        !epubTypes.contains('noteref') &&
+        !roles.contains('doc-pagebreak') &&
+        !epubTypes.contains('pagebreak')) {
+      return false;
+    }
+    final String value = text ?? element.text;
+    final bool protectedMarkerText = _isProtectedMarkerText(value);
 
     if ((roles.contains('doc-noteref') || epubTypes.contains('noteref')) &&
         protectedMarkerText) {
       return true;
     }
     if (roles.contains('doc-pagebreak') || epubTypes.contains('pagebreak')) {
-      return _isProtectedPagebreakText(element.text);
+      return _isProtectedPagebreakText(value);
     }
     final String href = element.attributes['href'] ?? '';
     if (tag != 'a') {
@@ -2972,9 +3086,10 @@ class EpubChapterTranslator {
   static void _validateTranslatedBlockQuality({
     required TranslationConfig config,
     required ExtractedBlock block,
-    required String translatedHtml,
+    required _ResponseHtml sourceDom,
+    required _ResponseHtml translatedDom,
   }) {
-    _validateNonemptyBody(block.sourceHtml, translatedHtml);
+    _validateNonemptyDoms(sourceDom, translatedDom);
     if (!config.residualQualityCheck) {
       return;
     }
@@ -3001,13 +3116,14 @@ class EpubChapterTranslator {
       return;
     }
     final TranslationResidualFinding? finding =
-        TranslationQuality.findSuspiciousHtmlResidual(
-          sourceHtml: block.sourceHtml,
-          translatedHtml: translatedHtml,
+        TranslationQuality.findSuspiciousFragmentResidual(
+          sourceFragment: sourceDom.fragment,
+          translatedFragment: translatedDom.fragment,
           targetLanguage: config.targetLanguage,
           allowRetainedAuthorSignature: block.isAuthorSignature,
           allowBibliographicRetention: isBibliographicEntry,
         );
+    _responseCount(translatedDom.instrumentation, 'qualityDomChecks');
     if (finding == null) {
       return;
     }
@@ -3287,12 +3403,15 @@ class EpubChapterTranslator {
   Future<String> _inputFingerprint(
     String inputPath, {
     String? expectedSourceFingerprint,
+    required CancelToken cancelToken,
   }) async {
     // Read as a stream: context changes elsewhere in the book must invalidate
     // block translations even when the file size and timestamp are unchanged.
-    final Digest contentHash = await sha256
-        .bind(File(inputPath).openRead())
-        .first;
+    final Digest contentHash = await cancellableFingerprint(
+      File(inputPath).openRead(),
+      cancelToken: cancelToken,
+      throwIfCancelled: _run.throwIfCancelled,
+    );
     checkEpubSourceHash(contentHash.toString(), expectedSourceFingerprint);
     final String normalizedPath = _normalizeInputPathForCache(inputPath);
     return sha256
@@ -3487,11 +3606,14 @@ class EpubChapterTranslator {
     }.contains(normalizeTargetLanguage(targetLanguage));
   }
 
-  static void _validateNonemptyBody(String sourceHtml, String translatedHtml) {
-    bool hasBody(String html) => _textSlotsInFragment(
-      html,
-    ).any((slot) => !slot.protected && slot.text.trim().isNotEmpty);
-    if (hasBody(sourceHtml) && !hasBody(translatedHtml)) {
+  static void _validateNonemptyDoms(
+    _ResponseHtml sourceDom,
+    _ResponseHtml translatedDom,
+  ) {
+    bool hasBody(_ResponseHtml html) => html.slots.any(
+      (slot) => !slot.protected && slot.text.trim().isNotEmpty,
+    );
+    if (hasBody(sourceDom) && !hasBody(translatedDom)) {
       throw const TranslationParseException(
         'Translated block has empty body text for a nonempty source.',
       );
@@ -3624,15 +3746,159 @@ class EpubChapterTranslator {
   }
 }
 
+/// A response-local DOM. Clones and rebuilt skeletons stay in DOM form;
+/// serialization is deferred until the response leaves structure handling.
+class _ResponseHtml {
+  _ResponseHtml(this.fragment, [this.instrumentation]);
+
+  factory _ResponseHtml.parse(
+    String html, [
+    Map<String, int>? instrumentation,
+  ]) {
+    _responseCount(instrumentation, 'parses');
+    return _ResponseHtml(
+      XhtmlHtmlCompatibility.parseFragment(html),
+      instrumentation,
+    );
+  }
+
+  factory _ResponseHtml.fromRoot(
+    dom.Element root,
+    Map<String, int>? instrumentation,
+  ) => _ResponseHtml(dom.DocumentFragment()..append(root), instrumentation);
+
+  final dom.DocumentFragment fragment;
+  final Map<String, int>? instrumentation;
+  _ResponseNodeFacts? _facts;
+  List<_HtmlTextSlot>? _slots;
+
+  dom.Element? get root => EpubChapterTranslator._fragmentRoot(fragment);
+  String get html => root?.outerHtml ?? fragment.outerHtml.trim();
+  _ResponseNodeFacts get facts =>
+      _facts ??= _ResponseNodeFacts(fragment, instrumentation);
+  String get plainText => facts.fullText;
+  String textOf(dom.Element node) => facts.textOf(node);
+  bool isProtected(dom.Element node) => facts.isProtected(node);
+
+  List<_HtmlTextSlot> get slots => _slots ??= () {
+    final slots = <_HtmlTextSlot>[];
+    for (final node in fragment.nodes) {
+      EpubChapterTranslator._collectTextSlots(
+        node,
+        slots,
+        protected: false,
+        facts: facts,
+      );
+    }
+    return slots;
+  }();
+
+  // All text/structure mutations must invalidate before the next read.
+  void invalidate() {
+    _facts = null;
+    _slots = null;
+  }
+}
+
+void _responseCount(Map<String, int>? counts, String key) {
+  if (counts != null) counts[key] = (counts[key] ?? 0) + 1;
+}
+
+/// One linear text index per immutable DOM phase. Marker classification needs
+/// at most 12 non-whitespace characters, so summaries are capped at 13. This
+/// avoids concatenating every ancestor's entire descendant text in deep trees.
+class _ResponseNodeFacts {
+  _ResponseNodeFacts(dom.Node root, [this.instrumentation]) {
+    _index(root);
+    fullText = _buffer.toString();
+  }
+
+  final Map<String, int>? instrumentation;
+  final _buffer = StringBuffer();
+  final _ranges = Map<dom.Node, (int, int)>.identity();
+  final _compact = Map<dom.Node, String>.identity();
+  final _protected = Map<dom.Element, bool>.identity();
+  final _texts = <(int, int), String>{};
+  late final String fullText;
+
+  void _index(dom.Node node) {
+    _responseCount(instrumentation, 'indexedNodes');
+    final start = _buffer.length;
+    String compact = '';
+    if (node is dom.Text) {
+      _buffer.write(node.data);
+      compact = node.data.replaceAll(RegExp(r'\s+'), '');
+      if (compact.length > 13) compact = compact.substring(0, 13);
+    } else {
+      for (final child in node.nodes) {
+        _index(child);
+        if (compact.length < 13) {
+          compact += _compact[child]!;
+          if (compact.length > 13) compact = compact.substring(0, 13);
+        }
+      }
+    }
+    _ranges[node] = (start, _buffer.length);
+    _compact[node] = compact;
+  }
+
+  String textOf(dom.Node node) {
+    final range = _ranges[node]!;
+    return _texts.putIfAbsent(range, () {
+      _responseCount(instrumentation, 'textMaterializations');
+      return fullText.substring(range.$1, range.$2);
+    });
+  }
+
+  bool isProtected(dom.Element node) => _protected.putIfAbsent(node, () {
+    _responseCount(instrumentation, 'protectionChecks');
+    return EpubChapterTranslator._isProtectedTextElement(
+      node,
+      text: _compact[node]!,
+    );
+  });
+}
+
+/// Compare aligned subtree ranges in O(1) after one linear mismatch index.
+/// This also covers a lang attribute on every level of a nested reply. When
+/// rebuilding shifts text boundaries, fall back to cached exact text rather
+/// than using a probabilistic hash for a semantic alignment decision.
+class _ResponseTextAlignment {
+  _ResponseTextAlignment(this.reply, this.output) {
+    final length = min(reply.fullText.length, output.fullText.length);
+    var lastMismatch = -1;
+    _lastMismatch = List<int>.generate(length, (index) {
+      _responseCount(reply.instrumentation, 'alignmentCharacters');
+      if (reply.fullText.codeUnitAt(index) !=
+          output.fullText.codeUnitAt(index)) {
+        lastMismatch = index;
+      }
+      return lastMismatch;
+    });
+  }
+
+  final _ResponseNodeFacts reply;
+  final _ResponseNodeFacts output;
+  late final List<int> _lastMismatch;
+
+  bool matches(dom.Element replyNode, dom.Element outputNode) {
+    final a = reply._ranges[replyNode]!;
+    final b = output._ranges[outputNode]!;
+    if (a == b) {
+      return a.$1 == a.$2 || _lastMismatch[a.$2 - 1] < a.$1;
+    }
+    if (a.$2 - a.$1 != b.$2 - b.$1) return false;
+    return reply.textOf(replyNode) == output.textOf(outputNode);
+  }
+}
+
 class _NormalizedAnchorHtml {
   const _NormalizedAnchorHtml({
-    required this.html,
     this.root,
     this.hasOverflow = false,
     this.trustedOverflowTexts = const <dom.Text>[],
   });
 
-  final String html;
   final dom.Element? root;
   final bool hasOverflow;
   final List<dom.Text> trustedOverflowTexts;

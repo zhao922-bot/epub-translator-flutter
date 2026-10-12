@@ -116,6 +116,7 @@ body.epub-translator-cjk [data-translation="true"] {
     _synchronizeHtmlTocLabels(
       rendered,
       chapters,
+      labelsByPath: _navigationLabels(chapters),
       targetLanguage: targetLanguage,
     );
     return rendered[tocPath]!;
@@ -208,16 +209,17 @@ body.epub-translator-cjk [data-translation="true"] {
       );
       reportProgress(++completedChapters, chapters.length);
     }
+    final navigationLabelsByPath = _navigationLabels(chapters);
     _synchronizeHtmlTocLabels(
       translatedHtmlByPath,
       chapters,
+      labelsByPath: navigationLabelsByPath,
       targetLanguage: config.targetLanguage,
       bilingual: config.bilingual,
     );
     // Navigation metadata (OPF language + translated NCX labels) is rendered
     // inside the isolate from the same decoded archive, so the whole book is
     // never loaded into the main isolate just to read three small XML files.
-    final navigationLabelsByPath = _navigationLabels(chapters);
     _validateXmlReplacements(translatedHtmlByPath);
     return (html: translatedHtmlByPath, labels: navigationLabelsByPath);
   };
@@ -242,6 +244,8 @@ body.epub-translator-cjk [data-translation="true"] {
     final languageTag = _languageTagForTarget(targetLanguage);
     bool containsCjkTranslation = false;
     bool hasTranslation = false;
+    final replacementsByParent =
+        Map<dom.Node, Map<dom.Node, List<dom.Node>>>.identity();
     for (int index = 0; index < count; index += 1) {
       final dom.Element target = targets[index];
       final ExtractedBlock block = chapter.blocks[index];
@@ -307,11 +311,29 @@ body.epub-translator-cjk [data-translation="true"] {
       if (isDegraded) {
         // This block fell back to source/partial content. Leave an HTML
         // comment so the untranslated paragraph can be located in the EPUB
-        // source. It trails the replacement so node-replacement mechanics
-        // (first-node swap, td/th wrapper check) behave exactly as before.
+        // source. It trails all replacement nodes, including structural
+        // wrappers, so the marker stays next to its degraded block.
         replacement = '$replacement<!-- UNTRANSLATED -->';
       }
-      _replaceNodeWithHtml(target, replacement);
+      final parent = target.parentNode;
+      if (parent != null) {
+        final nodes = _replacementNodes(target, replacement);
+        if (nodes.isNotEmpty) {
+          (replacementsByParent[parent] ??= Map.identity())[target] = nodes;
+        }
+      }
+    }
+    // Rebuild each sibling list once, keeping whitespace, comments and
+    // untranslated nodes in their original positions. Detach before addAll
+    // so the DOM library does not search/remove every retained sibling.
+    for (final entry in replacementsByParent.entries) {
+      final nodes = <dom.Node>[
+        for (final node in entry.key.nodes)
+          ...entry.value[node] ?? <dom.Node>[node],
+      ];
+      entry.key.nodes
+        ..clear()
+        ..addAll(nodes);
     }
     if (hasTranslation && !bilingual && languageTag != null) {
       // Keep the original inherited language for unselected / degraded text.
@@ -575,27 +597,14 @@ body.epub-translator-cjk [data-translation="true"] {
         .replaceAll('>', '&gt;');
   }
 
-  void _replaceNodeWithHtml(dom.Element target, String replacementHtml) {
-    final dom.Node? parentNode = target.parentNode;
-    if (parentNode == null) {
-      return;
-    }
-    final int index = parentNode.nodes.indexOf(target);
-    if (index < 0) {
-      return;
-    }
+  List<dom.Node> _replacementNodes(dom.Element target, String replacementHtml) {
     final dom.DocumentFragment fragment = html_parser.parseFragment(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
       container: _replacementContainerFor(target),
     );
     final List<dom.Node> replacementNodes = fragment.nodes.toList();
-    if (replacementNodes.isEmpty) {
-      return;
-    }
-    parentNode.nodes[index] = replacementNodes.first;
-    for (int i = 1; i < replacementNodes.length; i += 1) {
-      parentNode.nodes.insert(index + i, replacementNodes[i]);
-    }
+    fragment.nodes.clear();
+    return replacementNodes;
   }
 
   /// Sanitizes a translation fragment for bilingual rendering: duplicate
@@ -947,10 +956,10 @@ body.epub-translator-cjk [data-translation="true"] {
   void _synchronizeHtmlTocLabels(
     Map<String, String> renderedByPath,
     List<InspectedChapter> chapters, {
+    required Map<String, String> labelsByPath,
     required String targetLanguage,
     bool bilingual = false,
   }) {
-    final labelsByPath = _navigationLabels(chapters);
     final languageTag = _languageTagForTarget(targetLanguage);
     if (labelsByPath.isEmpty) {
       return;

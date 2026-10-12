@@ -5,8 +5,61 @@ import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.nio.file.Files
+import java.io.File
 
 class ImportSafetyTest {
+    @Test fun knownSizeBoundaryAndUnknownMetadata() {
+        val limit = ImportSizeLimit()
+        for (size in listOf(-1L, 0L, MAX_IMPORT_BYTES - 1, MAX_IMPORT_BYTES)) {
+            limit.checkKnownSize(size)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            limit.checkKnownSize(MAX_IMPORT_BYTES + 1)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            limit.checkKnownSize(Long.MAX_VALUE)
+        }
+    }
+
+    @Test fun cumulativeBoundaryCannotBeBypassedByUnknownOrUnderreportedSize() {
+        for (reported in listOf(-1L, 1L, MAX_IMPORT_BYTES)) {
+            val limit = ImportSizeLimit()
+            limit.checkKnownSize(reported)
+            repeat(4096) { limit.acceptChunk(64 * 1024) }
+            limit.acceptChunk(0)
+            assertThrows(IllegalArgumentException::class.java) { limit.acceptChunk(1) }
+        }
+    }
+
+    @Test fun overLimitCopyRemovesPartialAndClaimButPreservesOtherImports() {
+        val directory = Files.createTempDirectory("import-limit").toFile()
+        try {
+            val target = File(directory, "book.epub").apply { createNewFile() }
+            val part = File(directory, "book.epub.part")
+            val retained = File(directory, "retained.epub").apply { writeText("retained") }
+            assertThrows(IllegalArgumentException::class.java) {
+                try {
+                    part.outputStream().use { output ->
+                        val limit = ImportSizeLimit(4)
+                        limit.acceptChunk(4)
+                        output.write(byteArrayOf(1, 2, 3, 4))
+                        limit.acceptChunk(1)
+                        output.write(5)
+                    }
+                } catch (error: Exception) {
+                    removeFailedImport(part, target)
+                    throw error
+                }
+            }
+            assertFalse(part.exists())
+            assertFalse(target.exists())
+            assertEquals("retained", retained.readText())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test fun confirmedTypesAlwaysHaveDartCompatibleSuffix() {
         for (name in listOf("book.bin", "book.zip", "book", "book.EPUB")) {
             assertTrue(confirmedEpubName(name).endsWith(".epub", ignoreCase = true))

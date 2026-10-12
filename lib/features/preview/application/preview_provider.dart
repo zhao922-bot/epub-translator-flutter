@@ -1,13 +1,20 @@
-import 'dart:convert';
-
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../shared/localization/app_strings.dart';
 import '../../translation/application/translation_dashboard_controller.dart';
-import '../../translation/domain/models/inspected_chapter.dart';
-import '../../translation/infrastructure/epub/epub_html_extractor.dart';
-import '../../translation/infrastructure/epub/xhtml_html_compatibility.dart';
 import '../domain/models/preview_chapter.dart';
+import 'preview_recovery.dart';
+
+export 'preview_recovery.dart' show previewChapterFromInspected;
+
+final previewRecoveryCacheProvider = Provider((ref) => PreviewRecoveryCache());
+
+final previewRecoveryProvider = FutureProvider<void>((ref) async {
+  final chapters = ref.watch(
+    translationDashboardProvider.select((s) => s.inspectedChapters),
+  );
+  await ref.read(previewRecoveryCacheProvider).prepare(chapters);
+});
 
 final previewSelectedIndexProvider = StateProvider<int>((ref) => 0);
 
@@ -17,6 +24,10 @@ final previewChaptersProvider = Provider<List<PreviewChapter>>((ref) {
   final chapters = ref.watch(
     translationDashboardProvider.select((s) => s.inspectedChapters),
   );
+  // Recovery runs off the UI isolate. Completion invalidates this projection;
+  // lookup checks the exact content version, including during an in-flight load.
+  ref.watch(previewRecoveryProvider);
+  final cache = ref.watch(previewRecoveryCacheProvider);
   if (chapters.isEmpty) {
     // Currently unreachable (the preview page renders strings.noPreviewYet
     // for the empty state), but keep it localized in case the fallback is
@@ -36,44 +47,14 @@ final previewChaptersProvider = Provider<List<PreviewChapter>>((ref) {
     ];
   }
 
-  return chapters.map(previewChapterFromInspected).toList();
+  return chapters.map((chapter) {
+    final recovered = cache.lookup(chapter);
+    return projectPreviewChapter(
+      chapter,
+      source:
+          recovered?.body ??
+          (needsPreviewRecovery(chapter) ? '' : chapter.body),
+      translated: recovered?.translatedBody ?? chapter.translatedBody,
+    );
+  }).toList();
 });
-
-/// Older completed chapters stored the translation in body and released the
-/// source block strings. Recover from the immutable source HTML in that case.
-PreviewChapter previewChapterFromInspected(InspectedChapter chapter) {
-  String source = chapter.body;
-  String? translated = chapter.translatedBody;
-  if (translated == null && chapter.translatedBlockCount > 0) {
-    source = chapter.originalHtml.isNotEmpty
-        ? const EpubHtmlExtractor()
-              .inspectChapterBytes(
-                chapterPath: chapter.path,
-                bytes: utf8.encode(chapter.originalHtml),
-              )
-              .body
-        : chapter.blocks.take(12).map((b) => b.sourceText).join('\n\n').trim();
-    translated = chapter.blocks
-        .map((b) => b.translatedHtml)
-        .whereType<String>()
-        .map(
-          (html) => (XhtmlHtmlCompatibility.parseFragment(html).text ?? '')
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim(),
-        )
-        .where((text) => text.isNotEmpty)
-        .take(12)
-        .join('\n\n');
-  }
-  return PreviewChapter(
-    title: chapter.title,
-    body: source,
-    translatedBody: translated,
-    path: chapter.path,
-    category: chapter.categoryLabel,
-    recommendedForTranslation: chapter.recommendedForTranslation,
-    includeInTranslation: chapter.includeInTranslation,
-    blockCount: chapter.blocks.length,
-    translatedBlockCount: chapter.translatedBlockCount,
-  );
-}

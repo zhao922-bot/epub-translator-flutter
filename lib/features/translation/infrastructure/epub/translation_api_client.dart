@@ -11,6 +11,7 @@ import '../../../../shared/localization/app_strings.dart';
 
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
+import 'cancellation_listener.dart';
 
 /// Thrown when a translation, style, or memory reply cannot be parsed as JSON
 /// (the message content is missing or is not a JSON object).
@@ -496,20 +497,19 @@ class TranslationApiClient {
       return;
     }
 
-    try {
-      await Future.any<void>(<Future<void>>[
-        Future<void>.delayed(delay),
-        cancelToken.whenCancel.then((_) {
-          throw const TranslationCancelledException();
-        }),
-      ]);
-    } on TranslationCancelledException {
-      rethrow;
-    } catch (error) {
-      if (isCancelError(error) || cancelToken.isCancelled) {
-        throw const TranslationCancelledException();
+    final completed = Completer<void>();
+    final timer = Timer(delay, () => completed.complete());
+    final detach = CancellationListener.listen(cancelToken, () {
+      timer.cancel();
+      if (!completed.isCompleted) {
+        completed.completeError(const TranslationCancelledException());
       }
-      rethrow;
+    });
+    try {
+      await completed.future;
+    } finally {
+      timer.cancel();
+      detach();
     }
 
     if (cancelToken.isCancelled) {

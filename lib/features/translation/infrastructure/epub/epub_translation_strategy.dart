@@ -1,5 +1,10 @@
 part of 'epub_chapter_translator.dart';
 
+/// Only rebuilt-block validation may trigger a whole individual-slot round.
+class _ProtectedSlotRenderException extends FormatException {
+  const _ProtectedSlotRenderException(super.message);
+}
+
 /// Owns HTML, protected-slot, and cross-file footnote translation strategies,
 /// including response validation, prompt rules, splitting, retries, and fallback.
 /// Every request goes through the invocation owner; child work shares the outer
@@ -8,6 +13,29 @@ class _EpubTranslationStrategy {
   _EpubTranslationStrategy(this.owner);
 
   final EpubChapterTranslator owner;
+
+  // Strategy workers never hold HTTP permits while waiting for child work.
+  // Every leaf request acquires the invocation's shared budget via the owner.
+  Future<Map<String, String>> _mapTranslations<T>(
+    List<T> items, {
+    required TranslationConfig config,
+    CancelToken? cancelToken,
+    required Future<Map<String, String>> Function(T item) process,
+  }) async {
+    final results = await const TranslationWorkQueue()
+        .map<T, Map<String, String>>(
+          items,
+          concurrency: config.maxConcurrent,
+          throwIfCancelled: () {
+            owner._run.throwIfCancelled();
+            if (cancelToken?.isCancelled == true) {
+              throw const TranslationCancelledException();
+            }
+          },
+          process: (item, _) => process(item),
+        );
+    return <String, String>{for (final result in results) ...result};
+  }
 
   Future<List<String>> translateBlockBatch({
     required Dio dio,
@@ -187,23 +215,15 @@ class _EpubTranslationStrategy {
                 );
               }
               final String locked =
-                  EpubChapterTranslator._lockTranslatedHtmlStructure(
-                    block,
-                    translated,
+                  EpubChapterTranslator._lockAndValidateTranslatedBlock(
+                    config: config,
+                    block: block,
+                    translatedHtml: translated,
                   );
-              EpubChapterTranslator._validateTranslatedBlockQuality(
-                config: config,
-                block: block,
-                translatedHtml: locked,
-              );
               okById[block.id] = locked;
               await onValidated?.call(block.id, locked);
-            } on FormatException catch (error) {
-              // Retry transient quality rejection at batch level. Preserve
-              // successfully parsed blocks when only structure is invalid.
-              if (_isQualityRejection(error)) {
-                rethrow;
-              }
+            } on FormatException {
+              // Both structure and quality failures are local to this item.
               failedBlocks.add(block);
             }
           }
@@ -450,13 +470,15 @@ class _EpubTranslationStrategy {
           );
         }
         final String locked =
-            EpubChapterTranslator._lockTranslatedHtmlStructure(block, cleaned);
-        lastLocked = locked;
-        EpubChapterTranslator._validateTranslatedBlockQuality(
-          config: config,
-          block: block,
-          translatedHtml: locked,
-        );
+            EpubChapterTranslator._lockAndValidateTranslatedBlock(
+              config: config,
+              block: block,
+              translatedHtml: cleaned,
+              // Capture the locked reply before quality validation below:
+              // a residual-quality rejection must degrade to this usable
+              // locked HTML, not to the raw source.
+              onLocked: (String html) => lastLocked = html,
+            );
         return locked;
       } catch (error) {
         if (EpubChapterTranslator._isCancelError(error) ||
@@ -740,10 +762,56 @@ class _EpubTranslationStrategy {
           // A receive timeout on a large batch can be payload related. Retry
           // each reference independently; one that still times out degrades
           // to its source HTML and is reported with the run.
-          for (final FootnoteBlockReference reference in htmlReferences) {
-            try {
-              translatedById.addAll(
-                await _translateFootnoteHtmlBatch(
+          translatedById.addAll(
+            await _mapTranslations(
+              htmlReferences,
+              config: config,
+              cancelToken: cancelToken,
+              process: (FootnoteBlockReference reference) async {
+                try {
+                  return await _translateFootnoteHtmlBatch(
+                    dio: dio,
+                    config: config,
+                    references: <FootnoteBlockReference>[reference],
+                    context: batch.context,
+                    retryDelayOverride: retryDelayOverride,
+                    cancelToken: cancelToken,
+                    onRequestAttempt: onRequestAttempt,
+                    onValidated: onValidated,
+                  );
+                } catch (singleError) {
+                  if (!_shouldDegradeSingle(singleError, config)) {
+                    rethrow;
+                  }
+                  owner._markDegradedBlock(
+                    chapterPath: reference.chapter.path,
+                    blockId: reference.block.id,
+                    reason: _oversizedReason(singleError),
+                  );
+                  AppLogger.warn(
+                    'Footnote ${reference.requestId} retained its source after ${singleError.runtimeType}.',
+                    tag: 'translate',
+                  );
+                  return {reference.requestId: reference.block.sourceHtml};
+                }
+              },
+            ),
+          );
+        }
+      } on FormatException {
+        // A malformed model reply is usually deterministic for the same
+        // prompt, so the whole batch is not re-sent. Retry each reference
+        // on its own; one that still comes back malformed degrades to its
+        // source HTML and is reported with the run instead of aborting the
+        // whole book.
+        translatedById.addAll(
+          await _mapTranslations(
+            htmlReferences,
+            config: config,
+            cancelToken: cancelToken,
+            process: (FootnoteBlockReference reference) async {
+              try {
+                return await _translateFootnoteHtmlBatch(
                   dio: dio,
                   config: config,
                   references: <FootnoteBlockReference>[reference],
@@ -752,55 +820,19 @@ class _EpubTranslationStrategy {
                   cancelToken: cancelToken,
                   onRequestAttempt: onRequestAttempt,
                   onValidated: onValidated,
-                ),
-              );
-            } catch (singleError) {
-              if (!_shouldDegradeSingle(singleError, config)) {
-                rethrow;
+                );
+              } catch (singleError) {
+                if (!_shouldDegradeSingle(singleError, config)) rethrow;
+                owner._markDegradedBlock(
+                  chapterPath: reference.chapter.path,
+                  blockId: reference.block.id,
+                  reason: _oversizedReason(singleError),
+                );
+                return {reference.requestId: reference.block.sourceHtml};
               }
-              owner._markDegradedBlock(
-                chapterPath: reference.chapter.path,
-                blockId: reference.block.id,
-                reason: _oversizedReason(singleError),
-              );
-              translatedById[reference.requestId] = reference.block.sourceHtml;
-              AppLogger.warn(
-                'Footnote ${reference.requestId} retained its source after ${singleError.runtimeType}.',
-                tag: 'translate',
-              );
-            }
-          }
-        }
-      } on FormatException {
-        // A malformed model reply is usually deterministic for the same
-        // prompt, so the whole batch is not re-sent. Retry each reference
-        // on its own; one that still comes back malformed degrades to its
-        // source HTML and is reported with the run instead of aborting the
-        // whole book.
-        for (final FootnoteBlockReference reference in htmlReferences) {
-          try {
-            translatedById.addAll(
-              await _translateFootnoteHtmlBatch(
-                dio: dio,
-                config: config,
-                references: <FootnoteBlockReference>[reference],
-                context: batch.context,
-                retryDelayOverride: retryDelayOverride,
-                cancelToken: cancelToken,
-                onRequestAttempt: onRequestAttempt,
-                onValidated: onValidated,
-              ),
-            );
-          } catch (singleError) {
-            if (!_shouldDegradeSingle(singleError, config)) rethrow;
-            owner._markDegradedBlock(
-              chapterPath: reference.chapter.path,
-              blockId: reference.block.id,
-              reason: _oversizedReason(singleError),
-            );
-            translatedById[reference.requestId] = reference.block.sourceHtml;
-          }
-        }
+            },
+          ),
+        );
       }
     }
     if (slotRequests.isNotEmpty) {
@@ -832,7 +864,8 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     Future<void> Function(String id, String html)? onValidated,
-  }) {
+  }) async {
+    final List<FootnoteBlockReference> failed = [];
     final Set<String> requestedIds = references
         .map((FootnoteBlockReference reference) => reference.requestId)
         .toSet();
@@ -849,7 +882,7 @@ class _EpubTranslationStrategy {
     };
     final String payload = jsonEncode(payloadMap);
 
-    return owner._apiClient.runRetried<Map<String, String>>(
+    final translated = await owner._apiClient.runRetried<Map<String, String>>(
       config: config,
       retryDelayOverride: retryDelayOverride,
       shouldRetry: TranslationApiClient.shouldRetryBatchError,
@@ -924,28 +957,63 @@ class _EpubTranslationStrategy {
 
         final Map<String, String> translatedById = <String, String>{};
         for (final FootnoteBlockReference reference in references) {
-          final String? translated = rawTranslatedById[reference.requestId];
-          if (translated == null) {
-            throw FormatException(
-              'Translated footnote ${reference.requestId} is missing from the batch response.',
-            );
-          }
-          final String locked =
-              EpubChapterTranslator._lockTranslatedHtmlStructure(
-                reference.block,
-                translated,
+          try {
+            final String? translated = rawTranslatedById[reference.requestId];
+            if (translated == null) {
+              throw FormatException(
+                'Translated footnote ${reference.requestId} is missing from the batch response.',
               );
-          EpubChapterTranslator._validateTranslatedBlockQuality(
-            config: config,
-            block: reference.block,
-            translatedHtml: locked,
+            }
+            final String locked =
+                EpubChapterTranslator._lockAndValidateTranslatedBlock(
+                  config: config,
+                  block: reference.block,
+                  translatedHtml: translated,
+                );
+            translatedById[reference.requestId] = locked;
+          } on FormatException {
+            if (references.length == 1) rethrow;
+            failed.add(reference);
+            continue;
+          }
+          await onValidated?.call(
+            reference.requestId,
+            translatedById[reference.requestId]!,
           );
-          translatedById[reference.requestId] = locked;
-          await onValidated?.call(reference.requestId, locked);
         }
         return translatedById;
       },
     );
+    translated.addAll(
+      await _mapTranslations(
+        failed,
+        config: config,
+        cancelToken: cancelToken,
+        process: (FootnoteBlockReference reference) async {
+          try {
+            return await _translateFootnoteHtmlBatch(
+              dio: dio,
+              config: config,
+              references: [reference],
+              context: context,
+              retryDelayOverride: retryDelayOverride,
+              cancelToken: cancelToken,
+              onRequestAttempt: onRequestAttempt,
+              onValidated: onValidated,
+            );
+          } catch (error) {
+            if (!_shouldDegradeSingle(error, config)) rethrow;
+            owner._markDegradedBlock(
+              chapterPath: reference.chapter.path,
+              blockId: reference.block.id,
+              reason: _oversizedReason(error),
+            );
+            return {reference.requestId: reference.block.sourceHtml};
+          }
+        },
+      ),
+    );
+    return translated;
   }
 
   Future<Map<String, String>> _translateProtectedSlotBatch({
@@ -979,6 +1047,7 @@ class _EpubTranslationStrategy {
         cancelToken: cancelToken,
         onRequestAttempt: onRequestAttempt,
         maxAttemptsOverride: maxBatchAttempts,
+        apiCounted: apiCounted,
         onValidated: onValidated,
       );
     } on FormatException catch (error) {
@@ -1024,53 +1093,46 @@ class _EpubTranslationStrategy {
         // prompt at every level of the split. Translate each block's slots
         // directly instead (the single-request path below still degrades
         // quality rejections per block).
-        final Map<String, String> translated = <String, String>{};
-        for (final _ProtectedSlotRequest request in requests) {
-          translated.addAll(
-            await _translateProtectedSlotBatch(
-              dio: dio,
-              config: config,
-              requests: <_ProtectedSlotRequest>[request],
-              context: context,
-              retryDelayOverride: retryDelayOverride,
-              cancelToken: cancelToken,
-              onRequestAttempt: onRequestAttempt,
-              apiCounted: apiCounted,
-              onValidated: onValidated,
-            ),
-          );
-        }
-        return translated;
+        return _mapTranslations(
+          requests,
+          config: config,
+          cancelToken: cancelToken,
+          process: (_ProtectedSlotRequest request) =>
+              _translateProtectedSlotBatch(
+                dio: dio,
+                config: config,
+                requests: <_ProtectedSlotRequest>[request],
+                context: context,
+                retryDelayOverride: retryDelayOverride,
+                cancelToken: cancelToken,
+                onRequestAttempt: onRequestAttempt,
+                apiCounted: apiCounted,
+                onValidated: onValidated,
+              ),
+        );
       }
       // Validation failure on a well-formed reply: bisect, but each level
       // gets a single attempt. A deterministic validation failure must not
       // eat maxRetries at every level of the split.
       final int midpoint = requests.length ~/ 2;
-      final Map<String, String> left = await _translateProtectedSlotBatch(
-        dio: dio,
+      return _mapTranslations(
+        [requests.sublist(0, midpoint), requests.sublist(midpoint)],
         config: config,
-        requests: requests.sublist(0, midpoint),
-        context: context,
-        retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
-        onRequestAttempt: onRequestAttempt,
-        maxBatchAttempts: 1,
-        apiCounted: apiCounted,
-        onValidated: onValidated,
+        process: (List<_ProtectedSlotRequest> half) =>
+            _translateProtectedSlotBatch(
+              dio: dio,
+              config: config,
+              requests: half,
+              context: context,
+              retryDelayOverride: retryDelayOverride,
+              cancelToken: cancelToken,
+              onRequestAttempt: onRequestAttempt,
+              maxBatchAttempts: 1,
+              apiCounted: apiCounted,
+              onValidated: onValidated,
+            ),
       );
-      final Map<String, String> right = await _translateProtectedSlotBatch(
-        dio: dio,
-        config: config,
-        requests: requests.sublist(midpoint),
-        context: context,
-        retryDelayOverride: retryDelayOverride,
-        cancelToken: cancelToken,
-        onRequestAttempt: onRequestAttempt,
-        maxBatchAttempts: 1,
-        apiCounted: apiCounted,
-        onValidated: onValidated,
-      );
-      return <String, String>{...left, ...right};
     } on DioException catch (error) {
       if (EpubChapterTranslator._isCancelError(error)) {
         throw const TranslationCancelledException();
@@ -1123,29 +1185,23 @@ class _EpubTranslationStrategy {
     // Transport-level fallback (e.g. 413 payload too large): split the batch
     // with the normal per-level retry policy; smaller payloads usually pass.
     final int midpoint = requests.length ~/ 2;
-    final Map<String, String> left = await _translateProtectedSlotBatch(
-      dio: dio,
+    return _mapTranslations(
+      [requests.sublist(0, midpoint), requests.sublist(midpoint)],
       config: config,
-      requests: requests.sublist(0, midpoint),
-      context: context,
-      retryDelayOverride: retryDelayOverride,
       cancelToken: cancelToken,
-      onRequestAttempt: onRequestAttempt,
-      apiCounted: apiCounted,
-      onValidated: onValidated,
+      process: (List<_ProtectedSlotRequest> half) =>
+          _translateProtectedSlotBatch(
+            dio: dio,
+            config: config,
+            requests: half,
+            context: context,
+            retryDelayOverride: retryDelayOverride,
+            cancelToken: cancelToken,
+            onRequestAttempt: onRequestAttempt,
+            apiCounted: apiCounted,
+            onValidated: onValidated,
+          ),
     );
-    final Map<String, String> right = await _translateProtectedSlotBatch(
-      dio: dio,
-      config: config,
-      requests: requests.sublist(midpoint),
-      context: context,
-      retryDelayOverride: retryDelayOverride,
-      cancelToken: cancelToken,
-      onRequestAttempt: onRequestAttempt,
-      apiCounted: apiCounted,
-      onValidated: onValidated,
-    );
-    return <String, String>{...left, ...right};
   }
 
   Future<Map<String, String>> _translateProtectedSlotBatchOnce({
@@ -1157,8 +1213,10 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     int? maxAttemptsOverride,
+    bool apiCounted = false,
     Future<void> Function(String id, String html)? onValidated,
-  }) {
+  }) async {
+    final List<_ProtectedSlotRequest> failed = [];
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
         .toSet();
@@ -1174,7 +1232,7 @@ class _EpubTranslationStrategy {
           .toList(growable: false),
     });
 
-    return owner._apiClient.runRetried<Map<String, String>>(
+    final result = await owner._apiClient.runRetried<Map<String, String>>(
       config: config,
       retryDelayOverride: retryDelayOverride,
       shouldRetry: TranslationApiClient.shouldRetryBatchError,
@@ -1285,17 +1343,44 @@ class _EpubTranslationStrategy {
 
         final Map<String, String> translated = <String, String>{};
         for (final _ProtectedSlotRequest request in requests) {
-          final String html = _renderAndValidateProtectedSlots(
-            config: config,
-            request: request,
-            translatedSlots: translatedSlotsById[request.id]!,
-          );
-          translated[request.id] = html;
-          await onValidated?.call(request.id, html);
+          try {
+            final String html = _renderAndValidateProtectedSlots(
+              config: config,
+              request: request,
+              translatedSlots: translatedSlotsById[request.id]!,
+            );
+            translated[request.id] = html;
+          } on FormatException {
+            if (requests.length == 1) rethrow;
+            failed.add(request);
+            continue;
+          }
+          await onValidated?.call(request.id, translated[request.id]!);
         }
         return translated;
       },
     );
+    result.addAll(
+      await _mapTranslations(
+        failed,
+        config: config,
+        cancelToken: cancelToken,
+        process: (_ProtectedSlotRequest request) =>
+            _translateProtectedSlotBatch(
+              dio: dio,
+              config: config,
+              requests: [request],
+              context: context,
+              retryDelayOverride: retryDelayOverride,
+              cancelToken: cancelToken,
+              onRequestAttempt: onRequestAttempt,
+              maxBatchAttempts: 1,
+              apiCounted: apiCounted,
+              onValidated: onValidated,
+            ),
+      ),
+    );
+    return result;
   }
 
   Future<Map<String, String>> _translateProtectedSlotsIndividually({
@@ -1337,9 +1422,8 @@ class _EpubTranslationStrategy {
             EpubChapterTranslator._isCancelError(error)) {
           throw const TranslationCancelledException();
         }
-        final bool retryable = TranslationApiClient.shouldRetryBatchError(
-          error,
-        );
+        // Transport retries belong exclusively to the per-slot retry layer.
+        final bool retryable = error is _ProtectedSlotRenderException;
         final int maxAttempts = TranslationApiClient.maxAttemptsForError(
           config,
           error,
@@ -1375,14 +1459,22 @@ class _EpubTranslationStrategy {
     void Function()? onRequestAttempt,
     String? retryReason,
   }) async {
-    final List<String> translatedSlots = <String>[];
-    for (final String sourceText in request.template.slotTexts) {
-      // Retry at the slot level: a transient failure on slot k must not
-      // re-bill the slots that already translated cleanly. A render/quality
-      // failure of the rebuilt block still retries the whole round via the
-      // loop in [_translateProtectedSlotsIndividually].
-      translatedSlots.add(
-        await owner._apiClient.runRetried<String>(
+    final List<String>
+    translatedSlots = await const TranslationWorkQueue().map<String, String>(
+      request.template.slotTexts,
+      concurrency: config.maxConcurrent,
+      throwIfCancelled: () {
+        owner._run.throwIfCancelled();
+        if (cancelToken?.isCancelled == true) {
+          throw const TranslationCancelledException();
+        }
+      },
+      process: (String sourceText, int index) {
+        // Retry at the slot level: a transient failure on slot k must not
+        // re-bill the slots that already translated cleanly. A render/quality
+        // failure of the rebuilt block still retries the whole round via the
+        // loop in [_translateProtectedSlotsIndividually].
+        return owner._apiClient.runRetried<String>(
           config: config,
           retryDelayOverride: retryDelayOverride,
           shouldRetry: TranslationApiClient.shouldRetryBatchError,
@@ -1391,27 +1483,35 @@ class _EpubTranslationStrategy {
             dio: dio,
             config: config,
             sourceText: sourceText,
+            request: request,
+            slotIndex: index,
             context: context,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
             retryReason: retryReason,
           ),
+        );
+      },
+    );
+    try {
+      return <String, String>{
+        request.id: _renderAndValidateProtectedSlots(
+          config: config,
+          request: request,
+          translatedSlots: translatedSlots,
         ),
-      );
+      };
+    } on FormatException catch (error) {
+      throw _ProtectedSlotRenderException(error.message);
     }
-    return <String, String>{
-      request.id: _renderAndValidateProtectedSlots(
-        config: config,
-        request: request,
-        translatedSlots: translatedSlots,
-      ),
-    };
   }
 
   Future<String> _translateProtectedSlotTextOnce({
     required Dio dio,
     required TranslationConfig config,
     required String sourceText,
+    required _ProtectedSlotRequest request,
+    required int slotIndex,
     required TranslationBatchContext context,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
@@ -1437,6 +1537,16 @@ class _EpubTranslationStrategy {
         _EpubBookMemory._styleProfileConfirmedFromBookMemoryJson(
           context.bookMemory,
         );
+    final Map<String, Object?> slotContext = <String, Object?>{
+      'sourceHtml': request.block.sourceHtml,
+      'currentSlotId': request.slotIds[slotIndex],
+      'previousText': slotIndex > 0
+          ? request.template.slotTexts[slotIndex - 1]
+          : null,
+      'nextText': slotIndex + 1 < request.template.slotTexts.length
+          ? request.template.slotTexts[slotIndex + 1]
+          : null,
+    };
     final Map<String, dynamic> requestData = <String, dynamic>{
       'model': config.model,
       'temperature': 0.2,
@@ -1448,6 +1558,14 @@ class _EpubTranslationStrategy {
         },
         if (!context.isEmpty)
           EpubChapterTranslator._fallbackContextMessage(context),
+        <String, String>{
+          'role': 'system',
+          'content':
+              'Read-only source block context. Use only for continuity, '
+              'pronouns, terminology and sentence flow; translate only the '
+              'current slot supplied in the user message, never this context.\n'
+              '${jsonEncode(slotContext)}',
+        },
         <String, String>{'role': 'user', 'content': userText},
       ],
     };
@@ -1577,7 +1695,8 @@ class _EpubTranslationStrategy {
     EpubChapterTranslator._validateTranslatedBlockQuality(
       config: config,
       block: request.block,
-      translatedHtml: rendered,
+      sourceDom: _ResponseHtml.parse(request.block.sourceHtml, null),
+      translatedDom: _ResponseHtml.parse(rendered, null),
     );
     return rendered;
   }

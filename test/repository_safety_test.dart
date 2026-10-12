@@ -955,45 +955,17 @@ class _HtmlFootnotePayloadTooLargeAdapter implements HttpClientAdapter {
   }
 }
 
-class _ResidualThenTranslatedBatchAdapter implements HttpClientAdapter {
-  int fetchCount = 0;
-
-  @override
-  void close({bool force = false}) {}
-
-  @override
-  Future<ResponseBody> fetch(
-    RequestOptions options,
-    Stream<Uint8List>? requestStream,
-    Future<void>? cancelFuture,
-  ) async {
-    fetchCount += 1;
-    final bool firstAttempt = fetchCount == 1;
-    return ResponseBody.fromString(
-      jsonEncode(<String, Object?>{
-        'choices': <Object?>[
-          <String, Object?>{
-            'message': <String, Object?>{
-              'content': jsonEncode(<String, Object?>{
-                'blocks': <Object?>[
-                  <String, Object?>{
-                    'id': 'block-1',
-                    'html': firstAttempt
-                        ? '<p>This sentence still has many English words remaining untranslated in the result.</p>'
-                        : '<p>这句话已经翻译完成。</p>',
-                  },
-                ],
-              }),
-            },
-          },
+class _ResidualThenTranslatedBatchAdapter extends _SequencedHtmlBatchAdapter {
+  _ResidualThenTranslatedBatchAdapter()
+    : super(
+        const <String>[
+          '<p>This sentence still has many English words remaining untranslated in the result.</p>',
+          '<p>这句话已经翻译完成。</p>',
         ],
-      }),
-      200,
-      headers: <String, List<String>>{
-        Headers.contentTypeHeader: <String>[Headers.jsonContentType],
-      },
-    );
-  }
+        translatedById: const <String, String>{
+          'block-2': '<p>这一段首次翻译就通过了。</p>',
+        },
+      );
 }
 
 class _ProperNounBatchAdapter implements HttpClientAdapter {
@@ -1035,9 +1007,14 @@ class _ProperNounBatchAdapter implements HttpClientAdapter {
 }
 
 class _SequencedHtmlBatchAdapter implements HttpClientAdapter {
-  _SequencedHtmlBatchAdapter(this.responses);
+  _SequencedHtmlBatchAdapter(
+    this.responses, {
+    this.translatedById = const <String, String>{},
+  });
 
   final List<String> responses;
+  final Map<String, String> translatedById;
+  final List<String> userContents = <String>[];
   int fetchCount = 0;
 
   @override
@@ -1058,12 +1035,13 @@ class _SequencedHtmlBatchAdapter implements HttpClientAdapter {
     final Map<String, dynamic> request =
         jsonDecode(utf8.decode(builder.takeBytes())) as Map<String, dynamic>;
     final List<dynamic> messages = request['messages'] as List<dynamic>;
-    final Map<String, dynamic> payload =
-        jsonDecode((messages.last as Map<String, dynamic>)['content'] as String)
-            as Map<String, dynamic>;
-    final List<dynamic> blocks = payload['blocks'] as List<dynamic>;
-    final String blockId =
-        (blocks.single as Map<String, dynamic>)['id'] as String;
+    final String userContent =
+        (messages.last as Map<String, dynamic>)['content'] as String;
+    userContents.add(userContent);
+    final List<dynamic>? blocks = userContent.startsWith('{')
+        ? (jsonDecode(userContent) as Map<String, dynamic>)['blocks']
+              as List<dynamic>
+        : null;
 
     fetchCount += 1;
     final int responseIndex = fetchCount <= responses.length
@@ -1074,14 +1052,19 @@ class _SequencedHtmlBatchAdapter implements HttpClientAdapter {
         'choices': <Object?>[
           <String, Object?>{
             'message': <String, Object?>{
-              'content': jsonEncode(<String, Object?>{
-                'blocks': <Object?>[
-                  <String, Object?>{
-                    'id': blockId,
-                    'html': responses[responseIndex],
-                  },
-                ],
-              }),
+              'content': blocks == null
+                  ? responses[responseIndex]
+                  : jsonEncode(<String, Object?>{
+                      'blocks': <Object?>[
+                        for (final dynamic block in blocks)
+                          <String, Object?>{
+                            'id': block['id'],
+                            'html':
+                                translatedById[block['id']] ??
+                                responses[responseIndex],
+                          },
+                      ],
+                    }),
             },
           },
         ],
@@ -3090,6 +3073,9 @@ void main() {
             '<p>随着边界消失，entitlement概念随之瓦解。</p>',
             '<p>随着边界消失，权利概念也随之瓦解。</p>',
           ],
+          translatedById: const <String, String>{
+            'block-2': '<p>这一段首次翻译就通过了。</p>',
+          },
         );
         final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
           ..httpClientAdapter = adapter;
@@ -3112,12 +3098,33 @@ void main() {
               sourceText:
                   'As borders disappear, the concept of entitlement falls apart.',
             ),
+            ExtractedBlock(
+              id: 'block-2',
+              tagName: 'p',
+              sourceHtml:
+                  '<p>This paragraph translates correctly on the first attempt.</p>',
+              sourceText:
+                  'This paragraph translates correctly on the first attempt.',
+            ),
           ],
         );
 
         expect(adapter.fetchCount, 2);
-        expect(translated.single, '<p>随着边界消失，权利概念也随之瓦解。</p>');
-        expect(translated.single, isNot(contains('entitlement')));
+        expect(translated, const <String>[
+          '<p>随着边界消失，权利概念也随之瓦解。</p>',
+          '<p>这一段首次翻译就通过了。</p>',
+        ]);
+        expect(translated.first, isNot(contains('entitlement')));
+        final Map<String, dynamic> firstPayload =
+            jsonDecode(adapter.userContents.first) as Map<String, dynamic>;
+        expect(
+          (firstPayload['blocks'] as List).map((dynamic block) => block['id']),
+          <String>['block-1', 'block-2'],
+        );
+        expect(
+          adapter.userContents.last,
+          '<p>As borders disappear, the concept of entitlement falls apart.</p>',
+        );
       },
     );
 
@@ -3410,39 +3417,57 @@ void main() {
       },
     );
 
-    test(
-      'retries Chinese-target batches that come back mostly untranslated',
-      () async {
-        final _ResidualThenTranslatedBatchAdapter adapter =
-            _ResidualThenTranslatedBatchAdapter();
-        final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
-          ..httpClientAdapter = adapter;
+    test('retries Chinese-target batches that come back mostly untranslated', () async {
+      final _ResidualThenTranslatedBatchAdapter adapter =
+          _ResidualThenTranslatedBatchAdapter();
+      final Dio dio = Dio(BaseOptions(baseUrl: 'https://api.example.test/v1'))
+        ..httpClientAdapter = adapter;
 
-        final List<String>
-        translated = await EpubTranslationRepository().translateBlockBatchForTest(
-          dio: dio,
-          config: TranslationConfig.defaults().copyWith(
-            apiKey: 'sk-test',
-            targetLanguage: 'Chinese',
-            maxRetries: 2,
-            retryDelaySeconds: 1,
+      final List<String>
+      translated = await EpubTranslationRepository().translateBlockBatchForTest(
+        dio: dio,
+        config: TranslationConfig.defaults().copyWith(
+          apiKey: 'sk-test',
+          targetLanguage: 'Chinese',
+          maxRetries: 2,
+          retryDelaySeconds: 1,
+        ),
+        blocks: const <ExtractedBlock>[
+          ExtractedBlock(
+            id: 'block-1',
+            tagName: 'p',
+            sourceHtml:
+                '<p>This sentence should be translated into Chinese before it is accepted.</p>',
+            sourceText:
+                'This sentence should be translated into Chinese before it is accepted.',
           ),
-          blocks: const <ExtractedBlock>[
-            ExtractedBlock(
-              id: 'block-1',
-              tagName: 'p',
-              sourceHtml:
-                  '<p>This sentence should be translated into Chinese before it is accepted.</p>',
-              sourceText:
-                  'This sentence should be translated into Chinese before it is accepted.',
-            ),
-          ],
-        );
+          ExtractedBlock(
+            id: 'block-2',
+            tagName: 'p',
+            sourceHtml:
+                '<p>This paragraph translates correctly on the first attempt.</p>',
+            sourceText:
+                'This paragraph translates correctly on the first attempt.',
+          ),
+        ],
+      );
 
-        expect(adapter.fetchCount, 2);
-        expect(translated, <String>['<p>这句话已经翻译完成。</p>']);
-      },
-    );
+      expect(adapter.fetchCount, 2);
+      expect(translated, const <String>[
+        '<p>这句话已经翻译完成。</p>',
+        '<p>这一段首次翻译就通过了。</p>',
+      ]);
+      final Map<String, dynamic> firstPayload =
+          jsonDecode(adapter.userContents.first) as Map<String, dynamic>;
+      expect(
+        (firstPayload['blocks'] as List).map((dynamic block) => block['id']),
+        <String>['block-1', 'block-2'],
+      );
+      expect(
+        adapter.userContents.last,
+        '<p>This sentence should be translated into Chinese before it is accepted.</p>',
+      );
+    });
 
     test(
       'does not retry Chinese translations with normal proper nouns',

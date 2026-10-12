@@ -21,6 +21,12 @@ class ProtectedAnchorTextSlots {
     final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
       sourceHtml,
     );
+    return ProtectedAnchorTextSlots.fromFragment(fragment);
+  }
+
+  /// Reuses the response pipeline's parsed source. The template never mutates
+  /// the supplied DOM; each render works on a fresh clone.
+  factory ProtectedAnchorTextSlots.fromFragment(dom.DocumentFragment fragment) {
     final List<dom.Node> roots = fragment.nodes
         .where(
           (dom.Node node) => node is! dom.Text || node.data.trim().isNotEmpty,
@@ -66,6 +72,8 @@ class ProtectedAnchorTextSlots {
 
   final dom.Element _sourceRoot;
 
+  dom.Element cloneSourceRoot() => _sourceRoot.clone(true);
+
   /// Whether the source contains at least one anchor whose marker and
   /// semantics must stay source-owned.
   final bool hasProtectedAnchors;
@@ -78,6 +86,11 @@ class ProtectedAnchorTextSlots {
   /// The number of translations must exactly match [slotTexts]. Source leading
   /// and trailing whitespace is retained at every slot boundary.
   String render(List<String> translatedSlotTexts) {
+    return renderElement(translatedSlotTexts).outerHtml;
+  }
+
+  /// Keeps rendered text in DOM form for downstream quality validation.
+  dom.Element renderElement(List<String> translatedSlotTexts) {
     if (translatedSlotTexts.length != slotTexts.length) {
       throw ArgumentError.value(
         translatedSlotTexts.length,
@@ -94,7 +107,7 @@ class ProtectedAnchorTextSlots {
         translated: translatedSlotTexts[index],
       );
     }
-    return renderedRoot.outerHtml;
+    return renderedRoot;
   }
 
   static List<dom.Text> _collectSlots(dom.Node root) {

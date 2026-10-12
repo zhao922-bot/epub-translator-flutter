@@ -154,6 +154,56 @@ class TranslationQuality {
     }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
+    return _findSuspiciousDocumentResidual(
+      sourceDocument: sourceDocument,
+      translatedDocument: translatedDocument,
+      targetLanguage: targetLanguage,
+      allowRetainedAuthorSignature: allowRetainedAuthorSignature,
+      allowBibliographicRetention: allowBibliographicRetention,
+    );
+  }
+
+  /// DOM entry point for the response pipeline. Quality rules clear exempted
+  /// content, so operate on clones rather than changing the source/output DOM.
+  static TranslationResidualFinding? findSuspiciousFragmentResidual({
+    required DocumentFragment sourceFragment,
+    required DocumentFragment translatedFragment,
+    required String targetLanguage,
+    bool allowRetainedAuthorSignature = false,
+    bool allowBibliographicRetention = false,
+  }) {
+    if (!shouldCheckResidual(targetLanguage)) return null;
+    Document qualityDocument(DocumentFragment fragment) {
+      final document = Document();
+      final html = Element.tag('html');
+      final body = Element.tag('body');
+      document.append(html);
+      html.append(body);
+      for (final node in fragment.nodes) {
+        body.append(node.clone(true));
+      }
+      return document;
+    }
+
+    return _findSuspiciousDocumentResidual(
+      sourceDocument: qualityDocument(sourceFragment),
+      translatedDocument: qualityDocument(translatedFragment),
+      targetLanguage: targetLanguage,
+      allowRetainedAuthorSignature: allowRetainedAuthorSignature,
+      allowBibliographicRetention: allowBibliographicRetention,
+    );
+  }
+
+  static TranslationResidualFinding? _findSuspiciousDocumentResidual({
+    required Document sourceDocument,
+    required Document translatedDocument,
+    required String targetLanguage,
+    required bool allowRetainedAuthorSignature,
+    required bool allowBibliographicRetention,
+  }) {
+    // Capture before any exemption clears source nodes. Previously these
+    // heuristics reparsed the original source HTML each time they ran.
+    final sourceAuditedCores = _sourceAuditedForeignTermCores(sourceDocument);
     // Source-owned code/formula text is intentionally retained. Exempt only
     // identical subtrees, so newly introduced code wrappers cannot hide prose.
     final selector = EpubHtmlExtractor.nonTextAncestors.join(',');
@@ -282,7 +332,7 @@ class TranslationQuality {
       }
       final String translatedVisibleText = _normalizeText(
         _stripSourceAuditedForeignTermsFromText(
-          sourceHtml,
+          sourceAuditedCores,
           translatedDocument.body?.text ?? translatedDocument.text ?? '',
         ),
       );
@@ -326,7 +376,7 @@ class TranslationQuality {
 
     final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
       _stripSourceAuditedForeignTermsFromText(
-        sourceHtml,
+        sourceAuditedCores,
         translatedDocument.body?.text ?? translatedDocument.text ?? '',
       ),
       targetLanguage: targetLanguage,
@@ -1303,12 +1353,21 @@ class TranslationQuality {
   /// (for example `agri deserti` without its audited comma form) stay intact
   /// and continue to be flagged.
   static String _stripSourceAuditedForeignTermsFromText(
-    String sourceHtml,
+    Set<String> sourceCores,
     String text,
   ) {
     String stripped = text;
+    for (final String core in sourceCores) {
+      stripped = stripped.replaceAll(
+        RegExp(RegExp.escape(core), caseSensitive: false),
+        ' ',
+      );
+    }
+    return stripped;
+  }
+
+  static Set<String> _sourceAuditedForeignTermCores(Document sourceDocument) {
     final Set<String> sourceCores = <String>{};
-    final Document sourceDocument = html_parser.parse(sourceHtml);
     for (final Element element in sourceDocument.querySelectorAll('i, em')) {
       if (element.children.isNotEmpty ||
           !auditedForeignTermNodes.containsKey(element.text)) {
@@ -1319,13 +1378,7 @@ class TranslationQuality {
         sourceCores.add(core);
       }
     }
-    for (final String core in sourceCores) {
-      stripped = stripped.replaceAll(
-        RegExp(RegExp.escape(core), caseSensitive: false),
-        ' ',
-      );
-    }
-    return stripped;
+    return sourceCores;
   }
 
   /// Strips surrounding punctuation/quotes/whitespace from an audited source

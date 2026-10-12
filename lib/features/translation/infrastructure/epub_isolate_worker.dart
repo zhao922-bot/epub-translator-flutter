@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -15,6 +16,48 @@ import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
 import 'epub/epub_source_guard.dart';
 import '../domain/repositories/translation_repository.dart';
+
+/// Navigation only looks up container, OPF and manifest-selected nav/NCX
+/// entries. Indexing names must not inflate unrelated chapter/media payloads.
+class _LazyArchiveView extends MapBase<String, List<int>> {
+  _LazyArchiveView(Archive archive)
+    : _entries = {
+        for (final file in archive)
+          if (file.isFile) file.name: file,
+      };
+
+  final Map<String, ArchiveFile> _entries;
+  final Map<String, List<int>> _bytes = {};
+
+  @override
+  List<int>? operator [](Object? key) {
+    final file = _entries[key];
+    if (file == null) return null;
+    // Reading via rawContent leaves ArchiveFile.isCompressed intact, even
+    // for container.xml, which is read for navigation but copied unchanged.
+    return _bytes.putIfAbsent(
+      file.name,
+      () => file.rawContent?.getStream().toUint8List() ?? <int>[],
+    );
+  }
+
+  @override
+  bool containsKey(Object? key) => _entries.containsKey(key);
+
+  @override
+  Iterable<String> get keys => _entries.keys;
+
+  @override
+  void operator []=(String key, List<int> value) =>
+      throw UnsupportedError('Read-only archive view');
+
+  @override
+  void clear() => throw UnsupportedError('Read-only archive view');
+
+  @override
+  List<int>? remove(Object? key) =>
+      throw UnsupportedError('Read-only archive view');
+}
 
 class _ProgressWork<T> {
   const _ProgressWork(this.operation, this.messages);
@@ -523,13 +566,16 @@ class EpubIsolateWorker {
         continue;
       }
       final navPath = navigationTargetKey(opfPath, hrefPath);
-      final bytes = archiveFiles[navPath];
-      if (bytes == null) continue;
+      if (!archiveFiles.containsKey(navPath)) continue;
       // Use rendered content when navigation is also a translated chapter,
       // preserving translated prose outside its toc rather than restoring it.
       final markup =
           renderedHtmlByPath[navPath] ??
-          decodeEpubText(bytes: bytes, filePath: navPath, strict: true);
+          decodeEpubText(
+            bytes: archiveFiles[navPath]!,
+            filePath: navPath,
+            strict: true,
+          );
       replacements[navPath] = synchronizeEpub3Navigation(
         markup: markup,
         documentPath: navPath,
@@ -1175,20 +1221,8 @@ class EpubIsolateWorker {
     String? expectedSourceFingerprint,
     String? translatedTitle,
   }) {
-    // Memory layout note: at peak this function holds the decoded source
-    // archive (decompressed payloads), the repacked archive (mostly shared
-    // views of the same payloads, plus replacements), and the encoded output.
-    // Two things keep the raw download from adding a fourth full copy:
-    //  1. [rawBytes] is released right after decoding: the read+decode is
-    //     scoped into a helper so the raw buffer has no live local
-    //     reference afterwards. Note the decoder is lazy: every source
-    //     ArchiveFile keeps its compressed input (a view into this buffer)
-    //     in its raw content slot even after decompression, so this alone
-    //     is not enough.
-    //  2. After the copy loop below, every source entry's raw+decompressed
-    //     slots are cleared. Repacked entries already hold their own
-    //     references to the payload buffers (shared Uint8List views), so
-    //     only the original download buffer becomes collectable here.
+    // Keep source payloads compressed and share their ArchiveFile objects.
+    // Only navigation metadata is inflated; output goes straight to disk.
     final Archive sourceArchive = _decodeEpubArchive(
       inputPath,
       expectedSourceFingerprint,
@@ -1210,10 +1244,9 @@ class EpubIsolateWorker {
     // rewrite must still happen (renderNavigationMetadata handles empty
     // labels by only updating the language tag).
     if (navigationLanguageTag != null) {
-      final Map<String, List<int>> archiveView = <String, List<int>>{
-        for (final ArchiveFile file in sourceArchive)
-          if (file.isFile) file.name: _fileBytes(file),
-      };
+      final Map<String, List<int>> archiveView = _LazyArchiveView(
+        sourceArchive,
+      );
       replacements.addAll(
         renderNavigationMetadata(
           archiveFiles: archiveView,
@@ -1295,25 +1328,9 @@ class EpubIsolateWorker {
         continue;
       }
 
-      final List<int> originalBytes = _fileBytes(sourceFile);
-      repacked.add(
-        ArchiveFile.bytes(sourceFile.name, originalBytes)
-          ..compression = sourceFile.compression
-          ..lastModTime = sourceFile.lastModTime
-          ..mode = sourceFile.mode,
-      );
+      repacked.add(sourceFile);
     }
 
-    // Every source entry was decompressed on first read in the loop above;
-    // release each entry's lazy link to the raw download buffer (see the
-    // memory note at the top of this function). The repacked entries keep
-    // their own references to the payload buffers, so this only drops the
-    // original ZIP bytes before the encode step allocates the output buffer.
-    for (final ArchiveFile sourceFile in sourceArchive) {
-      sourceFile.clear();
-    }
-
-    final Uint8List encoded = ZipEncoder().encodeBytes(repacked);
     final File outputFile = File(outputFilePath);
     outputFile.parent.createSync(recursive: true);
 
@@ -1323,7 +1340,20 @@ class EpubIsolateWorker {
     );
     final File tempFile = File(tempPath);
     try {
-      tempFile.writeAsBytesSync(encoded, flush: true);
+      final output = OutputFileStream(tempPath);
+      try {
+        ZipEncoder().encodeStream(repacked, output);
+      } finally {
+        output.closeSync();
+      }
+      // OutputFileStream.flush drains its buffer but does not fsync. Preserve
+      // the previous flush:true durability before exposing a committable temp.
+      final handle = tempFile.openSync(mode: FileMode.append);
+      try {
+        handle.flushSync();
+      } finally {
+        handle.closeSync();
+      }
       return tempFile.path;
     } catch (error) {
       if (tempFile.existsSync()) {
