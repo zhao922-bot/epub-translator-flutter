@@ -3390,7 +3390,7 @@ class EpubChapterTranslator {
       return result.toString();
     }
 
-    const int limit = 255 - 22;
+    const int limit = 255 - 26; // .recovery. + 16-digit microsecond timestamp
     final String name = '$baseName$suffix.epub';
     if (size(name) <= limit) return name;
     final String hash = sha256

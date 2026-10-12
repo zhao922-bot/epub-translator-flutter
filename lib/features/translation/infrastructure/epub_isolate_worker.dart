@@ -89,22 +89,38 @@ void _progressWorkEntry<T>(_ProgressWork<T> work) {
 /// protects the temp files of a second concurrently running app instance.
 const Duration _kStaleTempAge = Duration(minutes: 30);
 
-/// Thrown when the final output file is locked by another process at commit
-/// time (Windows: a reader holding it open without share access).
+/// A commit failed, but the complete translated payload remains recoverable.
 ///
 /// The fully-translated temp file is deliberately NOT deleted: the user can
 /// close the locking program and retry the translation (block cache makes the
 /// retry fast with no extra API cost), or rename [tempFilePath] manually.
 /// [message] is already localized by the caller via [EpubIsolateWorker.commitTempFile]'s
 /// `lockedMessage` callback.
-class OutputFileLockedException implements Exception {
-  OutputFileLockedException(this.message, this.tempFilePath);
+class OutputFileRecoveryException extends FileSystemException {
+  OutputFileRecoveryException(String message, this.tempFilePath)
+    : super(message, tempFilePath);
 
-  final String message;
   final String tempFilePath;
 
   @override
   String toString() => message;
+}
+
+class OutputFileLockedException extends OutputFileRecoveryException {
+  OutputFileLockedException(super.message, super.tempFilePath);
+}
+
+/// Preserve the established timeout classification while carrying recovery.
+class OutputFileRecoveryTimeoutException extends OutputFileRecoveryException
+    implements TimeoutException {
+  OutputFileRecoveryTimeoutException(
+    super.message,
+    super.tempFilePath,
+    this.duration,
+  );
+
+  @override
+  final Duration? duration;
 }
 
 /// Thrown when the SOURCE file is locked by another process at read time
@@ -160,10 +176,13 @@ class EpubIsolateWorker {
   /// be stopped. File-producing work must reserve its temp path in the parent
   /// and clean it after termination (as writeTranslatedEpub does); killing an
   /// isolate cannot run its finally blocks or report a newly created path.
+  /// [finishBeforeCancellation] lets file-producing operations finish their
+  /// synchronous work and close native handles before cancellation returns.
   static Future<T> prepareWithProgress<T>({
     required T Function(void Function(int, int)) operation,
     required bool Function() isCancelled,
     void Function(int, int)? onProgress,
+    bool finishBeforeCancellation = false,
   }) async {
     if (isCancelled()) throw const TranslationCancelledException();
     final messages = ReceivePort();
@@ -219,6 +238,10 @@ class EpubIsolateWorker {
       return await completed.future;
     } finally {
       cancellationPoll?.cancel();
+      // Synchronous file operations cannot receive a cooperative port message
+      // while encoding. Let file-producing workers unwind and close handles
+      // before termination; CPU-only workers remain immediately killable.
+      if (finishBeforeCancellation && worker != null) await exited.future;
       worker?.kill(priority: Isolate.immediate);
       // Await termination, not just the kill request. File-producing callers
       // can then clean their owned temp without racing a still-running writer.
@@ -398,7 +421,7 @@ class EpubIsolateWorker {
   ///
   /// Writes to a same-directory temp file first, then commits to [outputFilePath]
   /// only after encoding succeeds. [shouldCommit] is also polled during ZIP
-  /// work; refusal kills the worker and cleans its temp. Legacy shouldCommit
+  /// work; refusal waits for handle closure and cleans its temp. Legacy shouldCommit
   /// callers receive false (the repacker converts it to cancellation); explicit
   /// [isCancelled] callers receive [TranslationCancelledException].
   ///
@@ -449,6 +472,7 @@ class EpubIsolateWorker {
         isCancelled: () =>
             (isCancelled?.call() ?? false) ||
             (shouldCommit != null && !shouldCommit()),
+        finishBeforeCancellation: true,
       );
       if (isCancelled?.call() ?? false) {
         throw const TranslationCancelledException();
@@ -465,10 +489,10 @@ class EpubIsolateWorker {
         lockedMessage: lockedMessage,
       );
     } catch (error) {
-      // A locked output keeps its temp file by design (see
-      // OutputFileLockedException): deleting it here would destroy the
+      // A failed commit keeps its temp file by design (see
+      // OutputFileRecoveryException): deleting it here would destroy the
       // recovery path commitTempFile just preserved.
-      if (error is! OutputFileLockedException) {
+      if (error is! OutputFileRecoveryException) {
         await _deleteQuietly(tempFile);
       }
       // Keep the established bool contract for commit-veto-only callers;
@@ -898,9 +922,21 @@ class EpubIsolateWorker {
     } on OutputLockCancelledException {
       await _deleteQuietly(tempFile);
       return false;
-    } on TimeoutException {
-      await _deleteQuietly(tempFile);
-      rethrow;
+    } catch (error) {
+      if (error is OutputFileRecoveryException) rethrow;
+      final recovery = await preserveRecoveryTempForTest(tempFile, finalFile);
+      if (error is TimeoutException) {
+        throw OutputFileRecoveryTimeoutException(
+          'Timed out committing output. The translated file was kept at: ${recovery.path}',
+          recovery.path,
+          error.duration,
+        );
+      }
+      throw OutputFileRecoveryException(
+        'Could not commit the output (${error.runtimeType}). '
+        'The translated file was kept at: ${recovery.path}',
+        recovery.path,
+      );
     }
   }
 
@@ -984,10 +1020,8 @@ class EpubIsolateWorker {
           recoveryFile.path,
         );
       }
-      await _deleteQuietly(tempFile);
       rethrow;
     } catch (error) {
-      await _deleteQuietly(tempFile);
       rethrow;
     }
   }
@@ -1079,11 +1113,23 @@ class EpubIsolateWorker {
     try {
       final String prefix = '${path.basename(finalFile.path)}.tmp.';
       final DateTime cutoff = DateTime.now().subtract(_kStaleTempAge);
+      final retained = <String>{..._retainedRecoveryPaths};
+      final index = File('${finalFile.path}.recovery-index');
+      if (await index.exists()) {
+        retained.addAll(
+          (await index.readAsLines())
+              .where((name) => name.isNotEmpty && path.basename(name) == name)
+              .map((name) => path.join(finalFile.parent.path, name)),
+        );
+      }
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
         if (entity is! File || !path.basename(entity.path).startsWith(prefix)) {
           continue;
         }
-        if (entity.path == tempFile.path) {
+        if (sameFilesystemPath(entity.path, tempFile.path)) {
+          continue;
+        }
+        if (retained.any((name) => sameFilesystemPath(name, entity.path))) {
           continue;
         }
         if ((await entity.lastModified()).isBefore(cutoff)) {
@@ -1093,6 +1139,18 @@ class EpubIsolateWorker {
     } catch (_) {
       // Best effort: stale temps must never break a commit.
     }
+  }
+
+  @visibleForTesting
+  static bool sameFilesystemPath(String first, String second, {bool? windows}) {
+    if (windows ?? Platform.isWindows) {
+      return path.windows
+              .normalize(path.windows.absolute(first))
+              .toLowerCase() ==
+          path.windows.normalize(path.windows.absolute(second)).toLowerCase();
+    }
+    return path.normalize(path.absolute(first)) ==
+        path.normalize(path.absolute(second));
   }
 
   @visibleForTesting
@@ -1107,9 +1165,32 @@ class EpubIsolateWorker {
   static Future<File> preserveRecoveryTempForTest(
     File tempFile,
     File finalFile,
-  ) => tempFile.rename(
-    '${finalFile.path}.recovery.${DateTime.now().microsecondsSinceEpoch}',
-  );
+  ) async {
+    try {
+      return await tempFile.rename(
+        '${finalFile.path}.recovery.${DateTime.now().microsecondsSinceEpoch}',
+      );
+    } on FileSystemException {
+      // Even recovery naming can fail (component length, permissions, locks).
+      // Keep the original payload and mark it exempt from orphan sweeping.
+      _retainedRecoveryPaths.add(path.absolute(tempFile.path));
+      try {
+        await File('${finalFile.path}.recovery-index').writeAsString(
+          '${path.basename(tempFile.path)}\n',
+          mode: FileMode.append,
+          flush: true,
+        );
+      } catch (error) {
+        AppLogger.warn(
+          'Could not record recovery path ${tempFile.path}: ${error.runtimeType}',
+          tag: 'repack',
+        );
+      }
+      return tempFile;
+    }
+  }
+
+  static final Set<String> _retainedRecoveryPaths = {};
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
@@ -1138,9 +1219,7 @@ class EpubIsolateWorker {
         rethrow;
       }
     } catch (error) {
-      if (tempFile.existsSync()) {
-        tempFile.deleteSync();
-      }
+      // Match production commit semantics: a completed payload is recoverable.
       rethrow;
     }
   }
@@ -1548,12 +1627,20 @@ class EpubIsolateWorker {
   }
 
   static Future<void> _deleteQuietly(File file) async {
-    try {
-      if (await file.exists()) {
-        await file.delete();
+    for (int attempt = 0; attempt < 5; attempt++) {
+      try {
+        if (await file.exists()) await file.delete();
+        return;
+      } catch (error) {
+        if (attempt == 4) {
+          AppLogger.warn(
+            'Could not delete ${file.path}: ${error.runtimeType}',
+            tag: 'repack',
+          );
+          return;
+        }
+        await Future<void>.delayed(Duration(milliseconds: 25 * (1 << attempt)));
       }
-    } catch (_) {
-      // Best-effort cleanup only.
     }
   }
 

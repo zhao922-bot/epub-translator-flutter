@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as path;
 
@@ -155,10 +156,14 @@ class NativeSettingsSecretStore implements SettingsSecretStore {
 }
 
 class SettingsStore {
-  SettingsStore({this.settingsFileProvider, SettingsSecretStore? secretStore})
-    : _secretStore = secretStore ?? const NativeSettingsSecretStore();
+  SettingsStore({
+    this.settingsFileProvider,
+    SettingsSecretStore? secretStore,
+    @visibleForTesting this.settingsJsonWriter,
+  }) : _secretStore = secretStore ?? const NativeSettingsSecretStore();
 
   final Future<File> Function()? settingsFileProvider;
+  final Future<void> Function(File, String)? settingsJsonWriter;
   final SettingsSecretStore _secretStore;
   final Map<SettingsSecretSlot, _SecretReadStatus> _secretReadStatuses =
       <SettingsSecretSlot, _SecretReadStatus>{};
@@ -218,11 +223,17 @@ class SettingsStore {
 
   Object? _configLoadError;
   Object? get configLoadError => _configLoadError;
+  Map<String, String> _credentialBindings = {};
 
   Future<TranslationConfig> load() async {
-    final file = await _settingsFile();
-    // Endpoint metadata and its secure credentials must be read together.
-    return withSettingsFileLock(file, _loadLocked);
+    try {
+      final file = await _settingsFile();
+      // Include lock acquisition and file discovery in the load error boundary.
+      return await withSettingsFileLock(file, _loadLocked);
+    } catch (error) {
+      _configLoadError = error;
+      rethrow;
+    }
   }
 
   Future<TranslationConfig> _loadLocked() async {
@@ -235,6 +246,24 @@ class SettingsStore {
       rethrow;
     }
     final List<_SecretReadResult> storedKeys = await _readAllSecrets();
+    for (final slot in [
+      SettingsSecretSlot.deepSeek,
+      SettingsSecretSlot.custom,
+    ]) {
+      final index = slot == SettingsSecretSlot.deepSeek ? 1 : 2;
+      final binding = _credentialBindings[slot.name];
+      if (binding != null &&
+          storedKeys[index].status != _SecretReadStatus.readFailure &&
+          binding != _keyFingerprint(storedKeys[index].value ?? '')) {
+        // A process may have exited between secure storage and JSON writes.
+        // Never attach that uncommitted key to the previous endpoint.
+        _secretReadStatuses[slot] = _SecretReadStatus.readFailure;
+        storedKeys[index] = const _SecretReadResult(
+          _SecretReadStatus.readFailure,
+          null,
+        );
+      }
+    }
     final _SecretReadResult storedApiKey = storedKeys[0];
     final _SecretReadResult storedDeepSeekKey = storedKeys[1];
     final _SecretReadResult storedCustomKey = storedKeys[2];
@@ -382,6 +411,7 @@ class SettingsStore {
     lastCorruptBackupPath = null;
     final File file = await _settingsFile();
     if (!await file.exists()) {
+      _credentialBindings = {};
       _settingsSnapshot = null;
       _settingsRevision = 0;
       didCorruptReset = false;
@@ -439,6 +469,14 @@ class SettingsStore {
       throw const FormatException('settings.json is not a JSON object');
     }
     _settingsSnapshot = raw;
+    final bindings = decoded['credentialBindings'];
+    _credentialBindings = bindings is Map
+        ? {
+            for (final entry in bindings.entries)
+              if (entry.key is String && entry.value is String)
+                entry.key as String: entry.value as String,
+          }
+        : {};
     _allowLegacyMigration = decoded['credentialSchemaVersion'] != 2;
     _settingsRevision = decoded['settingsRevision'] is int
         ? decoded['settingsRevision'] as int
@@ -576,6 +614,53 @@ class SettingsStore {
       for (final slot in SettingsSecretSlot.values)
         if (values[slot] != baseline[slot]) slot,
     };
+    final previous = _loadedConfig;
+    if (previous != null &&
+        secretReadFailed(SettingsSecretSlot.custom) &&
+        !explicit.contains(SettingsSecretSlot.custom) &&
+        (config.customApiBaseUrl != previous.customApiBaseUrl ||
+            (config.apiProviderSelection == ApiProviderSelection.custom &&
+                config.apiBaseUrl !=
+                    (previous.apiProviderSelection ==
+                            ApiProviderSelection.custom
+                        ? previous.apiBaseUrl
+                        : previous.customApiBaseUrl)))) {
+      throw StateError(
+        'Custom API key could not be read; confirm the key before changing its endpoint.',
+      );
+    }
+    final oldSnapshot = Map<SettingsSecretSlot, String>.of(baseline);
+    final oldStatuses = Map<SettingsSecretSlot, _SecretReadStatus>.of(
+      _secretReadStatuses,
+    );
+    final oldPending = Map<SettingsSecretSlot, String>.of(
+      _pendingPlaintextKeys,
+    );
+    // Persist the old key binding BEFORE touching secure storage. If the
+    // process dies in the following window, load rejects the new key rather
+    // than sending it to the old endpoint. No plaintext secret is journaled.
+    if (previous != null &&
+        slotsToSave.any(
+          (slot) =>
+              slot == SettingsSecretSlot.custom ||
+              slot == SettingsSecretSlot.deepSeek,
+        )) {
+      for (final slot in [
+        SettingsSecretSlot.custom,
+        SettingsSecretSlot.deepSeek,
+      ]) {
+        if (slotsToSave.contains(slot) && secretReadFailed(slot)) {
+          // With no readable old key, an absent binding must not admit a new
+          // credential after a crash. Retain an existing binding or reserve
+          // the empty/fallback snapshot, which rejects any new nonempty key.
+          _credentialBindings.putIfAbsent(
+            slot.name,
+            () => _keyFingerprint(oldSnapshot[slot] ?? ''),
+          );
+        }
+      }
+      await _writeSettingsJson(previous);
+    }
     // The JSON write sits in a finally block on purpose: a secret-store
     // failure (e.g. the Windows DPAPI file being locked so deleteSecret
     // throws StateError) must not silently discard the non-secret settings
@@ -588,7 +673,6 @@ class SettingsStore {
     } finally {
       // Endpoint and credentials form one unit. A partial secret failure
       // must not publish a changed endpoint with credentials from an old run.
-      final previous = _loadedConfig;
       final customFailed =
           values[SettingsSecretSlot.custom] !=
           _secretSnapshot?[SettingsSecretSlot.custom];
@@ -616,7 +700,42 @@ class SettingsStore {
               httpProxy: proxyFailed ? previous.httpProxy : config.httpProxy,
             )
           : config;
-      await _writeSettingsJson(safeConfig);
+      try {
+        await _writeSettingsJson(safeConfig);
+      } catch (writeError) {
+        // A failed transaction must be reloaded before another UI edit can
+        // publish an in-memory key snapshot that never committed to JSON.
+        _configLoadError = writeError;
+        if (previous != null) {
+          final restorable = slotsToSave
+              .where(
+                (slot) => oldStatuses[slot] != _SecretReadStatus.readFailure,
+              )
+              .toSet();
+          try {
+            await _saveSecrets(
+              previous.copyWith(
+                apiKey: oldSnapshot[SettingsSecretSlot.legacy],
+                deepseekApiKey: oldSnapshot[SettingsSecretSlot.deepSeek],
+                customApiKey: oldSnapshot[SettingsSecretSlot.custom],
+              ),
+              slotsToSave: restorable,
+              explicit: restorable,
+            );
+            _secretSnapshot = oldSnapshot;
+            _secretReadStatuses.addAll(oldStatuses);
+            _pendingPlaintextKeys.addAll(oldPending);
+          } catch (error) {
+            // The durable old binding still prevents a credential leak when
+            // the backend also refuses rollback. Never log secret values.
+            AppLogger.error(
+              'Credential rollback failed: ${error.runtimeType}',
+              tag: 'settings',
+            );
+          }
+        }
+        rethrow;
+      }
       _loadedConfig = safeConfig;
     }
   }
@@ -792,12 +911,24 @@ class SettingsStore {
     // Atomic write: a kill mid-save must not leave a truncated settings.json
     // behind (that would silently reset all settings on next load).
     try {
+      final bindings = Map<String, String>.of(_credentialBindings);
+      for (final slot in [
+        SettingsSecretSlot.deepSeek,
+        SettingsSecretSlot.custom,
+      ]) {
+        if (!secretReadFailed(slot)) {
+          bindings[slot.name] = _keyFingerprint(
+            _secretSnapshot?[slot] ?? _secretValues(config)[slot]!,
+          );
+        }
+      }
       final encoded = const JsonEncoder.withIndent('  ').convert(
         <String, dynamic>{
           ...config.toJson(),
           // Provider-specific slots are authoritative after the first write.
           // A failed legacy deletion can never migrate into another provider.
           'credentialSchemaVersion': 2,
+          'credentialBindings': bindings,
           'settingsRevision': _settingsRevision + 1,
           // Only retain an existing legacy value while migration is pending.
           // Its original endpoint binding must survive unrelated saves.
@@ -810,14 +941,18 @@ class SettingsStore {
             'customApiKey': _pendingPlaintextKeys[SettingsSecretSlot.custom],
         },
       );
-      await writeFileAtomically(file, encoded);
+      await (settingsJsonWriter ?? writeFileAtomically)(file, encoded);
       _settingsSnapshot = encoded;
+      _credentialBindings = bindings;
       _allowLegacyMigration = false;
       _settingsRevision += 1;
     } catch (error) {
       throw mapSettingsWriteError(file.path, error);
     }
   }
+
+  static String _keyFingerprint(String key) =>
+      sha256.convert(utf8.encode(key.trim())).toString();
 
   Future<void> _saveSecret(
     SettingsSecretSlot slot,

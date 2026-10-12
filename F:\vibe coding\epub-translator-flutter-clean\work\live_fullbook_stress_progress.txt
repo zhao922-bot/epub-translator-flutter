@@ -1,0 +1,243 @@
+2026-10-09T17:05:24.188855 STEP inspect
+2026-10-09T17:05:24.542627 INSPECT_MS=354 chapters=3 selected=2 totalBlocks=329
+2026-10-09T17:05:24.547554 SELECTED=[8878401390937179042_1952-h-0.htm.html:278, 8878401390937179042_1952-h-1.htm.html:51]
+2026-10-09T17:05:24.549831 STEP style_profile
+2026-10-09T17:05:37.628747 STYLE genre="literary fiction" conf=high rules=6 avoid=5 ms=13440
+2026-10-09T17:05:37.634203 STYLE_JSON={"primaryGenre":"literary fiction","secondaryGenres":["horror","psychological fiction","feminist literature"],"tone":"first-person, increasingly unhinged, intimate, claustrophobic","sentenceStyle":"short declarative sentences, repetitive imagery, shifting between calm description and frantic outbursts","translationConstraints":["Preserve the recurring motif of 'creeping' and its variants; maintain the narrator's unreliable, intensifying perspective.","Keep the historical setting without resorting to archaic Chinese; use modern but restrained language.","Translate dialogue naturally, preserving John's condescending and dismissive tone.","Preserve the ellipses, dashes, and sentence fragments that convey the narrator's disordered thought.","Translate the title as '黄色墙纸' or a similar equivalent, but keep the author's name in transliteration.","Maintain the ambiguity of the final line, especially the reference to 'Jane'—do not clarify what the original leaves unresolved."],"avoid":["Over-explaining psychological metaphors or adding interpretive footnotes.","Making the prose more polished, coherent, or controlled than the original.","Using contemporary slang or internet idioms.","Smoothing out the fragmented narrative into conventionally flowing sentences.","Overtly moralizing or adding feminist commentary beyond the text."],"confidence":"high"}
+2026-10-09T17:05:37.637113 STEP phase1_cancel_after_45
+2026-10-09T17:05:37.682824 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Restoring local cache for 2 chapters and 329 extracted blocks.
+2026-10-09T17:05:37.740183 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 20/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.773285 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 40/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.800925 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 60/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.831154 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 80/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.856278 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 100/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.875754 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 120/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.893189 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 140/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.907121 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 160/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.925822 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 180/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.939819 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 200/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.951698 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 220/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.964633 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 240/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.980293 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 260/329: verified 0 reusable blocks.
+2026-10-09T17:05:37.993652 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 280/329: verified 0 reusable blocks.
+2026-10-09T17:05:38.014804 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 300/329: verified 0 reusable blocks.
+2026-10-09T17:05:38.030120 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Cache scan 320/329: verified 0 reusable blocks.
+2026-10-09T17:05:38.035324 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=Continuing translation | Reused 0 cached blocks; cache restoration made no API requests. Continuing with 329 blocks.
+2026-10-09T17:05:38.091135 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Prepared 55 batched requests for The Yellow Wallpaper.
+fiction (high).
+2026-10-09T17:05:58.351112 P1 completed=0/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 1/55 for The Yellow Wallpaper (10 blocks) took 16.66s.
+2026-10-09T17:05:58.365535 P1 completed=10/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 2/55 for The Yellow Wallpaper (7 blocks) took 20.21s.
+2026-10-09T17:06:32.864288 P1 completed=17/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 3/55 for The Yellow Wallpaper (5 blocks) took 10.74s.
+2026-10-09T17:06:32.880725 P1 completed=27/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Translated 27/329 blocks after batch 4/55 for The Yellow Wallpaper.
+ 34.46s.
+2026-10-09T17:06:46.789433 P1 completed=27/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 5/55 for The Yellow Wallpaper (5 blocks) took 13.88s.
+2026-10-09T17:06:46.803246 P1 completed=32/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 6/55 for The Yellow Wallpaper (4 blocks) took 8.37s.
+2026-10-09T17:06:54.874485 P1 completed=42/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Translated 42/329 blocks after batch 8/55 for The Yellow Wallpaper.
+ 6.42s.
+2026-10-09T17:07:06.408481 P1 completed=42/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Performance: API batch 9/55 for The Yellow Wallpaper (2 blocks) took 11.51s.
+2026-10-09T17:07:06.443723 P1 completed=44/329 files=0/2 cached=0 resumed=0 chapter=The Yellow Wallpaper | Translated 44/329 blocks after batch 9/55 for The Yellow Wallpaper.
+
+ 11.06s.
+2026-10-09T17:07:06.481229 PHASE1_ERROR type=TranslationCancelledException cancelled=true maxCompleted=48 lastCompleted=48 cached=0 resumed=0 ms=102292
+2026-10-09T17:07:06.484880 PHASE1_LAST_LOG=Translated 48/329 blocks after batch 10/55 for The Yellow Wallpaper.
+2026-10-09T17:07:06.487259 PHASE1_OK cancelled_after maxCompleted=48 / 329
+2026-10-09T17:07:06.489236 STEP phase2_resume_to_completion
+2026-10-09T17:07:06.504543 P2 completed=48/329 files=0/2 cached=0 resumed=0 chapter=Restoring cached translations | Restoring local cache for 2 chapters and 329 extracted blocks.
+26-10-09T17:07:06.447982. Verifying local cache before new API calls.
+2026-10-09T17:07:06.526785 P2 completed=48/329 files=0/2 cached=20 resumed=20 chapter=Restoring cached translations | Cache scan 20/329: verified 20 reusable blocks.
+2026-10-09T17:07:06.544461 P2 completed=48/329 files=0/2 cached=40 resumed=40 chapter=Restoring cached translations | Cache scan 40/329: verified 40 reusable blocks.
+2026-10-09T17:07:06.555379 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 60/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.562612 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 80/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.571081 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 100/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.587540 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 120/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.618795 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 140/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.629336 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 160/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.639930 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 180/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.647065 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 200/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.655446 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 220/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.667751 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 240/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.678528 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 260/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.690476 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 280/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.699381 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 300/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.710406 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Restoring cached translations | Cache scan 320/329: verified 48 reusable blocks.
+2026-10-09T17:07:06.715809 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=Continuing translation | Reused 48 cached blocks; cache restoration made no API requests. Continuing with 281 blocks.
+2026-10-09T17:07:06.741726 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Prepared 45 batched requests for The Yellow Wallpaper.
+fiction (high).
+2026-10-09T17:07:17.026359 P2 completed=48/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 1/45 for The Yellow Wallpaper (7 blocks) took 10.26s.
+2026-10-09T17:07:17.039327 P2 completed=61/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 61/329 blocks after batch 2/45 for The Yellow Wallpaper.
+ 10.11s.
+2026-10-09T17:07:27.954097 P2 completed=61/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 3/45 for The Yellow Wallpaper (5 blocks) took 10.89s.
+2026-10-09T17:07:27.966563 P2 completed=71/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 71/329 blocks after batch 4/45 for The Yellow Wallpaper.
+ 8.44s.
+2026-10-09T17:07:37.100134 P2 completed=78/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 78/329 blocks after batch 6/45 for The Yellow Wallpaper.
+ 8.10s.
+2026-10-09T17:07:45.661149 P2 completed=78/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 7/45 for The Yellow Wallpaper (3 blocks) took 8.54s.
+2026-10-09T17:07:45.673119 P2 completed=84/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 84/329 blocks after batch 8/45 for The Yellow Wallpaper.
+ 7.65s.
+2026-10-09T17:08:05.489071 P2 completed=84/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 9/45 for The Yellow Wallpaper (4 blocks) took 6.59s.
+2026-10-09T17:08:05.504026 P2 completed=92/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 92/329 blocks after batch 10/45 for The Yellow Wallpaper.
+ 19.79s.
+2026-10-09T17:08:13.909030 P2 completed=98/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 12/45 for The Yellow Wallpaper (7 blocks) took 8.34s.
+2026-10-09T17:08:13.922605 P2 completed=105/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 105/329 blocks after batch 12/45 for The Yellow Wallpaper.
+2026-10-09T17:08:22.482878 P2 completed=112/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 112/329 blocks after batch 14/45 for The Yellow Wallpaper.
+8.54s.
+2026-10-09T17:09:18.553594 P2 completed=112/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 15/45 for The Yellow Wallpaper (7 blocks) took 10.98s.
+2026-10-09T17:09:18.574806 P2 completed=124/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 124/329 blocks after batch 16/45 for The Yellow Wallpaper.
+56.03s.
+2026-10-09T17:09:44.474839 P2 completed=124/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 17/45 for The Yellow Wallpaper (4 blocks) took 6.32s.
+2026-10-09T17:09:44.487400 P2 completed=134/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 134/329 blocks after batch 18/45 for The Yellow Wallpaper.
+25.87s.
+2026-10-09T17:10:14.928029 P2 completed=134/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 19/45 for The Yellow Wallpaper (7 blocks) took 9.19s.
+2026-10-09T17:10:14.940838 P2 completed=145/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 145/329 blocks after batch 20/45 for The Yellow Wallpaper.
+30.41s.
+2026-10-09T17:10:51.688317 P2 completed=145/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 21/45 for The Yellow Wallpaper (3 blocks) took 36.72s.
+2026-10-09T17:10:51.700173 P2 completed=151/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 151/329 blocks after batch 22/45 for The Yellow Wallpaper.
+15.62s.
+2026-10-09T17:11:02.327043 P2 completed=151/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 23/45 for The Yellow Wallpaper (3 blocks) took 10.61s.
+2026-10-09T17:11:02.338180 P2 completed=156/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 156/329 blocks after batch 24/45 for The Yellow Wallpaper.
+5.23s.
+2026-10-09T17:11:44.576490 P2 completed=156/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 25/45 for The Yellow Wallpaper (4 blocks) took 10.74s.
+2026-10-09T17:11:44.591706 P2 completed=165/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 165/329 blocks after batch 26/45 for The Yellow Wallpaper.
+42.21s.
+2026-10-09T17:12:07.315580 P2 completed=165/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 27/45 for The Yellow Wallpaper (7 blocks) took 14.78s.
+2026-10-09T17:12:07.326732 P2 completed=175/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 175/329 blocks after batch 28/45 for The Yellow Wallpaper.
+22.70s.
+2026-10-09T17:12:21.273695 P2 completed=175/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 29/45 for The Yellow Wallpaper (3 blocks) took 13.92s.
+2026-10-09T17:12:21.285860 P2 completed=182/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 182/329 blocks after batch 30/45 for The Yellow Wallpaper.
+8.02s.
+2026-10-09T17:12:37.166011 P2 completed=182/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 31/45 for The Yellow Wallpaper (5 blocks) took 15.49s.
+2026-10-09T17:12:37.182071 P2 completed=193/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 193/329 blocks after batch 32/45 for The Yellow Wallpaper.
+8.52s.
+2026-10-09T17:13:42.260250 P2 completed=193/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 33/45 for The Yellow Wallpaper (6 blocks) took 13.01s.
+2026-10-09T17:13:42.284855 P2 completed=206/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 206/329 blocks after batch 34/45 for The Yellow Wallpaper.
+1m 5s.
+2026-10-09T17:14:21.983091 P2 completed=206/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 35/45 for The Yellow Wallpaper (6 blocks) took 7.56s.
+2026-10-09T17:14:22.002449 P2 completed=218/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 218/329 blocks after batch 36/45 for The Yellow Wallpaper.
+39.65s.
+2026-10-09T17:14:31.933749 P2 completed=224/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 38/45 for The Yellow Wallpaper (6 blocks) took 9.90s.
+2026-10-09T17:14:31.946781 P2 completed=230/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 230/329 blocks after batch 38/45 for The Yellow Wallpaper.
+2026-10-09T17:14:41.757661 P2 completed=240/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 240/329 blocks after batch 40/45 for The Yellow Wallpaper.
+6.93s.
+2026-10-09T17:14:54.029604 P2 completed=240/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 41/45 for The Yellow Wallpaper (9 blocks) took 10.42s.
+2026-10-09T17:14:54.042301 P2 completed=255/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 255/329 blocks after batch 42/45 for The Yellow Wallpaper.
+12.25s.
+2026-10-09T17:15:46.207821 P2 completed=255/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 43/45 for The Yellow Wallpaper (5 blocks) took 7.14s.
+2026-10-09T17:15:46.233985 P2 completed=271/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Translated 271/329 blocks after batch 44/45 for The Yellow Wallpaper.
+ 52.12s.
+2026-10-09T17:18:10.198381 P2 completed=271/329 files=0/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: API batch 45/45 for The Yellow Wallpaper (7 blocks) took 2m 23s.
+2026-10-09T17:18:10.227063 P2 completed=278/329 files=1/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Performance: Chapter 1/2 took 11m 3s. API time 14m 14s for 230 new blocks; block cache writes 3.51s across 230 writes; throughput 20.8 new blocks/min.
+2026-10-09T17:18:21.196827 P2 completed=278/329 files=1/2 cached=48 resumed=48 chapter=The Yellow Wallpaper | Book memory: updated rolling summary after The Yellow Wallpaper in 10.97s.
+2026-10-09T17:18:21.245742 P2 completed=278/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Prepared 51 batched requests for THE FULL PROJECT GUTENBERG™ LICENSE.
+2026-10-09T17:18:38.741329 P2 completed=278/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 1/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 3.48s.
+2026-10-09T17:18:38.753924 P2 completed=280/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 280/329 blocks after batch 2/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+17.48s.
+2026-10-09T17:18:47.793669 P2 completed=282/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 282/329 blocks after batch 4/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+2.96s.
+2026-10-09T17:18:51.138962 P2 completed=282/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 5/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 3.33s.
+2026-10-09T17:18:51.151472 P2 completed=284/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 284/329 blocks after batch 6/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+2.85s.
+2026-10-09T17:18:55.215239 P2 completed=286/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 286/329 blocks after batch 8/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+3.08s.
+2026-10-09T17:19:34.220064 P2 completed=286/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 9/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 38.98s.
+2026-10-09T17:19:34.243047 P2 completed=288/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 288/329 blocks after batch 10/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+4.36s.
+2026-10-09T17:21:23.864572 P2 completed=288/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 11/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 24.84s.
+2026-10-09T17:21:23.885292 P2 completed=290/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 290/329 blocks after batch 12/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+1m 49s.
+2026-10-09T17:21:51.359116 P2 completed=290/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 13/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 27.45s.
+2026-10-09T17:21:51.386922 P2 completed=292/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 292/329 blocks after batch 14/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+9.12s.
+2026-10-09T17:21:55.243576 P2 completed=294/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 294/329 blocks after batch 16/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+3.84s.
+2026-10-09T17:22:02.248345 P2 completed=294/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 17/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 3.48s.
+2026-10-09T17:22:02.299561 P2 completed=296/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 296/329 blocks after batch 18/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+6.96s.
+2026-10-09T17:22:09.255596 P2 completed=297/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 297/329 blocks after batch 19/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+6.93s.
+2026-10-09T17:22:20.078972 P2 completed=298/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 21/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 10.78s.
+2026-10-09T17:22:20.098463 P2 completed=300/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 300/329 blocks after batch 22/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+2.90s.
+2026-10-09T17:25:26.858908 P2 completed=300/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 23/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 3m 6s.
+2026-10-09T17:25:26.887376 P2 completed=302/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 302/329 blocks after batch 24/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+6.01s.
+2026-10-09T17:25:31.019252 P2 completed=304/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 304/329 blocks after batch 26/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+3.70s.
+2026-10-09T17:26:18.152667 P2 completed=304/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 27/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 5.70s.
+2026-10-09T17:26:18.175012 P2 completed=305/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 305/329 blocks after batch 27/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+47.09s.
+2026-10-09T17:26:30.258202 P2 completed=306/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 29/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 5.13s.
+2026-10-09T17:26:30.287201 P2 completed=308/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 308/329 blocks after batch 30/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+12.06s.
+2026-10-09T17:27:35.350497 P2 completed=308/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 31/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 1m 5s.
+2026-10-09T17:27:35.373542 P2 completed=309/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 32/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 3.75s.
+2026-10-09T17:27:42.609624 P2 completed=311/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 311/329 blocks after batch 33/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+7.22s.
+2026-10-09T17:27:52.073463 P2 completed=312/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 35/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 9.44s.
+2026-10-09T17:27:52.094693 P2 completed=314/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 314/329 blocks after batch 36/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+4.02s.
+2026-10-09T17:27:56.941776 P2 completed=316/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 316/329 blocks after batch 38/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+2.92s.
+2026-10-09T17:28:13.521206 P2 completed=316/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 39/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 16.55s.
+2026-10-09T17:28:13.541066 P2 completed=318/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 318/329 blocks after batch 40/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+6.95s.
+2026-10-09T17:28:20.146154 P2 completed=320/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 320/329 blocks after batch 42/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+5.82s.
+2026-10-09T17:29:26.556887 P2 completed=320/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 43/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 4.34s.
+2026-10-09T17:29:26.577877 P2 completed=322/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 322/329 blocks after batch 44/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+1m 6s.
+2026-10-09T17:32:30.541193 P2 completed=322/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 45/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 7.29s.
+2026-10-09T17:32:30.566467 P2 completed=324/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 324/329 blocks after batch 46/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+3m 3s.
+2026-10-09T17:33:35.003560 P2 completed=324/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 47/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 1m 4s.
+2026-10-09T17:33:35.028137 P2 completed=325/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Performance: API batch 48/51 for THE FULL PROJECT GUTENBERG™ LICENSE (1 blocks) took 4.56s.
+2026-10-09T17:33:38.975302 P2 completed=328/329 files=1/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Translated 328/329 blocks after batch 50/51 for THE FULL PROJECT GUTENBERG™ LICENSE.
+3.93s.
+2026-10-09T17:33:43.109086 P2 completed=329/329 files=2/2 cached=48 resumed=48 chapter=THE FULL PROJECT GUTENBERG™ LICENSE | Book memory: skipped chapter summary after THE FULL PROJECT GUTENBERG™ LICENSE because no later uncached blocks need it.
+ghput 3.3 new blocks/min.
+2026-10-09T17:33:43.121610 P2 completed=329/329 files=2/2 cached=48 resumed=48 chapter=Repacking EPUB | Writing translated XHTML back into the EPUB package.
+2026-10-09T17:33:47.376646 P2 completed=329/329 files=2/2 cached=48 resumed=48 chapter=EPUB ready | Performance: Translation run took 26m 40s. Translated 281 new blocks at 10.5 blocks/min on average, excluding cache and resume hits. Total API time 31m 47s; book memory 10.97s across 1 requests; block cache writes 5.49s across 281 writes.
+2026-10-09T17:33:47.390704 PHASE2_DONE status=completed completed=329/329 cached=48 resumed=48 files=2/2 ms=1703202
+2026-10-09T17:33:47.398266 PHASE2_OUTPUT=/tmp/live_fullbook_stress_FQOYFE/yellow-wallpaper_stress_fullbook.epub
+2026-10-09T17:33:47.399342 PHASE2_MILESTONES=5
+2026-10-09T17:33:47.400149 P2_MILESTONE c=48/329 cache=0 resume=0 | Found a saved translation checkpoint with 48/329 blocks from 2026-10-09T17:07:06.447982. Verifying local cache before new API calls.
+2026-10-09T17:33:47.400931 P2_MILESTONE c=48/329 cache=48 resume=48 | Reused 48 cached blocks; cache restoration made no API requests. Continuing with 281 blocks.
+2026-10-09T17:33:47.401643 P2_MILESTONE c=48/329 cache=48 resume=48 | Reused 48 cached blocks for The Yellow Wallpaper.
+2026-10-09T17:33:47.402429 P2_MILESTONE c=278/329 cache=48 resume=48 | Completed chapter 1/2: The Yellow Wallpaper
+2026-10-09T17:33:47.403176 P2_MILESTONE c=329/329 cache=48 resume=48 | Completed chapter 2/2: THE FULL PROJECT GUTENBERG™ LICENSE
+2026-10-09T17:33:47.405592 STEP phase3_full_cache_rerun
+2026-10-09T17:33:47.417112 P3 completed=329/329 cached=0 resumed=0 | Restoring local cache for 2 chapters and 329 extracted blocks.
+026-10-09T17:33:47.376766. Verifying local cache before new API calls.
+2026-10-09T17:33:47.481476 P3 completed=329/329 cached=20 resumed=20 | Cache scan 20/329: verified 20 reusable blocks.
+2026-10-09T17:33:47.547621 P3 completed=329/329 cached=40 resumed=40 | Cache scan 40/329: verified 40 reusable blocks.
+2026-10-09T17:33:47.589742 P3 completed=329/329 cached=60 resumed=60 | Cache scan 60/329: verified 60 reusable blocks.
+2026-10-09T17:33:47.617072 P3 completed=329/329 cached=80 resumed=80 | Cache scan 80/329: verified 80 reusable blocks.
+2026-10-09T17:33:47.651936 P3 completed=329/329 cached=100 resumed=100 | Cache scan 100/329: verified 100 reusable blocks.
+2026-10-09T17:33:47.672814 P3 completed=329/329 cached=120 resumed=120 | Cache scan 120/329: verified 120 reusable blocks.
+2026-10-09T17:33:47.695202 P3 completed=329/329 cached=140 resumed=140 | Cache scan 140/329: verified 140 reusable blocks.
+2026-10-09T17:33:47.713544 P3 completed=329/329 cached=160 resumed=160 | Cache scan 160/329: verified 160 reusable blocks.
+2026-10-09T17:33:47.730698 P3 completed=329/329 cached=180 resumed=180 | Cache scan 180/329: verified 180 reusable blocks.
+2026-10-09T17:33:47.748991 P3 completed=329/329 cached=200 resumed=200 | Cache scan 200/329: verified 200 reusable blocks.
+2026-10-09T17:33:47.763206 P3 completed=329/329 cached=220 resumed=220 | Cache scan 220/329: verified 220 reusable blocks.
+2026-10-09T17:33:47.780110 P3 completed=329/329 cached=240 resumed=240 | Cache scan 240/329: verified 240 reusable blocks.
+2026-10-09T17:33:47.793469 P3 completed=329/329 cached=260 resumed=260 | Cache scan 260/329: verified 260 reusable blocks.
+2026-10-09T17:33:47.820806 P3 completed=329/329 cached=280 resumed=280 | Cache scan 280/329: verified 280 reusable blocks.
+2026-10-09T17:33:47.836477 P3 completed=329/329 cached=300 resumed=300 | Cache scan 300/329: verified 300 reusable blocks.
+2026-10-09T17:33:47.852234 P3 completed=329/329 cached=320 resumed=320 | Cache scan 320/329: verified 320 reusable blocks.
+2026-10-09T17:33:47.857254 P3 completed=329/329 cached=329 resumed=329 | Reused all 329 blocks; this run made no API requests.
+2026-10-09T17:33:47.870385 P3 completed=329/329 cached=329 resumed=329 | Book memory: skipped chapter summary after The Yellow Wallpaper because no later uncached blocks need it.
+throughput 0.0 new blocks/min.
+2026-10-09T17:33:47.884367 P3 completed=329/329 cached=329 resumed=329 | Book memory: skipped chapter summary after THE FULL PROJECT GUTENBERG™ LICENSE because no later uncached blocks need it.
+w blocks/min.
+2026-10-09T17:33:47.895718 P3 completed=329/329 cached=329 resumed=329 | Writing translated XHTML back into the EPUB package.
+2026-10-09T17:33:50.694029 P3 completed=329/329 cached=329 resumed=329 | Performance: Translation run took 3.28s. Translated 0 new blocks at 0.0 blocks/min on average, excluding cache and resume hits. Total API time 0ms; book memory 0ms across 0 requests; block cache writes 0ms across 0 writes.
+2026-10-09T17:33:50.709951 PHASE3_DONE status=completed completed=329/329 cached=329 resumed=329 elapsedMs=3303 ms=1706521
+2026-10-09T17:33:50.712433 STEP quality_sample_on_output
+2026-10-09T17:33:50.748997 QUALITY sampleChapters=2 checked=8 emptyFail=0 unchangedFail=0 noHanFail=0 residualFail=0
+2026-10-09T17:33:50.750510 --- SAMPLE 1 8878401390937179042_1952-h-0.htm.html id=span-2 ---
+2026-10-09T17:33:50.751935 EN: This eBook is for the use of anyone anywhere in the United States and most other parts of the world at no cost and with almost no restrictions whatsoever. You may copy it, give it away or re-use it under the terms of the Project Gutenberg License included with this eBook or on...
+2026-10-09T17:33:50.752763 ZH: 本电子书供美国及世界大部分地区的任何人免费使用，几乎没有任何限制。您可以根据随本电子书附带的古腾堡计划许可条款或访问 www.gutenberg.org 在线获取的条款，复制、分发或重新使用本电子书。如果您不在美国，使用本电子书前需查阅您所在国家的法律。
+2026-10-09T17:33:50.753653 --- SAMPLE 2 8878401390937179042_1952-h-1.htm.html id=span-3 ---
+2026-10-09T17:33:50.758957 EN: Creating the works from print editions not protected by U.S. copyright law means that no one owns a United States copyright in these works, so the Foundation (and you!) can copy and distribute it in the United States without permission and without paying copyright royalties. S...
+2026-10-09T17:33:50.770818 ZH: 从不受美国版权法保护的印刷版本创作作品，意味着没有人拥有这些作品的美国版权， 因此基金会（还有你！）可以在美国未经许可、无需支付版权费地复制和分发它们。 本许可证的通用使用条款部分规定了适用于复制和分发Project Gutenberg™电子作品的特殊规则，以保护PROJECT GUTENBERG™ 的概念和商标。Project Gutenberg是注册商标， 如果你对电子书收费，则不得使用该商标，除非遵循 商标许可的条款，包括为使用Project Gutenberg商标支付版税。如果你对 本电子书的副本不收取任何费用，遵守商标许可就非常 容易。你...
+2026-10-09T17:33:50.777900 SUMMARY phase1_cancel_at=48 phase2_cached=48 phase2_resumed=48 phase3_cached=329 phase3_ms=3303 total_ms=1706589 selected_chapters=2 total_blocks=329
+2026-10-09T17:33:50.783455 DONE
