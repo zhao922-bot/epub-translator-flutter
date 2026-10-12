@@ -2,6 +2,41 @@
 
 本项目遵循语义化版本号；`+` 后的数字为构建号。
 
+## [1.6.18] - 2026-10-12
+
+构建号：`1.6.18+34`。opencode `6.1-sol` 审查轮 13 项确认全修（9 项为"修 bug 引入的新 bug"，多为并发/竞态类交互回归）。
+
+### 修复（P1）
+
+- 翻译：单块 HTTP 400 且含 context-overflow 语义时走降级保留原文（v1.6.17 的 overflow 检查对 400 不可达，修法意图落空）。
+- 设置：revert v1.6.17 的 lock 文件删除——POSIX 锁绑定 inode，删 sidecar 会让两进程各锁各的 inode，跨进程互斥失效；sidecar 永久保留。
+- 设置：冲突重放绑定原始端点/服务商/槽位；重放时服务已变更则拒绝自动重放并提示确认（fail-closed），密钥不再被发往错的服务。
+
+### 修复（P2）
+
+- 翻译：`onChapterSourcesReleased` 回调加异常隔离（照抄 `onProgress` 模式），回调异常不再中断整本流水线。
+- 翻译：批量 slot 保存前复用逐槽的包装校验，"翻译结果："前缀/Markdown/HTML 包装走 fallback 不再直接进缓存。
+- 翻译：书名翻译加包装清理，不合格置 `titleTranslationFailed`，污染书名不再写入 OPF/NCX。
+- 估算：run 开始时冻结 static 估算（v1.6.16 的 #42 接线曾使全书总量随章节完成递减且每章触发全书重扫）。
+- 分享（Android）：chooser 启动失败回滚已登记的 grant 并删除快照文件。
+- 设置：自动恢复重放已记录的冲突编辑；reload 失败不再提前清空冲突队列。
+- 缓存：轻量配额强制加 mtime 比对（fail-closed），同尺寸重写不再被误删；检查点配对删除前复查伴侣状态。
+- 历史：损坏备份前重读比对指纹，不再移走另一实例刚修好的文件。
+
+## [1.6.17] - 2026-10-12
+
+构建号：`1.6.17+33`。spark 终审轮 24 项确认全修（P1×1、P2×13、性能×4、代码质量×6）。
+
+### 修复（P1）
+
+- 翻译：取消/失败后"继续翻译"不再因 UI 源文本已释放而抛 `Source block order changed`——`ChapterSourceRestorer` 加 archive 回退（按源书批量回读、指纹校验）。
+
+### 其他
+
+- 记忆 checkpoint 先 record 再 persist；footnote 批量遇 context-overflow 走 shrink 重试；context-overflow 判定收紧；单块独占批次自适应输出上限；逐槽上下文按位置取窗口；批量 slot 拒空文本；记忆快照/检查点落盘去 O(n²)；取消监听器回调异常隔离。
+- 设置：API 地址拒 fragment；钥匙串外部删密钥保持 `missing`；冲突 reload 自动重放用户编辑；缓存退避期轻量配额；`settings.json.lock` 不再删除（后在 1.6.18 revert 相关逻辑并固化保留语义）；迁移冲突单独分类。
+- 导出/平台：Windows 路径后缀预算统一；share grant 串行化；配额驱逐保护活跃分享；`.recovery-index` 纳入回收；inspection job ID 加序列号；sweep 改单次删除。
+
 ## [1.6.0] - 2026-10-09
 
 构建号：`1.6.0+16`。四轮代码审查共 21 项修复，聚焦翻译可靠性、密钥安全与 EPUB 导出。

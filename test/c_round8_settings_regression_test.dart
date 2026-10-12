@@ -215,8 +215,8 @@ void main() {
     });
   });
 
-  group('C-6 lock 文件不残留', () {
-    test('加锁解锁后 lock 文件被删除', () async {
+  group('P1-#2 lock 文件永久保留（不分裂锁身份）', () {
+    test('加锁解锁后 lock 文件保留', () async {
       final dir = await Directory.systemTemp.createTemp('c8_c6_');
       addTearDown(() => dir.delete(recursive: true));
       final file = File(p.join(dir.path, 'settings.json'));
@@ -227,10 +227,13 @@ void main() {
         return 'ok';
       });
       expect(result, 'ok');
-      expect(lockFile.existsSync(), isFalse);
+      // P1-#2：删除 sidecar 会分裂锁身份（POSIX 锁绑定 inode 不绑定
+      // 路径），另一个进程可建同名新文件锁住不同 inode，导致互斥失效。
+      // 空 sidecar 永久保留是正确的（与 job_history_store 一致）。
+      expect(lockFile.existsSync(), isTrue);
     });
 
-    test('action 抛错时 lock 文件同样被清理', () async {
+    test('action 抛错时 lock 文件同样保留', () async {
       final dir = await Directory.systemTemp.createTemp('c8_c6_err_');
       addTearDown(() => dir.delete(recursive: true));
       final file = File(p.join(dir.path, 'settings.json'));
@@ -242,7 +245,20 @@ void main() {
         }),
         throwsStateError,
       );
-      expect(lockFile.existsSync(), isFalse);
+      expect(lockFile.existsSync(), isTrue);
+    });
+
+    test('重复加锁复用同一个 sidecar 文件', () async {
+      final dir = await Directory.systemTemp.createTemp('c8_c6_reuse_');
+      addTearDown(() => dir.delete(recursive: true));
+      final file = File(p.join(dir.path, 'settings.json'));
+      final lockFile = File('${file.absolute.path}.lock');
+
+      await withSettingsFileLock(file, () async {});
+      final DateTime created = (await lockFile.stat()).changed;
+      await withSettingsFileLock(file, () async {});
+      // ctime 未变：没有删除-重建分裂锁身份，复用的是同一个文件。
+      expect((await lockFile.stat()).changed, created);
     });
   });
 

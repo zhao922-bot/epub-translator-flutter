@@ -60,6 +60,10 @@ final settingsProvider =
             ref.read(settingsWriteConflictProvider.notifier).state = (
               id: DateTime.now().microsecondsSinceEpoch,
             ),
+        onReplayBlocked: () =>
+            ref.read(settingsReplayBlockedProvider.notifier).state = (
+              id: DateTime.now().microsecondsSinceEpoch,
+            ),
       ),
     );
 
@@ -87,9 +91,14 @@ final settingsSaveErrorProvider =
 /// save again.
 ///
 /// Same event-record pattern as [settingsSaveErrorProvider].
-final settingsWriteConflictProvider = StateProvider<({int id})?>(
-  (ref) => null,
-);
+final settingsWriteConflictProvider = StateProvider<({int id})?>((ref) => null);
+
+/// Holds the latest credential replay blocked by a changed service route.
+///
+/// The queued edit is retained until the user explicitly confirms the new
+/// target or discards it. Uses the event-record pattern so repeated blocked
+/// replay attempts can each notify the UI.
+final settingsReplayBlockedProvider = StateProvider<({int id})?>((ref) => null);
 
 /// Holds the latest "settings.json was unreadable/corrupt, defaults were
 /// restored" event, if any.
@@ -144,6 +153,13 @@ typedef _ConflictedEdit = ({
   TranslationConfig Function(TranslationConfig) update,
   Set<SettingsSecretSlot> explicitSecretMutations,
   Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
+  ({
+    ApiProviderSelection providerSelection,
+    String apiBaseUrl,
+    String customApiBaseUrl,
+    Set<SettingsSecretSlot> secretSlots,
+  })
+  credentialRoute,
 });
 
 class SettingsController extends StateNotifier<TranslationConfig> {
@@ -154,6 +170,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     this.onSecretKeyRotated,
     this.onSecretsRecovered,
     this.onWriteConflict,
+    this.onReplayBlocked,
   }) : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
@@ -179,6 +196,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// changed settings.json, so this instance's snapshot is stale. The page
   /// offers a "reload" recovery action.
   final void Function()? onWriteConflict;
+
+  /// Called once per replay pass when credential edits need confirmation
+  /// because their target service changed.
+  final void Function()? onReplayBlocked;
   final Set<SettingsSecretSlot> _unresolvedSecretFailures = {};
   Timer? _sliderTimer;
   Completer<bool>? _sliderCompletion;
@@ -188,11 +209,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   /// Edits whose save failed with [SettingsWriteConflict]. [reloadSettings]
   /// re-applies them onto the freshly loaded snapshot instead of silently
-  /// discarding the user's work — the same shape as the automatic recovery
-  /// path ([_ensureConfigLoaded] followed by [_update]: reload first, then
-  /// apply the edit closure). Cleared by any successful save, which means
-  /// the user moved on from the conflicted base.
+  /// discarding the user's work. Automatic load recovery uses the same replay
+  /// path; blocked credential edits remain queued until confirmed or discarded.
   final List<_ConflictedEdit> _conflictedEdits = <_ConflictedEdit>[];
+  bool _replayingConflictedEdits = false;
 
   /// The latest debounced (slider) transformation not yet flushed. Slider
   /// setters are absolute, so chaining keeps the effective transformation.
@@ -206,16 +226,16 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   bool secretReadFailed(SettingsSecretSlot slot) =>
       _store.secretReadFailed(slot);
 
-  Future<void> _load() async {
+  Future<bool> _load() async {
     final TranslationConfig loaded;
     try {
       loaded = await _store.load();
     } catch (error) {
       if (mounted) onSaveError?.call(error);
-      return;
+      return false;
     }
     if (!mounted) {
-      return;
+      return false;
     }
     _loaded = true;
     state = loaded;
@@ -225,6 +245,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (_store.secretKeyRotated) {
       onSecretKeyRotated?.call();
     }
+    return true;
   }
 
   Future<void> _persist(
@@ -264,10 +285,18 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (!mounted) {
       return false;
     }
-    if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
+    final bool hadLoadError = _store.configLoadError != null;
+    if (hadLoadError && !await _ensureConfigLoaded()) {
       return false;
     }
+    if (hadLoadError) await _replayConflictedEdits();
     final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
+    final credentialRoute = (
+      providerSelection: state.apiProviderSelection,
+      apiBaseUrl: state.apiBaseUrl,
+      customApiBaseUrl: state.customApiBaseUrl,
+      secretSlots: Set<SettingsSecretSlot>.of(slots),
+    );
     final TranslationConfig next = update(state);
     if (!mounted) {
       return false;
@@ -304,6 +333,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
         update: effectiveUpdate,
         explicitSecretMutations: explicitSecretMutations,
         secretMutationsFor: secretMutationsFor,
+        credentialRoute: credentialRoute,
       ),
     );
     pendingSlider?.complete(result);
@@ -327,6 +357,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
                 update: debounced,
                 explicitSecretMutations: const <SettingsSecretSlot>{},
                 secretMutationsFor: null,
+                credentialRoute: (
+                  providerSelection: state.apiProviderSelection,
+                  apiBaseUrl: state.apiBaseUrl,
+                  customApiBaseUrl: state.customApiBaseUrl,
+                  secretSlots: const <SettingsSecretSlot>{},
+                ),
               ),
       ),
     );
@@ -339,9 +375,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   }) async {
     try {
       await _persist(next, explicitSecretMutations: slots);
-      // A save that went through supersedes any conflicted base: the user
-      // moved on, so stale replay closures must not linger.
-      _conflictedEdits.clear();
+      // Successful saves must retain blocked or newly conflicted replays.
       _unresolvedSecretFailures.removeAll(slots);
       if (mounted) {
         // Secret read status can change even when the displayed value doesn't.
@@ -384,20 +418,85 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// failed state wholesale) keeps the other instance's unrelated changes
   /// intact. Clears the store's load error on success.
   Future<void> reloadSettings() async {
+    if (!await _load()) return;
+    await _replayConflictedEdits();
+  }
+
+  bool _isReplayBlockedByRouteChange(_ConflictedEdit edit) {
+    final route = edit.credentialRoute;
+    return route.secretSlots.any(
+          (slot) => const {
+            SettingsSecretSlot.legacy,
+            SettingsSecretSlot.deepSeek,
+            SettingsSecretSlot.custom,
+          }.contains(slot),
+        ) &&
+        (route.providerSelection != state.apiProviderSelection ||
+            route.apiBaseUrl != state.apiBaseUrl ||
+            route.customApiBaseUrl != state.customApiBaseUrl);
+  }
+
+  Future<void> _replayConflictedEdits() async {
+    if (_replayingConflictedEdits || !mounted) return;
+    _replayingConflictedEdits = true;
     final List<_ConflictedEdit> pending = _conflictedEdits.toList();
     _conflictedEdits.clear();
-    await _load();
-    for (final edit in pending) {
-      if (!mounted) break;
-      // A replay that conflicts again re-records itself via [_saveUpdate]
-      // and re-surfaces the conflict, so no edit is silently dropped.
-      await _update(
-        edit.update,
-        explicitSecretMutations: edit.explicitSecretMutations,
-        secretMutationsFor: edit.secretMutationsFor,
-      );
+    int blocked = 0;
+    try {
+      for (int i = 0; i < pending.length; i++) {
+        if (!mounted) {
+          _conflictedEdits.addAll(pending.skip(i));
+          break;
+        }
+        final edit = pending[i];
+        // If recovery cannot load, _update never reaches _saveUpdate to
+        // re-enqueue the edit. Keep this and the remaining edits for retry.
+        if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
+          _conflictedEdits.addAll(pending.skip(i));
+          break;
+        }
+        if (_isReplayBlockedByRouteChange(edit)) {
+          _conflictedEdits.add(edit);
+          blocked++;
+          continue;
+        }
+        await _update(
+          edit.update,
+          explicitSecretMutations: edit.explicitSecretMutations,
+          secretMutationsFor: edit.secretMutationsFor,
+        );
+      }
+    } finally {
+      _replayingConflictedEdits = false;
+      if (blocked > 0 && mounted) onReplayBlocked?.call();
     }
   }
+
+  /// Explicitly accepts the current service route for queued credential edits.
+  Future<void> confirmBlockedConflictReplays() async {
+    if (!mounted) return;
+    for (int i = 0; i < _conflictedEdits.length; i++) {
+      final edit = _conflictedEdits[i];
+      _conflictedEdits[i] = (
+        update: edit.update,
+        explicitSecretMutations: edit.explicitSecretMutations,
+        secretMutationsFor: edit.secretMutationsFor,
+        credentialRoute: (
+          providerSelection: state.apiProviderSelection,
+          apiBaseUrl: state.apiBaseUrl,
+          customApiBaseUrl: state.customApiBaseUrl,
+          secretSlots: Set<SettingsSecretSlot>.of(
+            edit.secretMutationsFor?.call(state) ??
+                edit.explicitSecretMutations,
+          ),
+        ),
+      );
+    }
+    await _replayConflictedEdits();
+  }
+
+  /// Discards queued conflict edits, including blocked credential replays.
+  void discardBlockedConflictReplays() => _conflictedEdits.clear();
 
   Future<bool> setApiBaseUrl(String value) => _update((config) {
     final String nextUrl = value.trim();
@@ -443,7 +542,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> setThemeMode(AppThemeMode value) =>
       _update((config) => config.copyWith(themeMode: value));
 
-  Future<void> setTargetLanguage(String value) =>
+  Future<bool> setTargetLanguage(String value) =>
       _update((config) => config.copyWith(targetLanguage: value.trim()));
 
   Future<void> setBilingual(bool value) =>

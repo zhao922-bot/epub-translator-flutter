@@ -65,7 +65,7 @@ class _ReleasingRepository implements TranslationRepository {
     required TranslationConfig config,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
-  }) async {
+}) async {
     final TranslationJob job = _inspectedJob(inputPath, outputDirectory);
     onProgress?.call(job, 'Inspection complete.');
     return InspectionResult(job: job, chapters: chapters());
@@ -222,6 +222,51 @@ void main() {
         controller.state.inspectedChapters.single.body,
         bodyBefore,
         reason: 'unknown release paths must not touch existing chapters',
+      );
+    },
+  );
+
+  test(
+    'P2-#7: releasing chapter sources mid-run does not shrink the estimate',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('source_release_');
+      addTearDown(() => temp.delete(recursive: true));
+      final repository = _ReleasingRepository();
+      final controller = TranslationDashboardController(
+        repository: repository,
+      );
+      addTearDown(controller.debugDispose);
+      repository.readState = () => controller.state;
+      controller.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      controller.setInputPath('${temp.path}/book.epub');
+      await controller.startInspection();
+
+      // The static estimate is frozen from the full sources at run start
+      // (startTranslation calls _buildEstimate before any release).
+      await controller.startTranslation();
+
+      expect(
+        repository.chapterAtReleaseTime,
+        isNotNull,
+        reason: 'the release callback must have fired mid-run',
+      );
+      // The release cleared block.sourceText; the frozen static part must
+      // still report the pre-run totals instead of shrinking.
+      final frozen = controller.debugStaticEstimateCache;
+      expect(frozen, isNotNull);
+      expect(frozen!.estimatedSourceChars, greaterThan(0));
+      expect(
+        controller.state.runEstimate?.estimatedSourceChars,
+        frozen.estimatedSourceChars,
+        reason:
+            'run totals must stay frozen after sources are released, not '
+            'shrink as chapters complete',
+      );
+      expect(
+        controller.state.runEstimate?.estimatedInputTokens,
+        frozen.estimatedInputTokens,
       );
     },
   );

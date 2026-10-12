@@ -1,8 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import '../logging/app_logger.dart';
-
 // POSIX file locks are process-scoped, so also serialize stores in this isolate.
 final Map<String, Future<void>> _settingsWriters = {};
 
@@ -32,28 +30,16 @@ Future<T> withSettingsFileLock<T>(
     }
     return await action();
   } finally {
-    try {
-      await handle?.close();
-    } finally {
-      // Best-effort cleanup of the sidecar lock file: it is only needed
-      // while the lock is held, and leaving it behind pollutes the
-      // settings directory forever. Deletion must come after close —
-      // on Windows deleting an open file fails. A failure (e.g. another
-      // process holding the file) is logged, never thrown: releasing the
-      // lock must not fail because of cleanup.
-      try {
-        if (await lockFile.exists()) await lockFile.delete();
-      } catch (error) {
-        AppLogger.warn(
-          'Could not delete settings lock file ${lockFile.path} '
-          '($error); leaving it in place.',
-          tag: 'settings',
-        );
-      }
-      done.complete();
-      if (identical(_settingsWriters[key], done.future)) {
-        _settingsWriters.remove(key);
-      }
+    // Never delete the sidecar lock file here: POSIX locks are tied to the
+    // inode, not the path. Deleting the file lets another process create a
+    // new file at the same path and lock a different inode, so two
+    // processes could hold "the lock" simultaneously and corrupt settings.
+    // An empty sidecar left behind is harmless (job_history_store keeps its
+    // sidecar permanently for the same reason).
+    await handle?.close();
+    done.complete();
+    if (identical(_settingsWriters[key], done.future)) {
+      _settingsWriters.remove(key);
     }
   }
 }

@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../shared/io/atomic_file_writer.dart';
@@ -79,6 +81,11 @@ class JobHistoryStore {
 
   final Future<File> Function()? historyFileProvider;
 
+  @visibleForTesting
+  Future<void> Function()? onBeforeCorruptBackupForTest;
+
+  String _fingerprint(String raw) => sha256.convert(utf8.encode(raw)).toString();
+
   Future<List<TranslationJob>> load() async => (await loadWithTombstone()).jobs;
 
   /// Loads the history together with the clear tombstone: the
@@ -99,16 +106,27 @@ class JobHistoryStore {
       // Windows Notepad writes UTF-8 with BOM; without stripping, a
       // hand-edited job-history.json parses as corrupt, the load returns
       // empty, and the next persist silently wipes the whole history.
-      final Object? decoded = jsonDecode(
-        stripLeadingBom(await file.readAsString()),
-      );
-      final Object? jobsNode = decoded is Map<String, dynamic>
-          ? decoded['jobs']
-          : decoded;
-      final int clearedAt = decoded is Map<String, dynamic>
-          ? _readClearedAt(decoded)
-          : 0;
-      return (jobs: _parseJobs(jobsNode), clearedAt: clearedAt);
+      final String raw = await file.readAsString();
+      try {
+        final Object? decoded = jsonDecode(stripLeadingBom(raw));
+        final Object? jobsNode = decoded is Map<String, dynamic>
+            ? decoded['jobs']
+            : decoded;
+        final int clearedAt = decoded is Map<String, dynamic>
+            ? _readClearedAt(decoded)
+            : 0;
+        return (jobs: _parseJobs(jobsNode), clearedAt: clearedAt);
+      } catch (parseError) {
+        // Preserve genuinely unparseable history, unless another writer has
+        // changed it since this read (including repairing its clear tombstone).
+        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
+        AppLogger.error(
+          'Failed to parse job-history.json; moved aside and starting fresh.',
+          tag: 'history',
+          error: parseError,
+        );
+        return (jobs: const <TranslationJob>[], clearedAt: 0);
+      }
     } on FileSystemException catch (error) {
       // Transient IO failure (an antivirus/indexer lock on Windows, a
       // disappearing network drive): the file is not corrupt, only
@@ -121,26 +139,21 @@ class JobHistoryStore {
         error: error,
       );
       return (jobs: const <TranslationJob>[], clearedAt: 0);
-    } catch (error) {
-      // A genuinely unparseable history file would otherwise be silently
-      // overwritten by the next persist with no recovery path; rename it
-      // aside (best effort) like the settings store does.
-      await _backupCorruptHistoryFile();
-      AppLogger.error(
-        'Failed to parse job-history.json; moved aside and starting fresh.',
-        tag: 'history',
-        error: error,
-      );
-      return (jobs: const <TranslationJob>[], clearedAt: 0);
     }
   }
 
   /// Renames an unparseable history file aside (best effort) so the next
   /// [save] cannot silently destroy it with no recovery path.
-  Future<void> _backupCorruptHistoryFile() async {
+  Future<void> _backupCorruptHistoryFile({String? expectedFingerprint}) async {
     try {
+      await onBeforeCorruptBackupForTest?.call();
       final File file = await _historyFile();
       if (!await file.exists()) return;
+      final String raw = await file.readAsString();
+      if (expectedFingerprint != null &&
+          _fingerprint(raw) != expectedFingerprint) {
+        return;
+      }
       final String backupPath = path.join(
         file.parent.path,
         'job-history.json.bad-${DateTime.now().microsecondsSinceEpoch}',
@@ -221,10 +234,9 @@ class JobHistoryStore {
     final File file = await _historyFile();
     await file.parent.create(recursive: true);
     if (await file.exists()) {
+      final String raw = await file.readAsString();
       try {
-        final Object? decoded = jsonDecode(
-          stripLeadingBom(await file.readAsString()),
-        );
+        final Object? decoded = jsonDecode(stripLeadingBom(raw));
         if (decoded is Map<String, dynamic> &&
             _readClearedAt(decoded) > clearedAtEpochMs) {
           throw HistoryWriteConflict(_readClearedAt(decoded));
@@ -232,7 +244,7 @@ class JobHistoryStore {
       } on HistoryWriteConflict {
         rethrow;
       } on FormatException {
-        await _backupCorruptHistoryFile();
+        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
         if (await file.exists()) rethrow;
       }
     }
@@ -301,10 +313,9 @@ class JobHistoryStore {
         int fileClearedAt = 0;
         List<TranslationJob> fileJobs = const <TranslationJob>[];
         if (await file.exists()) {
+          final String raw = await file.readAsString();
           try {
-            final Object? decoded = jsonDecode(
-              stripLeadingBom(await file.readAsString()),
-            );
+            final Object? decoded = jsonDecode(stripLeadingBom(raw));
             final int clearedAt = decoded is Map<String, dynamic>
                 ? _readClearedAt(decoded)
                 : 0;
@@ -319,7 +330,9 @@ class JobHistoryStore {
           } on FormatException {
             // Only parse failures can start fresh, after preserving evidence.
             // IO failures must propagate: an unreadable file is not empty.
-            await _backupCorruptHistoryFile();
+            await _backupCorruptHistoryFile(
+              expectedFingerprint: _fingerprint(raw),
+            );
             if (await file.exists()) rethrow;
           }
         }

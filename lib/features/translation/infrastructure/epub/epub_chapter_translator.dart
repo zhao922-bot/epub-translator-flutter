@@ -1625,7 +1625,16 @@ class EpubChapterTranslator {
           if (invocationIndex != null) {
             invocationChapters[invocationIndex] = released;
           }
-          onChapterSourcesReleased?.call(chapter.path);
+          try {
+            onChapterSourcesReleased?.call(chapter.path);
+          } catch (error) {
+            // A UI-side chapter-sources-released listener must never abort a
+            // translation run. Log the failure and keep the pipeline going.
+            AppLogger.warn(
+              'Chapter-sources-released callback failed (${error.runtimeType}); continuing.',
+              tag: 'translate',
+            );
+          }
           translatedByChapterIndex.remove(chapterIndex);
           pendingBlocksByChapter.remove(chapterIndex);
           restoration.translationsByChapter.remove(chapter.path);
@@ -1990,7 +1999,16 @@ class EpubChapterTranslator {
           if (invocationIndex != null) {
             invocationChapters[invocationIndex] = released;
           }
-          onChapterSourcesReleased?.call(chapter.path);
+          try {
+            onChapterSourcesReleased?.call(chapter.path);
+          } catch (error) {
+            // A UI-side chapter-sources-released listener must never abort a
+            // translation run. Log the failure and keep the pipeline going.
+            AppLogger.warn(
+              'Chapter-sources-released callback failed (${error.runtimeType}); continuing.',
+              tag: 'translate',
+            );
+          }
           restoration.translationsByChapter.remove(chapter.path);
         }
       } catch (error) {
@@ -3404,6 +3422,74 @@ class EpubChapterTranslator {
     return false;
   }
 
+  static String cleanBookTitleForTest(String raw) => _cleanBookTitle(raw);
+
+  static String _cleanBookTitle(String raw) {
+    String value = raw.trim();
+    // Peel nested presentation wrappers without changing the title itself.
+    while (true) {
+      final String previous = value;
+      final fence = RegExp(
+        r'^```[^\r\n`]*\r?\n([\s\S]*?)\r?\n```$',
+      ).firstMatch(value);
+      if (fence != null) value = fence.group(1)!.trim();
+      value = value
+          .replaceFirst(
+            RegExp(
+              r'^(?:(?:好的|当然|可以|没问题)[，,。.!！\s]*)?(?:(?:以下|下面)是)?(?:译文|翻译(?:结果|内容)?)(?:如下)?\s*[:：]',
+            ),
+            '',
+          )
+          .replaceFirst(
+            RegExp(
+              r"^(?:(?:sure|certainly|of course|okay|ok)[,!.]?\s*)?(?:here(?:'s| is)\s+)?(?:the\s+)?(?:translation(?: result)?|translated (?:text|html(?: fragment)?))(?:\s+is)?\s*[:：]",
+              caseSensitive: false,
+            ),
+            '',
+          )
+          .trim();
+      value = value
+          .replaceFirst(RegExp(r'^(?:#{1,6}|>|[-+*]|\d+[.)])\s+'), '')
+          .trim();
+      for (final String marker in <String>['**', '__', '~~', '*', '_']) {
+        if (value.length >= marker.length * 2 &&
+            value.startsWith(marker) &&
+            value.endsWith(marker)) {
+          value = value
+              .substring(marker.length, value.length - marker.length)
+              .trim();
+          break;
+        }
+      }
+      for (final pair in <(String, String)>[
+        ('"', '"'),
+        ("'", "'"),
+        ('「', '」'),
+        ('『', '』'),
+        ('“', '”'),
+        ('‘', '’'),
+        ('＂', '＂'),
+        ('«', '»'),
+      ]) {
+        if (value.length >= 2 &&
+            value.startsWith(pair.$1) &&
+            value.endsWith(pair.$2)) {
+          value = value.substring(1, value.length - 1).trim();
+          break;
+        }
+      }
+      if (value == previous) break;
+    }
+    if (value.isEmpty) {
+      throw const FormatException('Empty translated book title');
+    }
+    _EpubTranslationStrategy._validateIndividualSlotTranslation(
+      sourceText: value,
+      translatedText: value,
+    );
+    return value;
+  }
+
   /// Translates the book's metadata title with a single lightweight API call.
   /// Returns null when translation is unnecessary. Failures are handled by the
   /// caller as a non-fatal warning, keeping the original title in the repacker.
@@ -3433,12 +3519,9 @@ class EpubChapterTranslator {
       data: requestData,
       cancelToken: cancelToken,
     );
-    final String translated = _apiClient
-        .extractMessageContent(response.data)
-        .trim();
-    if (translated.isEmpty) {
-      throw const FormatException('Empty translated book title');
-    }
+    final String translated = _cleanBookTitle(
+      _apiClient.extractMessageContent(response.data),
+    );
     if (translated == originalTitle.trim()) {
       return null;
     }

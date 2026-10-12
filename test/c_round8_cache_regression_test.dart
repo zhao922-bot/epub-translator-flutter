@@ -3,7 +3,6 @@ import 'dart:io';
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:path/path.dart' as p;
 
 /// 每个 block entry 约 120B（22B 正文 + 98B integrity envelope）。
 const int _entryBytes = 22 + 98;
@@ -40,20 +39,10 @@ void main() {
         onMaintenanceScan: () async {
           scans++;
           if (perturb) {
-            // 模拟"不可回收"：全盘扫描删不掉任何文件 → ineffective →
-            // backoff 被 arm。只改 mtime（size 不变），以便轻量配额强制
-            // 仍能按记录的 size 删除。
-            final blocksDir = Directory(p.join(root.path, 'blocks'));
-            if (await blocksDir.exists()) {
-              await for (final entity in blocksDir.list(recursive: true)) {
-                if (entity is File && entity.path.endsWith('.html')) {
-                  final stat = await entity.stat();
-                  await entity.setLastModified(
-                    stat.modified.add(const Duration(seconds: 1)),
-                  );
-                }
-              }
-            }
+            // 模拟"不可回收"：全盘扫描直接失败 → ineffective → backoff
+            // 被 arm。抛异常不碰文件 mtime，轻量配额强制的 mtime 校验
+            // 不受影响（P2-#11 后，旧的改 mtime 模拟会误伤轻量删除）。
+            throw StateError('simulated unscannable cache');
           }
         },
       );

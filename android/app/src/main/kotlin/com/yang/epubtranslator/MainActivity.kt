@@ -1115,6 +1115,32 @@ class MainActivity : FlutterActivity() {
                         )
                         result.success(null)
                     } catch (error: Exception) {
+                        // Serialize rollback with grant recording and staging cleanup.
+                        try {
+                            ioExecutor.execute {
+                                try {
+                                    val prefs = appContext.getSharedPreferences(
+                                        PREFS_NAME,
+                                        Context.MODE_PRIVATE,
+                                    )
+                                    ShareRollback.rollbackFailedShare(
+                                        readGrants = {
+                                            prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
+                                                ?: emptySet()
+                                        },
+                                        writeGrants = { grants ->
+                                            prefs.edit().putStringSet(SHARE_GRANTS_PREF_KEY, grants)
+                                                .apply()
+                                        },
+                                        shareFile = shareFile,
+                                    )
+                                } catch (_: Exception) {
+                                    Log.w(TAG, "Failed to roll back share staging.")
+                                }
+                            }
+                        } catch (_: Exception) {
+                            Log.w(TAG, "Dropped share rollback after teardown.")
+                        }
                         try {
                             result.error("SHARE_FAILED", error.message, null)
                         } catch (_: Exception) {
@@ -1132,6 +1158,25 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
+        }
+    }
+
+    /** Android-free rollback helper kept beside the share flow for JVM tests. */
+    internal object ShareRollback {
+        internal fun rollbackFailedShare(
+            readGrants: () -> Set<String>,
+            writeGrants: (Set<String>) -> Unit,
+            shareFile: File,
+        ): Boolean {
+            val entries = readGrants()
+            val remaining = dropShareGrant(entries, shareFile.absolutePath)
+            writeGrants(remaining)
+            try {
+                if (shareFile.exists()) shareFile.delete()
+            } catch (_: Exception) {
+                // Snapshot deletion is best effort; the ledger no longer protects it.
+            }
+            return remaining.size < entries.size
         }
     }
 

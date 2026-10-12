@@ -1560,6 +1560,14 @@ class TranslationDashboardController
             ],
           );
           state = state.copyWith(inspectedChapters: next);
+          // P2-#7: the static estimate was frozen from the full sources at
+          // run start. Releasing sources must not shrink the run totals
+          // (staticPart recomputes from block.sourceText) nor thrash the
+          // identical-keyed cache into a full rescan every chapter: just
+          // re-key the cache to the new list, keeping the frozen part.
+          if (identical(chapters, _estimateStaticChaptersKey)) {
+            _estimateStaticChaptersKey = next;
+          }
         },
       );
       if (!mounted) return true;

@@ -575,6 +575,12 @@ class _EpubTranslationStrategy {
             error is TranslationCancelledException) {
           throw const TranslationCancelledException();
         }
+        // An atomic context-overflow request must degrade before the generic
+        // deterministic HTTP 400 check can abort the run.
+        if (TranslationApiClient.isContextOverflowError(error)) {
+          lastError = error;
+          break;
+        }
         // 401/403/404 are deterministic configuration errors: fail fast with
         // the precise diagnostic instead of burning maxRetries attempts.
         if (TranslationApiClient.isDeterministicHttpError(error)) {
@@ -1474,6 +1480,15 @@ class _EpubTranslationStrategy {
                 'Translated slot contains an unknown or duplicate id, or non-string text.',
               );
             }
+            _validateIndividualSlotTranslation(
+              sourceText: request
+                  .template
+                  .slotTexts[request.slotIds.indexOf(rawSlotId)],
+              translatedText: rawText,
+              // Batch slots may carry HTML that the renderer escapes;
+              // only the non-HTML wrapper checks apply here.
+              checkHtmlTags: false,
+            );
             textBySlotId[rawSlotId] = rawText;
           }
           translatedSlotsById[rawId] = request.slotIds
@@ -1788,6 +1803,12 @@ class _EpubTranslationStrategy {
   static void _validateIndividualSlotTranslation({
     required String sourceText,
     required String translatedText,
+    // Batch protected slots may legitimately contain HTML (e.g. a model
+    // returning "<script>"): the downstream renderer escapes it (see
+    // epub_repository_performance_test's "&lt;script&gt;" assertions).
+    // Rejecting HTML tags here would false-positive on that established
+    // defense, so the batch path skips only the tag check.
+    bool checkHtmlTags = true,
   }) {
     final String trimmed = translatedText.trim();
     if (trimmed.isEmpty) {
@@ -1807,7 +1828,7 @@ class _EpubTranslationStrategy {
         RegExp(r'<!--[\s\S]*?-->').hasMatch(trimmed) ||
         // See [_slotWrapperTagPattern]: `<` must abut a letter/`/`/`!`/`?`
         // or a comparison like "a < b" is misread as markup.
-        _slotWrapperTagPattern.hasMatch(trimmed) ||
+        (checkHtmlTags && _slotWrapperTagPattern.hasMatch(trimmed)) ||
         _hasTranslationExplanationPrefix(trimmed)) {
       throw const TranslationParseException(
         'Individual protected slot translation contains wrapper content.',

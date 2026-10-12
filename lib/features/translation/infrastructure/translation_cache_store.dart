@@ -56,6 +56,7 @@ class TranslationCacheStore {
   // A full pass establishes/reconciles the disk baseline. Between passes,
   // successful writes update it by byte delta, not by accumulating payloads.
   final Map<String, int> _sizes = <String, int>{};
+  final Map<String, DateTime> _mtimes = <String, DateTime>{};
 
   /// Block-cache paths in oldest-first eviction order (insertion order).
   /// Writes move their path to the end; a full scan rebuilds it from
@@ -149,9 +150,11 @@ class TranslationCacheStore {
     });
   }
 
-  void _recordSize(String key, int size) {
+  void _recordSize(String key, int size, [DateTime? modified]) {
     _estimatedBytes += size - (_sizes[key] ?? 0);
     _sizes[key] = size;
+    if (modified != null) _mtimes[key] = modified;
+    if (size == 0) _mtimes.remove(key);
     _scanChanges?[key] = size;
     if (_estimatedBytes <= _capacity) _resetBackoff();
   }
@@ -220,14 +223,16 @@ class TranslationCacheStore {
         _recordSize(
           file.path,
           stat.type == FileSystemEntityType.file ? stat.size : 0,
+          stat.modified,
         );
       }
       final String envelope =
           '$_envelopePrefix'
           '${sha256.convert(utf8.encode(translatedHtml))}\n$translatedHtml';
       await writeFileAtomically(file, envelope);
+      final FileStat written = await file.stat();
       _writeGeneration++;
-      _recordSize(file.path, utf8.encode(envelope).length);
+      _recordSize(file.path, utf8.encode(envelope).length, written.modified);
       _noteWriteOrder(file.path);
     });
     _pruneIfNeeded();
@@ -320,6 +325,9 @@ class TranslationCacheStore {
   /// recorded, leaving those for the next full scan to reconcile. Returns
   /// the reclaimed bytes. Job checkpoints are never in [_sizes], so they
   /// are never touched here.
+  @visibleForTesting
+  Future<int> enforceQuotaLightlyForTest() => _enforceQuotaLightly();
+
   Future<int> _enforceQuotaLightly() async {
     final int targetBytes = (_capacity * 0.9).toInt();
     int deletedBytes = 0;
@@ -339,6 +347,10 @@ class TranslationCacheStore {
           // recorded size is stale, so leave it for a full scan.
           if (current.type != FileSystemEntityType.file ||
               current.size != recorded) {
+            return;
+          }
+          final DateTime? recordedModified = _mtimes[filePath];
+          if (recordedModified == null || current.modified != recordedModified) {
             return;
           }
           await file.delete();
@@ -448,6 +460,7 @@ class TranslationCacheStore {
                 promoted.modified == temp.value.modified &&
                 !changes.containsKey(target)) {
               scannedSizes[target] = promoted.size;
+              _mtimes[target] = promoted.modified;
             }
           }
         }
@@ -491,6 +504,16 @@ class TranslationCacheStore {
       _sizes
         ..clear()
         ..addAll(scannedSizes);
+      _mtimes.removeWhere(
+        (String path, DateTime _) => !scannedSizes.containsKey(path),
+      );
+      for (final _CacheEntry entry in entries) {
+        if (!scannedSizes.containsKey(entry.file.path)) continue;
+        final DateTime? known = _mtimes[entry.file.path];
+        if (known == null || entry.modified.isAfter(known)) {
+          _mtimes[entry.file.path] = entry.modified;
+        }
+      }
       _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
       // Rebuild the lightweight-eviction order from on-disk mtimes (oldest
       // first) so the backoff-period quota pass evicts approximately LRU
@@ -566,6 +589,7 @@ class TranslationCacheStore {
   Future<void> pruneJobCheckpointsForTest(
     Directory jobsDir, {
     int maxCheckpoints = _maxJobCheckpoints,
+    Future<void> Function()? onListedForTest,
   }) async {
     if (!await jobsDir.exists()) {
       return;
@@ -585,6 +609,9 @@ class TranslationCacheStore {
     if (entries.length <= maxCheckpoints) {
       return;
     }
+    final Map<String, DateTime> listedModified = {
+      for (final entry in entries) entry.file.path: entry.modified,
+    };
     entries.sort(
       (
         ({File file, DateTime modified}) a,
@@ -618,6 +645,7 @@ class TranslationCacheStore {
       }
       candidatePaths.remove(entry.file.path);
     }
+    await onListedForTest?.call();
     for (final entry in candidates) {
       if (!candidatePaths.contains(entry.file.path)) continue;
       try {
@@ -631,7 +659,27 @@ class TranslationCacheStore {
               !current.modified.isBefore(activeSince)) {
             return;
           }
+          final String? matePath = await _pairedCheckpointPath(
+            jobsDir,
+            entry.file,
+          );
+          if (matePath != null) {
+            final DateTime? listedMateModified = listedModified[matePath];
+            final File mateFile = File(matePath);
+            if (await mateFile.exists()) {
+              final DateTime mateModified = (await mateFile.stat()).modified;
+              if (listedMateModified == null ||
+                  mateModified != listedMateModified) {
+                return;
+              }
+            } else if (listedMateModified != null) {
+              return;
+            }
+          }
           await entry.file.delete();
+          // A mate removed by this pass is expected to be absent; an
+          // externally vanished or refreshed mate must still block deletion.
+          listedModified.remove(entry.file.path);
         });
       } catch (_) {
         // Best effort; a locked file is left for the next pass.
