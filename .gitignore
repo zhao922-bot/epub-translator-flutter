@@ -93,3 +93,7 @@ coverage/
 
 # 测试跑出来的本地缓存产物
 /translation_cache/
+
+# Build artifacts and test residue (never commit)
+*.apk
+settings.json.lock
