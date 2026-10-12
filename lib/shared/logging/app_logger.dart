@@ -5,6 +5,8 @@ class AppLogger {
   AppLogger._();
 
   static final Logger _logger = Logger(
+    // Unlike DevelopmentFilter, this does not depend on enabled assertions.
+    filter: ProductionFilter(),
     printer: SimplePrinter(colors: false),
     // Keep noise low during unit tests and normal runs.
     level: Level.warning,

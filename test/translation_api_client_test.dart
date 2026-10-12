@@ -611,14 +611,14 @@ void main() {
       );
     });
 
-    test('non-map message yields empty content instead of throwing', () {
+    test('non-map message throws TranslationParseException', () {
       expect(
-        client.extractMessageContent(<String, dynamic>{
+        () => client.extractMessageContent(<String, dynamic>{
           'choices': <dynamic>[
             <String, dynamic>{'message': 'oops'},
           ],
         }),
-        isEmpty,
+        throwsA(isA<TranslationParseException>()),
       );
     });
   });

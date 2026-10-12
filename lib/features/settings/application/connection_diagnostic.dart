@@ -1,4 +1,5 @@
 import '../../../shared/security/sensitive_text.dart';
+import '../../../shared/localization/app_strings.dart';
 import '../../translation/domain/models/translation_config.dart';
 import '../../translation/infrastructure/epub/translation_api_client.dart';
 
@@ -17,6 +18,19 @@ class ConnectionDiagnostic {
     );
     final String lower = raw.toLowerCase();
     final String host = _hostFromConfig(config);
+
+    if (error is TranslationParseException) {
+      final message = AppStrings(
+        config.uiLanguage,
+      ).connectionResponseParseError;
+      final detail = SensitiveText.redact(
+        error.message,
+        configuredApiKey: config.apiKey,
+      );
+      return ConnectionDiagnostic(
+        detail.startsWith(message) ? detail : '$message $detail',
+      );
+    }
 
     if (error is MissingApiConfigurationException ||
         lower.contains('required before testing the connection')) {

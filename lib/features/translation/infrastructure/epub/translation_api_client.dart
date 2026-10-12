@@ -394,11 +394,16 @@ class TranslationApiClient {
         dio: dio,
         data: requestData,
       );
-      final String content = extractMessageContent(response.data);
+      final String content = extractMessageContent(
+        response.data,
+        requireNonEmpty: true,
+      );
       final String host = Uri.parse(normalizedBaseUrl(config.apiBaseUrl)).host;
-      return AppStrings(
-        config.uiLanguage,
-      ).connectionDetail(host, content.isEmpty ? 'OK' : content);
+      return AppStrings(config.uiLanguage).connectionDetail(host, content);
+    } on TranslationParseException catch (error) {
+      throw TranslationParseException(
+        '${AppStrings(config.uiLanguage).connectionResponseParseError} ${error.message}',
+      );
     } on DioException catch (error) {
       if (error.error is HandshakeException) {
         final String host = Uri.parse(
@@ -512,7 +517,10 @@ class TranslationApiClient {
     }
   }
 
-  String extractMessageContent(dynamic responseData) {
+  String extractMessageContent(
+    dynamic responseData, {
+    bool requireNonEmpty = false,
+  }) {
     // A proxy/gateway may answer with a plain string (or another non-JSON
     // shape) instead of the chat-completions object. Report that as a
     // deterministic parse failure so the retry policy does not burn
@@ -554,9 +562,12 @@ class TranslationApiClient {
       );
     }
     final dynamic rawMessage = firstChoice['message'];
-    final dynamic rawContent = rawMessage is Map<String, dynamic>
-        ? rawMessage['content']
-        : null;
+    if (rawMessage is! Map<String, dynamic>) {
+      throw const TranslationParseException(
+        'Translation API response message is not a JSON object.',
+      );
+    }
+    final dynamic rawContent = rawMessage['content'];
     final String content = switch (rawContent) {
       String value => value.trim(),
       List<dynamic> value =>
@@ -568,9 +579,19 @@ class TranslationApiClient {
             .whereType<String>()
             .join()
             .trim(),
-      _ => '',
+      _ => throw const TranslationParseException(
+        'Translation API response content is not text or a content-parts list.',
+      ),
     };
-    return _stripReasoningBlocks(content);
+    final String visibleContent = _stripReasoningBlocks(content);
+    // Translation consumers already validate empty output with their own
+    // quality/retry policy. Probes must reject it before reporting success.
+    if (requireNonEmpty && visibleContent.isEmpty) {
+      throw const TranslationParseException(
+        'Translation API response has no visible message content.',
+      );
+    }
+    return visibleContent;
   }
 
   /// Removes `<think>...</think>` reasoning blocks that reasoning models

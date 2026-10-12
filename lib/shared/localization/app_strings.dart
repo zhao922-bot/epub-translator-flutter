@@ -232,6 +232,9 @@ class AppStrings {
   String get testingConnection => isChinese ? '测试中…' : 'Testing…';
   String get connectionOk => isChinese ? '连接成功' : 'Connection OK';
   String get connectionFailed => isChinese ? '连接失败' : 'Connection failed';
+  String get connectionResponseParseError => isChinese
+      ? '响应解析错误：接口未返回有效的消息结构或非空文本内容。'
+      : 'Response parsing error: the API did not return a valid message structure with non-empty text content.';
   String httpAuthError(String host) => isChinese
       ? 'HTTP 401 认证失败（$host）：请前往设置页检查 API Key 是否有效、可用，且复制时没有多余空格。'
       : 'HTTP 401 authentication failed for $host. Check the API key in the settings page: it must be valid, active, and copied without extra spaces.';

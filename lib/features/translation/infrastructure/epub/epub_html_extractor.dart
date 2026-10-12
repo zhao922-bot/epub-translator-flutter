@@ -416,29 +416,34 @@ class EpubHtmlExtractor {
       return node.nodes.any(hasUnclaimedText);
     }
 
+    final originalNodes = container.nodes.toList(growable: false);
+    // NodeList.add/addAll removes nodes from their old parent. Detach all
+    // siblings at once so building wrappers cannot scan/shift that list.
+    container.nodes.clear();
+    final replacement = <dom.Node>[];
     final run = <dom.Node>[];
     void flush() {
       if (run.any(hasUnclaimedText)) {
         final wrapper = dom.Element.tag('span');
-        final index = container.nodes.indexOf(run.first);
-        for (final node in run) {
-          node.remove();
-          wrapper.nodes.add(node);
-        }
-        container.nodes.insert(index, wrapper);
+        wrapper.nodes.addAll(run);
+        replacement.add(wrapper);
+      } else {
+        replacement.addAll(run);
       }
       run.clear();
     }
 
-    for (final node in container.nodes.toList()) {
+    for (final node in originalNodes) {
       if (node is! dom.Element || inlineTags.contains(node.localName)) {
         run.add(node);
       } else {
         flush();
         _wrapUnclaimedText(node);
+        replacement.add(node);
       }
     }
     flush();
+    container.nodes.addAll(replacement);
   }
 
   List<dom.Element> extractTranslatableTextElements(dom.Document document) {
