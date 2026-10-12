@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   late Directory temp;
@@ -41,7 +42,10 @@ void main() {
       .where(
         (FileSystemEntity entity) =>
             entity is File &&
-            entity.path.startsWith('${file.path}.bad-'),
+            // Compare by basename: on Windows, file.path may use '/'
+            // (from '${temp.path}/job-history.json') while path.join
+            // produces '\', breaking a full-path startsWith.
+            p.basename(entity.path).startsWith('job-history.json.bad-'),
       )
       .toList();
 
