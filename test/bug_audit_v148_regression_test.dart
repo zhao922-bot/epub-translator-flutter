@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:html/parser.dart' as html;
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
@@ -22,6 +23,9 @@ class ReadFailureFile implements File {
   Future<bool> exists() => delegate.exists();
   @override
   Future<String> readAsString({Encoding encoding = utf8}) async =>
+      throw FileSystemException('Simulated transient read failure', path);
+  @override
+  Future<Uint8List> readAsBytes() async =>
       throw FileSystemException('Simulated transient read failure', path);
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);

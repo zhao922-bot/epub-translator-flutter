@@ -6,6 +6,34 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ShareRollbackTest {
+    @Test fun rollbackExecutorRunsAfterIoExecutorShutdown() {
+        val io = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val snapshot = File.createTempFile("share-rollback-teardown-", ".epub")
+        try {
+            var ledger = recordShareGrant(emptySet(), "content://u/failed", snapshot.absolutePath, 1000)
+            io.shutdown()
+            assertTrue(io.isShutdown)
+
+            val done = java.util.concurrent.CountDownLatch(1)
+            var daemon = false
+            ShareRollbackExecutor.execute {
+                try {
+                    daemon = Thread.currentThread().isDaemon
+                    rollbackFailedShare({ ledger }, { ledger = it }, snapshot)
+                } finally {
+                    done.countDown()
+                }
+            }
+            assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(daemon)
+            assertTrue(ledger.isEmpty())
+            assertFalse(snapshot.exists())
+        } finally {
+            io.shutdownNow()
+            snapshot.delete()
+        }
+    }
+
     @Test fun rollbackRemovesFailedGrantAndSnapshotButKeepsOtherGrants() {
         val snapshot = File.createTempFile("share-rollback-", ".epub")
         try {

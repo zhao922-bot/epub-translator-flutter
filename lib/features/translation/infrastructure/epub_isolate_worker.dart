@@ -96,6 +96,58 @@ const Duration _kStaleTempAge = Duration(minutes: 30);
 const int _kMaxRecoveryFiles = 5;
 const int _kMaxRecoveryBytes = 512 * 1024 * 1024;
 
+enum RecoveryBudgetKind { recoverySpare, fallbackTmp, indexLedger }
+
+typedef RecoveryBudgetEntry = ({
+  String name,
+  int sizeBytes,
+  RecoveryBudgetKind kind,
+});
+
+/// Pure eviction policy; the ledger counts toward both limits but sorts last.
+/// A complete payload always survives, even when it alone exceeds the budget.
+@visibleForTesting
+List<String> recoveryBudgetDeletions(
+  List<RecoveryBudgetEntry> entries, {
+  Set<String> exemptNames = const {},
+}) {
+  bool isComplete(RecoveryBudgetEntry entry) =>
+      entry.kind == RecoveryBudgetKind.fallbackTmp ||
+      (entry.kind == RecoveryBudgetKind.recoverySpare &&
+          RegExp(r'\.recovery\.\d+$').hasMatch(entry.name));
+  final ordered = [...entries]..sort((a, b) {
+    final aIsIndex = a.kind == RecoveryBudgetKind.indexLedger;
+    final bIsIndex = b.kind == RecoveryBudgetKind.indexLedger;
+    if (aIsIndex != bIsIndex) return aIsIndex ? 1 : -1;
+    // Compare timestamps across prefixes, rather than sorting all tmp files
+    // after all recovery files regardless of age.
+    final suffix = RegExp(r'\.(\d+)$');
+    final aStamp = int.tryParse(suffix.firstMatch(a.name)?.group(1) ?? '');
+    final bStamp = int.tryParse(suffix.firstMatch(b.name)?.group(1) ?? '');
+    if (aStamp != null && bStamp != null && aStamp != bStamp) {
+      return aStamp.compareTo(bStamp);
+    }
+    return a.name.compareTo(b.name);
+  });
+  var remaining = ordered.length;
+  var complete = ordered.where(isComplete).length;
+  var totalBytes = ordered.fold<int>(0, (sum, entry) => sum + entry.sizeBytes);
+  final deletions = <String>[];
+  for (final entry in ordered) {
+    if (remaining <= _kMaxRecoveryFiles && totalBytes <= _kMaxRecoveryBytes) {
+      break;
+    }
+    if (exemptNames.contains(entry.name) || (isComplete(entry) && complete == 1)) {
+      continue;
+    }
+    deletions.add(entry.name);
+    remaining--;
+    totalBytes -= entry.sizeBytes;
+    if (isComplete(entry)) complete--;
+  }
+  return deletions;
+}
+
 /// A commit failed, but the complete translated payload remains recoverable.
 ///
 /// The fully-translated temp file is deliberately NOT deleted: the user can
@@ -977,7 +1029,7 @@ class EpubIsolateWorker {
         await tempFile.rename(finalFile.path);
         // The final file now holds the translation: lock-conflict spares
         // kept for this output are obsolete.
-        await _reclaimRecoveryFiles(finalFile);
+        await _reclaimRecoveryFiles(finalFile, committedTempFile: tempFile);
         return true;
       }
 
@@ -1009,7 +1061,7 @@ class EpubIsolateWorker {
         await _deleteBestEffort(backupFile);
         // The final file now holds the translation: lock-conflict spares
         // kept for this output are obsolete.
-        await _reclaimRecoveryFiles(finalFile);
+        await _reclaimRecoveryFiles(finalFile, committedTempFile: tempFile);
         return true;
       } catch (error) {
         if (await backupFile.exists() && !await finalFile.exists()) {
@@ -1217,7 +1269,7 @@ class EpubIsolateWorker {
       );
       // A stuck lock would otherwise leave one full translated copy per
       // retry with no bound; enforce the count/size budget oldest-first.
-      await _enforceRecoveryBudget(finalFile);
+      await _enforceRecoveryBudget(finalFile, exemptFile: recoveryFile);
       return recoveryFile;
     } on FileSystemException {
       // Even recovery naming can fail (component length, permissions, locks).
@@ -1235,20 +1287,32 @@ class EpubIsolateWorker {
           tag: 'repack',
         );
       }
+      await _enforceRecoveryBudget(finalFile, exemptFile: tempFile);
       return tempFile;
     }
   }
 
   static final Set<String> _retainedRecoveryPaths = {};
 
+  /// Only local, output-specific ledger entries authorize touching tmp files.
+  static Future<Set<String>> _indexedRecoveryTemps(File finalFile) async {
+    final index = File('${finalFile.path}.recovery-index');
+    if (!await index.exists()) return {};
+    final prefix = '${path.basename(finalFile.path)}.tmp.';
+    return (await index.readAsLines())
+        .where((name) => path.basename(name) == name && name.startsWith(prefix))
+        .toSet();
+  }
+
   /// Enforces the `.recovery.*` budget for one output: keeps at most
-  /// [_kMaxRecoveryFiles] newest spares within [_kMaxRecoveryBytes] total,
-  /// deleting oldest-first. The `<basename>.recovery-index` ledger counts
-  /// as a spare too: without it the index would grow by append forever.
+  /// [_kMaxRecoveryFiles] newest entries within [_kMaxRecoveryBytes] total,
+  /// deleting oldest-first but retaining the last complete payload. Indexed
+  /// tmp payloads and the pinned-last recovery ledger count toward the budget.
   /// Best effort; never throws.
   static Future<void> _enforceRecoveryBudget(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
+    File? exemptFile,
   }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.recovery.';
@@ -1257,51 +1321,53 @@ class EpubIsolateWorker {
       final String indexName = '${path.basename(finalFile.path)}.recovery-index';
       final Future<void> Function(File file) deleteFile =
           deleteForTest ?? _deleteBestEffort;
-      final List<File> spares = <File>[];
+      final indexedTemps = await _indexedRecoveryTemps(finalFile);
+      final spares = <String, File>{};
+      final entries = <RecoveryBudgetEntry>[];
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
         if (entity is! File) continue;
         final String name = path.basename(entity.path);
-        if (name.startsWith(prefix) || name == indexName) {
-          spares.add(entity);
+        if (!name.startsWith(prefix) &&
+            name != indexName &&
+            !indexedTemps.contains(name)) {
+          continue;
         }
-      }
-      if (spares.isEmpty) {
-        return;
-      }
-      // The timestamp suffix sorts chronologically; oldest first. The
-      // `<basename>.recovery-index` ledger is pinned last ('-' < '.' would
-      // otherwise sort it before every `...recovery.<digits>` spare) so the
-      // ledger is evicted last.
-      spares.sort((File a, File b) {
-        final bool aIsIndex = path.basename(a.path) == indexName;
-        final bool bIsIndex = path.basename(b.path) == indexName;
-        if (aIsIndex != bIsIndex) return aIsIndex ? 1 : -1;
-        return a.path.compareTo(b.path);
-      });
-      int totalBytes = 0;
-      final List<int> sizes = <int>[];
-      for (final File spare in spares) {
         int size = 0;
         try {
-          size = await spare.length();
+          size = await entity.length();
         } catch (_) {
           // Treat an unreadable spare as empty; it is still count-capped.
         }
-        sizes.add(size);
-        totalBytes += size;
+        spares[name] = entity;
+        entries.add((
+          name: name,
+          sizeBytes: size,
+          kind: name == indexName
+              ? RecoveryBudgetKind.indexLedger
+              : indexedTemps.contains(name)
+              ? RecoveryBudgetKind.fallbackTmp
+              : RecoveryBudgetKind.recoverySpare,
+        ));
       }
-      for (int i = 0; i < spares.length; i++) {
-        final int remaining = spares.length - i;
-        if (remaining <= _kMaxRecoveryFiles &&
-            totalBytes <= _kMaxRecoveryBytes) {
-          break;
-        }
+      final exemptNames = {
+        for (final entry in spares.entries)
+          if (exemptFile != null &&
+              sameFilesystemPath(entry.value.path, exemptFile.path))
+            entry.key,
+      };
+      for (final name in recoveryBudgetDeletions(
+        entries,
+        exemptNames: exemptNames,
+      )) {
+        final spare = spares[name]!;
         try {
-          await deleteFile(spares[i]);
+          await deleteFile(spare);
+          if (!await spare.exists()) {
+            _retainedRecoveryPaths.remove(path.absolute(spare.path));
+          }
         } catch (_) {
           // Best effort: one stuck spare must not block the rest.
         }
-        totalBytes -= sizes[i];
       }
     } catch (_) {
       // Best effort: budget enforcement must never break a commit.
@@ -1315,6 +1381,7 @@ class EpubIsolateWorker {
   static Future<void> _reclaimRecoveryFiles(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
+    File? committedTempFile,
   }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.recovery.';
@@ -1324,12 +1391,20 @@ class EpubIsolateWorker {
       final String indexName = '${path.basename(finalFile.path)}.recovery-index';
       final Future<void> Function(File file) deleteFile =
           deleteForTest ?? _deleteBestEffort;
+      final indexedTemps = await _indexedRecoveryTemps(finalFile);
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
         if (entity is! File) continue;
         final String name = path.basename(entity.path);
-        if (name.startsWith(prefix) || name == indexName) {
+        if (committedTempFile != null &&
+            sameFilesystemPath(entity.path, committedTempFile.path)) {
+          continue;
+        }
+        if (name.startsWith(prefix) || name == indexName || indexedTemps.contains(name)) {
           try {
             await deleteFile(entity);
+            if (!await entity.exists()) {
+              _retainedRecoveryPaths.remove(path.absolute(entity.path));
+            }
           } catch (_) {
             // Best effort: one stuck file must not block the rest.
           }
@@ -1351,8 +1426,13 @@ class EpubIsolateWorker {
   static Future<void> reclaimRecoveryFilesForTest(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
+    File? committedTempFile,
   }) =>
-      _reclaimRecoveryFiles(finalFile, deleteForTest: deleteForTest);
+      _reclaimRecoveryFiles(
+        finalFile,
+        deleteForTest: deleteForTest,
+        committedTempFile: committedTempFile,
+      );
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {

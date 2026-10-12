@@ -36,10 +36,16 @@ Future<T> withSettingsFileLock<T>(
     // processes could hold "the lock" simultaneously and corrupt settings.
     // An empty sidecar left behind is harmless (job_history_store keeps its
     // sidecar permanently for the same reason).
-    await handle?.close();
-    done.complete();
-    if (identical(_settingsWriters[key], done.future)) {
-      _settingsWriters.remove(key);
+    try {
+      await handle?.close();
+    } finally {
+      // P1-#1: done.complete() must run even if close() throws; otherwise
+      // _settingsWriters keeps an incomplete future and every later caller
+      // hangs forever on `await previous`.
+      done.complete();
+      if (identical(_settingsWriters[key], done.future)) {
+        _settingsWriters.remove(key);
+      }
     }
   }
 }

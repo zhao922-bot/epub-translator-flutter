@@ -588,6 +588,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     List<String> args, {
     String? stdinInput,
     int? missingExitCode,
+    Duration timeout = const Duration(seconds: 30),
   }) async {
     assert(
       args.isNotEmpty && args.first == executable,
@@ -605,17 +606,19 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
         'Secret helper "$executable" is not available (${error.message}).',
       );
     }
-    final String? input = stdinInput;
-    if (input != null) {
-      process.stdin.write(input);
-    }
-    await process.stdin.close();
     try {
-      return await _collectHelperOutput(
-        process,
-        executable,
-        missingExitCode: missingExitCode,
-      ).timeout(const Duration(seconds: 30));
+      return await (() async {
+        final String? input = stdinInput;
+        if (input != null) {
+          process.stdin.write(input);
+        }
+        await process.stdin.close();
+        return _collectHelperOutput(
+          process,
+          executable,
+          missingExitCode: missingExitCode,
+        );
+      })().timeout(timeout);
     } on TimeoutException {
       process.kill();
       throw StateError('Secret helper "$executable" timed out.');
@@ -881,8 +884,14 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     String executable,
     List<String> args, {
     String? stdinInput,
+    Duration timeout = const Duration(seconds: 30),
   }) {
-    return _runDesktopSecretHelper(executable, args, stdinInput: stdinInput);
+    return _runDesktopSecretHelper(
+      executable,
+      args,
+      stdinInput: stdinInput,
+      timeout: timeout,
+    );
   }
 
   @visibleForTesting

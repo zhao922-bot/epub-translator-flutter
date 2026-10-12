@@ -633,7 +633,13 @@ body.epub-translator-cjk [data-translation="true"] {
     for (final dom.Node node in fragment.nodes) {
       if (node is dom.Element) {
         node.attributes['data-translation'] = 'true';
-        if (languageTag != null) {
+        final markedLanguage =
+            node.attributes['lang'] ?? node.attributes['xml:lang'];
+        // Source-aware labeling below decides whether a foreign mark is a
+        // stale echo. Sanitizing must preserve it until that comparison.
+        if (languageTag != null &&
+            (markedLanguage == null ||
+                markedLanguage.toLowerCase() == languageTag.toLowerCase())) {
           node.attributes['lang'] = languageTag;
           node.attributes['xml:lang'] = languageTag;
         }

@@ -5,11 +5,14 @@ internal const val SHARE_STAGING_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
 /** Cap for share_staging/: newest files win, oldest evicted first. */
 internal const val MAX_SHARE_STAGING_FILES = 20
 internal const val MAX_SHARE_STAGING_BYTES = 200L * 1024 * 1024
+/** Under quota pressure, protect only a handful of recent grants / tens of
+ * MiB. Dismissed choosers have no result callback to release their grants. */
+internal const val MAX_SHARE_GRANT_EXEMPT_FILES = 5
+internal const val MAX_SHARE_GRANT_EXEMPT_BYTES = 50L * 1024 * 1024
 /** Staging files younger than this are exempt from the count/size cap when
  * they carry no share grant: their chooser may still be open and the target
- * app may not have read the file yet. Files WITH a live grant are exempt
- * regardless of age (a fixed grace period cannot guarantee the receiver
- * has read the file). */
+ * app may not have read the file yet. Live grants are protected within the
+ * exemption caps, independent of this grace period. */
 internal const val SHARE_STAGING_CAP_GRACE_MS = 5L * 60 * 1000
 /** SharedPreferences key holding the share-grant ledger (a string set of
  * `uri|absolutePath|grantedAtMs` entries). */
@@ -35,7 +38,7 @@ internal data class ShareStagingEntry(
 internal data class ShareStagingCleanupPlan(
     /** Files past the max age: deleted unconditionally. */
     val deleteForAge: List<ShareStagingEntry>,
-    /** Grant URIs to revoke before deleting [deleteForAge]. */
+    /** Grant URIs to revoke before age deletion or quota eviction. */
     val revokeUris: List<String>,
     /** Files to evict oldest-first until the quota is met (already ordered). */
     val evictForCap: List<ShareStagingEntry>,
@@ -104,9 +107,11 @@ internal fun dropStaleShareGrants(
  *   its file — cleanup follows the grant's lifetime, not a fixed grace.
  * - The count/size quota counts ALL surviving snapshots: a burst of shares
  *   inside the grace period must not let the quota be exceeded silently.
- * - Eviction only takes the oldest grace-expired files WITHOUT a live
- *   grant and not in [activeSharePaths]; a live grant exempts its snapshot
- *   regardless of age.
+ * - Evict oldest grace-expired, non-active files WITHOUT grants first.
+ * - If still over quota, grant-held snapshots beyond the count/byte
+ *   exemption caps become evictable oldest-first (lastModified is the
+ *   grant-age proxy), with their URIs revoked first. Grants within the
+ *   caps and [activeSharePaths] remain quota-protected.
  */
 internal fun planShareStagingCleanup(
     entries: List<ShareStagingEntry>,
@@ -117,7 +122,7 @@ internal fun planShareStagingCleanup(
     val (expired, survivors) = entries.partition { entry ->
         now - entry.lastModified >= SHARE_STAGING_MAX_AGE_MS
     }
-    val revokeUris = expired.mapNotNull { grantUriByPath[it.path] }
+    val revokeUris = expired.mapNotNullTo(mutableListOf()) { grantUriByPath[it.path] }
     var totalBytes = survivors.sumOf { it.length }
     var count = survivors.size
     val evictForCap = mutableListOf<ShareStagingEntry>()
@@ -125,8 +130,7 @@ internal fun planShareStagingCleanup(
         if (count <= MAX_SHARE_STAGING_FILES && totalBytes <= MAX_SHARE_STAGING_BYTES) {
             break
         }
-        // A live share grant outlives any fixed grace period: never evict
-        // its snapshot for quota.
+        // Prefer non-granted snapshots before considering grant overflow.
         if (file.path in grantUriByPath) {
             continue
         }
@@ -142,6 +146,27 @@ internal fun planShareStagingCleanup(
         evictForCap.add(file)
         totalBytes -= file.length
         count -= 1
+    }
+    val granted = survivors.filter { it.path in grantUriByPath }
+        .sortedBy { it.lastModified }
+    var grantedCount = granted.size
+    var grantedBytes = granted.sumOf { it.length }
+    for (file in granted) {
+        if (count <= MAX_SHARE_STAGING_FILES && totalBytes <= MAX_SHARE_STAGING_BYTES) {
+            break
+        }
+        if (grantedCount <= MAX_SHARE_GRANT_EXEMPT_FILES &&
+            grantedBytes <= MAX_SHARE_GRANT_EXEMPT_BYTES
+        ) {
+            break
+        }
+        if (file.path in activeSharePaths) continue
+        evictForCap.add(file)
+        revokeUris.add(grantUriByPath.getValue(file.path))
+        totalBytes -= file.length
+        count -= 1
+        grantedBytes -= file.length
+        grantedCount -= 1
     }
     return ShareStagingCleanupPlan(
         deleteForAge = expired,

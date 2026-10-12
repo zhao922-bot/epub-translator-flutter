@@ -1171,6 +1171,11 @@ class TranslationDashboardController
     // profile or empty): any in-flight edit markers from a previous
     // generation no longer describe this profile.
     _styleFieldsEditedDuringGeneration.clear();
+    // Drop the previous book's strong cache reference before inspection,
+    // including when the replacement inspection fails.
+    _estimateStaticChaptersKey = null;
+    _estimateStaticChunkSizeKey = -1;
+    _estimateStaticCache = null;
     state = state.copyWith(
       outputDirectory: outputDirectory,
       actionableError: null,
@@ -1264,6 +1269,9 @@ class TranslationDashboardController
       }
     } catch (error) {
       if (!mounted) return;
+      _estimateStaticChaptersKey = null;
+      _estimateStaticChunkSizeKey = -1;
+      _estimateStaticCache = null;
       if (_handleCancellation(error)) {
         return;
       }
@@ -2737,10 +2745,34 @@ class TranslationDashboardController
     if (!identical(sourceChapters, _estimateStaticChaptersKey) ||
         chunkSize != _estimateStaticChunkSizeKey ||
         staticPart == null) {
-      staticPart = TranslationRunEstimate.staticPart(
-        sourceChapters,
-        chunkSize: chunkSize,
-      );
+      if (identical(sourceChapters, _estimateStaticChaptersKey) &&
+          staticPart != null &&
+          !sourceChapters.any(
+            (chapter) =>
+                chapter.blocks.any((block) => block.sourceText.isNotEmpty),
+          )) {
+        // P2-#9: released sources cannot be replanned. Approximate the new
+        // batch count by scaling the frozen count inversely with chunk size,
+        // preserving all source-derived totals from before the release.
+        staticPart = TranslationRunEstimate(
+          selectedChapters: staticPart.selectedChapters,
+          totalBlocks: staticPart.totalBlocks,
+          estimatedSourceChars: staticPart.estimatedSourceChars,
+          estimatedInputTokens: staticPart.estimatedInputTokens,
+          estimatedApiBatches: max(
+            1,
+            (staticPart.estimatedApiBatches *
+                    _estimateStaticChunkSizeKey /
+                    chunkSize)
+                .ceil(),
+          ),
+        );
+      } else {
+        staticPart = TranslationRunEstimate.staticPart(
+          sourceChapters,
+          chunkSize: chunkSize,
+        );
+      }
       _estimateStaticChaptersKey = sourceChapters;
       _estimateStaticChunkSizeKey = chunkSize;
       _estimateStaticCache = staticPart;

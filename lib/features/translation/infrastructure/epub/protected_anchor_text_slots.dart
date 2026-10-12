@@ -171,9 +171,11 @@ class ProtectedAnchorTextSlots {
           (_isShortMarker(compact) ||
               RegExp(r'^[0-9ivxlcdmIVXLCDM]+$').hasMatch(compact));
     }
-    return _isShortMarker(element.text) &&
-        (roles.any(const {'doc-noteref', 'doc-backlink'}.contains) ||
-            types.any(const {'noteref', 'backlink'}.contains));
+    // Ordinary elements cannot be semantic markers. Check the cheap metadata
+    // first so nested prose does not repeatedly concatenate descendant text.
+    return (roles.any(const {'doc-noteref', 'doc-backlink'}.contains) ||
+            types.any(const {'noteref', 'backlink'}.contains)) &&
+        _isShortMarker(element.text);
   }
 
   static bool _isRawTextElement(dom.Element element) {

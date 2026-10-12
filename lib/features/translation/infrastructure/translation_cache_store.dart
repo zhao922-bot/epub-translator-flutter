@@ -57,6 +57,9 @@ class TranslationCacheStore {
   // successful writes update it by byte delta, not by accumulating payloads.
   final Map<String, int> _sizes = <String, int>{};
   final Map<String, DateTime> _mtimes = <String, DateTime>{};
+  // Content baselines distinguish a clock/backup timestamp rollback from a
+  // same-size external rewrite, even if several files roll back together.
+  final Map<String, Digest> _contentDigests = <String, Digest>{};
 
   /// Block-cache paths in oldest-first eviction order (insertion order).
   /// Writes move their path to the end; a full scan rebuilds it from
@@ -154,7 +157,10 @@ class TranslationCacheStore {
     _estimatedBytes += size - (_sizes[key] ?? 0);
     _sizes[key] = size;
     if (modified != null) _mtimes[key] = modified;
-    if (size == 0) _mtimes.remove(key);
+    if (size == 0) {
+      _mtimes.remove(key);
+      _contentDigests.remove(key);
+    }
     _scanChanges?[key] = size;
     if (_estimatedBytes <= _capacity) _resetBackoff();
   }
@@ -233,6 +239,7 @@ class TranslationCacheStore {
       final FileStat written = await file.stat();
       _writeGeneration++;
       _recordSize(file.path, utf8.encode(envelope).length, written.modified);
+      _contentDigests[file.path] = sha256.convert(utf8.encode(envelope));
       _noteWriteOrder(file.path);
     });
     _pruneIfNeeded();
@@ -501,16 +508,69 @@ class TranslationCacheStore {
       tempBytes = reconcileTemps();
       scannedSizes.addAll(changes);
       scannedSizes.removeWhere((_, size) => size == 0);
+      // Only unchanged contents with a shared backward offset form a clock
+      // event. A lone rollback (or a real rewrite) stays fail-closed. Read
+      // contents only to establish a baseline or reconcile changed mtimes.
+      final Map<Duration, List<_CacheEntry>> rollbacks = {};
+      for (final _CacheEntry entry in entries) {
+        final String key = entry.file.path;
+        if (!scannedSizes.containsKey(key) || changes.containsKey(key)) {
+          continue;
+        }
+        final DateTime? known = _mtimes[key];
+        if (known == entry.modified && _contentDigests.containsKey(key)) {
+          continue;
+        }
+        try {
+          await _withFileGate(entry.file, () async {
+            if (changes.containsKey(key)) return;
+            final Digest digest = await sha256.bind(entry.file.openRead()).first;
+            final FileStat current = await entry.file.stat();
+            if (current.type != FileSystemEntityType.file ||
+                current.size != entry.size ||
+                current.modified != entry.modified) {
+              return;
+            }
+            if (known != null && entry.modified.isBefore(known)) {
+              if (_sizes[key] == entry.size && _contentDigests[key] == digest) {
+                rollbacks
+                    .putIfAbsent(known.difference(entry.modified), () => [])
+                    .add(entry);
+              }
+            } else {
+              _contentDigests[key] = digest;
+            }
+          });
+        } catch (_) {
+          // Unreadable or concurrently replaced entries cannot prove rollback.
+        }
+      }
+      final Set<String> clockRollbackPaths = {
+        for (final cohort in rollbacks.values)
+          if (cohort
+                  .where((entry) => !changes.containsKey(entry.file.path))
+                  .length >=
+              2)
+            for (final entry in cohort) entry.file.path,
+      };
+      // Digest reads yield: overlay writes completed during reconciliation too.
+      tempBytes = reconcileTemps();
+      scannedSizes.addAll(changes);
+      scannedSizes.removeWhere((_, size) => size == 0);
       _sizes
         ..clear()
         ..addAll(scannedSizes);
       _mtimes.removeWhere(
         (String path, DateTime _) => !scannedSizes.containsKey(path),
       );
+      _contentDigests.removeWhere((key, _) => !scannedSizes.containsKey(key));
       for (final _CacheEntry entry in entries) {
         if (!scannedSizes.containsKey(entry.file.path)) continue;
+        if (changes.containsKey(entry.file.path)) continue;
         final DateTime? known = _mtimes[entry.file.path];
-        if (known == null || entry.modified.isAfter(known)) {
+        if (known == null ||
+            entry.modified.isAfter(known) ||
+            clockRollbackPaths.contains(entry.file.path)) {
           _mtimes[entry.file.path] = entry.modified;
         }
       }

@@ -7,6 +7,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_estimate.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
@@ -27,6 +28,8 @@ class _Repository implements TranslationRepository {
   final TranslationJobPhase phase;
   final int cachedBlocks;
   final TranslationJobStatus? terminalStatus;
+  Completer<void>? inspectionGate;
+  Future<void> Function()? afterSourcesReleased;
 
   TranslationJob _job(String inputPath, String outputPath) => TranslationJob(
     id: 'book',
@@ -44,29 +47,32 @@ class _Repository implements TranslationRepository {
     required TranslationConfig config,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
-  }) async => InspectionResult(
-    job: _job(inputPath, outputDirectory),
-    chapters: <InspectedChapter>[
-      InspectedChapter(
-        path: 'chapter.xhtml',
-        title: 'Chapter',
-        body: '',
-        originalHtml: '<p>Source book text</p>',
-        blocks: List<ExtractedBlock>.generate(
-          60,
-          (index) => ExtractedBlock(
-            id: 'block-$index',
-            tagName: 'p',
-            sourceHtml: 'source $index',
-            sourceText: 'source $index',
+  }) async {
+    await inspectionGate?.future;
+    return InspectionResult(
+      job: _job(inputPath, outputDirectory),
+      chapters: <InspectedChapter>[
+        InspectedChapter(
+          path: 'chapter.xhtml',
+          title: 'Chapter',
+          body: '',
+          originalHtml: '<p>Source book text</p>',
+          blocks: List<ExtractedBlock>.generate(
+            60,
+            (index) => ExtractedBlock(
+              id: 'block-$index',
+              tagName: 'p',
+              sourceHtml: 'source $index',
+              sourceText: 'source $index',
+            ),
           ),
+          category: ChapterCategory.content,
+          recommendedForTranslation: true,
+          includeInTranslation: true,
         ),
-        category: ChapterCategory.content,
-        recommendedForTranslation: true,
-        includeInTranslation: true,
-      ),
-    ],
-  );
+      ],
+    );
+  }
 
   @override
   Future<TranslationRunResult> translateChapters({
@@ -79,6 +85,10 @@ class _Repository implements TranslationRepository {
     TranslationCancellationCheck? isCancelled,
     void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
+    if (afterSourcesReleased != null) {
+      onChapterSourcesReleased?.call('chapter.xhtml');
+      await afterSourcesReleased!();
+    }
     final job = _job(inputPath, '$outputDirectory/book_translated.epub')
         .copyWith(
           status: TranslationJobStatus.running,
@@ -268,6 +278,128 @@ void main() {
       expect(controller.debugStaticEstimateCache, isNull);
       await controller.startInspection();
       expect(controller.debugStaticEstimateCache, isNotNull);
+    });
+  }
+
+  test('P2-#9 chunk changes preserve released-source totals mid-run', () async {
+    final repository = _Repository();
+    final controller = _controller(repository: repository);
+    controller.syncSettings(controller.state.config.copyWith(chunkSize: 100));
+    await controller.startInspection();
+    final frozen = controller.debugStaticEstimateCache!;
+    expect(frozen.estimatedSourceChars, greaterThan(0));
+    expect(frozen.estimatedInputTokens, greaterThan(0));
+
+    final entered = Completer<void>();
+    final resume = Completer<void>();
+    repository.afterSourcesReleased = () async {
+      entered.complete();
+      await resume.future;
+    };
+    final translating = controller.startTranslation();
+    await entered.future;
+    try {
+      expect(controller.state.isRunActive, isTrue);
+      final released = controller.state.inspectedChapters.single;
+      expect(released.originalHtml, isEmpty);
+      expect(
+        released.blocks.every(
+          (block) => block.sourceHtml.isEmpty && block.sourceText.isEmpty,
+        ),
+        isTrue,
+      );
+      expect(identical(controller.debugStaticEstimateCache, frozen), isTrue);
+
+      // Inspection's active-run guard must preserve the re-keyed cache.
+      await controller.startInspection();
+      expect(identical(controller.debugStaticEstimateCache, frozen), isTrue);
+
+      var previous = frozen;
+      var previousChunkSize = 100;
+      for (final chunkSize in <int>[60, 120, 100000]) {
+        controller.syncSettings(
+          controller.state.config.copyWith(chunkSize: chunkSize),
+        );
+        final updated = controller.debugStaticEstimateCache!;
+        final scaled =
+            (previous.estimatedApiBatches * previousChunkSize / chunkSize)
+                .ceil();
+        expect(updated.estimatedApiBatches, scaled < 1 ? 1 : scaled);
+        expect(updated.estimatedSourceChars, frozen.estimatedSourceChars);
+        expect(updated.estimatedInputTokens, frozen.estimatedInputTokens);
+        expect(updated.selectedChapters, frozen.selectedChapters);
+        expect(updated.totalBlocks, frozen.totalBlocks);
+        expect(
+          controller.state.runEstimate!.estimatedApiBatches,
+          updated.estimatedApiBatches,
+        );
+        expect(
+          controller.state.runEstimate!.estimatedSourceChars,
+          frozen.estimatedSourceChars,
+        );
+        expect(
+          controller.state.runEstimate!.estimatedInputTokens,
+          frozen.estimatedInputTokens,
+        );
+        controller.syncSettings(
+          controller.state.config.copyWith(targetLanguage: 'Japanese'),
+        );
+        expect(identical(controller.debugStaticEstimateCache, updated), isTrue);
+        previous = updated;
+        previousChunkSize = chunkSize;
+      }
+    } finally {
+      resume.complete();
+      await translating;
+    }
+  });
+
+  test('chunk changes with full sources use the actual planners', () async {
+    final controller = _controller();
+    controller.syncSettings(controller.state.config.copyWith(chunkSize: 100));
+    await controller.startInspection();
+    final previous = controller.debugStaticEstimateCache;
+    controller.syncSettings(controller.state.config.copyWith(chunkSize: 60));
+    final expected = TranslationRunEstimate.staticPart(
+      controller.state.inspectedChapters,
+      chunkSize: 60,
+    );
+    final updated = controller.debugStaticEstimateCache!;
+    expect(identical(updated, previous), isFalse);
+    expect(updated.estimatedApiBatches, expected.estimatedApiBatches);
+    expect(updated.estimatedSourceChars, expected.estimatedSourceChars);
+    expect(updated.estimatedInputTokens, expected.estimatedInputTokens);
+  });
+
+  for (final fails in <bool>[false, true]) {
+    test('perf-#20 re-inspection clears the old cache; fails=$fails', () async {
+      final repository = _Repository();
+      final controller = _controller(repository: repository);
+      await controller.startInspection();
+      expect(controller.debugStaticEstimateCache, isNotNull);
+
+      final gate = Completer<void>();
+      repository.inspectionGate = gate;
+      final inspecting = controller.startInspection();
+      while (controller.state.inspectedChapters.isNotEmpty) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(controller.state.job!.phase, TranslationJobPhase.inspection);
+      expect(controller.debugStaticEstimateCache, isNull);
+      if (fails) {
+        gate.completeError(StateError('Replacement inspection failed'));
+      } else {
+        gate.complete();
+      }
+      await inspecting;
+      if (fails) {
+        expect(controller.state.job!.status, TranslationJobStatus.failed);
+        expect(controller.state.inspectedChapters, isEmpty);
+        expect(controller.debugStaticEstimateCache, isNull);
+      } else {
+        expect(controller.state.inspectedChapters, isNotEmpty);
+        expect(controller.debugStaticEstimateCache, isNotNull);
+      }
     });
   }
 

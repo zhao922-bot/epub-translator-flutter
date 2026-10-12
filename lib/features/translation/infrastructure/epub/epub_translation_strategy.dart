@@ -25,7 +25,9 @@ class _EpubTranslationStrategy {
   /// Validate before the legacy decoder wraps every syntax failure as final.
   /// Returns the already-parsed payload so callers do not decode the same
   /// reply a second time.
-  Map<String, dynamic> _validateBatchReply(dynamic response, Set<String> ids, {
+  Map<String, dynamic> _validateBatchReply(
+    dynamic response,
+    Set<String> ids, {
     Map<String, Set<String>>? slotIds,
   }) {
     final content = owner._apiClient.extractMessageContent(response);
@@ -46,34 +48,53 @@ class _EpubTranslationStrategy {
           !error.message.contains('duplicate object key')) {
         throw const FormatException('Retryable JSON syntax jitter.');
       }
-      throw TranslationParseException('Deterministic JSON schema failure (${stripped.value.runtimeType}).');
+      throw TranslationParseException(
+        'Deterministic JSON schema failure (${stripped.value.runtimeType}).',
+      );
     }
     final blocks = json['blocks'];
     if (blocks is! List || blocks.length != ids.length) {
-      throw const _DeterministicBatchStructureException('Response must contain all requested blocks.');
+      throw const _DeterministicBatchStructureException(
+        'Response must contain all requested blocks.',
+      );
     }
     final seen = <String>{};
     for (final item in blocks) {
-      if (item is! Map<String, dynamic> || item['id'] is! String ||
-          !ids.contains(item['id']) || !seen.add(item['id'] as String)) {
-        throw const _DeterministicBatchStructureException('Response block structure/id mismatch.');
+      if (item is! Map<String, dynamic> ||
+          item['id'] is! String ||
+          !ids.contains(item['id']) ||
+          !seen.add(item['id'] as String)) {
+        throw const _DeterministicBatchStructureException(
+          'Response block structure/id mismatch.',
+        );
       }
       if (slotIds == null) {
         if (item['html'] is! String) {
-          throw const _DeterministicBatchStructureException('Response block is missing string html.');
+          throw const _DeterministicBatchStructureException(
+            'Response block is missing string html.',
+          );
         }
       } else {
         final slots = item['slots'];
         final expected = slotIds[item['id']]!;
         final seenSlots = <String>{};
-        if (item.keys.length != 2 || slots is! List || slots.length != expected.length) {
-          throw const _DeterministicBatchStructureException('Response slot structure/count mismatch.');
+        if (item.keys.length != 2 ||
+            slots is! List ||
+            slots.length != expected.length) {
+          throw const _DeterministicBatchStructureException(
+            'Response slot structure/count mismatch.',
+          );
         }
         for (final slot in slots) {
-          if (slot is! Map<String, dynamic> || slot.keys.length != 2 ||
-              slot['id'] is! String || slot['text'] is! String ||
-              !expected.contains(slot['id']) || !seenSlots.add(slot['id'] as String)) {
-            throw const _DeterministicBatchStructureException('Response slot structure/id mismatch.');
+          if (slot is! Map<String, dynamic> ||
+              slot.keys.length != 2 ||
+              slot['id'] is! String ||
+              slot['text'] is! String ||
+              !expected.contains(slot['id']) ||
+              !seenSlots.add(slot['id'] as String)) {
+            throw const _DeterministicBatchStructureException(
+              'Response slot structure/id mismatch.',
+            );
           }
           // An empty slot translation would render as empty HTML, silently
           // dropping the source text from the finished book. Reject it like
@@ -594,7 +615,8 @@ class _EpubTranslationStrategy {
         // context-overflow 400 on a single block means even one block is too
         // large to ever succeed: break out and let the normal failure path
         // degrade/throw instead of wasting retries.
-        final bool payloadTooLarge = error is DioException &&
+        final bool payloadTooLarge =
+            error is DioException &&
             (error.response?.statusCode == 413 ||
                 TranslationApiClient.isContextOverflowError(error));
         if (error is TranslationParseException ||
@@ -675,7 +697,8 @@ class _EpubTranslationStrategy {
         chapterPath: chapterPath ?? '',
         blockId: block.id,
         apiCounted: true,
-        reason: 'HTTP ${lastError.response?.statusCode}: block exceeds server request limit; source retained',
+        reason:
+            'HTTP ${lastError.response?.statusCode}: block exceeds server request limit; source retained',
       );
       AppLogger.warn(
         'Block ${block.id} exceeds the server request limit (HTTP ${lastError.response?.statusCode}); source retained.',
@@ -853,6 +876,7 @@ class _EpubTranslationStrategy {
                   owner._markDegradedBlock(
                     chapterPath: reference.chapter.path,
                     blockId: reference.block.id,
+                    apiCounted: true,
                     reason: _oversizedReason(singleError),
                   );
                   AppLogger.warn(
@@ -884,6 +908,7 @@ class _EpubTranslationStrategy {
               owner._markDegradedBlock(
                 chapterPath: reference.chapter.path,
                 blockId: reference.block.id,
+                apiCounted: true,
                 reason: _oversizedReason(error),
               );
               translatedById[reference.requestId] = reference.block.sourceHtml;
@@ -907,46 +932,60 @@ class _EpubTranslationStrategy {
           // Binary splitting preserves the existing verified split contract,
           // with no identical whole-batch retry.
           final middle = htmlReferences.length ~/ 2;
-          translatedById.addAll(await _mapTranslations(
-            [htmlReferences.sublist(0, middle), htmlReferences.sublist(middle)],
-            config: config, cancelToken: cancelToken,
-            process: (List<FootnoteBlockReference> part) => _translateFootnoteBatch(
-              dio: dio, config: config,
-              batch: FootnoteTranslationBatch(part, context: batch.context),
-              retryDelayOverride: retryDelayOverride, cancelToken: cancelToken,
-              onRequestAttempt: onRequestAttempt, onValidated: onValidated,
+          translatedById.addAll(
+            await _mapTranslations(
+              [
+                htmlReferences.sublist(0, middle),
+                htmlReferences.sublist(middle),
+              ],
+              config: config,
+              cancelToken: cancelToken,
+              process: (List<FootnoteBlockReference> part) =>
+                  _translateFootnoteBatch(
+                    dio: dio,
+                    config: config,
+                    batch: FootnoteTranslationBatch(
+                      part,
+                      context: batch.context,
+                    ),
+                    retryDelayOverride: retryDelayOverride,
+                    cancelToken: cancelToken,
+                    onRequestAttempt: onRequestAttempt,
+                    onValidated: onValidated,
+                  ),
             ),
-          ));
+          );
         } else {
-        translatedById.addAll(
-          await _mapTranslations(
-            htmlReferences,
-            config: config,
-            cancelToken: cancelToken,
-            process: (FootnoteBlockReference reference) async {
-              try {
-                return await _translateFootnoteHtmlBatch(
-                  dio: dio,
-                  config: config,
-                  references: <FootnoteBlockReference>[reference],
-                  context: batch.context,
-                  retryDelayOverride: retryDelayOverride,
-                  cancelToken: cancelToken,
-                  onRequestAttempt: onRequestAttempt,
-                  onValidated: onValidated,
-                );
-              } catch (singleError) {
-                if (!_shouldDegradeSingle(singleError, config)) rethrow;
-                owner._markDegradedBlock(
-                  chapterPath: reference.chapter.path,
-                  blockId: reference.block.id,
-                  reason: _oversizedReason(singleError),
-                );
-                return {reference.requestId: reference.block.sourceHtml};
-              }
-            },
-          ),
-        );
+          translatedById.addAll(
+            await _mapTranslations(
+              htmlReferences,
+              config: config,
+              cancelToken: cancelToken,
+              process: (FootnoteBlockReference reference) async {
+                try {
+                  return await _translateFootnoteHtmlBatch(
+                    dio: dio,
+                    config: config,
+                    references: <FootnoteBlockReference>[reference],
+                    context: batch.context,
+                    retryDelayOverride: retryDelayOverride,
+                    cancelToken: cancelToken,
+                    onRequestAttempt: onRequestAttempt,
+                    onValidated: onValidated,
+                  );
+                } catch (singleError) {
+                  if (!_shouldDegradeSingle(singleError, config)) rethrow;
+                  owner._markDegradedBlock(
+                    chapterPath: reference.chapter.path,
+                    blockId: reference.block.id,
+                    apiCounted: true,
+                    reason: _oversizedReason(singleError),
+                  );
+                  return {reference.requestId: reference.block.sourceHtml};
+                }
+              },
+            ),
+          );
         }
       }
     }
@@ -957,6 +996,7 @@ class _EpubTranslationStrategy {
           config: config,
           requests: slotRequests,
           context: batch.context,
+          apiCounted: true,
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           onRequestAttempt: onRequestAttempt,
@@ -1126,6 +1166,7 @@ class _EpubTranslationStrategy {
             owner._markDegradedBlock(
               chapterPath: reference.chapter.path,
               blockId: reference.block.id,
+              apiCounted: true,
               reason: _oversizedReason(error),
             );
             return {reference.requestId: reference.block.sourceHtml};
@@ -1211,13 +1252,21 @@ class _EpubTranslationStrategy {
         final midpoint = requests.length ~/ 2;
         return _mapTranslations(
           [requests.sublist(0, midpoint), requests.sublist(midpoint)],
-          config: config, cancelToken: cancelToken,
-          process: (List<_ProtectedSlotRequest> half) => _translateProtectedSlotBatch(
-            dio: dio, config: config, requests: half, context: context,
-            retryDelayOverride: retryDelayOverride, cancelToken: cancelToken,
-            onRequestAttempt: onRequestAttempt, maxBatchAttempts: 1,
-            apiCounted: apiCounted, onValidated: onValidated,
-          ),
+          config: config,
+          cancelToken: cancelToken,
+          process: (List<_ProtectedSlotRequest> half) =>
+              _translateProtectedSlotBatch(
+                dio: dio,
+                config: config,
+                requests: half,
+                context: context,
+                retryDelayOverride: retryDelayOverride,
+                cancelToken: cancelToken,
+                onRequestAttempt: onRequestAttempt,
+                maxBatchAttempts: 1,
+                apiCounted: apiCounted,
+                onValidated: onValidated,
+              ),
         );
       }
       if (error is TranslationParseException) {
@@ -1670,12 +1719,16 @@ class _EpubTranslationStrategy {
   /// characters, so long-distance context is not systematically dropped
   /// for slots near the end of a long block. When the slot text cannot be
   /// located in the block, it falls back to the leading window.
+  static const int _slotContextLimit = 600;
+
+  static String _boundedSlotNeighbor(String text) =>
+      text.length <= _slotContextLimit
+      ? text
+      : text.substring(0, _slotContextLimit);
+
   static String _blockContextSummary(ExtractedBlock block, {String? slotText}) {
-    const int limit = 600;
-    final String text = block.sourceText.trim().replaceAll(
-      RegExp(r'\s+'),
-      ' ',
-    );
+    const int limit = _slotContextLimit;
+    final String text = block.sourceText.trim().replaceAll(RegExp(r'\s+'), ' ');
     if (text.length <= limit) return text;
     int center = text.length ~/ 2;
     bool located = false;
@@ -1747,10 +1800,10 @@ class _EpubTranslationStrategy {
       ),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0
-          ? request.template.slotTexts[slotIndex - 1]
+          ? _boundedSlotNeighbor(request.template.slotTexts[slotIndex - 1])
           : null,
       'nextText': slotIndex + 1 < request.template.slotTexts.length
-          ? request.template.slotTexts[slotIndex + 1]
+          ? _boundedSlotNeighbor(request.template.slotTexts[slotIndex + 1])
           : null,
     };
     final Map<String, dynamic> requestData = <String, dynamic>{
@@ -1799,6 +1852,7 @@ class _EpubTranslationStrategy {
   /// must not trip the wrapper detector — otherwise it would burn
   /// maxRetries² paid retries across the nested retry layers.
   static final RegExp _slotWrapperTagPattern = RegExp(r'</?[A-Za-z!?][^>]*>');
+  static final RegExp _slotHtmlCommentPattern = RegExp(r'<!--[\s\S]*?-->');
 
   static void _validateIndividualSlotTranslation({
     required String sourceText,
@@ -1807,7 +1861,7 @@ class _EpubTranslationStrategy {
     // returning "<script>"): the downstream renderer escapes it (see
     // epub_repository_performance_test's "&lt;script&gt;" assertions).
     // Rejecting HTML tags here would false-positive on that established
-    // defense, so the batch path skips only the tag check.
+    // defense, so the batch path skips tag and HTML comment checks.
     bool checkHtmlTags = true,
   }) {
     final String trimmed = translatedText.trim();
@@ -1825,7 +1879,7 @@ class _EpubTranslationStrategy {
           translatedText: trimmed,
         ) ||
         _hasMarkdownWrapper(trimmed) ||
-        RegExp(r'<!--[\s\S]*?-->').hasMatch(trimmed) ||
+        (checkHtmlTags && _slotHtmlCommentPattern.hasMatch(trimmed)) ||
         // See [_slotWrapperTagPattern]: `<` must abut a letter/`/`/`!`/`?`
         // or a comparison like "a < b" is misread as markup.
         (checkHtmlTags && _slotWrapperTagPattern.hasMatch(trimmed)) ||
@@ -1879,7 +1933,11 @@ class _EpubTranslationStrategy {
       final Object? decoded = jsonDecode(translatedText);
       if (decoded is String) {
         final String source = sourceText.trim();
-        return !(source.startsWith('"') && source.endsWith('"'));
+        // P2-#13: the confirmed false positive was a curly-quoted source whose
+        // translation normalized the quotes to ASCII; quote-wrapped sources in
+        // any recognized style must not be misjudged as JSON wrappers.
+        if (source.length >= 2 && _isQuoteWrapped(source)) return false;
+        return true;
       }
       if (decoded is Map || decoded is List) return true;
       // Numbers and booleans are ordinary text when the source is also a
@@ -1898,6 +1956,12 @@ class _EpubTranslationStrategy {
       return false;
     }
   }
+
+  static bool _isQuoteWrapped(String s) =>
+      (s.startsWith('"') && s.endsWith('"')) ||
+      (s.startsWith('\u201C') && s.endsWith('\u201D')) ||
+      (s.startsWith("'") && s.endsWith("'")) ||
+      (s.startsWith('\u2018') && s.endsWith('\u2019'));
 
   static String _renderAndValidateProtectedSlots({
     required TranslationConfig config,
@@ -2051,7 +2115,7 @@ class _EpubTranslationStrategy {
 }
 
 class _ProtectedSlotRequest {
-  const _ProtectedSlotRequest({
+  _ProtectedSlotRequest({
     required this.id,
     required this.block,
     required this.template,
@@ -2066,7 +2130,7 @@ class _ProtectedSlotRequest {
   /// bare id would collide across chapters.
   final String chapterPath;
 
-  List<String> get slotIds => List<String>.generate(
+  late final List<String> slotIds = List<String>.generate(
     template.slotTexts.length,
     (int index) => 's$index',
     growable: false,

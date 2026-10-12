@@ -75,9 +75,8 @@ class EpubChapterTranslator {
   TranslationRunContext _run = TranslationRunContext(concurrency: 1);
   Set<String> get _degradedBlocks => _run.degradedBlocks;
 
-  /// Degraded blocks that were also counted in `apiTranslatedBlocks` (the
-  /// main block pipeline; footnote degrades are tracked in [_degradedBlocks]
-  /// but never enter the API counter). Subtracted from it for the
+  /// Degraded blocks counted as completed API work in either pipeline.
+  /// Subtracted from the run-local `apiTranslatedBlocks` counter for the
   /// performance report so "translated N blocks" only counts blocks that
   /// actually got translated text.
   ///
@@ -90,8 +89,8 @@ class EpubChapterTranslator {
   /// Records [blockId] of [chapterPath] as degraded. The chapter scope is
   /// required because block ids are only unique within a chapter.
   ///
-  /// Pass [apiCounted] when the block was counted in `apiTranslatedBlocks`
-  /// (the main block pipeline); footnote-path degrades leave it false.
+  /// Pass [apiCounted] when the block will count as completed API work in
+  /// `apiTranslatedBlocks`, including footnote-path degrades.
   /// Callers of the shared protected-slot pipeline forward their own
   /// pipeline's value.
   void _markDegradedBlock({
@@ -188,6 +187,42 @@ class EpubChapterTranslator {
     memory,
     trustedLocks: trustedMemoryLocks,
   ).mergeChapter(_ChapterMemory.fromJson(chapter, trustedLocks: trustedChapterLocks)).toJson();
+
+  @visibleForTesting
+  static List<String> Function() protectedSlotIdsForTest(ExtractedBlock block) {
+    final request = _ProtectedSlotRequest(
+      id: block.id,
+      block: block,
+      template: ProtectedAnchorTextSlots.parse(block.sourceHtml),
+      chapterPath: '',
+    );
+    return () => request.slotIds;
+  }
+
+  /// Retains the production checkpoint's cache across saves in a test.
+  @visibleForTesting
+  static Future<Future<void> Function(
+    List<({String path, Map<String, Object?> memory})> timeline,
+  )> bookMemoryCheckpointWriterForTest({
+    required TranslationCacheStore cacheStore,
+    required String jobKey,
+    required int chunkSize,
+    bool resume = false,
+  }) async {
+    final checkpoint = _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize);
+    if (resume) await checkpoint.load();
+    return (List<({String path, Map<String, Object?> memory})> timeline) => checkpoint.save(
+      timeline.isEmpty
+          ? _BookMemory.fromJson({})
+          : _BookMemory.fromJson(timeline.last.memory, trustedLocks: true),
+      completedChapterPaths: timeline.map((entry) => entry.path).toSet(),
+      timeline: [
+        for (final entry in timeline)
+          (path: entry.path,
+           memory: _BookMemory.fromJson(entry.memory, trustedLocks: true)),
+      ],
+    );
+  }
 
   static Future<void> saveBookMemoryCheckpointForTest({
     required TranslationCacheStore cacheStore,
@@ -1425,15 +1460,9 @@ class EpubChapterTranslator {
               translatedHtml: translated,
             );
             completedBlocks += 1;
-            // Footnote-path degrades never enter the API counter (see
-            // [_apiDegradedBlocks]): a block that kept its source text must
-            // not inflate "translated N new blocks" in the final report.
-            if (!_isDegradedBlock(
-              chapterPath: reference.chapter.path,
-              blockId: reference.block.id,
-            )) {
-              apiTranslatedBlocks += 1;
-            }
+            // Both throughput and the final report subtract degraded API
+            // work, so count every completed reference before subtraction.
+            apiTranslatedBlocks += 1;
             persistence.blockCompleted();
             currentJob = currentJob.copyWith(
               progress: completedBlocks / totalBlocks,
@@ -2648,7 +2677,12 @@ class EpubChapterTranslator {
       return rebuilt;
     }
 
-    final String translatedPlainText = translatedDom.plainText;
+    // Protected source slots retain their text; including translated code or
+    // markers here would duplicate them in the first writable source slot.
+    final String translatedPlainText = translatedSlots
+        .where((_HtmlTextSlot slot) => !slot.protected)
+        .map((_HtmlTextSlot slot) => slot.text)
+        .join();
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
         <({_HtmlTextSlot slot, String sourceText})>[];
@@ -3422,9 +3456,12 @@ class EpubChapterTranslator {
     return false;
   }
 
-  static String cleanBookTitleForTest(String raw) => _cleanBookTitle(raw);
+  static String cleanBookTitleForTest(
+    String raw, {
+    bool checkHtmlTags = true,
+  }) => _cleanBookTitle(raw, checkHtmlTags: checkHtmlTags);
 
-  static String _cleanBookTitle(String raw) {
+  static String _cleanBookTitle(String raw, {bool checkHtmlTags = true}) {
     String value = raw.trim();
     // Peel nested presentation wrappers without changing the title itself.
     while (true) {
@@ -3483,9 +3520,21 @@ class EpubChapterTranslator {
     if (value.isEmpty) {
       throw const FormatException('Empty translated book title');
     }
+    // A paired presentation tag is still a wrapper, even when literal angle
+    // brackets (such as a generic type parameter) are allowed in XML text.
+    if (!checkHtmlTags &&
+        RegExp(
+          r'^<([A-Za-z][\w:-]*)\b[^>]*>[\s\S]*</\1\s*>$',
+          caseSensitive: false,
+        ).hasMatch(value)) {
+      throw const TranslationParseException(
+        'Translated book title contains an HTML wrapper.',
+      );
+    }
     _EpubTranslationStrategy._validateIndividualSlotTranslation(
       sourceText: value,
       translatedText: value,
+      checkHtmlTags: checkHtmlTags,
     );
     return value;
   }
@@ -3521,6 +3570,7 @@ class EpubChapterTranslator {
     );
     final String translated = _cleanBookTitle(
       _apiClient.extractMessageContent(response.data),
+      checkHtmlTags: false,
     );
     if (translated == originalTitle.trim()) {
       return null;

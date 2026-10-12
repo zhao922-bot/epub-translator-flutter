@@ -1014,13 +1014,10 @@ class _BookMemoryCheckpoint {
   final String jobKey;
   final int chunkSize;
 
-  /// Incremental-persist watermark: JSON of the timeline entries already
-  /// written by a previous save, and how many in-memory entries they cover.
-  /// Timeline entries are append-only in book order, so each save only
-  /// serializes the suffix appended since the previous one (O(new entries)
-  /// per save instead of O(all entries), i.e. O(n) total, not O(n^2)).
-  final List<Map<String, Object?>> _persistedTimelineJson =
-      <Map<String, Object?>>[];
+  /// Encoded array contents (without brackets) and their entry watermark.
+  /// Only new entries are JSON-encoded; assembling/writing the full checkpoint
+  /// still copies the prefix, but never traverses its memory objects again.
+  String _persistedTimelineJson = '';
   int _persistedTimelineLength = 0;
 
   String get key => sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
@@ -1057,12 +1054,9 @@ class _BookMemoryCheckpoint {
       final timeline = _timelineFromJson(decoded['memoryTimeline']);
       // Seed the incremental-persist watermark so the first save after a
       // resume does not re-serialize the restored prefix.
-      _persistedTimelineJson
-        ..clear()
-        ..addAll([
-          for (final entry in timeline)
-            {'path': entry.path, 'memory': entry.memory.toJson()},
-        ]);
+      _persistedTimelineJson = timeline.map((entry) => jsonEncode(
+        {'path': entry.path, 'memory': entry.memory.toJson()},
+      )).join(',');
       _persistedTimelineLength = timeline.length;
       return (
         memory: _BookMemory.fromJson(memoryJson, trustedLocks: true),
@@ -1146,27 +1140,38 @@ class _BookMemoryCheckpoint {
     if (timeline.length < _persistedTimelineLength) {
       // The timeline was rebuilt (e.g. a fresh run reusing this
       // checkpoint): the cached prefix no longer applies.
-      _persistedTimelineJson.clear();
+      _persistedTimelineJson = '';
       _persistedTimelineLength = 0;
     }
-    for (int i = _persistedTimelineLength; i < timeline.length; i++) {
-      final entry = timeline[i];
-      _persistedTimelineJson.add(
-        {'path': entry.path, 'memory': entry.memory.toJson()},
-      );
+    if (timeline.length > _persistedTimelineLength) {
+      final suffix = StringBuffer();
+      for (int i = _persistedTimelineLength; i < timeline.length; i++) {
+        if (i > 0) suffix.write(',');
+        final entry = timeline[i];
+        suffix.write(jsonEncode(
+          {'path': entry.path, 'memory': entry.memory.toJson()},
+        ));
+      }
+      _persistedTimelineJson += suffix.toString();
     }
     _persistedTimelineLength = timeline.length;
+    // Encode the bounded envelope separately, then insert the already-encoded
+    // timeline before its last field. This retains the original JSON field
+    // order and escaping without re-encoding the growing timeline.
+    final envelope = jsonEncode({
+      'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
+      'memory': memory.toJson(),
+      'completedChapterPaths': completedChapterPaths.toList(),
+    });
+    final currentChapter = '${envelope.substring(0, envelope.length - 1)},'
+        '"memoryTimeline":[$_persistedTimelineJson],'
+        '"glossaryEvictionPolicy":${jsonEncode(_BookMemory.glossaryEvictionPolicy)}}';
     return cacheStore.saveJobState(JobResumeState(
       jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
       status: 'book-memory', completedFiles: completedChapterPaths.length,
       totalFiles: 0, completedBlocks: 0, totalBlocks: 0, cachedBlocks: 0,
       resumedBlocks: 0,
-      currentChapter: jsonEncode({
-        'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
-        'memory': memory.toJson(), 'completedChapterPaths': completedChapterPaths.toList(),
-        'memoryTimeline': _persistedTimelineJson,
-        'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
-      }),
+      currentChapter: currentChapter,
       updatedAtIso8601: DateTime.now().toIso8601String(),
     ));
   }

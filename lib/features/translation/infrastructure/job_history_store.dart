@@ -84,7 +84,11 @@ class JobHistoryStore {
   @visibleForTesting
   Future<void> Function()? onBeforeCorruptBackupForTest;
 
-  String _fingerprint(String raw) => sha256.convert(utf8.encode(raw)).toString();
+  @visibleForTesting
+  Future<void> Function()? onBeforeCorruptRenameForTest;
+
+  String _fingerprint(String raw) =>
+      sha256.convert(utf8.encode(raw)).toString();
 
   Future<List<TranslationJob>> load() async => (await loadWithTombstone()).jobs;
 
@@ -106,7 +110,10 @@ class JobHistoryStore {
       // Windows Notepad writes UTF-8 with BOM; without stripping, a
       // hand-edited job-history.json parses as corrupt, the load returns
       // empty, and the next persist silently wipes the whole history.
-      final String raw = await file.readAsString();
+      final String raw = utf8.decode(
+        await file.readAsBytes(),
+        allowMalformed: true,
+      );
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
         final Object? jobsNode = decoded is Map<String, dynamic>
@@ -149,7 +156,10 @@ class JobHistoryStore {
       await onBeforeCorruptBackupForTest?.call();
       final File file = await _historyFile();
       if (!await file.exists()) return;
-      final String raw = await file.readAsString();
+      final String raw = utf8.decode(
+        await file.readAsBytes(),
+        allowMalformed: true,
+      );
       if (expectedFingerprint != null &&
           _fingerprint(raw) != expectedFingerprint) {
         return;
@@ -158,7 +168,24 @@ class JobHistoryStore {
         file.parent.path,
         'job-history.json.bad-${DateTime.now().microsecondsSinceEpoch}',
       );
-      await file.rename(backupPath);
+      await onBeforeCorruptRenameForTest?.call();
+      final File backup = await file.rename(backupPath);
+      final String movedRaw = utf8.decode(
+        await backup.readAsBytes(),
+        allowMalformed: true,
+      );
+      if (expectedFingerprint != null &&
+          _fingerprint(movedRaw) != expectedFingerprint) {
+        // A writer replaced the history after the precheck. Preserve the
+        // moved contents, without restoring over a newer write or pruning.
+        // If no new active file exists, move it back so a repaired history
+        // isn't lost from view (P1-#2: the rename must not silently drop a
+        // just-fixed history).
+        if (!await file.exists()) {
+          await backup.rename(file.path);
+        }
+        return;
+      }
       await _pruneCorruptBackups(file.parent);
     } catch (_) {
       // Best effort only: a failed backup must not break startup.
@@ -213,11 +240,12 @@ class JobHistoryStore {
       }
       try {
         jobs.add(TranslationJob.fromJson(item));
+        if (jobs.length == 20) break;
       } catch (_) {
         // A single corrupt entry should not prevent the app from opening.
       }
     }
-    return jobs.take(20).toList(growable: false);
+    return jobs.toList(growable: false);
   }
 
   /// Saves the history. [clearedAtEpochMs] preserves the clear tombstone so
@@ -234,7 +262,10 @@ class JobHistoryStore {
     final File file = await _historyFile();
     await file.parent.create(recursive: true);
     if (await file.exists()) {
-      final String raw = await file.readAsString();
+      final String raw = utf8.decode(
+        await file.readAsBytes(),
+        allowMalformed: true,
+      );
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
         if (decoded is Map<String, dynamic> &&

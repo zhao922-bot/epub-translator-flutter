@@ -4,6 +4,66 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ShareStagingTest {
+    @Test fun grantOverflowEvictsOldestFirstAndRevokesUris() {
+        val now = System.currentTimeMillis()
+        // Fresh grants have no grace exemption once their protection cap overflows.
+        val files = (1..25).map { ShareStagingEntry("/s/$it.epub", now - 1000 + it, 1024) }
+        val grants = files.associate { it.path to "content://u/${it.path}" }
+        val plan = planShareStagingCleanup(files.reversed(), grants, now)
+        assertTrue(plan.deleteForAge.isEmpty())
+        assertEquals(files.take(5), plan.evictForCap)
+        assertEquals(files.take(5).map { grants.getValue(it.path) }, plan.revokeUris)
+    }
+
+    @Test fun grantByteOverflowEvictsOldestFirst() {
+        val now = System.currentTimeMillis()
+        val files = (1..3).map {
+            ShareStagingEntry("/s/$it.epub", now - 1000 + it, 100L * 1024 * 1024)
+        }
+        val grants = files.associate { it.path to "content://u/${it.path}" }
+        val plan = planShareStagingCleanup(files.reversed(), grants, now)
+        assertEquals(listOf(files.first()), plan.evictForCap)
+        assertEquals(listOf(grants.getValue(files.first().path)), plan.revokeUris)
+    }
+
+    @Test fun grantsWithinExemptionCapsSurviveQuotaPressure() {
+        val now = System.currentTimeMillis()
+        val granted = (1..MAX_SHARE_GRANT_EXEMPT_FILES).map {
+            ShareStagingEntry(
+                "/granted/$it.epub",
+                now - 600_000 + it,
+                MAX_SHARE_GRANT_EXEMPT_BYTES / MAX_SHARE_GRANT_EXEMPT_FILES,
+            )
+        }
+        val fresh = (1..MAX_SHARE_STAGING_FILES).map {
+            ShareStagingEntry("/fresh/$it.epub", now, 1024)
+        }
+        val grants = granted.associate { it.path to "content://u/${it.path}" }
+        val plan = planShareStagingCleanup(granted + fresh, grants, now)
+        assertTrue(plan.evictForCap.isEmpty())
+        assertTrue(plan.revokeUris.isEmpty())
+    }
+
+    @Test fun grantOverflowDoesNotEvictWithoutQuotaPressure() {
+        val now = System.currentTimeMillis()
+        val files = (1..MAX_SHARE_GRANT_EXEMPT_FILES + 1).map {
+            ShareStagingEntry("/s/$it.epub", now - 600_000 + it, 1024)
+        }
+        val grants = files.associate { it.path to "content://u/${it.path}" }
+        val plan = planShareStagingCleanup(files, grants, now)
+        assertTrue(plan.evictForCap.isEmpty())
+        assertTrue(plan.revokeUris.isEmpty())
+    }
+
+    @Test fun activeGrantedSnapshotSurvivesOverflowEviction() {
+        val now = System.currentTimeMillis()
+        val files = (1..25).map { ShareStagingEntry("/s/$it.epub", now - 1000 + it, 1024) }
+        val grants = files.associate { it.path to "content://u/${it.path}" }
+        val plan = planShareStagingCleanup(files, grants, now, setOf(files.first().path))
+        assertEquals(files.drop(1).take(5), plan.evictForCap)
+        assertEquals(files.drop(1).take(5).map { grants.getValue(it.path) }, plan.revokeUris)
+    }
+
     private fun entry(path: String, ageMs: Long, length: Long = 1024) =
         ShareStagingEntry(path, System.currentTimeMillis() - ageMs, length)
 

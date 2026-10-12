@@ -7,6 +7,7 @@ import 'package:epub_translator_flutter/features/preview/application/preview_rec
 import 'package:epub_translator_flutter/features/preview/domain/models/preview_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 
 InspectedChapter legacy({
@@ -33,6 +34,139 @@ InspectedChapter legacy({
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'runner receives bounded recovery payloads with identical excerpts',
+    () async {
+      final long = '${'a' * 5998}😀${'文' * 100000}';
+      final chapters = [
+        legacy(source: long, translation: long),
+        legacy(translation: '${'a' * 6000} ${'b' * 100000}'),
+        legacy().copyWith(
+          blocks: [
+            legacy().blocks.single.copyWith(translatedHtml: '<p>Start</p>'),
+            legacy().blocks.single.copyWith(translatedHtml: '<p>$long</p>'),
+          ],
+        ),
+        legacy().copyWith(
+          originalHtml:
+              '<html><head><style>${'x' * 100000}</style></head>'
+              '<body><p>First<br>line</p><p>Second &amp; third</p></body></html>',
+          blocks: [
+            legacy().blocks.single.copyWith(translatedHtml: '<p></p>'),
+            ...List.generate(
+              15,
+              (i) => legacy().blocks.single.copyWith(
+                translatedHtml: '<p>Translation $i</p>',
+              ),
+            ),
+          ],
+        ),
+        legacy(source: long, translation: long).copyWith(
+          originalHtml: '',
+          blocks: [
+            legacy().blocks.single.copyWith(
+              sourceText: long,
+              translatedHtml: '<p>$long</p>',
+            ),
+            legacy().blocks.single.copyWith(
+              sourceText: 'tail',
+              translatedHtml: '<p>tail</p>',
+            ),
+          ],
+        ),
+        legacy().copyWith(
+          originalHtml: '<html><body><pre>${'x' * 100000}</pre></body></html>',
+        ),
+        legacy().copyWith(
+          originalHtml: '<html><body><p>${'&amp;' * 15000}</p></body></html>',
+        ),
+      ];
+      for (final chapter in chapters) {
+        final expected = previewChapterFromInspected(chapter);
+        final cache = PreviewRecoveryCache(
+          runner: (payloads) async {
+            final payload = payloads.single;
+            expect(identical(payload, chapter), isFalse);
+            expect(
+              payload.originalHtml.length,
+              lessThanOrEqualTo(previewRecoveryMarkupLimit),
+            );
+            expect(
+              payload.body.length,
+              lessThanOrEqualTo(EpubHtmlExtractor.previewCharacterLimit),
+            );
+            expect(payload.blocks.length, lessThanOrEqualTo(12));
+            expect(payload.sourceIdentity, isNull);
+            for (final block in payload.blocks) {
+              expect(block.sourceHtml, isEmpty);
+              expect(block.sourceText, isEmpty);
+              expect(
+                block.translatedHtml!.length,
+                lessThanOrEqualTo(previewRecoveryMarkupLimit),
+              );
+            }
+            return payloads.map(previewChapterFromInspected).toList();
+          },
+        );
+        await cache.prepare([chapter]);
+        final actual = cache.lookup(chapter)!;
+        expect(actual.body, expected.body);
+        expect(actual.translatedBody, expected.translatedBody);
+        expect(actual.blockCount, expected.blockCount);
+        expect(actual.translatedBlockCount, expected.translatedBlockCount);
+        expect(actual.title, expected.title);
+        expect(actual.category, expected.category);
+      }
+    },
+  );
+
+  test(
+    'switched-away completion is dropped before reading or applying results',
+    () async {
+      final jobs = <Completer<List<PreviewChapter>>>[];
+      final cache = PreviewRecoveryCache(
+        runner: (_) {
+          final job = Completer<List<PreviewChapter>>();
+          jobs.add(job);
+          return job.future;
+        },
+      );
+      final first = legacy();
+      final second = legacy(source: 'Second book');
+      final oldWork = cache.prepare([first]);
+      final newWork = cache.prepare([second]);
+      // An empty result makes any attempt to apply the obsolete batch observable.
+      jobs.first.complete([]);
+      await oldWork;
+      expect(cache.lookup(first), isNull);
+      expect(cache.lookup(second), isNull);
+      jobs.last.complete([previewChapterFromInspected(second)]);
+      await newWork;
+      expect(cache.lookup(second)!.body, 'Second book');
+    },
+  );
+
+  test(
+    'identical pending content is adopted by the current generation',
+    () async {
+      final job = Completer<List<PreviewChapter>>();
+      var calls = 0;
+      final cache = PreviewRecoveryCache(
+        runner: (_) {
+          calls++;
+          return job.future;
+        },
+      );
+      final chapter = legacy();
+      final first = cache.prepare([chapter]);
+      final second = cache.prepare([chapter.copyWith(title: 'New title')]);
+      job.complete([previewChapterFromInspected(chapter)]);
+      await Future.wait([first, second]);
+      expect(calls, 1);
+      expect(cache.lookup(chapter)!.body, 'Original');
+    },
+  );
 
   test(
     'real isolate restores released legacy source and helper stays compatible',

@@ -186,6 +186,10 @@ class MainActivity : FlutterActivity() {
      * instead (see below). */
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
+    /** Runs chooser-failure cleanup on a process-lifetime daemon worker.
+     * Never shut down in onDestroy: queued shares may fail after teardown. */
+    private val shareRollbackExecutor = ShareRollbackExecutor
+
     /**
      * Runs the SAF/DocumentProvider import copy on its own thread, isolated
      * from [ioExecutor]: reading from a cloud provider (Drive, OneDrive)
@@ -1063,14 +1067,13 @@ class MainActivity : FlutterActivity() {
                 }
                 // Record the URI grant here on ioExecutor, before the chooser
                 // starts and before leaving this thread. The staging snapshot
-                // must not be swept while its grant is alive (the grant is
-                // revoked, and the snapshot deleted, only by the 7-day
-                // backstop in cleanupOldShareStaging):
+                // is protected within the grant exemption caps; cleanup
+                // revokes its grant before age/quota deletion:
                 // - if the process dies between startActivity and the record,
                 //   the grant is lost and a later sweep may delete the
                 //   snapshot under the live chooser;
                 // - the ledger read-modify-write must serialize with
-                //   cleanupOldShareStaging on the single ioExecutor thread —
+                //   cleanupOldShareStaging and rollback under grantLock —
                 //   recording it on mainHandler.post lost-update against a
                 //   concurrent cleanup's read-modify-write.
                 // FileProvider.getUriForFile is thread-safe; only the
@@ -1081,22 +1084,24 @@ class MainActivity : FlutterActivity() {
                     shareFile,
                 )
                 try {
-                    val prefs = appContext.getSharedPreferences(
-                        PREFS_NAME,
-                        Context.MODE_PRIVATE,
-                    )
-                    val entries =
-                        prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
-                            ?: emptySet()
-                    prefs.edit().putStringSet(
-                        SHARE_GRANTS_PREF_KEY,
-                        recordShareGrant(
-                            entries,
-                            uri.toString(),
-                            shareFile.absolutePath,
-                            System.currentTimeMillis(),
-                        ),
-                    ).apply()
+                    synchronized(ShareRollbackExecutor.grantLock) {
+                        val prefs = appContext.getSharedPreferences(
+                            PREFS_NAME,
+                            Context.MODE_PRIVATE,
+                        )
+                        val entries =
+                            prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
+                                ?: emptySet()
+                        prefs.edit().putStringSet(
+                            SHARE_GRANTS_PREF_KEY,
+                            recordShareGrant(
+                                entries,
+                                uri.toString(),
+                                shareFile.absolutePath,
+                                System.currentTimeMillis(),
+                            ),
+                        ).apply()
+                    }
                 } catch (_: Exception) {
                     // Best effort: without a ledger entry the file
                     // falls back to the grace-period heuristic.
@@ -1115,9 +1120,10 @@ class MainActivity : FlutterActivity() {
                         )
                         result.success(null)
                     } catch (error: Exception) {
-                        // Serialize rollback with grant recording and staging cleanup.
+                        // Survive teardown; grantLock serializes ledger updates
+                        // with grant recording and staging cleanup on ioExecutor.
                         try {
-                            ioExecutor.execute {
+                            shareRollbackExecutor.execute {
                                 try {
                                     val prefs = appContext.getSharedPreferences(
                                         PREFS_NAME,
@@ -1167,7 +1173,7 @@ class MainActivity : FlutterActivity() {
             readGrants: () -> Set<String>,
             writeGrants: (Set<String>) -> Unit,
             shareFile: File,
-        ): Boolean {
+        ): Boolean = synchronized(ShareRollbackExecutor.grantLock) {
             val entries = readGrants()
             val remaining = dropShareGrant(entries, shareFile.absolutePath)
             writeGrants(remaining)
@@ -1176,7 +1182,7 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
                 // Snapshot deletion is best effort; the ledger no longer protects it.
             }
-            return remaining.size < entries.size
+            remaining.size < entries.size
         }
     }
 
@@ -1185,13 +1191,14 @@ class MainActivity : FlutterActivity() {
      *
      * Deletion follows the URI grants' lifetime, not a fixed grace period:
      * every share records its grant in the ledger, a snapshot with a live
-     * grant is never quota-evicted, and the 7-day backstop revokes the
-     * grant before deleting the file — so a grant never outlives its file.
+     * grant is quota-protected within the count/byte exemption caps. Both
+     * quota eviction and the 7-day backstop revoke the grant before deleting
+     * the file — so a grant never outlives its file.
      * The count/size quota counts ALL surviving snapshots (a burst of
      * shares inside the grace period cannot silently exceed it). Best
      * effort only: a failed cleanup must not block sharing.
      */
-    private fun cleanupOldShareStaging(stagingDir: File) {
+    private fun cleanupOldShareStaging(stagingDir: File) = synchronized(ShareRollbackExecutor.grantLock) {
         try {
             val appCtx = applicationContext
             val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -1221,7 +1228,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             }
-            val liveFiles = stagingDir.listFiles()?.filter { it.isFile } ?: return
+            val liveFiles = stagingDir.listFiles()?.filter { it.isFile } ?: return@synchronized
             // Forget ledger entries whose file is already gone.
             grants = dropStaleShareGrants(
                 grants,

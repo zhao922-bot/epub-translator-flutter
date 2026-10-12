@@ -280,6 +280,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
         const <SettingsSecretSlot>{},
     Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
     bool debounce = false,
+    bool isConflictReplay = false,
   }) async {
     if (!_loaded) await _initialLoad;
     if (!mounted) {
@@ -329,12 +330,14 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final result = await _saveUpdate(
       next,
       slots,
-      pendingEdit: (
-        update: effectiveUpdate,
-        explicitSecretMutations: explicitSecretMutations,
-        secretMutationsFor: secretMutationsFor,
-        credentialRoute: credentialRoute,
-      ),
+      pendingEdit: isConflictReplay
+          ? null
+          : (
+              update: effectiveUpdate,
+              explicitSecretMutations: explicitSecretMutations,
+              secretMutationsFor: secretMutationsFor,
+              credentialRoute: credentialRoute,
+            ),
     );
     pendingSlider?.complete(result);
     return result;
@@ -418,6 +421,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// failed state wholesale) keeps the other instance's unrelated changes
   /// intact. Clears the store's load error on success.
   Future<void> reloadSettings() async {
+    await _pendingSave;
     if (!await _load()) return;
     await _replayConflictedEdits();
   }
@@ -440,31 +444,33 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (_replayingConflictedEdits || !mounted) return;
     _replayingConflictedEdits = true;
     final List<_ConflictedEdit> pending = _conflictedEdits.toList();
-    _conflictedEdits.clear();
     int blocked = 0;
     try {
-      for (int i = 0; i < pending.length; i++) {
-        if (!mounted) {
-          _conflictedEdits.addAll(pending.skip(i));
+      for (final edit in pending) {
+        if (!mounted) break;
+        try {
+          // Leave failed, blocked and unprocessed edits in their original
+          // order, including when recovery cannot load a fresh snapshot.
+          if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
+            break;
+          }
+          if (_isReplayBlockedByRouteChange(edit)) {
+            blocked++;
+            continue;
+          }
+          if (await _update(
+            edit.update,
+            explicitSecretMutations: edit.explicitSecretMutations,
+            secretMutationsFor: edit.secretMutationsFor,
+            // This edit is still queued; a new conflict must not duplicate it.
+            isConflictReplay: true,
+          )) {
+            _conflictedEdits.remove(edit);
+          }
+        } catch (error) {
+          if (mounted) onSaveError?.call(error);
           break;
         }
-        final edit = pending[i];
-        // If recovery cannot load, _update never reaches _saveUpdate to
-        // re-enqueue the edit. Keep this and the remaining edits for retry.
-        if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
-          _conflictedEdits.addAll(pending.skip(i));
-          break;
-        }
-        if (_isReplayBlockedByRouteChange(edit)) {
-          _conflictedEdits.add(edit);
-          blocked++;
-          continue;
-        }
-        await _update(
-          edit.update,
-          explicitSecretMutations: edit.explicitSecretMutations,
-          secretMutationsFor: edit.secretMutationsFor,
-        );
       }
     } finally {
       _replayingConflictedEdits = false;

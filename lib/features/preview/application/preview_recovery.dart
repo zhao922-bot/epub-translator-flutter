@@ -23,6 +23,8 @@ PreviewChapter previewChapterFromInspected(InspectedChapter chapter) {
                 bytes: utf8.encode(chapter.originalHtml),
               )
               .body
+        : chapter is _PreviewRecoveryPayload
+        ? chapter.body
         : chapter.blocks.take(12).map((b) => b.sourceText).join('\n\n').trim();
     translated = chapter.blocks
         .map((b) => b.translatedHtml)
@@ -56,12 +58,101 @@ PreviewChapter projectPreviewChapter(
   category: chapter.categoryLabel,
   recommendedForTranslation: chapter.recommendedForTranslation,
   includeInTranslation: chapter.includeInTranslation,
-  blockCount: chapter.blocks.length,
+  blockCount: chapter is _PreviewRecoveryPayload
+      ? chapter.blockCount
+      : chapter.blocks.length,
   translatedBlockCount: chapter.translatedBlockCount,
 );
 
 typedef PreviewRecoveryRunner =
     Future<List<PreviewChapter>> Function(List<InspectedChapter> chapters);
+
+/// Keep the runner's existing chapter API, but transfer only recovery fields.
+/// Eight times the text budget allows entity/markup overhead, plus parser slack.
+const previewRecoveryMarkupLimit =
+    EpubHtmlExtractor.previewCharacterLimit * 8 + 4096;
+
+class _PreviewRecoveryPayload extends InspectedChapter {
+  _PreviewRecoveryPayload(InspectedChapter chapter)
+    : blockCount = chapter.blocks.length,
+      translatedBlockCount = chapter.translatedBlockCount,
+      super(
+        path: chapter.path,
+        title: chapter.title,
+        body: _slimSourceBody(chapter),
+        originalHtml: _slimOriginalHtml(chapter),
+        blocks: _slimTranslations(chapter),
+        category: chapter.category,
+        recommendedForTranslation: chapter.recommendedForTranslation,
+        includeInTranslation: chapter.includeInTranslation,
+      );
+
+  final int blockCount;
+  @override
+  final int translatedBlockCount;
+}
+
+String _excerptMarkup(String text) {
+  // Keep overflow evidence for the final ellipsis, even if fragment parsing
+  // trims a trailing normalized space. Do not insert an ellipsis per block:
+  // joins and surrogate boundaries must be limited only at final projection.
+  const limit = EpubHtmlExtractor.previewCharacterLimit + 2;
+  final prefix = text.length > limit ? text.substring(0, limit) : text;
+  return '<p>${const HtmlEscape().convert(prefix)}</p>';
+}
+
+String _slimOriginalHtml(InspectedChapter chapter) {
+  if (chapter.originalHtml.length <= previewRecoveryMarkupLimit) {
+    return chapter.originalHtml;
+  }
+  // A raw prefix is not equivalent to inspection: a long head/skipped subtree
+  // may precede the body, and truncation can change block selection or entities.
+  // For oversized HTML, extract the exact bounded body before transfer instead.
+  // This fallback parses on the caller isolate, trading CPU for exact semantics
+  // and a strictly bounded transfer; ordinary markup is parsed in compute.
+  return '';
+}
+
+String _slimSourceBody(InspectedChapter chapter) {
+  if (chapter.originalHtml.length > previewRecoveryMarkupLimit) {
+    return const EpubHtmlExtractor()
+        .inspectChapterBytes(
+          chapterPath: chapter.path,
+          bytes: utf8.encode(chapter.originalHtml),
+        )
+        .body;
+  }
+  return EpubHtmlExtractor.limitPreviewText(
+    chapter.originalHtml.isEmpty
+        ? chapter.blocks.take(12).map((b) => b.sourceText).join('\n\n').trim()
+        : chapter.body,
+  );
+}
+
+List<ExtractedBlock> _slimTranslations(InspectedChapter chapter) {
+  final blocks = <ExtractedBlock>[];
+  for (final block in chapter.blocks) {
+    final markup = block.translatedHtml;
+    if (markup == null) continue;
+    final text = (XhtmlHtmlCompatibility.parseFragment(markup).text ?? '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (text.isEmpty) continue;
+    blocks.add(
+      ExtractedBlock(
+        id: '',
+        tagName: '',
+        sourceHtml: '',
+        sourceText: '',
+        translatedHtml: markup.length <= previewRecoveryMarkupLimit
+            ? markup
+            : _excerptMarkup(text),
+      ),
+    );
+    if (blocks.length == 12) break;
+  }
+  return blocks;
+}
 
 Future<List<PreviewChapter>> _recoverInIsolate(
   List<InspectedChapter> chapters,
@@ -80,6 +171,7 @@ class PreviewRecoveryCache {
 
   final PreviewRecoveryRunner _runner;
   final Map<String, _RecoveryEntry> _entries = {};
+  int _generation = 0;
 
   PreviewChapter? lookup(InspectedChapter chapter) {
     final entry = _entries[chapter.path];
@@ -87,6 +179,7 @@ class PreviewRecoveryCache {
   }
 
   Future<void> prepare(List<InspectedChapter> chapters) async {
+    final generation = ++_generation;
     final paths = chapters.map((c) => c.path).toSet();
     _entries.removeWhere((path, _) => !paths.contains(path));
     final missing = <InspectedChapter>[];
@@ -99,19 +192,27 @@ class PreviewRecoveryCache {
       }
       final existing = _entries[chapter.path];
       if (existing != null && existing.matches(chapter)) {
+        // Identical pending work is adopted by this generation, preserving reuse.
+        existing.generation = generation;
         pending.add(existing.ready);
       } else {
-        final entry = _RecoveryEntry(chapter);
+        final entry = _RecoveryEntry(chapter, generation);
         _entries[chapter.path] = entry;
         missing.add(chapter);
         newEntries.add(entry);
       }
     }
     if (missing.isNotEmpty) {
-      final work = _runner(missing)
+      final work = _runner(missing.map(_PreviewRecoveryPayload.new).toList())
           .then((results) {
             for (var i = 0; i < newEntries.length; i++) {
-              newEntries[i].result = results[i];
+              final entry = newEntries[i];
+              // compute cannot be cancelled. Logical cancellation drops results
+              // for switched-away content without applying them even to old entries.
+              if (entry.generation == _generation &&
+                  identical(_entries[entry.chapter.path], entry)) {
+                entry.result = results[i];
+              }
             }
           })
           .catchError((Object error, StackTrace stack) {
@@ -132,8 +233,9 @@ class PreviewRecoveryCache {
 }
 
 class _RecoveryEntry {
-  _RecoveryEntry(this.chapter);
+  _RecoveryEntry(this.chapter, this.generation);
   final InspectedChapter chapter;
+  int generation;
   PreviewChapter? result;
   Future<void> ready = Future.value();
 

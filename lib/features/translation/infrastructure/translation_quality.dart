@@ -341,7 +341,8 @@ class TranslationQuality {
           RegExp(r'[》」』〉]').hasMatch(translatedVisibleText) ||
           translatedCandidates.any(
             (Element candidate) => RegExp(
-              r'[\u3400-\u9FFF\u20000-\u2FA1F]',
+              r'[\u3400-\u9FFF\u{20000}-\u{2FA1F}]',
+              unicode: true,
             ).hasMatch(candidate.text),
           );
       for (final String unexempted in unexemptedSourceTexts) {
@@ -646,11 +647,12 @@ class TranslationQuality {
     // Direction 1: translated term first, original inside parentheses, e.g.
     // 伐林开垦（assarting） or 伐林开垦(assarting).
     final RegExp translatedFirstPattern = RegExp(
-      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u20000-\u2FA1F]\s*[（(]'
+      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]\s*[（(]'
       r'[^）)]*'
       '$escaped'
       r'[^）)]*'
       r'[）)]',
+      unicode: true,
     );
     if (translatedFirstPattern.hasMatch(text)) {
       return true;
@@ -663,9 +665,10 @@ class TranslationQuality {
       '$escaped'
       r'\s*[（(]'
       r'[^）)]*'
-      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u20000-\u2FA1F]'
+      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]'
       r'[^）)]*'
       r'[）)]',
+      unicode: true,
     );
     return retainedFirstPattern.hasMatch(text);
   }
