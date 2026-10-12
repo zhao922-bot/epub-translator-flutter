@@ -188,9 +188,10 @@ class TranslationConfig {
     // Credential-bearing components are rejected in BOTH slots: an old
     // custom URL stored from a previous version must never persist plaintext
     // credentials (P1-9), even when DeepSeek is currently selected. Ordinary
-    // non-credential query parameters / fragments / path '@' are allowed by
+    // non-credential query parameters and path '@' are allowed by
     // validateApiUrl, so a stale legitimate custom URL no longer blocks
-    // saving unrelated settings (#17).
+    // saving unrelated settings (#17); fragments are rejected outright
+    // (C-1: never sent to the server, zero legitimate use).
     validateApiUrl(apiBaseUrl);
     validateApiUrl(customApiBaseUrl);
     return <String, dynamic>{
@@ -219,11 +220,14 @@ class TranslationConfig {
 
   /// API authentication belongs in the secure API-key slot, not in the URL.
   ///
-  /// Only credential-like components are rejected: userinfo
-  /// (`user:pass@host`) and query parameters whose names look like secrets
-  /// (`key`, `token`, `secret`, `password` and friends). Ordinary query
-  /// parameters (e.g. `/v1?tenant=books`), `@` inside the path (e.g.
-  /// `/@team/v1`) and fragments are legitimate and allowed.
+  /// Rejected outright: userinfo (`user:pass@host`), query parameters whose
+  /// names look like secrets (`key`, `token`, `secret`, `password` and
+  /// friends), and any fragment. A fragment is never sent to the server, so
+  /// it has zero legitimate use in an API base URL — while the OAuth
+  /// implicit-flow shape (`#api_key=sk-xxx`) would silently drop the key
+  /// from requests and could leak it through history/logs. Ordinary query
+  /// parameters (e.g. `/v1?tenant=books`) and `@` inside the path (e.g.
+  /// `/@team/v1`) remain allowed.
   static void validateApiUrl(String value) {
     final String trimmed = value.trim();
     if (trimmed.isEmpty) return;
@@ -234,6 +238,15 @@ class TranslationConfig {
     if (uri.userInfo.isNotEmpty) {
       throw const FormatException(
         'API URLs must not embed userinfo credentials; '
+        'put the API key in the key field.',
+      );
+    }
+    // Uri.tryParse populates [Uri.fragment] even for schemeless input
+    // (e.g. `example.com#frag`), so a direct emptiness check is enough;
+    // an empty fragment (`...#`) carries nothing and is allowed.
+    if (uri.fragment.isNotEmpty) {
+      throw const FormatException(
+        'API URLs must not contain a fragment; '
         'put the API key in the key field.',
       );
     }

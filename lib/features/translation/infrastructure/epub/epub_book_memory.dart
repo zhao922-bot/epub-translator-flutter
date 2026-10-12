@@ -1014,6 +1014,15 @@ class _BookMemoryCheckpoint {
   final String jobKey;
   final int chunkSize;
 
+  /// Incremental-persist watermark: JSON of the timeline entries already
+  /// written by a previous save, and how many in-memory entries they cover.
+  /// Timeline entries are append-only in book order, so each save only
+  /// serializes the suffix appended since the previous one (O(new entries)
+  /// per save instead of O(all entries), i.e. O(n) total, not O(n^2)).
+  final List<Map<String, Object?>> _persistedTimelineJson =
+      <Map<String, Object?>>[];
+  int _persistedTimelineLength = 0;
+
   String get key => sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
 
   Future<({ _BookMemory memory, Set<String> completedChapterPaths, List<({String path, _BookMemory memory})> timeline })?> load() async {
@@ -1045,11 +1054,21 @@ class _BookMemoryCheckpoint {
         AppLogger.warn('Book memory checkpoint chapter list damaged; discarding.', tag: 'book-memory');
         return null;
       }
+      final timeline = _timelineFromJson(decoded['memoryTimeline']);
+      // Seed the incremental-persist watermark so the first save after a
+      // resume does not re-serialize the restored prefix.
+      _persistedTimelineJson
+        ..clear()
+        ..addAll([
+          for (final entry in timeline)
+            {'path': entry.path, 'memory': entry.memory.toJson()},
+        ]);
+      _persistedTimelineLength = timeline.length;
       return (
         memory: _BookMemory.fromJson(memoryJson, trustedLocks: true),
         completedChapterPaths: ((rawPaths as List<dynamic>?) ?? [])
             .whereType<String>().toSet(),
-        timeline: _timelineFromJson(decoded['memoryTimeline']),
+        timeline: timeline,
       );
     } catch (error) {
       AppLogger.warn('Book memory checkpoint unreadable (${error.runtimeType}); discarding.', tag: 'book-memory');
@@ -1117,22 +1136,40 @@ class _BookMemoryCheckpoint {
     Set<String> completedChapterPaths = const {},
     List<({String path, _BookMemory memory})> timeline = const [],
     String schema = EpubChapterTranslator.qualityCacheSchemaVersion,
-  }) => cacheStore.saveJobState(JobResumeState(
-    jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
-    status: 'book-memory', completedFiles: completedChapterPaths.length,
-    totalFiles: 0, completedBlocks: 0, totalBlocks: 0, cachedBlocks: 0,
-    resumedBlocks: 0,
-    currentChapter: jsonEncode({
-      'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
-      'memory': memory.toJson(), 'completedChapterPaths': completedChapterPaths.toList(),
-      'memoryTimeline': [
-        for (final entry in timeline)
-          {'path': entry.path, 'memory': entry.memory.toJson()},
-      ],
-      'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
-    }),
-    updatedAtIso8601: DateTime.now().toIso8601String(),
-  ));
+  }) {
+    // Incremental timeline persist: entries are append-only in book order
+    // (see recordMemoryTimeline), so only the suffix appended since the
+    // previous save is serialized. The on-disk envelope still carries the
+    // full merged timeline, so a resume sees every entry exactly once.
+    // This pairs with the record-before-persist order (A-2): the entry
+    // recorded for the just-finished chapter is included in this save.
+    if (timeline.length < _persistedTimelineLength) {
+      // The timeline was rebuilt (e.g. a fresh run reusing this
+      // checkpoint): the cached prefix no longer applies.
+      _persistedTimelineJson.clear();
+      _persistedTimelineLength = 0;
+    }
+    for (int i = _persistedTimelineLength; i < timeline.length; i++) {
+      final entry = timeline[i];
+      _persistedTimelineJson.add(
+        {'path': entry.path, 'memory': entry.memory.toJson()},
+      );
+    }
+    _persistedTimelineLength = timeline.length;
+    return cacheStore.saveJobState(JobResumeState(
+      jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
+      status: 'book-memory', completedFiles: completedChapterPaths.length,
+      totalFiles: 0, completedBlocks: 0, totalBlocks: 0, cachedBlocks: 0,
+      resumedBlocks: 0,
+      currentChapter: jsonEncode({
+        'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
+        'memory': memory.toJson(), 'completedChapterPaths': completedChapterPaths.toList(),
+        'memoryTimeline': _persistedTimelineJson,
+        'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
+      }),
+      updatedAtIso8601: DateTime.now().toIso8601String(),
+    ));
+  }
 }
 
 /// Source strings are spooled before clearing every invocation-owned list.
@@ -1272,6 +1309,13 @@ class _TranslationRequestBudget {
   /// aborting the run (see TranslationApiClient.isContextOverflowError).
   static const int maxOutputTokensCeiling = 32768;
 
+  /// Absolute sanity bound for the adaptive single-block ceiling below: no
+  /// current model accepts more output tokens than this, so a larger
+  /// max_tokens would be rejected outright instead of degrading gracefully.
+  /// This is intentionally not per-model: providers with a stricter cap
+  /// surface a 400 that the shrink/degrade path already handles.
+  static const int maxAdaptiveOutputTokens = 131072;
+
   static int estimateTokens(String value) =>
       (utf8.encode(value).length / bytesPerToken * conservativeFactor).ceil();
 
@@ -1293,6 +1337,59 @@ class _TranslationRequestBudget {
     // output ceiling keeps a misestimated input from sending a max_tokens
     // value the provider rejects outright.
     data['max_tokens'] =
-        min(maxOutputTokensCeiling, max(256, budget.totalTokens));
+        min(_adaptiveCeiling(data), max(256, budget.totalTokens));
+  }
+
+  /// Ceiling for [apply]: the default [maxOutputTokensCeiling] for normal
+  /// multi-block batches, or — when a single block occupies the whole batch
+  /// (e.g. one giant block alone after the shrink fallbacks) — an adaptive
+  /// ceiling scaled from that block's own estimated output tokens, so the
+  /// translation is not truncated mid-block. Bounded by
+  /// [maxAdaptiveOutputTokens] as the model-side sanity limit.
+  static int _adaptiveCeiling(Map<String, dynamic> data) {
+    final String? blockText = _singleBlockText(data);
+    if (blockText == null) return maxOutputTokensCeiling;
+    // Translation output tracks input size; estimateTokens already carries
+    // the conservative headroom, so it doubles as the output estimate.
+    return min(
+      maxAdaptiveOutputTokens,
+      max(maxOutputTokensCeiling, estimateTokens(blockText)),
+    );
+  }
+
+  /// Returns the source text when the request payload carries exactly one
+  /// translatable block, else null. Every batch payload is a JSON object
+  /// with a top-level "blocks" array; non-batch requests (memory, style
+  /// profile, ...) never match and keep the default ceiling.
+  static String? _singleBlockText(Map<String, dynamic> data) {
+    try {
+      final messages = data['messages'];
+      if (messages is! List) return null;
+      for (final message in messages) {
+        if (message is! Map || message['role'] != 'user') continue;
+        final content = message['content'];
+        if (content is! String) continue;
+        final decoded = jsonDecode(content);
+        if (decoded is! Map) continue;
+        final blocks = decoded['blocks'];
+        if (blocks is! List || blocks.length != 1) continue;
+        final block = blocks.single;
+        if (block is! Map) continue;
+        final html = block['html'];
+        if (html is String && html.isNotEmpty) return html;
+        final slots = block['slots'];
+        if (slots is List) {
+          final texts = <String>[
+            for (final slot in slots)
+              if (slot is Map && slot['text'] is String)
+                slot['text'] as String,
+          ];
+          if (texts.isNotEmpty) return texts.join('\n');
+        }
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 }

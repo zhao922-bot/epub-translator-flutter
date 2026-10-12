@@ -90,4 +90,86 @@ class ShareStagingTest {
         val plan = planShareStagingCleanup(files, emptyMap(), now)
         assertEquals(listOf("/s/a.epub"), plan.evictForCap.map { it.path })
     }
+
+    @Test fun activeShareTargetsExemptFromCapEviction() {
+        val now = System.currentTimeMillis()
+        // 25 snapshots past the grace period: quota (20) evicts the 5
+        // oldest — unless they are in-flight shares.
+        val files = (1..25).map { entry("/s/$it.epub", ageMs = 10 * 60_000, length = 1024) }
+        val plan = planShareStagingCleanup(
+            files,
+            emptyMap(),
+            now,
+            activeSharePaths = setOf("/s/1.epub"),
+        )
+        assertEquals(5, plan.evictForCap.size)
+        assertFalse(plan.evictForCap.any { it.path == "/s/1.epub" })
+        // /s/1.epub would have been evicted first; /s/6.epub takes its place.
+        assertEquals("/s/2.epub", plan.evictForCap.first().path)
+        assertEquals("/s/6.epub", plan.evictForCap.last().path)
+    }
+
+    @Test fun activeSharePathsDefaultKeepsOldCallersEvicting() {
+        val now = System.currentTimeMillis()
+        val files = (1..25).map { entry("/s/$it.epub", ageMs = 10 * 60_000, length = 1024) }
+        // No activeSharePaths argument: same behavior as before the param.
+        val plan = planShareStagingCleanup(files, emptyMap(), now)
+        assertEquals(5, plan.evictForCap.size)
+        assertEquals("/s/1.epub", plan.evictForCap.first().path)
+    }
+
+    /**
+     * B-02: the share-grant ledger's read-modify-write must serialize with
+     * cleanupOldShareStaging's read-modify-write. MainActivity runs both on
+     * the single ioExecutor thread (the grant is recorded there before the
+     * chooser starts); this test pins the invariant that interleaved RMWs
+     * submitted to one single-thread executor never lost-update each other.
+     *
+     * Manual test strategy for the wiring itself (needs Android): share two
+     * large EPUBs back-to-back so the second share's cleanup runs while the
+     * first share's grant record is in flight; assert both grants survive in
+     * SharedPreferences and neither snapshot is swept before its chooser
+     * is dismissed.
+     */
+    @Test fun singleThreadExecutorSerializesLedgerReadModifyWrites() {
+        val io = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            var ledger = emptySet<String>()
+            fun readLedger(): Set<String> = ledger
+            fun writeLedger(next: Set<String>) {
+                ledger = next
+            }
+            val done = java.util.concurrent.CountDownLatch(20)
+            repeat(10) { i ->
+                // Simulates cleanupOldShareStaging's ledger RMW.
+                io.execute {
+                    writeLedger(dropShareGrant(readLedger(), "/gone/$i.epub"))
+                    done.countDown()
+                }
+                // Simulates the share path's grant-record RMW.
+                io.execute {
+                    writeLedger(
+                        recordShareGrant(
+                            readLedger(),
+                            "content://u/$i",
+                            "/s/$i.epub",
+                            i.toLong(),
+                        ),
+                    )
+                    done.countDown()
+                }
+            }
+            assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            io.shutdown()
+            assertTrue(io.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS))
+            // No lost updates: every recorded grant survived every
+            // cleanup RMW that ran around it.
+            val grants = loadShareGrants(readLedger())
+            for (i in 0 until 10) {
+                assertEquals("content://u/$i", grants["/s/$i.epub"]?.uri)
+            }
+        } finally {
+            io.shutdownNow()
+        }
+    }
 }

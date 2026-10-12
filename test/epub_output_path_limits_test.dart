@@ -196,9 +196,9 @@ void main() {
     },
   );
   group('outputPathExceedsWindowsMaxPath', () {
-    test('boundary: 237 chars fits (237 + 22 == 259, the longest usable)', () {
-      final String path = "C:\\${'a' * 234}";
-      expect(path.length, 237);
+    test('boundary: 233 chars fits (233 + 26 == 259, the longest usable)', () {
+      final String path = "C:\\${'a' * 230}";
+      expect(path.length, 233);
       expect(
         EpubChapterTranslator.outputPathExceedsWindowsMaxPath(path),
         isFalse,
@@ -206,10 +206,10 @@ void main() {
     });
 
     test(
-      'boundary: 238 chars exceeds (238 + 22 == 260, NUL no longer fits)',
+      'boundary: 234 chars exceeds (234 + 26 == 260, NUL no longer fits)',
       () {
-        final String path = "C:\\${'a' * 235}";
-        expect(path.length, 238);
+        final String path = "C:\\${'a' * 231}";
+        expect(path.length, 234);
         expect(
           EpubChapterTranslator.outputPathExceedsWindowsMaxPath(path),
           isTrue,

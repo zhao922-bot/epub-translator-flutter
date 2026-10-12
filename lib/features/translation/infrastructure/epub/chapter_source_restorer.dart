@@ -4,6 +4,7 @@ import '../../domain/models/inspected_chapter.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'epub_source_guard.dart';
 
 /// Reconstructs released source strings without parsing on the UI isolate.
 class ChapterSourceRestorer {
@@ -29,8 +30,14 @@ class ChapterSourceRestorer {
         if (chapter.includeInTranslation && _needsSources(chapter)) chapter,
     ];
     if (pending.isEmpty) return chapters;
+    // A cancelled/failed run may have released originalHtml from the
+    // caller's chapters (e.g. the dashboard drops UI-side sources once the
+    // worker spools them). The worker below re-parses from originalHtml,
+    // so reload it from the source archive first; without this a retry
+    // after cancellation dies with "Source block order changed".
+    final withHtml = await _ensureOriginalHtml(pending, isCancelled);
     final restored = await EpubIsolateWorker.prepareWithProgress(
-      operation: _operation(pending),
+      operation: _operation(withHtml),
       isCancelled: isCancelled,
       onProgress: onProgress,
     );
@@ -45,6 +52,58 @@ class ChapterSourceRestorer {
   static bool _needsSources(InspectedChapter chapter) =>
       _isLegacyPreview(chapter) ||
       chapter.blocks.any((block) => block.sourceHtml.isEmpty);
+
+  /// Reload original HTML for chapters whose sources were released, grouped
+  /// by source archive so each book's zip is opened only once. The archive
+  /// fingerprint is verified: a replaced EPUB fails loudly instead of
+  /// restoring sources that no longer match the inspected blocks.
+  static Future<List<InspectedChapter>> _ensureOriginalHtml(
+    List<InspectedChapter> pending,
+    bool Function() isCancelled,
+  ) async {
+    final missing = <InspectedChapter>[
+      for (final chapter in pending)
+        if (chapter.originalHtml.isEmpty) chapter,
+    ];
+    if (missing.isEmpty) return pending;
+    final groups = <(String, String?), List<InspectedChapter>>{};
+    for (final chapter in missing) {
+      final identity = chapter.sourceIdentity;
+      if (identity == null) {
+        throw FormatException(
+          'Released chapter has no recoverable source; '
+          're-inspect the book: ${chapter.path}',
+        );
+      }
+      final key = (identity.inputPath, identity.sha256);
+      (groups[key] ??= <InspectedChapter>[]).add(chapter);
+    }
+    final reloaded = <String, InspectedChapter>{};
+    for (final entry in groups.entries) {
+      if (isCancelled()) throw const TranslationCancelledException();
+      final wanted = <String>{for (final c in entry.value) c.path};
+      final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
+        entry.key.$1,
+        selectEntries: (_, _) => wanted,
+        isCancelled: isCancelled,
+      );
+      checkEpubSourceHash(snapshot.fingerprint, entry.key.$2);
+      for (final chapter in entry.value) {
+        if (isCancelled()) throw const TranslationCancelledException();
+        final bytes = snapshot.files[chapter.path];
+        if (bytes == null) {
+          throw FormatException(
+            'Source chapter not found in archive: ${chapter.path}',
+          );
+        }
+        // Lenient decode matches the extractor/decoder convention.
+        reloaded[chapter.path] = chapter.copyWith(
+          originalHtml: utf8.decode(bytes, allowMalformed: true),
+        );
+      }
+    }
+    return [for (final chapter in pending) reloaded[chapter.path] ?? chapter];
+  }
 
   // Build this closure separately so UI callbacks and cancellation tokens do
   // not enter the worker. Only selected chapters needing restoration are sent.

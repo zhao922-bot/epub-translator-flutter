@@ -311,6 +311,52 @@ class EpubChapterTranslator {
     return TranslationApiClient.shouldFallbackBatchDioException(error);
   }
 
+  /// Records a chapter's memory timeline entry and persists the checkpoint.
+  /// The record MUST precede the persist (A-2): no persist happens after the
+  /// run ends, so persisting first would leave the checkpoint lagging one
+  /// chapter behind after a cancellation.
+  static Future<void> _recordAndPersistChapterMemory({
+    required void Function() record,
+    required Future<void> Function() persist,
+  }) async {
+    record();
+    await persist();
+  }
+
+  /// Test hook for the A-2 ordering contract: [record] must run before
+  /// [persist].
+  @visibleForTesting
+  static Future<void> recordAndPersistChapterMemoryForTest({
+    required void Function() record,
+    required Future<void> Function() persist,
+  }) => _recordAndPersistChapterMemory(record: record, persist: persist);
+
+  /// Selects the memory-timeline entry behind [chapterPath]'s snapshot (the
+  /// newest entry strictly before the chapter in book order) and serializes
+  /// only that entry via [serialize]. Selecting before serializing keeps the
+  /// per-chapter cost O(1) instead of O(timeline length); [fallback] is
+  /// returned when no earlier entry exists.
+  @visibleForTesting
+  static Map<String, Object?>? memorySnapshotForTest({
+    required List<({String path, Object? memory})> timeline,
+    required Map<String, int> positionByPath,
+    required String chapterPath,
+    required Map<String, Object?> Function(Object? memory) serialize,
+    Map<String, Object?>? fallback,
+  }) {
+    final int? position = positionByPath[chapterPath];
+    Object? winner;
+    if (position != null && position > 0) {
+      for (final entry in timeline) {
+        final int? entryPosition = positionByPath[entry.path];
+        if (entryPosition != null && entryPosition < position) {
+          winner = entry.memory;
+        }
+      }
+    }
+    return winner == null ? fallback : serialize(winner);
+  }
+
   static String sanitizeOutputSuffixForTest(String suffix) {
     return TranslationApiClient.sanitizeOutputSuffix(suffix);
   }
@@ -455,6 +501,19 @@ class EpubChapterTranslator {
       chapterPath: chapterPath,
       blockId: blockId,
     );
+  }
+
+  /// Test-only view of the reason recorded for a degraded block (the text
+  /// shown in the run report's degraded-block sample line), or null when
+  /// the block degraded without a reason.
+  String? degradedReasonForTest({
+    String chapterPath = '',
+    required String blockId,
+  }) {
+    return _run.degradedReasons[degradedKeyForTest(
+      chapterPath: chapterPath,
+      blockId: blockId,
+    )];
   }
 
   void _beginDegradedTracking({int concurrency = 1}) {
@@ -774,9 +833,10 @@ class EpubChapterTranslator {
             );
           }
         }
-        // Windows: the final commit appends `.tmp.<16 digits>` (+22) to the
-        // output path, and a failed-commit recovery may add `.bak.<13
-        // digits>` (+18). The pick-time warning only measures the directory
+        // Windows: the lock-conflict recovery path keeps
+        // `<output>.recovery.<16 digits>` (+26) beside the output, and the
+        // repack commit writes `<output>.tmp.<16 digits>` (+21) before
+        // promoting it. The pick-time warning only measures the directory
         // the user chose, so a deep directory plus a long book name can push
         // the longest write path past MAX_PATH (260) — failing at ~98% after
         // every API call was already billed. Fail loudly now, before any
@@ -1070,16 +1130,16 @@ class EpubChapterTranslator {
       /// Rolling-memory snapshot for [chapter]'s own time position: the
       /// newest timeline entry strictly before the chapter in book order,
       /// falling back to the live memory when no earlier entry exists.
+      ///
+      /// The winning entry is selected positionally BEFORE serializing, so
+      /// only one entry pays for toJson per chapter (O(1)) instead of the
+      /// whole timeline (O(n^2) over the book).
       Map<String, Object?>? bookMemorySnapshotFor(InspectedChapter chapter) {
-        return positionalMemorySnapshotForTest(
-          timeline: [
-            for (final entry in memoryTimeline)
-              {'path': entry.path, 'memory': entry.memory.toJson()},
-          ],
-          orderedPaths: [
-            for (final c in selectedChapters) c.path,
-          ],
+        return EpubChapterTranslator.memorySnapshotForTest(
+          timeline: memoryTimeline,
+          positionByPath: selectedPositionByPath,
           chapterPath: chapter.path,
+          serialize: (Object? memory) => (memory as _BookMemory).toJson(),
           fallback: bookMemory?.toJson(),
         );
       }
@@ -1871,9 +1931,18 @@ class EpubChapterTranslator {
               );
               memoryStopwatch.stop();
               memoryChapters.add(chapter.path);
-              await persistBookMemory();
-              // Record after persist so the snapshot includes user locks.
-              recordMemoryTimeline(chapter.path, bookMemory!);
+              // Resolve user locks before recording so the timeline entry
+              // carries them (previously achieved by recording after the
+              // persist, which applied the locks inside persistBookMemory).
+              bookMemory =
+                  bookMemory!.withLockedGlossary(config.lockedGlossary);
+              // Record BEFORE persist (A-2): no persist happens after the run
+              // ends, so persisting first would leave the checkpoint lagging
+              // one chapter behind after a cancellation.
+              await _recordAndPersistChapterMemory(
+                record: () => recordMemoryTimeline(chapter.path, bookMemory!),
+                persist: persistBookMemory,
+              );
               totalMemoryElapsed += memoryStopwatch.elapsed;
               memoryRequestCount += 1;
               emit(
@@ -3617,8 +3686,10 @@ class EpubChapterTranslator {
   }
 
   /// Longest write-path form the app ever produces for [outputFilePath]:
-  /// `<output>.tmp.<16 digits>` during the repack commit (+22), which also
-  /// covers the shorter `.bak.<13 digits>` recovery form (+18). Dart's
+  /// `<output>.recovery.<16 digits>` kept by the lock-conflict recovery path
+  /// (+26), which also covers the shorter `.tmp.<16 digits>` (+21) repack
+  /// form and the `.bak.<16 digits>` (+21) backup form. All three suffixes
+  /// use [DateTime.microsecondsSinceEpoch] (16 digits). Dart's
   /// [String.length] counts UTF-16 code units, which is what Windows
   /// MAX_PATH (260) counts.
   ///
@@ -3627,7 +3698,7 @@ class EpubChapterTranslator {
   static bool outputPathExceedsWindowsMaxPath(String outputFilePath) {
     // MAX_PATH (260) counts the terminating NUL, so 259 is the longest
     // usable path; a final path of exactly 260 already overflows.
-    return outputFilePath.length + 22 >= 260;
+    return outputFilePath.length + 26 >= 260;
   }
 
   /// Throws [WindowsLongPathException] when the longest write path the
@@ -3646,7 +3717,7 @@ class EpubChapterTranslator {
     Future<bool?> Function()? longPathsEnabledReader,
   }) async {
     final String fileName = path.windows.basename(outputFilePath);
-    if (fileName.length + 22 > 255) {
+    if (fileName.length + 26 > 255) {
       throw FileSystemException(
         'Output filename plus temporary suffix exceeds 255 UTF-16 code units.',
         outputFilePath,

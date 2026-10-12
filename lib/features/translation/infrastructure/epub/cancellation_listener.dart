@@ -32,7 +32,14 @@ class _CancellationListeners {
     final pending = callbacks.toList();
     callbacks.clear();
     for (final callback in pending) {
-      callback();
+      // One throwing callback must not skip the rest: each listener gets
+      // its own guard so cancellation still reaches every subscriber.
+      try {
+        callback();
+      } catch (_) {
+        // Cancellation delivery is best-effort; a failing listener must
+        // not break the others or the cancellation itself.
+      }
     }
   }
 }

@@ -112,7 +112,7 @@ void main() {
   );
 
   group('#18 max_tokens ceiling and context-overflow routing', () {
-    test('max_tokens is clamped to the model output ceiling', () async {
+    test('max_tokens uses the adaptive ceiling for a giant single block', () async {
       final api = _Api();
       final bigText = List.filled(60000, 'word ').join();
       await EpubChapterTranslator(apiClient: api).translateBlockBatchForTest(
@@ -120,7 +120,10 @@ void main() {
         blocks: _chapter('Big', 'big.xhtml', text: bigText).blocks,
       );
       final maxTokens = api.requests.single['max_tokens'] as int;
-      expect(maxTokens, lessThanOrEqualTo(32768));
+      // A-5: a single block alone in a batch scales past 32768 instead of
+      // being truncated, bounded by the model-side sanity cap.
+      expect(maxTokens, greaterThan(32768));
+      expect(maxTokens, lessThanOrEqualTo(131072));
     });
 
     test('context-window 400 responses are detected as overflow, not deterministic', () {

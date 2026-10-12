@@ -1061,13 +1061,48 @@ class MainActivity : FlutterActivity() {
                 } finally {
                     activeShareTargets.remove(shareFile.absolutePath)
                 }
+                // Record the URI grant here on ioExecutor, before the chooser
+                // starts and before leaving this thread. The staging snapshot
+                // must not be swept while its grant is alive (the grant is
+                // revoked, and the snapshot deleted, only by the 7-day
+                // backstop in cleanupOldShareStaging):
+                // - if the process dies between startActivity and the record,
+                //   the grant is lost and a later sweep may delete the
+                //   snapshot under the live chooser;
+                // - the ledger read-modify-write must serialize with
+                //   cleanupOldShareStaging on the single ioExecutor thread —
+                //   recording it on mainHandler.post lost-update against a
+                //   concurrent cleanup's read-modify-write.
+                // FileProvider.getUriForFile is thread-safe; only the
+                // startActivity call itself stays on the main thread.
+                val uri = FileProvider.getUriForFile(
+                    appContext,
+                    "${appContext.packageName}.fileprovider",
+                    shareFile,
+                )
+                try {
+                    val prefs = appContext.getSharedPreferences(
+                        PREFS_NAME,
+                        Context.MODE_PRIVATE,
+                    )
+                    val entries =
+                        prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
+                            ?: emptySet()
+                    prefs.edit().putStringSet(
+                        SHARE_GRANTS_PREF_KEY,
+                        recordShareGrant(
+                            entries,
+                            uri.toString(),
+                            shareFile.absolutePath,
+                            System.currentTimeMillis(),
+                        ),
+                    ).apply()
+                } catch (_: Exception) {
+                    // Best effort: without a ledger entry the file
+                    // falls back to the grace-period heuristic.
+                }
                 mainHandler.post {
                     try {
-                        val uri = FileProvider.getUriForFile(
-                            appContext,
-                            "${appContext.packageName}.fileprovider",
-                            shareFile
-                        )
                         val shareIntent = Intent(Intent.ACTION_SEND).apply {
                             type = mimeType
                             putExtra(Intent.EXTRA_STREAM, uri)
@@ -1078,31 +1113,6 @@ class MainActivity : FlutterActivity() {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                         )
-                        // Record the URI grant: the staging snapshot must not
-                        // be swept while its grant is alive. The grant is
-                        // revoked (and the snapshot deleted) only by the
-                        // 7-day backstop in cleanupOldShareStaging.
-                        try {
-                            val prefs = appContext.getSharedPreferences(
-                                PREFS_NAME,
-                                Context.MODE_PRIVATE,
-                            )
-                            val entries =
-                                prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
-                                    ?: emptySet()
-                            prefs.edit().putStringSet(
-                                SHARE_GRANTS_PREF_KEY,
-                                recordShareGrant(
-                                    entries,
-                                    uri.toString(),
-                                    shareFile.absolutePath,
-                                    System.currentTimeMillis(),
-                                ),
-                            ).apply()
-                        } catch (_: Exception) {
-                            // Best effort: without a ledger entry the file
-                            // falls back to the grace-period heuristic.
-                        }
                         result.success(null)
                     } catch (error: Exception) {
                         try {
@@ -1184,6 +1194,9 @@ class MainActivity : FlutterActivity() {
                 },
                 grantUriByPath,
                 now,
+                // Snapshot: the planner is pure and must not hold the live
+                // mutable set. Everything here already runs on ioExecutor.
+                activeSharePaths = activeShareTargets.toSet(),
             )
             // Revoke before deleting: the grant must never outlive its file.
             for (uri in plan.revokeUris) {

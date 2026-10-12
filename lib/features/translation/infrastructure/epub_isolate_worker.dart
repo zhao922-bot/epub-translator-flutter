@@ -1004,7 +1004,9 @@ class EpubIsolateWorker {
           return false;
         }
         await tempFile.rename(finalFile.path);
-        await _deleteQuietly(backupFile);
+        // Best effort: the promotion already succeeded; a stuck backup
+        // delete must not fail the commit or stall it on retry backoff.
+        await _deleteBestEffort(backupFile);
         // The final file now holds the translation: lock-conflict spares
         // kept for this output are obsolete.
         await _reclaimRecoveryFiles(finalFile);
@@ -1074,9 +1076,14 @@ class EpubIsolateWorker {
   /// Recovers from a commit that died mid-rename: if the final file is
   /// missing but a `.bak.*` backup survived, the newest backup is restored;
   /// remaining stale backups are deleted. Best effort; never throws.
-  static Future<void> _reclaimStaleBackups(File finalFile) async {
+  static Future<void> _reclaimStaleBackups(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.bak.';
+      final Future<void> Function(File file) deleteFile =
+          deleteForTest ?? _deleteBestEffort;
       final List<File> backups = <File>[];
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
         if (entity is File && path.basename(entity.path).startsWith(prefix)) {
@@ -1104,12 +1111,23 @@ class EpubIsolateWorker {
         }
       }
       for (final File stale in backups) {
-        await _deleteQuietly(stale);
+        try {
+          await deleteFile(stale);
+        } catch (_) {
+          // Best effort: one stuck file must not block the rest.
+        }
       }
     } catch (_) {
       // Best effort: stale backups must never break a commit.
     }
   }
+
+  @visibleForTesting
+  static Future<void> reclaimStaleBackupsForTest(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) =>
+      _reclaimStaleBackups(finalFile, deleteForTest: deleteForTest);
 
   /// Deletes `.tmp.*` orphans left by a previous process that died after
   /// the isolate wrote the temp EPUB but before [commitTempFile] promoted
@@ -1122,10 +1140,13 @@ class EpubIsolateWorker {
   /// Best effort; never throws.
   static Future<void> _reclaimStaleTempFiles(
     File finalFile,
-    File tempFile,
-  ) async {
+    File tempFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.tmp.';
+      final Future<void> Function(File file) deleteFile =
+          deleteForTest ?? _deleteBestEffort;
       final DateTime cutoff = DateTime.now().subtract(_kStaleTempAge);
       final retained = <String>{..._retainedRecoveryPaths};
       final index = File('${finalFile.path}.recovery-index');
@@ -1147,7 +1168,11 @@ class EpubIsolateWorker {
           continue;
         }
         if ((await entity.lastModified()).isBefore(cutoff)) {
-          await _deleteQuietly(entity);
+          try {
+            await deleteFile(entity);
+          } catch (_) {
+            // Best effort: one stuck file must not block the rest.
+          }
         }
       }
     } catch (_) {
@@ -1170,8 +1195,14 @@ class EpubIsolateWorker {
   @visibleForTesting
   static Future<void> reclaimStaleTempFilesForTest(
     File finalFile,
-    File tempFile,
-  ) => _reclaimStaleTempFiles(finalFile, tempFile);
+    File tempFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) =>
+      _reclaimStaleTempFiles(
+        finalFile,
+        tempFile,
+        deleteForTest: deleteForTest,
+      );
 
   /// Rename before reporting the path so automatic orphan sweeping cannot
   /// destroy the sole translated copy deliberately retained for recovery.
@@ -1212,21 +1243,41 @@ class EpubIsolateWorker {
 
   /// Enforces the `.recovery.*` budget for one output: keeps at most
   /// [_kMaxRecoveryFiles] newest spares within [_kMaxRecoveryBytes] total,
-  /// deleting oldest-first. Best effort; never throws.
-  static Future<void> _enforceRecoveryBudget(File finalFile) async {
+  /// deleting oldest-first. The `<basename>.recovery-index` ledger counts
+  /// as a spare too: without it the index would grow by append forever.
+  /// Best effort; never throws.
+  static Future<void> _enforceRecoveryBudget(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.recovery.';
+      // `<basename>.recovery-index` does not start with
+      // `<basename>.recovery.` — match it explicitly.
+      final String indexName = '${path.basename(finalFile.path)}.recovery-index';
+      final Future<void> Function(File file) deleteFile =
+          deleteForTest ?? _deleteBestEffort;
       final List<File> spares = <File>[];
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
-        if (entity is File && path.basename(entity.path).startsWith(prefix)) {
+        if (entity is! File) continue;
+        final String name = path.basename(entity.path);
+        if (name.startsWith(prefix) || name == indexName) {
           spares.add(entity);
         }
       }
       if (spares.isEmpty) {
         return;
       }
-      // The timestamp suffix sorts chronologically; oldest first.
-      spares.sort((File a, File b) => a.path.compareTo(b.path));
+      // The timestamp suffix sorts chronologically; oldest first. The
+      // `<basename>.recovery-index` ledger is pinned last ('-' < '.' would
+      // otherwise sort it before every `...recovery.<digits>` spare) so the
+      // ledger is evicted last.
+      spares.sort((File a, File b) {
+        final bool aIsIndex = path.basename(a.path) == indexName;
+        final bool bIsIndex = path.basename(b.path) == indexName;
+        if (aIsIndex != bIsIndex) return aIsIndex ? 1 : -1;
+        return a.path.compareTo(b.path);
+      });
       int totalBytes = 0;
       final List<int> sizes = <int>[];
       for (final File spare in spares) {
@@ -1245,7 +1296,11 @@ class EpubIsolateWorker {
             totalBytes <= _kMaxRecoveryBytes) {
           break;
         }
-        await _deleteQuietly(spares[i]);
+        try {
+          await deleteFile(spares[i]);
+        } catch (_) {
+          // Best effort: one stuck spare must not block the rest.
+        }
         totalBytes -= sizes[i];
       }
     } catch (_) {
@@ -1257,12 +1312,27 @@ class EpubIsolateWorker {
   /// successful commit: the final file now holds the translation, so the
   /// spares kept for lock-conflict recovery are obsolete. Best effort;
   /// never throws.
-  static Future<void> _reclaimRecoveryFiles(File finalFile) async {
+  static Future<void> _reclaimRecoveryFiles(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) async {
     try {
       final String prefix = '${path.basename(finalFile.path)}.recovery.';
+      // `<basename>.recovery-index` does not start with
+      // `<basename>.recovery.` — match it explicitly so the ledger is
+      // reclaimed together with the spares it describes.
+      final String indexName = '${path.basename(finalFile.path)}.recovery-index';
+      final Future<void> Function(File file) deleteFile =
+          deleteForTest ?? _deleteBestEffort;
       await for (final FileSystemEntity entity in finalFile.parent.list()) {
-        if (entity is File && path.basename(entity.path).startsWith(prefix)) {
-          await _deleteQuietly(entity);
+        if (entity is! File) continue;
+        final String name = path.basename(entity.path);
+        if (name.startsWith(prefix) || name == indexName) {
+          try {
+            await deleteFile(entity);
+          } catch (_) {
+            // Best effort: one stuck file must not block the rest.
+          }
         }
       }
     } catch (_) {
@@ -1271,12 +1341,18 @@ class EpubIsolateWorker {
   }
 
   @visibleForTesting
-  static Future<void> enforceRecoveryBudgetForTest(File finalFile) =>
-      _enforceRecoveryBudget(finalFile);
+  static Future<void> enforceRecoveryBudgetForTest(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) =>
+      _enforceRecoveryBudget(finalFile, deleteForTest: deleteForTest);
 
   @visibleForTesting
-  static Future<void> reclaimRecoveryFilesForTest(File finalFile) =>
-      _reclaimRecoveryFiles(finalFile);
+  static Future<void> reclaimRecoveryFilesForTest(
+    File finalFile, {
+    Future<void> Function(File file)? deleteForTest,
+  }) =>
+      _reclaimRecoveryFiles(finalFile, deleteForTest: deleteForTest);
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
@@ -1769,6 +1845,27 @@ class EpubIsolateWorker {
     }
   }
 
+  /// Single-attempt best-effort delete for sweep/commit paths: stale
+  /// backups, stale temps, recovery spares and the post-promotion backup
+  /// are obsolete files whose deletion must never stall a commit on retry
+  /// backoff. Never throws.
+  static Future<void> _deleteBestEffort(File file) async {
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Best-effort cleanup only.
+    }
+  }
+
+  /// Visible for testing.
+  @visibleForTesting
+  static Future<void> deleteBestEffortForTest(File file) =>
+      _deleteBestEffort(file);
+
+  /// Retrying delete for the cancel path only: right after the isolate
+  /// releases the temp file's handle, Windows may hold a transient lock,
+  /// so a single attempt would spuriously fail. Never throws; warns on the
+  /// final failed attempt.
   static Future<void> _deleteQuietly(File file) async {
     for (int attempt = 0; attempt < 5; attempt++) {
       try {

@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
 
@@ -27,6 +28,21 @@ class EpubInspector {
   /// inspecting. Defaults to English when the caller does not pass one.
   final AppStrings _strings;
 
+  /// Process-local monotonic suffix for inspection job ids, so two
+  /// inspections started within the same millisecond cannot collide.
+  static int _jobIdSequence = 0;
+
+  /// Unique-enough inspection job id (`<ms>-<seq>`): wall-clock millis plus
+  /// the process-local suffix. Mirrors the dashboard controller's
+  /// `_newJobId`, whose `<ms>-<seq>` prefix parsing downstream relies on.
+  ///
+  /// Visible for testing.
+  @visibleForTesting
+  static String newJobIdForTest() {
+    _jobIdSequence += 1;
+    return '${DateTime.now().millisecondsSinceEpoch}-$_jobIdSequence';
+  }
+
   Future<InspectionResult> inspect({
     required String inputPath,
     required String outputDirectory,
@@ -39,7 +55,7 @@ class EpubInspector {
     // can localize with the run's UI language.
     final AppStrings s = strings ?? _strings;
     final Stopwatch inspectionStopwatch = Stopwatch()..start();
-    final String jobId = DateTime.now().millisecondsSinceEpoch.toString();
+    final String jobId = newJobIdForTest();
     TranslationJob currentJob = TranslationJob(
       id: jobId,
       inputPath: inputPath,

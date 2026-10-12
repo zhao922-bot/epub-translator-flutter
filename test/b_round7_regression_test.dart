@@ -591,7 +591,8 @@ void main() {
       includeInTranslation: true,
     );
 
-    test('failure records the error and a later prepare retries', () async {
+    test('failure surfaces through prepare and a later prepare retries',
+        () async {
       int calls = 0;
       final PreviewRecoveryCache cache = PreviewRecoveryCache(
         runner: (List<InspectedChapter> chapters) async {
@@ -622,14 +623,14 @@ void main() {
         cache.prepare(<InspectedChapter>[chapter]),
         throwsStateError,
       );
-      expect(cache.lastError, isA<StateError>());
       // Failed entries are dropped, so the UI must not project stale data.
+      // (The failure itself surfaces through the provider's AsyncValue, not
+      // a cache field.)
       expect(cache.lookup(chapter), isNull);
 
-      // Retry re-runs the runner and clears the error.
+      // Retry re-runs the runner.
       await cache.prepare(<InspectedChapter>[chapter]);
       expect(calls, 2);
-      expect(cache.lastError, isNull);
       expect(cache.lookup(chapter), isNotNull);
       expect(cache.lookup(chapter)!.body, 'recovered');
     });

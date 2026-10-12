@@ -374,12 +374,16 @@ void main() {
           expect(secrets.secretMutationCount, count);
         }
       }
-      // Fragments carry no credentials over HTTP and are allowed (#17), but
-      // must round-trip without leaking anything into secrets.
-      final okConfig = TranslationConfig.defaults().copyWith(
+      // Fragments are rejected outright (C-1): a fragment is never sent to
+      // the server, so it has zero legitimate use in an API base URL —
+      // and the OAuth implicit-flow shape would silently drop the key.
+      // A fragment-bearing URL must never reach JSON or secret mutations.
+      final fragConfig = TranslationConfig.defaults().copyWith(
         apiBaseUrl: 'https://host/v1#section',
       );
-      await store.save(okConfig);
+      expect(fragConfig.toJson, throwsFormatException);
+      await expectLater(store.save(fragConfig), throwsFormatException);
+      expect(await file.readAsString(), before);
       expect(secrets.secretMutationCount, count);
       // A stale legitimate custom URL (non-credential query) must not block
       // saving unrelated settings when DeepSeek is selected (#17).

@@ -75,6 +75,16 @@ class _EpubTranslationStrategy {
               !expected.contains(slot['id']) || !seenSlots.add(slot['id'] as String)) {
             throw const _DeterministicBatchStructureException('Response slot structure/id mismatch.');
           }
+          // An empty slot translation would render as empty HTML, silently
+          // dropping the source text from the finished book. Reject it like
+          // the individual-slot path does (TranslationParseException, not a
+          // retryable FormatException): the request is then retried on its
+          // own and degrades to its source text instead of shipping empty.
+          if ((slot['text'] as String).trim().isEmpty) {
+            throw const TranslationParseException(
+              'Translated slot text is empty.',
+            );
+          }
         }
       }
     }
@@ -711,10 +721,20 @@ class _EpubTranslationStrategy {
         (error is DioException && error.response?.statusCode == 413);
   }
 
-  static String? _oversizedReason(Object error) =>
-      error is DioException && error.response?.statusCode == 413
-      ? 'HTTP 413: block exceeds server request limit; source retained'
-      : null;
+  /// Short cause for the degraded-block run report. A context-overflow 400
+  /// degrades like a 413 (see _shouldDegradeSingle), so it gets its own
+  /// `HTTP 400: ...` reason instead of a blank — aligned with the main
+  /// block path, which reports its HTTP status the same way.
+  static String? _oversizedReason(Object error) {
+    if (error is! DioException) return null;
+    if (error.response?.statusCode == 413) {
+      return 'HTTP 413: block exceeds server request limit; source retained';
+    }
+    if (TranslationApiClient.isContextOverflowError(error)) {
+      return 'HTTP 400: block exceeds model context limit; source retained';
+    }
+    return null;
+  }
 
   static bool _isEmptyTranslationResponse(Object error) {
     return error is FormatException &&
@@ -778,46 +798,31 @@ class _EpubTranslationStrategy {
           ),
         );
       } on DioException catch (error) {
-        // 401/403/404/400 are deterministic configuration errors: fail fast
-        // with the precise localized diagnostic instead of burning
-        // per-reference fallback requests that would all fail the same way.
         if (EpubChapterTranslator._isCancelError(error)) {
           throw const TranslationCancelledException();
         }
-        if (TranslationApiClient.isDeterministicHttpError(error)) {
-          throw StateError(
-            TranslationApiClient.deterministicHttpErrorMessage(error, config),
-          );
-        }
-        if (TranslationApiClient.isConnectionTimeout(error) ||
-            (error.response?.statusCode == 413 && htmlReferences.length == 1)) {
-          // A connection timeout is endpoint-wide rather than payload-size
-          // related. The batch already retried once, so retain its source
-          // blocks instead of multiplying the outage into per-block calls.
-          for (final FootnoteBlockReference reference in htmlReferences) {
-            owner._markDegradedBlock(
-              chapterPath: reference.chapter.path,
-              blockId: reference.block.id,
-              reason: _oversizedReason(error),
-            );
-            translatedById[reference.requestId] = reference.block.sourceHtml;
-            AppLogger.warn(
-              'Footnote ${reference.requestId} retained its source (HTTP ${error.response?.statusCode}, ${error.type}).',
-              tag: 'translate',
-            );
-          }
-        } else {
+        // Shrink fallback first: a context-overflow 400 (or 413 /
+        // send-receive timeout) is payload-size dependent, so per-reference
+        // requests can still succeed. Only errors that no smaller request
+        // could fix stay fatal. Matches the main block path (:344) and the
+        // protected-slot path (:1248).
+        //
+        // A lone 413 keeps its direct fast path below: a single reference
+        // cannot shrink further, so re-sending it would only burn a doomed
+        // request.
+        final bool loneOversizedPayload =
+            error.response?.statusCode == 413 && htmlReferences.length == 1;
+        if (!loneOversizedPayload &&
+            TranslationApiClient.shouldFallbackBatchDioException(error)) {
           // Send and receive timeouts degrade alike: a receive timeout on a
           // large batch can be payload related, and a send timeout means
           // the payload never left — retrying each reference on its own
-          // (one that still times out degrades to its source HTML) matches
+          // (one that still fails degrades to its source HTML) matches
           // the main block path, which degrades on any request timeout.
-          if (!TranslationApiClient.shouldFallbackBatchDioException(error)) {
-            rethrow;
-          }
-          // A receive timeout on a large batch can be payload related. Retry
-          // each reference independently; one that still times out degrades
-          // to its source HTML and is reported with the run.
+          // A context-overflow 400 or 413 is likewise payload-size
+          // dependent: smaller per-reference requests can still succeed.
+          // Retry each reference independently; one that still fails
+          // degrades to its source HTML and is reported with the run.
           translatedById.addAll(
             await _mapTranslations(
               htmlReferences,
@@ -853,6 +858,37 @@ class _EpubTranslationStrategy {
               },
             ),
           );
+        } else {
+          // 401/403/404 and non-overflow 400s are deterministic
+          // configuration errors: fail fast with the precise localized
+          // diagnostic instead of burning per-reference fallback requests
+          // that would all fail the same way.
+          if (TranslationApiClient.isDeterministicHttpError(error)) {
+            throw StateError(
+              TranslationApiClient.deterministicHttpErrorMessage(error, config),
+            );
+          }
+          if (TranslationApiClient.isConnectionTimeout(error) ||
+              loneOversizedPayload) {
+            // A connection timeout is endpoint-wide rather than
+            // payload-size related. The batch already retried once, so
+            // retain its source blocks instead of multiplying the outage
+            // into per-block calls.
+            for (final FootnoteBlockReference reference in htmlReferences) {
+              owner._markDegradedBlock(
+                chapterPath: reference.chapter.path,
+                blockId: reference.block.id,
+                reason: _oversizedReason(error),
+              );
+              translatedById[reference.requestId] = reference.block.sourceHtml;
+              AppLogger.warn(
+                'Footnote ${reference.requestId} retained its source (HTTP ${error.response?.statusCode}, ${error.type}).',
+                tag: 'translate',
+              );
+            }
+          } else {
+            rethrow;
+          }
         }
       } on FormatException {
         // A malformed model reply is usually deterministic for the same
@@ -1610,17 +1646,48 @@ class _EpubTranslationStrategy {
     }
   }
 
-  /// Bounded plain-text digest of a block for per-slot requests: enough for
+  /// Bounded plain-text window of a block for per-slot requests: enough for
   /// continuity, pronouns and terminology without re-sending the whole HTML
   /// once per slot.
-  static String _blockContextSummary(ExtractedBlock block) {
+  ///
+  /// The window is centered on the slot's own position in the block (text
+  /// before and after it) instead of always taking the first 600
+  /// characters, so long-distance context is not systematically dropped
+  /// for slots near the end of a long block. When the slot text cannot be
+  /// located in the block, it falls back to the leading window.
+  static String _blockContextSummary(ExtractedBlock block, {String? slotText}) {
     const int limit = 600;
     final String text = block.sourceText.trim().replaceAll(
       RegExp(r'\s+'),
       ' ',
     );
     if (text.length <= limit) return text;
-    return '${text.substring(0, limit)}…';
+    int center = text.length ~/ 2;
+    bool located = false;
+    if (slotText != null && slotText.trim().isNotEmpty) {
+      final String needle = slotText.trim().replaceAll(RegExp(r'\s+'), ' ');
+      if (needle.isNotEmpty) {
+        final int found = text.indexOf(needle);
+        if (found >= 0) {
+          center = found + needle.length ~/ 2;
+          located = true;
+        }
+      }
+    }
+    int start;
+    if (!located) {
+      // Slot position unknown: keep the historical leading window.
+      start = 0;
+    } else {
+      start = center - limit ~/ 2;
+      if (start < 0) start = 0;
+    }
+    int end = start + limit;
+    if (end > text.length) {
+      end = text.length;
+      start = end - limit;
+    }
+    return text.substring(start, end);
   }
 
   Future<String> _translateProtectedSlotTextOnce({
@@ -1659,7 +1726,10 @@ class _EpubTranslationStrategy {
       // whole block, multiplying input tokens by the slot count and risking
       // the input window on small slots. A bounded plain-text summary is
       // enough for continuity, pronouns and terminology.
-      'blockSummary': _blockContextSummary(request.block),
+      'blockSummary': _blockContextSummary(
+        request.block,
+        slotText: request.template.slotTexts[slotIndex],
+      ),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0
           ? request.template.slotTexts[slotIndex - 1]

@@ -261,8 +261,18 @@ class SettingsStore {
     ]) {
       final index = slot == SettingsSecretSlot.deepSeek ? 1 : 2;
       final binding = _credentialBindings[slot.name];
+      // Only a *read* value whose fingerprint mismatches the binding means
+      // "the process exited between the secure write and the JSON write".
+      // A `missing` read (the key was deleted externally, or was never
+      // there) must stay `missing` so the UI reports "no key" instead of a
+      // bogus read failure. Fail-closed is preserved: the mismatch arm
+      // still rejects any uncommitted key, and a missing slot never falls
+      // back to stale JSON plaintext (the legacy/plaintext fallbacks below
+      // only apply while migration is pending, and a missing secure slot
+      // keeps its `missing` status through save, so no old secret is
+      // resurrected as the active key).
       if (binding != null &&
-          storedKeys[index].status != _SecretReadStatus.readFailure &&
+          storedKeys[index].status == _SecretReadStatus.value &&
           binding != _keyFingerprint(storedKeys[index].value ?? '')) {
         // A process may have exited between secure storage and JSON writes.
         // Never attach that uncommitted key to the previous endpoint.
@@ -380,6 +390,25 @@ class SettingsStore {
           _legacyMigrationFailed = true;
           AppLogger.error(
             'Legacy credential migration is not supported on this backend; will not retry.',
+            tag: 'settings',
+            error: error,
+          );
+          _loadedConfig = resolvedConfig;
+          return resolvedConfig;
+        }
+        if (error is SettingsWriteConflict) {
+          // Not a migration failure: another instance saved settings.json
+          // concurrently. Classify it as a conflict (like [save] does) so
+          // it is not misreported as "migration failed, will retry", and
+          // record it as a load error so the controller's recovery path
+          // reloads before the next save instead of conflicting again. The
+          // migration itself is retried on a later load.
+          _configLoadError = error;
+          AppLogger.error(
+            'Legacy credential migration hit a cross-instance write '
+            'conflict (attempt '
+            '$_legacyMigrationAttempts/$_maxLegacyMigrationAttempts); '
+            'settings loaded, migration will retry on a later load.',
             tag: 'settings',
             error: error,
           );

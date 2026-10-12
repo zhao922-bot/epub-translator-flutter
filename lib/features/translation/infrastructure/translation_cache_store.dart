@@ -56,6 +56,15 @@ class TranslationCacheStore {
   // A full pass establishes/reconciles the disk baseline. Between passes,
   // successful writes update it by byte delta, not by accumulating payloads.
   final Map<String, int> _sizes = <String, int>{};
+
+  /// Block-cache paths in oldest-first eviction order (insertion order).
+  /// Writes move their path to the end; a full scan rebuilds it from
+  /// on-disk mtimes. Used by the backoff-period quota pass
+  /// ([_enforceQuotaLightly]) to evict approximately-LRU without a
+  /// directory listing. Job checkpoints are never recorded here: they are
+  /// excluded from the cap and must never be evicted.
+  final Set<String> _evictionOrder = <String>{};
+
   final Map<String, Future<void>> _fileGates = <String, Future<void>>{};
   Map<String, int>? _scanChanges;
   int _estimatedBytes = 0;
@@ -147,6 +156,14 @@ class TranslationCacheStore {
     if (_estimatedBytes <= _capacity) _resetBackoff();
   }
 
+  /// Marks [path] as most-recently written for lightweight eviction order.
+  /// (A LinkedHashSet keeps insertion order; remove+add moves to the end.)
+  void _noteWriteOrder(String path) {
+    _evictionOrder
+      ..remove(path)
+      ..add(path);
+  }
+
   Future<void> _sweepStaleTempFiles(Directory directory) async {
     if (!_sweptTempDirs.add(directory.path)) {
       return;
@@ -211,6 +228,7 @@ class TranslationCacheStore {
       await writeFileAtomically(file, envelope);
       _writeGeneration++;
       _recordSize(file.path, utf8.encode(envelope).length);
+      _noteWriteOrder(file.path);
     });
     _pruneIfNeeded();
   }
@@ -227,18 +245,22 @@ class TranslationCacheStore {
     final bool overCapacity = _estimatedBytes > _capacity;
     final bool intervalActive =
         _lastPrune != null && now.difference(_lastPrune!) < pruneInterval;
-    // An over-capacity cache outranks the ineffective-scan backoff: without
-    // this, puts keep accepting writes while eviction stalls for up to 60
-    // minutes and the cache grows without bound past the cap. The prune
-    // interval still rate-limits rescans, so a fresh over-capacity
-    // transition (backoff was reset) scans promptly instead of waiting out
-    // a stale backoff.
-    if (intervalActive && (!overCapacity || _backoffActive())) {
+    final bool backoffActive = _backoffActive();
+    if (intervalActive && (!overCapacity || backoffActive)) {
       return;
     }
-    if (!overCapacity && _backoffActive()) {
+    if (!overCapacity && backoffActive) {
       return;
     }
+    // Over capacity while the ineffective-scan backoff is armed: the full
+    // scan was proven unable to reclaim space (its targets are locked or
+    // otherwise unreclaimable), so walking the whole tree again would only
+    // burn IO every interval. Skip the scan, but still enforce the quota
+    // with a lightweight pass over in-memory-known entries — without this
+    // the cache would grow without bound for the backoff's duration.
+    // A fresh over-capacity transition (backoff was reset) still scans
+    // promptly instead of waiting out a stale backoff.
+    final bool lightOnly = overCapacity && backoffActive;
     _maintenancePending = true;
     _lastPrune = now;
     // Start on a separate event turn, and never join this future from put.
@@ -248,8 +270,12 @@ class TranslationCacheStore {
         bool scanned = false;
         int deletedBytes = 0;
         try {
-          deletedBytes = await _scanAndPrune(await _cacheRoot(), _capacity);
-          scanned = true;
+          if (lightOnly) {
+            deletedBytes = await _enforceQuotaLightly();
+          } else {
+            deletedBytes = await _scanAndPrune(await _cacheRoot(), _capacity);
+            scanned = true;
+          }
         } catch (_) {
           // Cache maintenance must never break translation.
         } finally {
@@ -283,6 +309,48 @@ class TranslationCacheStore {
         }
       }),
     );
+  }
+
+  /// Enforces the capacity quota without a directory listing, for use while
+  /// the ineffective-scan backoff is armed (see [_pruneIfNeeded]). Evicts
+  /// the oldest in-memory-known block entries down to 90% of the cap —
+  /// the same target the full scan uses — under the per-file gate shared
+  /// with writers, so a concurrent put can never lose a just-written
+  /// entry: the stat recheck skips files that changed since they were
+  /// recorded, leaving those for the next full scan to reconcile. Returns
+  /// the reclaimed bytes. Job checkpoints are never in [_sizes], so they
+  /// are never touched here.
+  Future<int> _enforceQuotaLightly() async {
+    final int targetBytes = (_capacity * 0.9).toInt();
+    int deletedBytes = 0;
+    for (final String filePath in _evictionOrder.toList()) {
+      if (_estimatedBytes <= targetBytes) break;
+      final int? recorded = _sizes[filePath];
+      if (recorded == null || recorded <= 0) {
+        _evictionOrder.remove(filePath);
+        continue;
+      }
+      final File file = File(filePath);
+      try {
+        await _withFileGate(file, () async {
+          if (_estimatedBytes <= targetBytes) return;
+          final FileStat current = await file.stat();
+          // Changed since recorded (rewritten, or touched externally): the
+          // recorded size is stale, so leave it for a full scan.
+          if (current.type != FileSystemEntityType.file ||
+              current.size != recorded) {
+            return;
+          }
+          await file.delete();
+          deletedBytes += recorded;
+          _evictionOrder.remove(filePath);
+          _recordSize(filePath, 0);
+        });
+      } catch (_) {
+        // Best effort; a locked file is left for the next pass.
+      }
+    }
+    return deletedBytes;
   }
 
   /// Scans [root] and evicts the oldest entries under `blocks/` until the
@@ -424,6 +492,16 @@ class TranslationCacheStore {
         ..clear()
         ..addAll(scannedSizes);
       _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
+      // Rebuild the lightweight-eviction order from on-disk mtimes (oldest
+      // first) so the backoff-period quota pass evicts approximately LRU
+      // without another full scan.
+      final List<_CacheEntry> byAge = entries.toList()
+        ..sort(
+          (_CacheEntry a, _CacheEntry b) => a.modified.compareTo(b.modified),
+        );
+      _evictionOrder
+        ..clear()
+        ..addAll(byAge.map((_CacheEntry entry) => entry.file.path));
       return deletedBytes;
     } finally {
       _scanChanges = null;
@@ -592,9 +670,14 @@ class TranslationCacheStore {
 
   Future<void> clearJobState(String jobKey) async {
     final File file = await _jobStateFile(jobKey);
-    if (await file.exists()) {
-      await file.delete();
-    }
+    // Go through the per-file gate shared with [saveJobState]: without it
+    // a clear racing a concurrent save could delete a checkpoint the save
+    // just wrote, discarding already-paid translation progress.
+    await _withFileGate(file, () async {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    });
   }
 
   Future<File> _blockCacheFile(String cacheKey) async {

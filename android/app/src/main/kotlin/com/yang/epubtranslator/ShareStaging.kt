@@ -105,12 +105,14 @@ internal fun dropStaleShareGrants(
  * - The count/size quota counts ALL surviving snapshots: a burst of shares
  *   inside the grace period must not let the quota be exceeded silently.
  * - Eviction only takes the oldest grace-expired files WITHOUT a live
- *   grant; a live grant exempts its snapshot regardless of age.
+ *   grant and not in [activeSharePaths]; a live grant exempts its snapshot
+ *   regardless of age.
  */
 internal fun planShareStagingCleanup(
     entries: List<ShareStagingEntry>,
     grantUriByPath: Map<String, String>,
     now: Long,
+    activeSharePaths: Set<String> = emptySet(),
 ): ShareStagingCleanupPlan {
     val (expired, survivors) = entries.partition { entry ->
         now - entry.lastModified >= SHARE_STAGING_MAX_AGE_MS
@@ -126,6 +128,12 @@ internal fun planShareStagingCleanup(
         // A live share grant outlives any fixed grace period: never evict
         // its snapshot for quota.
         if (file.path in grantUriByPath) {
+            continue
+        }
+        // An in-flight share's snapshot: the copy may stall past the grace
+        // period while quota pressure exists — never evict it under the
+        // chooser's feet.
+        if (file.path in activeSharePaths) {
             continue
         }
         if (now - file.lastModified < SHARE_STAGING_CAP_GRACE_MS) {

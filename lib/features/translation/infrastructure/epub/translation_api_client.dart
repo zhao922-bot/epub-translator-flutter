@@ -911,6 +911,12 @@ class TranslationApiClient {
   /// message). Unlike other 400s this is payload-size dependent: a smaller
   /// request can succeed, so callers route it to the shrink fallback
   /// instead of treating it as a deterministic configuration error.
+  ///
+  /// The patterns require genuine length/overflow semantics (context
+  /// length, too long, maximum context, token limit, ...). A bare
+  /// "context" substring is NOT enough: gateway 400s about malformed
+  /// structure (e.g. "invalid context: ...") must stay on the deterministic
+  /// fail-fast path instead of being misrouted into shrink retries.
   static bool isContextOverflowError(Object error) {
     if (error is! DioException) {
       return false;
@@ -920,7 +926,9 @@ class TranslationApiClient {
     }
     final String body = (error.response?.data?.toString() ?? '').toLowerCase();
     return RegExp(
-      r'context|too many tokens|maximum context|token limit|exceeds.{0,20}token|'
+      r'maximum.{0,24}context|context.{0,40}(length|window|limit|budget|'
+      r'size|too (long|large)|exceed|overflow|exhaust)|'
+      r'too many tokens|token.{0,24}limit|exceed.{0,24}tokens?|'
       r'max_tokens|input.{0,20}too (long|large)|prompt.{0,20}too (long|large)|'
       r'message.{0,20}too (long|large)',
     ).hasMatch(body);

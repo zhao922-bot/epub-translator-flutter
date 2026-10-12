@@ -135,6 +135,17 @@ final connectionTestProvider =
       return controller;
     });
 
+/// An edit whose save failed with [SettingsWriteConflict], kept as a pure
+/// transformation so [SettingsController.reloadSettings] can re-apply it
+/// onto the fresh snapshot. Replaying the closure (rather than restoring
+/// the failed state wholesale) preserves the user's intent without
+/// clobbering the other instance's unrelated changes.
+typedef _ConflictedEdit = ({
+  TranslationConfig Function(TranslationConfig) update,
+  Set<SettingsSecretSlot> explicitSecretMutations,
+  Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
+});
+
 class SettingsController extends StateNotifier<TranslationConfig> {
   SettingsController(
     this._store, {
@@ -174,6 +185,19 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
   Future<void>? _recoveryLoad;
+
+  /// Edits whose save failed with [SettingsWriteConflict]. [reloadSettings]
+  /// re-applies them onto the freshly loaded snapshot instead of silently
+  /// discarding the user's work — the same shape as the automatic recovery
+  /// path ([_ensureConfigLoaded] followed by [_update]: reload first, then
+  /// apply the edit closure). Cleared by any successful save, which means
+  /// the user moved on from the conflicted base.
+  final List<_ConflictedEdit> _conflictedEdits = <_ConflictedEdit>[];
+
+  /// The latest debounced (slider) transformation not yet flushed. Slider
+  /// setters are absolute, so chaining keeps the effective transformation.
+  TranslationConfig Function(TranslationConfig)? _debouncedEdit;
+
   int providerSelectionRevision = 0;
 
   Future<void> get ready => _initialLoad;
@@ -251,6 +275,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     state = next;
     if (debounce) {
       _sliderTimer?.cancel();
+      final previous = _debouncedEdit;
+      _debouncedEdit = previous == null
+          ? update
+          : (TranslationConfig config) => update(previous(config));
       final completion = _sliderCompletion ??= Completer<bool>();
       _sliderTimer = Timer(
         const Duration(milliseconds: 400),
@@ -261,7 +289,23 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final pendingSlider = _sliderCompletion;
     _sliderCompletion = null;
     _sliderTimer?.cancel();
-    final result = await _saveUpdate(next, slots);
+    final debounced = _debouncedEdit;
+    _debouncedEdit = null;
+    // A non-debounced edit flushes a pending slider edit implicitly: the
+    // recorded replay must compose both transformations, otherwise the
+    // slider's value would be lost on conflict-replay.
+    final effectiveUpdate = debounced == null
+        ? update
+        : (TranslationConfig config) => update(debounced(config));
+    final result = await _saveUpdate(
+      next,
+      slots,
+      pendingEdit: (
+        update: effectiveUpdate,
+        explicitSecretMutations: explicitSecretMutations,
+        secretMutationsFor: secretMutationsFor,
+      ),
+    );
     pendingSlider?.complete(result);
     return result;
   }
@@ -270,16 +314,34 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _sliderTimer?.cancel();
     final completion = _sliderCompletion;
     _sliderCompletion = null;
+    final debounced = _debouncedEdit;
+    _debouncedEdit = null;
     if (completion == null) return;
-    completion.complete(await _saveUpdate(state, const {}));
+    completion.complete(
+      await _saveUpdate(
+        state,
+        const {},
+        pendingEdit: debounced == null
+            ? null
+            : (
+                update: debounced,
+                explicitSecretMutations: const <SettingsSecretSlot>{},
+                secretMutationsFor: null,
+              ),
+      ),
+    );
   }
 
   Future<bool> _saveUpdate(
     TranslationConfig next,
-    Set<SettingsSecretSlot> slots,
-  ) async {
+    Set<SettingsSecretSlot> slots, {
+    _ConflictedEdit? pendingEdit,
+  }) async {
     try {
       await _persist(next, explicitSecretMutations: slots);
+      // A save that went through supersedes any conflicted base: the user
+      // moved on, so stale replay closures must not linger.
+      _conflictedEdits.clear();
       _unresolvedSecretFailures.removeAll(slots);
       if (mounted) {
         // Secret read status can change even when the displayed value doesn't.
@@ -300,6 +362,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
         // The store recorded this as a load error, so the next edit
         // auto-recovers via [_ensureConfigLoaded]; still surface the event
         // so the page can offer an explicit "reload" action right away.
+        // Keep the edit as a pure transformation: [reloadSettings]
+        // re-applies it onto the fresh snapshot instead of discarding it.
+        if (pendingEdit != null) _conflictedEdits.add(pendingEdit);
         if (mounted) onWriteConflict?.call();
       }
       // The UI already shows the new value, so a silent failure would leave
@@ -310,12 +375,28 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
   }
 
-  /// Re-reads settings from disk, discarding in-memory edits. Used after a
-  /// cross-instance write conflict: the other instance's values become
-  /// visible and the stale snapshot is refreshed, so a subsequent save no
-  /// longer conflicts. Clears the store's load error on success.
+  /// Re-reads settings from disk. Used after a cross-instance write
+  /// conflict: the other instance's values become visible and the stale
+  /// snapshot is refreshed, so a subsequent save no longer conflicts.
+  /// Edits whose save hit the conflict are re-applied onto the fresh
+  /// snapshot (same shape as the automatic recovery path) instead of being
+  /// silently discarded; replaying the closures (rather than restoring the
+  /// failed state wholesale) keeps the other instance's unrelated changes
+  /// intact. Clears the store's load error on success.
   Future<void> reloadSettings() async {
+    final List<_ConflictedEdit> pending = _conflictedEdits.toList();
+    _conflictedEdits.clear();
     await _load();
+    for (final edit in pending) {
+      if (!mounted) break;
+      // A replay that conflicts again re-records itself via [_saveUpdate]
+      // and re-surfaces the conflict, so no edit is silently dropped.
+      await _update(
+        edit.update,
+        explicitSecretMutations: edit.explicitSecretMutations,
+        secretMutationsFor: edit.secretMutationsFor,
+      );
+    }
   }
 
   Future<bool> setApiBaseUrl(String value) => _update((config) {

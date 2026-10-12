@@ -318,10 +318,12 @@ void main() {
       ]) {
         expect(() => client.normalizedBaseUrl(url), throwsFormatException);
       }
-      // Fragments carry no credentials over HTTP and are allowed (#17).
+      // Fragments are rejected outright (C-1): they never reach the server,
+      // so allowing them has zero business value, and OAuth-implicit-style
+      // fragments like #api_key= can carry plaintext credentials.
       expect(
-        client.normalizedBaseUrl('https://host/v1#secret'),
-        'https://host/v1#secret',
+        () => client.normalizedBaseUrl('https://host/v1#secret'),
+        throwsFormatException,
       );
     });
 

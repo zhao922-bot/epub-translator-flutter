@@ -560,9 +560,26 @@ void main() {
     test('allows non-credential query params and @ in path', () {
       TranslationConfig.validateApiUrl('https://example.com/v1?tenant=books');
       TranslationConfig.validateApiUrl('https://example.com/@team/v1');
-      TranslationConfig.validateApiUrl('https://example.com/v1#frag');
       TranslationConfig.validateApiUrl('  ');
       TranslationConfig.validateApiUrl('');
+    });
+
+    test('rejects any fragment (C-1: one-size-fits-all)', () {
+      // A fragment is never sent to the server: zero legitimate use, while
+      // the OAuth implicit-flow shape would silently drop the key.
+      for (final url in <String>[
+        'https://api.example.com/v1#api_key=sk-xxx',
+        'https://example.com/v1#section',
+        'example.com/v1#frag',
+      ]) {
+        expect(
+          () => TranslationConfig.validateApiUrl(url),
+          throwsFormatException,
+          reason: url,
+        );
+      }
+      // An empty fragment carries nothing and stays allowed.
+      TranslationConfig.validateApiUrl('https://example.com/v1#');
     });
 
     test('rejects userinfo and credential-like query params', () {
