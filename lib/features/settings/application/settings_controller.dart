@@ -30,6 +30,9 @@ final settingsProvider =
               message: null,
               settingsFileLocked: false,
             );
+            // A save that went through also resolves a pending write
+            // conflict (the snapshot is fresh again).
+            ref.read(settingsWriteConflictProvider.notifier).state = null;
             return;
           }
           notifier.state = (
@@ -53,6 +56,10 @@ final settingsProvider =
             ),
         onSecretsRecovered: () =>
             ref.read(secretKeyRotatedNoticeProvider.notifier).state = null,
+        onWriteConflict: () =>
+            ref.read(settingsWriteConflictProvider.notifier).state = (
+              id: DateTime.now().microsecondsSinceEpoch,
+            ),
       ),
     );
 
@@ -70,6 +77,19 @@ final settingsSaveErrorProvider =
     StateProvider<({int id, String? message, bool settingsFileLocked})?>(
       (ref) => null,
     );
+
+/// Holds the latest cross-instance write-conflict event, if any.
+///
+/// Another app instance saved settings.json after this instance loaded it,
+/// so this instance's snapshot is stale and further saves keep conflicting.
+/// The settings page shows a notice with a "reload" action; reloading
+/// re-reads the file so the user can review the other instance's values and
+/// save again.
+///
+/// Same event-record pattern as [settingsSaveErrorProvider].
+final settingsWriteConflictProvider = StateProvider<({int id})?>(
+  (ref) => null,
+);
 
 /// Holds the latest "settings.json was unreadable/corrupt, defaults were
 /// restored" event, if any.
@@ -122,6 +142,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     this.onCorruptReset,
     this.onSecretKeyRotated,
     this.onSecretsRecovered,
+    this.onWriteConflict,
   }) : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
@@ -142,6 +163,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// are unrecoverable, so the UI warns the user to re-enter them.
   final void Function()? onSecretKeyRotated;
   final void Function()? onSecretsRecovered;
+
+  /// Called when a save fails with [SettingsWriteConflict]: another instance
+  /// changed settings.json, so this instance's snapshot is stale. The page
+  /// offers a "reload" recovery action.
+  final void Function()? onWriteConflict;
   final Set<SettingsSecretSlot> _unresolvedSecretFailures = {};
   Timer? _sliderTimer;
   Completer<bool>? _sliderCompletion;
@@ -270,12 +296,26 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       } else {
         _unresolvedSecretFailures.addAll(slots);
       }
+      if (error is SettingsWriteConflict) {
+        // The store recorded this as a load error, so the next edit
+        // auto-recovers via [_ensureConfigLoaded]; still surface the event
+        // so the page can offer an explicit "reload" action right away.
+        if (mounted) onWriteConflict?.call();
+      }
       // The UI already shows the new value, so a silent failure would leave
       // it lying about what is actually persisted. Surface it instead of
       // letting the future go unhandled at the call site.
       if (mounted) onSaveError?.call(error);
       return false;
     }
+  }
+
+  /// Re-reads settings from disk, discarding in-memory edits. Used after a
+  /// cross-instance write conflict: the other instance's values become
+  /// visible and the stale snapshot is refreshed, so a subsequent save no
+  /// longer conflicts. Clears the store's load error on success.
+  Future<void> reloadSettings() async {
+    await _load();
   }
 
   Future<bool> setApiBaseUrl(String value) => _update((config) {

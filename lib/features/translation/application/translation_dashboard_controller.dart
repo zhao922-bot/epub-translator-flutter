@@ -315,6 +315,62 @@ class TranslationDashboardController
   // before the first await in [clearJobHistory], reset once the clear's
   // save has landed.
   int _ownClearTombstoneMs = 0;
+  // Microsecond deletion watermark of our own in-flight [clearJobHistory],
+  // paired with [_ownClearTombstoneMs]. Ordinary saves queued across the
+  // clear re-apply the "keep jobs newer than the watermark" rule instead
+  // of writing memory verbatim, so a job another instance appended after
+  // our clear began is not discarded. Reset together with the tombstone.
+  int _ownClearWatermarkUs = 0;
+  // Monotonic microsecond logical clock backing the clear deletion
+  // watermark. Raised above every runStartedAt observed by this instance
+  // (see [_noteObservedRunStartedAtUs]) and above its own previous value,
+  // so a system-clock rollback cannot make a clear report success while
+  // leaving pre-rollback records behind.
+  int _historyClearWatermarkUs = 0;
+  // Largest runStartedAt (microseconds; ID-derived wall-ms * 1000 for
+  // inspection-phase jobs whose runStartedAt is 0) ever observed by this
+  // instance. Feeds [_historyClearWatermarkUs].
+  int _maxObservedRunStartedAtUs = 0;
+
+  /// Records a job's timestamp for the clear watermark. Inspection-phase
+  /// jobs carry runStartedAt == 0; their creation wall-time (ms) is encoded
+  /// in the ID prefix (`<ms>-<seq>` from [_newJobId]).
+  void _noteObservedRunStartedAtUs(TranslationJob job) {
+    int timestampUs = job.runStartedAt;
+    if (timestampUs <= 0) {
+      timestampUs = (int.tryParse(job.id.split('-').first) ?? 0) * 1000;
+    }
+    if (timestampUs > _maxObservedRunStartedAtUs) {
+      _maxObservedRunStartedAtUs = timestampUs;
+    }
+  }
+
+  /// True when [job] was created after the clear with deletion watermark
+  /// [clearWatermarkUs] and must survive it. Jobs with runStartedAt == 0
+  /// are inspection-phase records, not legacy rows: their ID prefix carries
+  /// the creation time, so a freshly inspected book is not deleted by
+  /// another instance's clear.
+  static bool _isJobNewerThanClearUs(TranslationJob job, int clearWatermarkUs) {
+    if (job.runStartedAt > 0) {
+      return job.runStartedAt > clearWatermarkUs;
+    }
+    final int createdMs = int.tryParse(job.id.split('-').first) ?? 0;
+    return createdMs * 1000 > clearWatermarkUs;
+  }
+
+  /// Test-only: the clear-watermark predicate behind [clearJobHistory].
+  @visibleForTesting
+  static bool isJobNewerThanClearUsForTest(
+    TranslationJob job,
+    int clearWatermarkUs,
+  ) => _isJobNewerThanClearUs(job, clearWatermarkUs);
+
+  /// Test-only: the history merge + newest-first sort behind persistence.
+  @visibleForTesting
+  static List<TranslationJob> mergeHistorySnapshotsForTest(
+    List<TranslationJob> memoryJobs,
+    List<TranslationJob> fileJobs,
+  ) => _mergeHistorySnapshots(memoryJobs, fileJobs);
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
   int _activeTranslationRunStartedAt = 0;
@@ -860,9 +916,14 @@ class TranslationDashboardController
         return;
       }
       if (profile.isEmpty) {
+        // Empty profile means "generic translation style": auto-confirm it
+        // (restores the pre-v1.6.7 semantics). The v1.6.7 "empty sampling
+        // must not overwrite" fix is unaffected because this early-return
+        // never merges anything into state.styleProfile. A cancelled
+        // generation never reaches this branch (checked above).
         state = state.copyWith(
           isGeneratingStyleProfile: false,
-          styleProfileConfirmed: false,
+          styleProfileConfirmed: true,
           logs: <String>[...state.logs, _s.logStyleProfileEmpty],
         );
         return;
@@ -1339,7 +1400,10 @@ class TranslationDashboardController
     // bar and block counters start at zero while `resumeCheckpointBlocks`
     // keeps the pending figure (the UI labels it as "to verify").
     final int previousRun = state.jobHistory.fold<int>(
-      state.job?.runStartedAt ?? 0,
+      // Fold the clear watermark in: a run started after a clear began must
+      // sort strictly after the clear's deletion watermark, or a retry of
+      // the clear's save would delete the just-started run.
+      max(state.job?.runStartedAt ?? 0, _historyClearWatermarkUs),
       (latest, job) => job.runStartedAt > latest ? job.runStartedAt : latest,
     );
     final int now = DateTime.now().microsecondsSinceEpoch;
@@ -1468,6 +1532,35 @@ class TranslationDashboardController
           _persistProgressHistoryIfDue();
         },
         isCancelled: () => _cancelRequested,
+        // The worker spooled this chapter's sources to disk and dropped its
+        // own copies; drop the UI-side copies too instead of retaining the
+        // whole book in memory. `body` stays: it is only a <=6K preview
+        // excerpt and the preview has no recovery path for finished
+        // chapters (unlike the worker, which restores from spool/archive).
+        onChapterSourcesReleased: (String chapterPath) {
+          if (!mounted) return;
+          final List<InspectedChapter> chapters = state.inspectedChapters;
+          final int index = chapters.indexWhere(
+            (InspectedChapter chapter) => chapter.path == chapterPath,
+          );
+          if (index < 0) return;
+          final InspectedChapter chapter = chapters[index];
+          if (chapter.originalHtml.isEmpty &&
+              chapter.blocks.every(
+                (ExtractedBlock block) => block.sourceHtml.isEmpty,
+              )) {
+            return;
+          }
+          final List<InspectedChapter> next = <InspectedChapter>[...chapters];
+          next[index] = chapter.copyWith(
+            originalHtml: '',
+            blocks: <ExtractedBlock>[
+              for (final ExtractedBlock block in chapter.blocks)
+                block.copyWith(sourceHtml: '', sourceText: ''),
+            ],
+          );
+          state = state.copyWith(inspectedChapters: next);
+        },
       );
       if (!mounted) return true;
       // A returned terminal result means the repository already committed the
@@ -1706,10 +1799,7 @@ class TranslationDashboardController
           return;
         }
         state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            _s.logCouldNotExport(_safeErrorText(error)),
-          ],
+          logs: <String>[...state.logs, debugShareErrorLogLine(error)],
         );
       }
     } finally {
@@ -1852,10 +1942,7 @@ class TranslationDashboardController
           return;
         }
         state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            _s.logCouldNotOpenJobOutput(_safeErrorText(error)),
-          ],
+          logs: <String>[...state.logs, debugOpenJobOutputErrorLogLine(error)],
         );
       }
     } finally {
@@ -2034,13 +2121,31 @@ class TranslationDashboardController
     _lastSeenHistoryClearedAt = nowMs > _lastSeenHistoryClearedAt
         ? nowMs
         : _lastSeenHistoryClearedAt + 1;
+    // Deletion watermark as a monotonic microsecond logical clock. The
+    // deletion decision compares against runStartedAt (microseconds); a
+    // millisecond watermark multiplied by 1000 would wrongly retain jobs
+    // started in the same millisecond before the clear. Raising it above
+    // every timestamp observed so far (and above its own previous value)
+    // keeps a clock rollback from making the clear "succeed" while leaving
+    // pre-rollback records behind.
+    final int nowUs = DateTime.now().microsecondsSinceEpoch;
+    int watermarkUs = nowUs;
+    if (watermarkUs <= _maxObservedRunStartedAtUs) {
+      watermarkUs = _maxObservedRunStartedAtUs + 1;
+    }
+    if (watermarkUs <= _historyClearWatermarkUs) {
+      watermarkUs = _historyClearWatermarkUs + 1;
+    }
+    _historyClearWatermarkUs = watermarkUs;
     // Set synchronously, before any await: a persist that read the file
     // before this clear must save verbatim (not merge) so it cannot
     // resurrect the entries being cleared. Reset once our clear's save has
     // landed — afterwards the file carries our tombstone and the merge path
     // is safe again.
     _ownClearTombstoneMs = _lastSeenHistoryClearedAt;
+    _ownClearWatermarkUs = _historyClearWatermarkUs;
     final clearMs = _ownClearTombstoneMs;
+    final clearUs = _ownClearWatermarkUs;
     state = state.copyWith(
       jobHistory: const <TranslationJob>[],
       logs: <String>[...state.logs, _s.logClearedHistory],
@@ -2065,14 +2170,16 @@ class TranslationDashboardController
               clearedAtEpochMs: candidate,
               // The lock-protected read can see runs added by another instance
               // after this clear began. Preserve them rather than erasing the
-              // latest file wholesale. runStartedAt is microseconds, clearMs
-              // is milliseconds: align units before comparing. Legacy zero
-              // timestamps predate any clear and are intentionally removed.
-              // candidate may rebase on another tombstone during retries, but
-              // the deletion watermark must remain this clear's original
-              // clearMs, or a retry would also delete newly started runs.
+              // latest file wholesale. The watermark is this clear's original
+              // microsecond instant: strict greater-than, units already
+              // aligned, and inspection-phase jobs (runStartedAt == 0) are
+              // ordered by their ID creation time instead of being dropped
+              // as legacy rows. candidate may rebase on another tombstone
+              // during retries, but the deletion watermark must remain this
+              // clear's original clearUs, or a retry would also delete newly
+              // started runs.
               merge: (fileJobs, _) => fileJobs
-                  .where((job) => job.runStartedAt > clearMs * 1000)
+                  .where((job) => _isJobNewerThanClearUs(job, clearUs))
                   .toList(growable: false),
             );
             if (result.written) {
@@ -2104,7 +2211,10 @@ class TranslationDashboardController
       }
       return false;
     } finally {
-      if (_ownClearTombstoneMs == clearMs) _ownClearTombstoneMs = 0;
+      if (_ownClearTombstoneMs == clearMs) {
+        _ownClearTombstoneMs = 0;
+        _ownClearWatermarkUs = 0;
+      }
     }
     return true;
   }
@@ -2129,6 +2239,31 @@ class TranslationDashboardController
     return safeError.contains('timed out')
         ? _s.saveTimeoutContinuesBackground
         : _s.logCouldNotSaveDownloads(safeError);
+  }
+
+  /// Maps a share failure to its log line.
+  ///
+  /// Extracted (and marked test-only) so the SHARE_NO_SPACE → localized
+  /// notice mapping stays covered by unit tests: the native bridge cannot
+  /// be driven on a desktop test host, but the mapping itself must never
+  /// regress to surfacing the raw English native text.
+  @visibleForTesting
+  String debugShareErrorLogLine(Object error) {
+    if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
+      return _s.logNotEnoughSpace;
+    }
+    return _s.logCouldNotExport(_safeErrorText(error));
+  }
+
+  /// Maps an openJobOutput share failure to its log line. The no-space case
+  /// shares the localized notice with [debugShareErrorLogLine]; other
+  /// failures keep this call site's own message.
+  @visibleForTesting
+  String debugOpenJobOutputErrorLogLine(Object error) {
+    if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
+      return _s.logNotEnoughSpace;
+    }
+    return _s.logCouldNotOpenJobOutput(_safeErrorText(error));
   }
 
   Future<String?> _completedOutputPath() async {
@@ -2549,6 +2684,7 @@ class TranslationDashboardController
     if (job.outputDirectory.isEmpty) {
       job = job.copyWith(outputDirectory: state.outputDirectory);
     }
+    _noteObservedRunStartedAtUs(job);
     final List<TranslationJob> history = <TranslationJob>[
       job,
       ...state.jobHistory.where(
@@ -2618,12 +2754,11 @@ class TranslationDashboardController
       elapsed: reuseProgress ? _translationStopwatch?.elapsed : null,
       // Only blocks translated via the real API count toward speed/ETA —
       // cache-restored blocks would otherwise distort the estimate (C-19).
+      // Scan-aware and degrade-aware (C-11/C-12): an unverified checkpoint
+      // during cache restoration and blocks degraded to their source text
+      // must not fabricate throughput.
       apiTranslatedBlocks: reuseProgress
-          ? max(
-              0,
-              (currentJob?.completedBlocks ?? 0) -
-                  (currentJob?.cachedBlocks ?? 0),
-            )
+          ? TranslationRunEstimate.apiTranslatedBlocksForThroughput(currentJob)
           : 0,
     );
   }
@@ -2678,6 +2813,9 @@ class TranslationDashboardController
     final List<TranslationJob> history = loaded.jobs
         .map(_restoreInterruptedJob)
         .toList(growable: false);
+    for (final TranslationJob job in history) {
+      _noteObservedRunStartedAtUs(job);
+    }
     if (_historyClearRevision != clearRevisionBeforeLoad || history.isEmpty) {
       return;
     }
@@ -2741,9 +2879,13 @@ class TranslationDashboardController
     }
     final sorted = merged.values.toList()
       ..sort((a, b) {
+        // runStartedAt is microseconds; the ID prefix is wall-clock
+        // milliseconds — scale it so a fresh inspection record is not
+        // sorted below (and truncated in favor of) older translation
+        // records by the ~1000x unit gap.
         int latestTaskTime(TranslationJob job) => job.runStartedAt > 0
             ? job.runStartedAt
-            : int.tryParse(job.id.split('-').first) ?? 0;
+            : (int.tryParse(job.id.split('-').first) ?? 0) * 1000;
         final byRun = latestTaskTime(b).compareTo(latestTaskTime(a));
         if (byRun != 0) return byRun;
         // Legacy IDs begin with wall-clock milliseconds. Deterministic ID
@@ -2767,17 +2909,41 @@ class TranslationDashboardController
       return Future<void>.value();
     }
     final Future<void> save = _pendingHistorySave.then<void>(
-      (_) => debugPersistJobHistoryNow(),
-      onError: (_) => debugPersistJobHistoryNow(),
+      (_) => _persistJobHistoryPass(),
+      onError: (_) => _persistJobHistoryPass(),
     );
     _pendingHistorySave = save.catchError((_) {});
     return save;
   }
 
   /// Test-only: runs a single history persistence pass, including the
-  /// cross-instance clear-tombstone guard.
+  /// cross-instance clear-tombstone guard. Chains onto [_pendingHistorySave]
+  /// so previously queued saves drain first: the returned future completes
+  /// only when no history save is still in flight.
   @visibleForTesting
-  Future<void> debugPersistJobHistoryNow() async {
+  Future<void> debugPersistJobHistoryNow() {
+    if (historyStore == null) {
+      return Future<void>.value();
+    }
+    final Future<void> save = _pendingHistorySave.then<void>(
+      (_) => _persistJobHistoryPass(),
+      onError: (_) => _persistJobHistoryPass(),
+    );
+    _pendingHistorySave = save.catchError((_) {});
+    return save;
+  }
+
+  /// Test-only: waits for in-flight history saves, then disposes. TearDowns
+  /// that delete the temp dir must use this instead of [dispose]: a
+  /// saveMerged holding the history file open makes Windows fail the
+  /// recursive delete with errno 32 (sharing violation).
+  @visibleForTesting
+  Future<void> debugDispose() async {
+    await _pendingHistorySave;
+    dispose();
+  }
+
+  Future<void> _persistJobHistoryPass() async {
     final JobHistoryStore? store = historyStore;
     if (store == null) {
       return;
@@ -2793,21 +2959,32 @@ class TranslationDashboardController
         .map((job) => _inferredInterruptions[job] ?? job)
         .toList(growable: false);
     final int ownClearMs = _ownClearTombstoneMs;
+    final int ownClearUs = _ownClearWatermarkUs;
     final int lastSeen = _lastSeenHistoryClearedAt;
     final ({bool written, int fileClearedAt}) result = await store.saveMerged(
       clearedAtEpochMs: lastSeen,
       merge: (List<TranslationJob> fileJobs, int fileClearedAt) {
         // Our own in-flight clear: the file still predates it, so its
-        // entries are exactly what we just cleared — save verbatim so the
-        // merge cannot resurrect them.
+        // entries are what we just cleared and must not be resurrected.
+        // But another instance may have appended jobs after our clear began
+        // (a plain save queued before the clear can run after the clear
+        // emptied memory): re-apply the clear's "keep jobs newer than the
+        // watermark" rule instead of writing memory verbatim, or those new
+        // jobs would be silently discarded.
         if (ownClearMs > 0 && fileClearedAt < ownClearMs) {
-          return memoryJobs;
+          final List<TranslationJob> preserved = fileJobs
+              .where((job) => _isJobNewerThanClearUs(job, ownClearUs))
+              .toList(growable: false);
+          return _mergeHistorySnapshots(memoryJobs, preserved);
         }
         // Cross-instance append guard (Windows has no single-instance
         // lock): another instance may have added jobs after our last read.
         // The read and the write are serialized by the store's lock, so the
         // merge sees the other instance's latest write instead of
         // discarding it. Completed records outrank stale interrupted copies.
+        for (final TranslationJob job in fileJobs) {
+          _noteObservedRunStartedAtUs(job);
+        }
         return _mergeHistorySnapshots(memoryJobs, fileJobs);
       },
     );

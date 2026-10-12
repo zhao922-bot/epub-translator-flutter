@@ -571,6 +571,7 @@ class _Round10FakeRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     lastTranslateChapters = chapters;

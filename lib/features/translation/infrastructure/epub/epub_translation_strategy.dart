@@ -23,7 +23,9 @@ class _EpubTranslationStrategy {
   /// Preserve the shared exception contract: structural replies use
   /// TranslationParseException (no retry), syntax jitter uses FormatException.
   /// Validate before the legacy decoder wraps every syntax failure as final.
-  void _validateBatchReply(dynamic response, Set<String> ids, {
+  /// Returns the already-parsed payload so callers do not decode the same
+  /// reply a second time.
+  Map<String, dynamic> _validateBatchReply(dynamic response, Set<String> ids, {
     Map<String, Set<String>>? slotIds,
   }) {
     final content = owner._apiClient.extractMessageContent(response);
@@ -33,14 +35,18 @@ class _EpubTranslationStrategy {
     } on FormatException catch (error) {
       // A legal JSON scalar/array is a deterministic schema mismatch. Broken
       // JSON beginning with an object/fence is transport/model format jitter.
-      Object? decoded;
-      bool validJson = false;
-      try { decoded = jsonDecode(content); validJson = true; } on FormatException { /* syntax jitter */ }
-      if (!validJson && (content.startsWith('{') || content.startsWith('```')) &&
+      // decodeJsonObject() already stripped fences before failing, so the
+      // classification must run on the fence-stripped candidate: decoding
+      // the raw content here would always fail on fenced replies and
+      // misclassify a legal non-object as retryable jitter.
+      final stripped = owner._apiClient.decodeJsonValueAfterFenceStrip(content);
+      final String trimmed = content.trimLeft();
+      if (!stripped.valid &&
+          (trimmed.startsWith('{') || trimmed.startsWith('```')) &&
           !error.message.contains('duplicate object key')) {
         throw const FormatException('Retryable JSON syntax jitter.');
       }
-      throw TranslationParseException('Deterministic JSON schema failure (${decoded.runtimeType}).');
+      throw TranslationParseException('Deterministic JSON schema failure (${stripped.value.runtimeType}).');
     }
     final blocks = json['blocks'];
     if (blocks is! List || blocks.length != ids.length) {
@@ -72,6 +78,7 @@ class _EpubTranslationStrategy {
         }
       }
     }
+    return json;
   }
 
   // Strategy workers never hold HTTP permits while waiting for child work.
@@ -222,9 +229,12 @@ class _EpubTranslationStrategy {
             cancelToken: cancelToken,
           );
 
-          _validateBatchReply(response.data, batch.blocks.map((b) => b.id).toSet());
-          final Map<String, dynamic> jsonPayload = owner._apiClient
-              .decodeBatchJsonPayload(response.data);
+          // The validator returns the already-parsed payload: decoding the
+          // same reply again would double the JSON parse cost per batch.
+          final Map<String, dynamic> jsonPayload = _validateBatchReply(
+            response.data,
+            batch.blocks.map((b) => b.id).toSet(),
+          );
           final Object? blocksJson = jsonPayload['blocks'];
           if (blocksJson is! List) {
             throw const FormatException(
@@ -252,9 +262,9 @@ class _EpubTranslationStrategy {
             }
             final Object? id = item['id'];
             final Object? html = item['html'];
-            if (id is! String || html is! String || html.trim().isEmpty) {
+            if (id is! String || id.isEmpty) {
               throw const FormatException(
-                'Translated batch item is missing id or html.',
+                'Translated batch item is missing id.',
               );
             }
             if (!requestedIds.contains(id) || translatedById.containsKey(id)) {
@@ -262,7 +272,13 @@ class _EpubTranslationStrategy {
                 'Translated batch contains an unknown or duplicate id.',
               );
             }
-            translatedById[id] = html.trim();
+            // An empty or missing html is a per-block failure, not a batch
+            // failure: leave it unrecorded so the per-block loop below
+            // routes only this block to the individual retry instead of
+            // re-billing every healthy block in the batch.
+            if (html is String && html.trim().isNotEmpty) {
+              translatedById[id] = html.trim();
+            }
           }
 
           final Map<String, String> okById = <String, String>{};
@@ -327,23 +343,9 @@ class _EpubTranslationStrategy {
       if (EpubChapterTranslator._isCancelError(error)) {
         throw const TranslationCancelledException();
       }
-      if (TranslationApiClient.isDeterministicHttpError(error)) {
-        throw StateError(
-          TranslationApiClient.deterministicHttpErrorMessage(error, config),
-        );
-      }
-      if (TranslationApiClient.isConnectionTimeout(error)) {
-        for (final ExtractedBlock block in batch.blocks) {
-          owner._markDegradedBlock(
-            chapterPath: chapterPath ?? '',
-            blockId: block.id,
-            apiCounted: true,
-          );
-        }
-        return batch.blocks
-            .map((ExtractedBlock block) => block.sourceHtml)
-            .toList(growable: false);
-      }
+      // Shrink fallback first: a context-overflow 400 (or 413 / send-receive
+      // timeout) is payload-size dependent, so per-block requests can still
+      // succeed. Only errors that no smaller request could fix stay fatal.
       if (TranslationApiClient.shouldFallbackBatchDioException(error)) {
         final TranslationStyleProfile fallbackStyleProfile =
             _EpubBookMemory._styleProfileFromBookMemoryJson(
@@ -365,6 +367,23 @@ class _EpubTranslationStrategy {
           fallbackWindow: fallbackWindow,
           onValidated: onValidated,
         );
+      }
+      if (TranslationApiClient.isDeterministicHttpError(error)) {
+        throw StateError(
+          TranslationApiClient.deterministicHttpErrorMessage(error, config),
+        );
+      }
+      if (TranslationApiClient.isConnectionTimeout(error)) {
+        for (final ExtractedBlock block in batch.blocks) {
+          owner._markDegradedBlock(
+            chapterPath: chapterPath ?? '',
+            blockId: block.id,
+            apiCounted: true,
+          );
+        }
+        return batch.blocks
+            .map((ExtractedBlock block) => block.sourceHtml)
+            .toList(growable: false);
       }
       rethrow;
     } on FormatException catch (_) {
@@ -521,20 +540,20 @@ class _EpubTranslationStrategy {
           cancelToken: cancelToken,
         );
 
-        final String cleaned = _cleanHtmlResponse(
+        // Single-parse entry: _cleanResponseDom parses the reply once and
+        // hands the DOM to the structure lock, instead of the old string
+        // cleaner (which parsed the reply twice) plus another parse inside
+        // the lock. rejectEmptyResponse keeps the empty-reply contract.
+        final _ResponseHtml replyDom = EpubChapterTranslator._cleanResponseDom(
           owner._apiClient.extractMessageContent(response.data),
           sourceText: block.sourceText,
+          rejectEmptyResponse: true,
         );
-        if (cleaned.isEmpty) {
-          throw const FormatException(
-            'The translation API returned an empty block.',
-          );
-        }
         final String locked =
-            EpubChapterTranslator._lockAndValidateTranslatedBlock(
+            EpubChapterTranslator._lockAndValidateTranslatedBlockDom(
               config: config,
               block: block,
-              translatedHtml: cleaned,
+              replyDom: replyDom,
               // Capture the locked reply before quality validation below:
               // a residual-quality rejection must degrade to this usable
               // locked HTML, not to the raw source.
@@ -555,12 +574,13 @@ class _EpubTranslationStrategy {
         }
         lastError = error;
         // A parse failure is deterministic for the same prompt (re-sending
-        // the block would just bill the same request again), and a 413 on a
-        // single block means even one block is too large to ever succeed:
-        // break out and let the normal failure path degrade/throw instead
-        // of wasting retries.
-        final bool payloadTooLarge =
-            error is DioException && error.response?.statusCode == 413;
+        // the block would just bill the same request again), and a 413 or a
+        // context-overflow 400 on a single block means even one block is too
+        // large to ever succeed: break out and let the normal failure path
+        // degrade/throw instead of wasting retries.
+        final bool payloadTooLarge = error is DioException &&
+            (error.response?.statusCode == 413 ||
+                TranslationApiClient.isContextOverflowError(error));
         if (error is TranslationParseException ||
             payloadTooLarge ||
             attempt >=
@@ -632,15 +652,17 @@ class _EpubTranslationStrategy {
       );
       return degradeFallback();
     }
-    if (lastError is DioException && lastError.response?.statusCode == 413) {
+    if (lastError is DioException &&
+        (lastError.response?.statusCode == 413 ||
+            TranslationApiClient.isContextOverflowError(lastError))) {
       owner._markDegradedBlock(
         chapterPath: chapterPath ?? '',
         blockId: block.id,
         apiCounted: true,
-        reason: 'HTTP 413: block exceeds server request limit; source retained',
+        reason: 'HTTP ${lastError.response?.statusCode}: block exceeds server request limit; source retained',
       );
       AppLogger.warn(
-        'Block ${block.id} exceeds the server request limit (HTTP 413); source retained.',
+        'Block ${block.id} exceeds the server request limit (HTTP ${lastError.response?.statusCode}); source retained.',
         tag: 'translate',
       );
       return block.sourceHtml;
@@ -669,42 +691,15 @@ class _EpubTranslationStrategy {
     ).hasMatch(message);
   }
 
-  static String _cleanHtmlResponse(String response, {String sourceText = ''}) {
-    String value = response.trim();
-    final Match? fence = RegExp(
-      r'^```(?:html|xhtml)?\s*\n([\s\S]*?)\n```$',
-      caseSensitive: false,
-    ).firstMatch(value);
-    if (fence != null) value = fence.group(1)!.trim();
-    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      value,
-    );
-    final bool hasMarkup = fragment.nodes.any((node) => node is dom.Element);
-    final bool hasOutsideText = fragment.nodes.any(
-      (node) => node is dom.Text && node.data.trim().isNotEmpty,
-    );
-    if (value.contains('```') ||
-        _hasTranslationExplanationPrefix(value) ||
-        (hasMarkup && hasOutsideText) ||
-        _hasTranslationExplanationPrefix(
-          _EpubBookMemory._plainTextFromHtmlFragment(value),
-        ) ||
-        _hasMarkdownWrapper(value) ||
-        _hasUnexpectedJsonWrapper(
-          sourceText: sourceText,
-          translatedText: value,
-        )) {
-      throw const TranslationParseException(
-        'HTML translation contains wrapper content.',
-      );
-    }
-    return value;
-  }
-
   static bool _shouldDegradeSingle(Object error, TranslationConfig config) {
     if (error is TranslationCancelledException ||
         EpubChapterTranslator._isCancelError(error)) {
       throw const TranslationCancelledException();
+    }
+    // A context-overflow 400 on an already-atomic request cannot shrink
+    // further: degrade to the source text like a 413 instead of failing fast.
+    if (TranslationApiClient.isContextOverflowError(error)) {
+      return true;
     }
     if (TranslationApiClient.isDeterministicHttpError(error)) {
       throw StateError(
@@ -994,9 +989,10 @@ class _EpubTranslationStrategy {
           data: requestData,
           cancelToken: cancelToken,
         );
-        _validateBatchReply(response.data, requestedIds);
-        final Map<String, dynamic> jsonPayload = owner._apiClient
-            .decodeBatchJsonPayload(response.data);
+        final Map<String, dynamic> jsonPayload = _validateBatchReply(
+          response.data,
+          requestedIds,
+        );
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
             rawBlocks.length != references.length) {
@@ -1014,12 +1010,9 @@ class _EpubTranslationStrategy {
           }
           final Object? rawId = item['id'];
           final Object? rawHtml = item['html'];
-          if (rawId is! String ||
-              rawId.isEmpty ||
-              rawHtml is! String ||
-              rawHtml.trim().isEmpty) {
+          if (rawId is! String || rawId.isEmpty) {
             throw const FormatException(
-              'Translated footnote batch item is missing id or html.',
+              'Translated footnote batch item is missing id.',
             );
           }
           if (!requestedIds.contains(rawId)) {
@@ -1032,7 +1025,12 @@ class _EpubTranslationStrategy {
               'Translated footnote batch contains duplicate id $rawId.',
             );
           }
-          rawTranslatedById[rawId] = rawHtml.trim();
+          // An empty or missing html is a per-reference failure: leave it
+          // unrecorded so the per-reference loop below retries only this
+          // footnote instead of re-billing the whole batch.
+          if (rawHtml is String && rawHtml.trim().isNotEmpty) {
+            rawTranslatedById[rawId] = rawHtml.trim();
+          }
         }
 
         final Map<String, String> translatedById = <String, String>{};
@@ -1230,27 +1228,8 @@ class _EpubTranslationStrategy {
       if (EpubChapterTranslator._isCancelError(error)) {
         throw const TranslationCancelledException();
       }
-      // 401/403/404 are deterministic configuration errors: fail fast with
-      // the precise diagnostic instead of billing per-block fallback
-      // requests that would all fail the same way.
-      if (TranslationApiClient.isDeterministicHttpError(error)) {
-        throw StateError(
-          TranslationApiClient.deterministicHttpErrorMessage(error, config),
-        );
-      }
-      if (TranslationApiClient.isConnectionTimeout(error)) {
-        for (final _ProtectedSlotRequest request in requests) {
-          owner._markDegradedBlock(
-            chapterPath: request.chapterPath,
-            blockId: request.block.id,
-            apiCounted: apiCounted,
-          );
-        }
-        return <String, String>{
-          for (final _ProtectedSlotRequest request in requests)
-            request.id: request.block.sourceHtml,
-        };
-      }
+      // Atomic size failures (413, send/receive timeout, context-overflow
+      // 400) degrade a single request to its source instead of aborting.
       if (_shouldDegradeSingle(error, config) && requests.length == 1) {
         // A send timeout on a single slot request means the payload never
         // left; degrading to the source text matches the main block path,
@@ -1269,8 +1248,34 @@ class _EpubTranslationStrategy {
           requests.single.id: requests.single.block.sourceHtml,
         };
       }
-      if (!TranslationApiClient.shouldFallbackBatchDioException(error) ||
-          requests.length == 1) {
+      // Shrink fallback: a size-dependent failure (413, timeout,
+      // context-overflow 400) bisects into smaller payloads, which usually
+      // pass. Only errors that no smaller request could fix stay fatal.
+      if (TranslationApiClient.shouldFallbackBatchDioException(error) &&
+          requests.length > 1) {
+        // Falls through to the bisect below.
+      } else {
+        // 401/403/404 are deterministic configuration errors: fail fast with
+        // the precise diagnostic instead of billing per-block fallback
+        // requests that would all fail the same way.
+        if (TranslationApiClient.isDeterministicHttpError(error)) {
+          throw StateError(
+            TranslationApiClient.deterministicHttpErrorMessage(error, config),
+          );
+        }
+        if (TranslationApiClient.isConnectionTimeout(error)) {
+          for (final _ProtectedSlotRequest request in requests) {
+            owner._markDegradedBlock(
+              chapterPath: request.chapterPath,
+              blockId: request.block.id,
+              apiCounted: apiCounted,
+            );
+          }
+          return <String, String>{
+            for (final _ProtectedSlotRequest request in requests)
+              request.id: request.block.sourceHtml,
+          };
+        }
         rethrow;
       }
     }
@@ -1360,11 +1365,13 @@ class _EpubTranslationStrategy {
           data: requestData,
           cancelToken: cancelToken,
         );
-        _validateBatchReply(response.data, requestedIds, slotIds: {
-          for (final request in requests) request.id: request.slotIds.toSet(),
-        });
-        final Map<String, dynamic> jsonPayload = owner._apiClient
-            .decodeBatchJsonPayload(response.data);
+        final Map<String, dynamic> jsonPayload = _validateBatchReply(
+          response.data,
+          requestedIds,
+          slotIds: {
+            for (final request in requests) request.id: request.slotIds.toSet(),
+          },
+        );
         final Object? rawBlocks = jsonPayload['blocks'];
         if (rawBlocks is! List<dynamic> ||
             rawBlocks.length != requests.length) {
@@ -1603,6 +1610,19 @@ class _EpubTranslationStrategy {
     }
   }
 
+  /// Bounded plain-text digest of a block for per-slot requests: enough for
+  /// continuity, pronouns and terminology without re-sending the whole HTML
+  /// once per slot.
+  static String _blockContextSummary(ExtractedBlock block) {
+    const int limit = 600;
+    final String text = block.sourceText.trim().replaceAll(
+      RegExp(r'\s+'),
+      ' ',
+    );
+    if (text.length <= limit) return text;
+    return '${text.substring(0, limit)}…';
+  }
+
   Future<String> _translateProtectedSlotTextOnce({
     required Dio dio,
     required TranslationConfig config,
@@ -1635,7 +1655,11 @@ class _EpubTranslationStrategy {
           context.bookMemory,
         );
     final Map<String, Object?> slotContext = <String, Object?>{
-      'sourceHtml': request.block.sourceHtml,
+      // Never the full source HTML: every slot request would re-send the
+      // whole block, multiplying input tokens by the slot count and risking
+      // the input window on small slots. A bounded plain-text summary is
+      // enough for continuity, pronouns and terminology.
+      'blockSummary': _blockContextSummary(request.block),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0
           ? request.template.slotTexts[slotIndex - 1]
@@ -1658,9 +1682,10 @@ class _EpubTranslationStrategy {
         <String, String>{
           'role': 'system',
           'content':
-              'Read-only source block context. Use only for continuity, '
-              'pronouns, terminology and sentence flow; translate only the '
-              'current slot supplied in the user message, never this context.\n'
+              'Read-only plain-text summary of the source block. Use only '
+              'for continuity, pronouns, terminology and sentence flow; '
+              'translate only the current slot supplied in the user message, '
+              'never this context.\n'
               '${jsonEncode(slotContext)}',
         },
         <String, String>{'role': 'user', 'content': userText},
@@ -1788,14 +1813,18 @@ class _EpubTranslationStrategy {
     required _ProtectedSlotRequest request,
     required List<String> translatedSlots,
   }) {
-    final String rendered = request.template.render(translatedSlots);
+    // renderElement keeps the rebuilt block in DOM form: wrapping it with
+    // fromRoot avoids parsing the rendered string a second time.
+    final dom.Element renderedRoot = request.template.renderElement(
+      translatedSlots,
+    );
     EpubChapterTranslator._validateTranslatedBlockQuality(
       config: config,
       block: request.block,
       sourceDom: _ResponseHtml.parse(request.block.sourceHtml, null),
-      translatedDom: _ResponseHtml.parse(rendered, null),
+      translatedDom: _ResponseHtml.fromRoot(renderedRoot, null),
     );
-    return rendered;
+    return renderedRoot.outerHtml;
   }
 
   /// Parses [sourceHtml] for protected-anchor slot translation, returning

@@ -63,6 +63,7 @@ class _CompletedInspectionRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) {
     throw UnimplementedError();
   }

@@ -24,12 +24,40 @@ class SettingsPage extends ConsumerStatefulWidget {
   ConsumerState<SettingsPage> createState() => _SettingsPageState();
 }
 
-class _SettingsPageState extends ConsumerState<SettingsPage> {
+class _SettingsPageState extends ConsumerState<SettingsPage>
+    with WidgetsBindingObserver {
   final _connectionFields = List.generate(
     4,
     (_) => GlobalKey<SettingsTextFieldState>(),
   );
   bool _committingConnectionFields = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // A slider value may be sitting in the 400ms debounce window when the
+    // app is backgrounded or killed. Flush it now instead of waiting for
+    // the timer: dispose()'s unawaited flush is not guaranteed to reach
+    // disk before the process dies. (True synchronous IO is impossible in
+    // Dart; starting the save at the lifecycle transition is the earliest
+    // possible point.)
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.detached) {
+      unawaited(ref.read(settingsProvider.notifier).flushSliderChanges());
+    }
+  }
 
   Future<bool> _commitConnectionFields() async {
     // Capture every field before settings notifications rebuild the page.
@@ -89,6 +117,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final strings = ref.watch(appStringsProvider);
     final bool secretKeyRotated =
         ref.watch(secretKeyRotatedNoticeProvider) != null;
+    final bool writeConflict =
+        ref.watch(settingsWriteConflictProvider) != null;
 
     // Surface persistence failures (e.g. the secret store timing out): the
     // fields already show the new values, so warn instead of failing silently.
@@ -120,6 +150,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           // 已不可恢复，提醒用户重新输入。
           if (secretKeyRotated)
             _SettingsWarningBanner(text: strings.secretKeyRotatedWarning),
+          // 跨实例写冲突：快照已过期，后续保存会继续冲突。提供"重新加载"
+          // 恢复路径：重读磁盘文件后再保存即可通过。
+          if (writeConflict)
+            _SettingsWarningBanner(
+              text: strings.isChinese
+                  ? '另一实例修改了设置，当前页面的值可能已过期，保存会失败。请重新加载后再试。'
+                  : 'Another instance changed the settings; this page may show stale values and saves will fail. Reload and try again.',
+              actionLabel: strings.isChinese ? '重新加载' : 'Reload',
+              onAction: () async {
+                await ref.read(settingsProvider.notifier).reloadSettings();
+                ref.read(settingsWriteConflictProvider.notifier).state = null;
+              },
+            ),
           // Windows 提权运行：DPAPI 密钥与普通用户不互通，提醒用户。
           if (PlatformUtils.isWindows) const _WindowsElevatedWarning(),
           // —— API ——
@@ -580,16 +623,26 @@ class _WindowsElevatedWarningState
 
 /// Warning banner shown at the top of the settings page for secret-store
 /// conditions the user must act on (Android KeyStore rotation, Windows
-/// elevation). Plain Card + icon so it fits both light and dark themes.
+/// elevation, cross-instance write conflicts). Plain Card + icon so it fits
+/// both light and dark themes. An optional action button (e.g. "Reload")
+/// gives the user a recovery path without leaving the page.
 class _SettingsWarningBanner extends StatelessWidget {
-  const _SettingsWarningBanner({required this.text});
+  const _SettingsWarningBanner({
+    required this.text,
+    this.actionLabel,
+    this.onAction,
+  });
 
   final String text;
+  final String? actionLabel;
+  final Future<void> Function()? onAction;
 
   @override
   Widget build(BuildContext context) {
     final ThemeData theme = Theme.of(context);
     final ColorScheme scheme = theme.colorScheme;
+    final String? actionLabel = this.actionLabel;
+    final Future<void> Function()? onAction = this.onAction;
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Card(
@@ -609,6 +662,13 @@ class _SettingsWarningBanner extends StatelessWidget {
                   ),
                 ),
               ),
+              if (actionLabel != null && onAction != null) ...[
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: () => unawaited(onAction()),
+                  child: Text(actionLabel),
+                ),
+              ],
             ],
           ),
         ),

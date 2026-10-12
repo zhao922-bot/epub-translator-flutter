@@ -81,12 +81,19 @@ class PreviewRecoveryCache {
   final PreviewRecoveryRunner _runner;
   final Map<String, _RecoveryEntry> _entries = {};
 
+  /// The error thrown by the most recent failed [prepare], if any. Cleared
+  /// when a later [prepare] starts. The UI surfaces it with a retry entry
+  /// instead of silently projecting an empty preview.
+  Object? get lastError => _lastError;
+  Object? _lastError;
+
   PreviewChapter? lookup(InspectedChapter chapter) {
     final entry = _entries[chapter.path];
     return entry != null && entry.matches(chapter) ? entry.result : null;
   }
 
   Future<void> prepare(List<InspectedChapter> chapters) async {
+    _lastError = null;
     final paths = chapters.map((c) => c.path).toSet();
     _entries.removeWhere((path, _) => !paths.contains(path));
     final missing = <InspectedChapter>[];
@@ -120,6 +127,10 @@ class PreviewRecoveryCache {
                 _entries.remove(entry.chapter.path);
               }
             }
+            // Record before rethrowing: the provider surfaces the failure
+            // through its AsyncValue, and the UI shows this error with a
+            // retry entry instead of an empty preview.
+            _lastError = error;
             Error.throwWithStackTrace(error, stack);
           });
       for (final entry in newEntries) {

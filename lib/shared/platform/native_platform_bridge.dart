@@ -405,8 +405,13 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   }
 
   static Future<String?> _readLinuxSecret(String name) async {
-    // A missing or broken secret-tool degrades to "no saved key": desktop
-    // startup must never be interrupted by the secret backend.
+    // Only "no such item" degrades to null. A missing secret-tool is a
+    // deterministic UnsupportedError (propagated: the store must not retry
+    // it like a transient failure), and any other helper failure is a
+    // genuine read failure (propagated: the store records readFailure so
+    // the UI can warn and _saveSecret never blind-deletes the key).
+    // Desktop startup still never breaks: the settings store catches these
+    // per slot.
     try {
       final String output = await _runDesktopSecretHelper(
         'secret-tool',
@@ -414,12 +419,17 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       );
       final String clean = output.trim();
       return clean.isEmpty ? null : clean;
-    } catch (error) {
+    } on _SecretHelperExitFailure catch (error) {
+      // `secret-tool lookup` signals a missing item with exit 1 and no
+      // output at all; any stderr detail (or a different exit code) means
+      // the lookup itself failed. (A missing secret-tool throws
+      // UnsupportedError above and propagates untouched.)
+      if (error.exitCode == 1 && error.stderr.trim().isEmpty) return null;
       AppLogger.debug(
         'Linux secret lookup failed for "$name": $error',
         tag: 'secrets',
       );
-      return null;
+      rethrow;
     }
   }
 
@@ -520,21 +530,17 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   }
 
   static Future<String?> _readMacosSecret(String name) async {
-    // Same degradation policy as Linux: never interrupt startup.
-    try {
-      final String output = await _runDesktopSecretHelper(
-        'security',
-        macosSecretLookupArgs(_desktopSecretService, name),
-      );
-      final String clean = output.trim();
-      return clean.isEmpty ? null : clean;
-    } catch (error) {
-      AppLogger.debug(
-        'macOS secret lookup failed for "$name": $error',
-        tag: 'secrets',
-      );
-      return null;
-    }
+    // Same policy as Linux: only "no such item" degrades to null.
+    // errSecItemNotFound (exit 44) means the item simply isn't stored;
+    // anything else propagates as UnsupportedError (no backend) or a
+    // genuine read failure.
+    final String output = await _runDesktopSecretHelper(
+      'security',
+      macosSecretLookupArgs(_desktopSecretService, name),
+      missingExitCode: 44, // errSecItemNotFound: not stored, not an error.
+    );
+    final String clean = output.trim();
+    return clean.isEmpty ? null : clean;
   }
 
   static Future<void> _writeMacosSecret(String name, String value) async {
@@ -567,9 +573,11 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   }
 
   /// Runs a desktop secret helper (`secret-tool` / `security`) and returns
-  /// its stdout. Throws [StateError] when the helper is missing, exits
-  /// non-zero, or times out (30s, mirroring the Windows secret path); a hung
-  /// helper is killed so it can never wedge the app.
+  /// its stdout. Throws [UnsupportedError] when the helper executable is
+  /// missing (no secret backend on this machine — deterministic, the
+  /// settings store must not respawn it on every load); throws [StateError]
+  /// when the helper exits non-zero or times out (30s, mirroring the Windows
+  /// secret path); a hung helper is killed so it can never wedge the app.
   ///
   /// [args] follows the argv[0] convention: its first element is the
   /// executable name itself, exactly as the `*SecretArgs` builders return it.
@@ -593,7 +601,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       // `secret-tool secret-tool store …` (unknown subcommand, exit 2).
       process = await Process.start(executable, args.sublist(1));
     } on ProcessException catch (error) {
-      throw StateError(
+      throw UnsupportedError(
         'Secret helper "$executable" is not available (${error.message}).',
       );
     }
@@ -635,11 +643,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       allowMalformed: true,
     );
     if (exitCode != 0 && exitCode != missingExitCode) {
-      final String detail = stderrText.trim();
-      throw StateError(
-        'Secret helper "$executable" failed'
-        '${detail.isNotEmpty ? ': $detail' : '.'}',
-      );
+      throw _SecretHelperExitFailure(executable, exitCode, stderrText);
     }
     return utf8.decode(await stdoutBytes, allowMalformed: true);
   }
@@ -982,8 +986,10 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
 
   /// Starts the PowerShell child process for Windows secret operations.
   /// A missing/unlaunchable powershell.exe (broken PATH, broken execution
-  /// host) surfaces as a [StateError] the settings UI already knows how to
-  /// report, instead of a raw [ProcessException] escaping to the caller.
+  /// host) surfaces as an [UnsupportedError] — no usable secret backend —
+  /// instead of a raw [ProcessException] escaping to the caller, so the
+  /// settings store's `isUnsupported` classification recognizes it and does
+  /// not respawn the helper on every load.
   @visibleForTesting
   static Future<Process> startWindowsSecretProcess(
     List<String> arguments,
@@ -993,7 +999,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     try {
       return await starter('powershell', arguments);
     } on ProcessException catch (error) {
-      throw StateError('无法启动 PowerShell 子进程：${error.message}');
+      throw UnsupportedError('无法启动 PowerShell 子进程：${error.message}');
     }
   }
 
@@ -1070,4 +1076,25 @@ class WindowsLongPathException implements Exception {
 
   @override
   String toString() => 'WindowsLongPathException: $detail';
+}
+
+/// A desktop secret helper (`secret-tool` / `security`) exited non-zero.
+///
+/// A [StateError] subtype (existing callers keep catching [StateError]),
+/// carrying the exit code and stderr so readers can distinguish "no such
+/// item" from a genuine backend failure without parsing the message:
+/// `secret-tool lookup` reports a missing item as exit 1 with no output at
+/// all, while a real failure (D-Bus unavailable, keyring locked) prints
+/// detail to stderr.
+class _SecretHelperExitFailure extends StateError {
+  _SecretHelperExitFailure(this.executable, this.exitCode, String stderr)
+    : stderr = stderr,
+      super(
+        'Secret helper "$executable" failed'
+        '${stderr.trim().isNotEmpty ? ': ${stderr.trim()}' : '.'}',
+      );
+
+  final String executable;
+  final int exitCode;
+  final String stderr;
 }

@@ -311,14 +311,18 @@ void main() {
       );
     });
 
-    test('rejects userinfo and fragments without echoing credentials', () {
+    test('rejects userinfo without echoing credentials', () {
       for (final url in [
         'https://user:password@host/v1?key=secret',
         'https://user:password@host/v1',
-        'https://host/v1#secret',
       ]) {
         expect(() => client.normalizedBaseUrl(url), throwsFormatException);
       }
+      // Fragments carry no credentials over HTTP and are allowed (#17).
+      expect(
+        client.normalizedBaseUrl('https://host/v1#secret'),
+        'https://host/v1#secret',
+      );
     });
 
     test('strips a pasted /chat/completions suffix', () {

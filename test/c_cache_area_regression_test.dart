@@ -116,7 +116,7 @@ void main() {
   );
 
   test(
-    'C-15: unreclaimable space backs off exponentially, caps at 1h and resets',
+    'C-15: over-capacity rescans outrank the backoff (no hour-long stall)',
     () async {
       var now = DateTime.now();
       int scans = 0;
@@ -148,34 +148,28 @@ void main() {
 
       await put();
       final baseline = scans;
+      // Puts inside the prune interval do not rescan.
       for (int i = 0; i < 10; i++) {
         await put();
       }
       expect(scans, baseline);
-      now = now.add(const Duration(minutes: 5));
-      await put();
-      expect(scans, baseline + 1);
-      now = now.add(const Duration(minutes: 9));
-      await put();
-      expect(scans, baseline + 1);
-      now = now.add(const Duration(minutes: 1));
-      await put();
-      expect(scans, baseline + 2);
-      for (final minutes in [20, 40, 60, 60]) {
-        final before = scans;
-        now = now.add(Duration(minutes: minutes - 1));
+      // After the interval, an over-capacity put rescans even though the
+      // previous pass was ineffective and armed the backoff: eviction must
+      // not stall for up to an hour while writes keep growing the cache.
+      // Repeated ineffective passes rescan every interval without
+      // escalating into hour-long stalls.
+      for (int i = 0; i < 4; i++) {
+        now = now.add(const Duration(minutes: 5));
         await put();
-        expect(scans, before);
-        now = now.add(const Duration(minutes: 1));
-        await put();
-        expect(scans, before + 1);
+        expect(scans, baseline + 1 + i);
       }
       await File(temp).delete();
-      now = now.add(const Duration(hours: 1));
+      now = now.add(const Duration(minutes: 5));
       await put();
       expect(store.estimatedCacheBytesForTest, lessThanOrEqualTo(200));
-      // A new over-cap write is scanned immediately once the backoff resets.
+      // A new over-cap write is scanned once the interval expires.
       final before = scans;
+      now = now.add(const Duration(minutes: 5));
       await store.putBlockTranslation('ablarge', 'z' * 300);
       await store.waitForMaintenanceForTest();
       expect(scans, before + 1);

@@ -285,12 +285,23 @@ void main() {
 
   test('both proxy port boundaries work for all supported forms', () {
     for (final port in [1, 65535]) {
-      for (final prefix in ['', 'http://', 'https://']) {
+      for (final prefix in ['', 'http://']) {
         for (final host in ['proxy.example', '[::1]']) {
           final value = '$prefix$host:$port';
           expect(TranslationApiClient.validateProxySetting(value), isNull);
           expect(TranslationApiClient.proxyHostPort(value), endsWith(':$port'));
         }
+      }
+      // HTTPS proxies are explicitly rejected (v1.6.5): Dart's HttpClient
+      // cannot do TLS to the proxy, so accepting https:// would silently
+      // downgrade to a plaintext proxy connection.
+      for (final host in ['proxy.example', '[::1]']) {
+        final value = 'https://$host:$port';
+        expect(
+          TranslationApiClient.validateProxySetting(value),
+          ProxySettingError.unsupportedScheme,
+        );
+        expect(TranslationApiClient.proxyHostPort(value), isNull);
       }
     }
   });

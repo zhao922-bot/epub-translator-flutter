@@ -639,12 +639,16 @@ class TranslationApiClient {
     return stripped.trim();
   }
 
-  Map<String, dynamic> decodeJsonObject(String content) {
+  static String _stripJsonFence(String content) {
     final String normalized = content.trim();
     final Match? fenced = RegExp(
       r'```(?:json)?\s*([\s\S]*?)\s*```',
     ).firstMatch(normalized);
-    final String candidate = fenced?.group(1)?.trim() ?? normalized;
+    return fenced?.group(1)?.trim() ?? normalized;
+  }
+
+  Map<String, dynamic> decodeJsonObject(String content) {
+    final String candidate = _stripJsonFence(content);
     try {
       return _decodeJsonObjectStrict(candidate);
     } on FormatException catch (original, stackTrace) {
@@ -657,6 +661,19 @@ class TranslationApiClient {
       } on FormatException {
         Error.throwWithStackTrace(original, stackTrace);
       }
+    }
+  }
+
+  /// Decodes [content] after stripping an optional markdown fence, without
+  /// requiring the result to be an object. Validators use this to tell a
+  /// legally-decoded non-object (deterministic schema failure) apart from
+  /// broken syntax (retryable jitter): the fence must be stripped first,
+  /// otherwise a fenced non-object always looks like broken syntax.
+  ({bool valid, Object? value}) decodeJsonValueAfterFenceStrip(String content) {
+    try {
+      return (valid: true, value: jsonDecode(_stripJsonFence(content)));
+    } on FormatException {
+      return (valid: false, value: null);
     }
   }
 
@@ -874,12 +891,39 @@ class TranslationApiClient {
     if (error.response?.statusCode == 413) {
       return true;
     }
+    // A 400 that complains about context length / token limits is a size
+    // problem, not a configuration problem: smaller payloads (per-block or
+    // bisected requests) usually pass, so it takes the shrink fallback
+    // instead of the deterministic fatal path.
+    if (isContextOverflowError(error)) {
+      return true;
+    }
     // A send or receive timeout on a large batch often means the endpoint is
     // too slow for the whole batch rather than that translation failed. Fall
     // back to smaller single-block requests, which are far less likely to
     // time out, instead of failing the entire translation run.
     return error.type == DioExceptionType.receiveTimeout ||
         error.type == DioExceptionType.sendTimeout;
+  }
+
+  /// True when the provider rejected the request because it exceeds a
+  /// context/output token limit (HTTP 400 with a context/token-limit
+  /// message). Unlike other 400s this is payload-size dependent: a smaller
+  /// request can succeed, so callers route it to the shrink fallback
+  /// instead of treating it as a deterministic configuration error.
+  static bool isContextOverflowError(Object error) {
+    if (error is! DioException) {
+      return false;
+    }
+    if (error.response?.statusCode != 400) {
+      return false;
+    }
+    final String body = (error.response?.data?.toString() ?? '').toLowerCase();
+    return RegExp(
+      r'context|too many tokens|maximum context|token limit|exceeds.{0,20}token|'
+      r'max_tokens|input.{0,20}too (long|large)|prompt.{0,20}too (long|large)|'
+      r'message.{0,20}too (long|large)',
+    ).hasMatch(body);
   }
 
   /// HTTP status codes that are deterministic configuration errors: a

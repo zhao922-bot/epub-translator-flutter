@@ -2935,8 +2935,10 @@ void main() {
               <String, Object?>{'id': 'f0:p-1', 'html': '<p>第一条脚注。</p>'},
               <String, Object?>{'id': 'f1:p-1', 'html': ' '},
             ],
+            // The valid f0 item is kept; only the empty f1 enters
+            // per-reference recovery and degrades to its source HTML.
             expected: <String, String>{
-              'f0:p-1': '<p>First footnote.</p>',
+              'f0:p-1': '<p>第一条脚注。</p>',
               'f1:p-1': '<p>Second footnote.</p>',
             },
           ),
@@ -3158,7 +3160,9 @@ void main() {
               ],
             );
 
-        expect(adapter.fetchCount, 4);
+        // The batch is sent once; only the empty block is retried
+        // individually (an empty item no longer re-bills the whole batch).
+        expect(adapter.fetchCount, 3);
         expect(adapter.userContents, anyElement(contains('[RETRY]')));
         expect(translated, const <String>['<p>这句话已经翻译完成。</p>']);
       },

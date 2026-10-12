@@ -185,6 +185,12 @@ class TranslationConfig {
   }
 
   Map<String, dynamic> toJson() {
+    // Credential-bearing components are rejected in BOTH slots: an old
+    // custom URL stored from a previous version must never persist plaintext
+    // credentials (P1-9), even when DeepSeek is currently selected. Ordinary
+    // non-credential query parameters / fragments / path '@' are allowed by
+    // validateApiUrl, so a stale legitimate custom URL no longer blocks
+    // saving unrelated settings (#17).
     validateApiUrl(apiBaseUrl);
     validateApiUrl(customApiBaseUrl);
     return <String, dynamic>{
@@ -211,19 +217,69 @@ class TranslationConfig {
     };
   }
 
-  /// API authentication belongs in the secure API-key slot. Query/fragment
-  /// credentials are ambiguous, so reject all query/fragment components.
+  /// API authentication belongs in the secure API-key slot, not in the URL.
+  ///
+  /// Only credential-like components are rejected: userinfo
+  /// (`user:pass@host`) and query parameters whose names look like secrets
+  /// (`key`, `token`, `secret`, `password` and friends). Ordinary query
+  /// parameters (e.g. `/v1?tenant=books`), `@` inside the path (e.g.
+  /// `/@team/v1`) and fragments are legitimate and allowed.
   static void validateApiUrl(String value) {
-    final uri = Uri.tryParse(value.trim());
-    if ((uri != null &&
-            (uri.userInfo.isNotEmpty || uri.hasQuery || uri.hasFragment)) ||
-        value.contains('@') ||
-        value.contains('?') ||
-        value.contains('#')) {
+    final String trimmed = value.trim();
+    if (trimmed.isEmpty) return;
+    final Uri? uri = Uri.tryParse(trimmed);
+    // An unparseable URL fails later at request time; nothing
+    // credential-like can be reliably identified in it here.
+    if (uri == null) return;
+    if (uri.userInfo.isNotEmpty) {
       throw const FormatException(
-        'API URLs must not contain embedded credentials, queries or fragments.',
+        'API URLs must not embed userinfo credentials; '
+        'put the API key in the key field.',
       );
     }
+    for (final String name in uri.queryParameters.keys) {
+      if (_looksLikeCredentialQueryParam(name)) {
+        throw FormatException(
+          'API URL query parameter "$name" looks like an embedded '
+          'credential; put the API key in the key field.',
+        );
+      }
+    }
+  }
+
+  /// Whether a query parameter name looks like an embedded secret.
+  /// Deliberately conservative: a bare substring check would false-positive
+  /// on innocent words (`monkey`), so only exact/affixed matches and a few
+  /// common separator-less compounds (`apikey`) count.
+  static bool _looksLikeCredentialQueryParam(String name) {
+    final String lower = name.toLowerCase();
+    const List<String> keywords = <String>[
+      'key',
+      'token',
+      'secret',
+      'password',
+      'passwd',
+      'pwd',
+    ];
+    for (final String keyword in keywords) {
+      if (lower == keyword ||
+          lower.endsWith('_$keyword') ||
+          lower.endsWith('-$keyword') ||
+          lower.startsWith('${keyword}_') ||
+          lower.startsWith('$keyword-') ||
+          lower.contains('_${keyword}_') ||
+          lower.contains('-$keyword-')) {
+        return true;
+      }
+    }
+    const List<String> compounds = <String>[
+      'apikey',
+      'accesstoken',
+      'authkey',
+      'clientsecret',
+      'apisecret',
+    ];
+    return compounds.contains(lower);
   }
 
   factory TranslationConfig.fromJson(Map<String, dynamic> json) {

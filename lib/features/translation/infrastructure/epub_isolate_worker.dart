@@ -3,7 +3,6 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
-import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
@@ -88,6 +87,14 @@ void _progressWorkEntry<T>(_ProgressWork<T> work) {
 /// timestamp granularity (FAT32/exFAT: 2s) and clock skew, and also
 /// protects the temp files of a second concurrently running app instance.
 const Duration _kStaleTempAge = Duration(minutes: 30);
+
+/// Budget for `.recovery.*` spares kept after lock-conflict commits. Every
+/// lock conflict preserves one full translated copy; without a cap a stuck
+/// lock would fill the disk with a spare per retry. Enforced oldest-first in
+/// [preserveRecoveryTempForTest]; a successful commit reclaims all spares
+/// for that output (the final file now holds the translation).
+const int _kMaxRecoveryFiles = 5;
+const int _kMaxRecoveryBytes = 512 * 1024 * 1024;
 
 /// A commit failed, but the complete translated payload remains recoverable.
 ///
@@ -968,6 +975,9 @@ class EpubIsolateWorker {
           return false;
         }
         await tempFile.rename(finalFile.path);
+        // The final file now holds the translation: lock-conflict spares
+        // kept for this output are obsolete.
+        await _reclaimRecoveryFiles(finalFile);
         return true;
       }
 
@@ -995,6 +1005,9 @@ class EpubIsolateWorker {
         }
         await tempFile.rename(finalFile.path);
         await _deleteQuietly(backupFile);
+        // The final file now holds the translation: lock-conflict spares
+        // kept for this output are obsolete.
+        await _reclaimRecoveryFiles(finalFile);
         return true;
       } catch (error) {
         if (await backupFile.exists() && !await finalFile.exists()) {
@@ -1103,8 +1116,9 @@ class EpubIsolateWorker {
   /// it. Only files older than [_kStaleTempAge] are touched, and the temp
   /// file this commit is about to promote is always excluded — so a live
   /// commit is protected. Recovery files use a separate `.recovery.*`
-  /// prefix: no TTL, since user retrieval may happen days later. They are
-  /// user-managed and may accumulate until manually retrieved/deleted.
+  /// prefix and are never swept here: they are count/size-capped in
+  /// [preserveRecoveryTempForTest] and reclaimed by [_reclaimRecoveryFiles]
+  /// once a later commit succeeds.
   /// Best effort; never throws.
   static Future<void> _reclaimStaleTempFiles(
     File finalFile,
@@ -1167,9 +1181,13 @@ class EpubIsolateWorker {
     File finalFile,
   ) async {
     try {
-      return await tempFile.rename(
+      final File recoveryFile = await tempFile.rename(
         '${finalFile.path}.recovery.${DateTime.now().microsecondsSinceEpoch}',
       );
+      // A stuck lock would otherwise leave one full translated copy per
+      // retry with no bound; enforce the count/size budget oldest-first.
+      await _enforceRecoveryBudget(finalFile);
+      return recoveryFile;
     } on FileSystemException {
       // Even recovery naming can fail (component length, permissions, locks).
       // Keep the original payload and mark it exempt from orphan sweeping.
@@ -1191,6 +1209,74 @@ class EpubIsolateWorker {
   }
 
   static final Set<String> _retainedRecoveryPaths = {};
+
+  /// Enforces the `.recovery.*` budget for one output: keeps at most
+  /// [_kMaxRecoveryFiles] newest spares within [_kMaxRecoveryBytes] total,
+  /// deleting oldest-first. Best effort; never throws.
+  static Future<void> _enforceRecoveryBudget(File finalFile) async {
+    try {
+      final String prefix = '${path.basename(finalFile.path)}.recovery.';
+      final List<File> spares = <File>[];
+      await for (final FileSystemEntity entity in finalFile.parent.list()) {
+        if (entity is File && path.basename(entity.path).startsWith(prefix)) {
+          spares.add(entity);
+        }
+      }
+      if (spares.isEmpty) {
+        return;
+      }
+      // The timestamp suffix sorts chronologically; oldest first.
+      spares.sort((File a, File b) => a.path.compareTo(b.path));
+      int totalBytes = 0;
+      final List<int> sizes = <int>[];
+      for (final File spare in spares) {
+        int size = 0;
+        try {
+          size = await spare.length();
+        } catch (_) {
+          // Treat an unreadable spare as empty; it is still count-capped.
+        }
+        sizes.add(size);
+        totalBytes += size;
+      }
+      for (int i = 0; i < spares.length; i++) {
+        final int remaining = spares.length - i;
+        if (remaining <= _kMaxRecoveryFiles &&
+            totalBytes <= _kMaxRecoveryBytes) {
+          break;
+        }
+        await _deleteQuietly(spares[i]);
+        totalBytes -= sizes[i];
+      }
+    } catch (_) {
+      // Best effort: budget enforcement must never break a commit.
+    }
+  }
+
+  /// Deletes all `.recovery.*` spares for [finalFile]. Called after a
+  /// successful commit: the final file now holds the translation, so the
+  /// spares kept for lock-conflict recovery are obsolete. Best effort;
+  /// never throws.
+  static Future<void> _reclaimRecoveryFiles(File finalFile) async {
+    try {
+      final String prefix = '${path.basename(finalFile.path)}.recovery.';
+      await for (final FileSystemEntity entity in finalFile.parent.list()) {
+        if (entity is File && path.basename(entity.path).startsWith(prefix)) {
+          await _deleteQuietly(entity);
+        }
+      }
+    } catch (_) {
+      // Best effort: stale spares must never break a commit.
+    }
+  }
+
+  @visibleForTesting
+  static Future<void> enforceRecoveryBudgetForTest(File finalFile) =>
+      _enforceRecoveryBudget(finalFile);
+
+  @visibleForTesting
+  static Future<void> reclaimRecoveryFilesForTest(File finalFile) =>
+      _reclaimRecoveryFiles(finalFile);
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
@@ -1302,16 +1388,29 @@ class EpubIsolateWorker {
     }
   }
 
+  /// Reads chunks into a single growable buffer instead of buffering every
+  /// chunk and then copying them all again (BytesBuilder.takeBytes): that
+  /// older shape peaked at ~2x the source size for large books. Growth is
+  /// amortized doubling, and the returned view aliases the buffer with no
+  /// final copy. The per-chunk limit check is preserved: the payload can
+  /// never exceed [limitBytes], even for a source that grows mid-read.
+  ///
+  /// Fully streaming decode is not possible here: the ZIP central directory
+  /// (and the EOCD scan in [checkZipEntryCountForTest]) requires random
+  /// access to the whole payload, so one contiguous buffer is the minimum.
   static Uint8List _readChunksGuarded(
     String inputPath,
     List<int> Function() nextChunk,
     int limitBytes,
   ) {
-    final bytes = BytesBuilder(copy: false);
+    Uint8List buffer = Uint8List(64 * 1024);
+    int length = 0;
     while (true) {
-      final chunk = nextChunk();
-      if (chunk.isEmpty) return bytes.takeBytes();
-      final actualLength = bytes.length + chunk.length;
+      final List<int> chunk = nextChunk();
+      if (chunk.isEmpty) {
+        break;
+      }
+      final int actualLength = length + chunk.length;
       // Check and accumulation are one operation; no stat/read TOCTOU gap.
       if (actualLength > limitBytes) {
         throw EpubDecompressionLimitException(
@@ -1321,8 +1420,26 @@ class EpubIsolateWorker {
           limitBytes: limitBytes,
         );
       }
-      bytes.add(chunk);
+      if (actualLength > buffer.length) {
+        int newCapacity = buffer.length * 2;
+        if (newCapacity < actualLength) {
+          newCapacity = actualLength;
+        }
+        if (newCapacity > limitBytes) {
+          newCapacity = limitBytes;
+        }
+        final Uint8List grown = Uint8List(newCapacity);
+        grown.setRange(0, length, buffer);
+        buffer = grown;
+      }
+      buffer.setRange(length, actualLength, chunk);
+      length = actualLength;
     }
+    if (length == buffer.length) {
+      return buffer;
+    }
+    // Zero-copy trim: callers only ever read length bytes.
+    return Uint8List.view(buffer.buffer, 0, length);
   }
 
   @visibleForTesting
@@ -1560,8 +1677,10 @@ class EpubIsolateWorker {
     // both sides agree on which copy survives. Insertion order (first-seen
     // position) is preserved, so entry ordering is unchanged.
     final Map<String, ArchiveFile> dedupedSource = <String, ArchiveFile>{};
+    final Map<String, int> nameCounts = <String, int>{};
     for (final ArchiveFile sourceFile in sourceArchive) {
       dedupedSource[sourceFile.name] = sourceFile;
+      nameCounts[sourceFile.name] = (nameCounts[sourceFile.name] ?? 0) + 1;
     }
 
     for (final ArchiveFile sourceFile in dedupedSource.values) {
@@ -1582,6 +1701,30 @@ class EpubIsolateWorker {
         final List<int> utf8Bytes = utf8.encode(replacement);
         repacked.add(
           ArchiveFile.bytes(sourceFile.name, utf8Bytes)
+            ..compression = sourceFile.compression
+            ..lastModTime = sourceFile.lastModTime
+            ..mode = sourceFile.mode,
+        );
+        continue;
+      }
+
+      // Compressed pass-through reuses the source payload verbatim, but for
+      // duplicate entry names the decoded ArchiveFile is corrupt by
+      // construction: ZipDecoder keeps the FIRST duplicate's payload while
+      // overwriting crc32 with the LAST duplicate's value. ZipEncoder would
+      // then write a CRC that does not match the content. Verify the stored
+      // CRC against the payload for duplicates and recompress on mismatch
+      // so the encoder writes a correct CRC.
+      if (nameCounts[sourceFile.name]! > 1 &&
+          !_storedCrcMatchesPayload(sourceFile)) {
+        final List<int> payload = _fileBytes(sourceFile);
+        AppLogger.warn(
+          'Duplicate entry "${sourceFile.name}" has a CRC mismatch; '
+          'recompressing instead of reusing the stored payload.',
+          tag: 'repack',
+        );
+        repacked.add(
+          ArchiveFile.bytes(sourceFile.name, payload)
             ..compression = sourceFile.compression
             ..lastModTime = sourceFile.lastModTime
             ..mode = sourceFile.mode,
@@ -1657,4 +1800,26 @@ class EpubIsolateWorker {
     }
     return file.readBytes()?.toList() ?? <int>[];
   }
+
+  /// True when the decoded entry's stored CRC32 matches its payload, so the
+  /// compressed payload can be passed through to the encoder untouched. A
+  /// null stored CRC is fine: the encoder recomputes it. Only duplicate
+  /// entry names can corrupt the stored value (the decoder keeps the first
+  /// duplicate's payload but overwrites crc32 with the last duplicate's),
+  /// so callers only need this check for duplicates.
+  static bool _storedCrcMatchesPayload(ArchiveFile file) {
+    final int? stored = file.crc32;
+    if (stored == null) {
+      return true;
+    }
+    try {
+      return getCrc32(_fileBytes(file)) == stored;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @visibleForTesting
+  static bool storedCrcMatchesPayloadForTest(ArchiveFile file) =>
+      _storedCrcMatchesPayload(file);
 }

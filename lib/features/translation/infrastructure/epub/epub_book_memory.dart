@@ -129,7 +129,19 @@ class _EpubBookMemory {
           'Summarize the just-translated EPUB chapter into rolling translation memory. Return strict JSON only with keys: title, summary, continuityNotes, glossary. Keep summary under 100 words. continuityNotes is a short string array focused on unresolved plot, tone, names, and terminology for later chapters. glossary is an array of objects with source and target. Write notes for ${config.targetLanguage}.',
       cancelToken: cancelToken,
     );
-    return currentMemory.mergeChapter(_ChapterMemory.fromJson(jsonPayload));
+    final _ChapterMemory chapterMemory = _ChapterMemory.fromJson(jsonPayload);
+    // The model is not asked for the path; stamp it locally so positional
+    // memory snapshots can attribute each entry to its chapter.
+    final _ChapterMemory stamped = chapterMemory.path.isEmpty
+        ? _ChapterMemory(
+            title: chapterMemory.title,
+            summary: chapterMemory.summary,
+            path: chapter.path,
+            continuityNotes: chapterMemory.continuityNotes,
+            glossary: chapterMemory.glossary,
+          )
+        : chapterMemory;
+    return currentMemory.mergeChapter(stamped);
   }
 
   Future<Map<String, dynamic>> requestJson({
@@ -345,12 +357,14 @@ class _EpubBookMemory {
     }
     // Match title and basename independently: directory names and words such
     // as discovery/recovery must not turn a body chapter into a cover page.
+    // Dart \b treats '_' as a word character, so \bcover\b misses
+    // cover_page.xhtml: use an explicit non-alphanumeric boundary instead.
     final excludedWords = RegExp(
-      r'\b(?:index|table[\s_-]+of[\s_-]+contents|contents|copyright|cover|'
-      r'title[\s_-]+page|acknowledg(?:e?ments?|ement)?|illustrations?|'
-      r'about[\s_-]+the[\s_-]+author|bibliography|endnotes?|'
+      r'(?:^|[^A-Za-z0-9])(?:index|table[\s_-]+of[\s_-]+contents|contents|'
+      r'copyright|cover|title[\s_-]+page|acknowledg(?:e?ments?|ement)?|'
+      r'illustrations?|about[\s_-]+the[\s_-]+author|bibliography|endnotes?|'
       r'about[\s_-]+the[\s_-]+publisher|book[\s_-]+perk|card[\s_-]+page|'
-      r'advertisements?|also[\s_-]+by|books[\s_-]+by)\b',
+      r'advertisements?|also[\s_-]+by|books[\s_-]+by)(?:$|[^A-Za-z0-9])',
       caseSensitive: false,
     );
     return excludedWords.hasMatch(fileName) ||
@@ -360,8 +374,10 @@ class _EpubBookMemory {
   }
 
   static bool _isMeaningfulFrontMatter(InspectedChapter chapter) {
+    // Same underscore-aware boundary as _excludeFromStyleSampling: \b
+    // misses prologue_page.xhtml because '_' counts as a word character.
     final words = RegExp(
-      r'\b(?:preface|foreword|introduction|prologue)\b',
+      r'(?:^|[^A-Za-z0-9])(?:preface|foreword|introduction|prologue)(?:$|[^A-Za-z0-9])',
       caseSensitive: false,
     );
     final fileName = chapter.path.replaceAll('\\', '/').split('/').last;
@@ -693,7 +709,10 @@ class _BookMemory {
 
   static const _BookMemory empty = _BookMemory();
 
-  factory _BookMemory.fromJson(Map<String, Object?> json) {
+  factory _BookMemory.fromJson(
+    Map<String, Object?> json, {
+    bool trustedLocks = false,
+  }) {
     final Object? rawStyleProfile = json['styleProfile'];
     final TranslationStyleProfile styleProfile =
         rawStyleProfile is Map<String, Object?>
@@ -712,8 +731,14 @@ class _BookMemory {
         json['styleGuide'],
         limit: _EpubBookMemory._memoryListLimit,
       ),
-      glossary: _mergeGlossary(_glossaryList(json['glossary']), const []),
-      recentChapters: _chapterMemoryList(json['recentChapters']),
+      glossary: _mergeGlossary(
+        _glossaryList(json['glossary'], trustedLocks: trustedLocks),
+        const [],
+      ),
+      recentChapters: _chapterMemoryList(
+        json['recentChapters'],
+        trustedLocks: trustedLocks,
+      ),
       styleProfile: styleProfile,
       styleProfileConfirmed: json['styleProfileConfirmed'] == true,
     );
@@ -807,7 +832,10 @@ class _BookMemory {
         .toList(growable: false);
   }
 
-  static List<Map<String, String>> _glossaryList(Object? value) {
+  static List<Map<String, String>> _glossaryList(
+    Object? value, {
+    bool trustedLocks = false,
+  }) {
     if (value is! List<dynamic>) {
       return const <Map<String, String>>[];
     }
@@ -819,10 +847,17 @@ class _BookMemory {
           if (source.isEmpty || target.isEmpty) {
             return null;
           }
+           // A model-declared locked:true is never trusted: only
+           // user-supplied locks (withLockedGlossary) and restored
+           // checkpoints (trustedLocks) may mark an entry locked. Otherwise
+           // a model lock could freeze a stale model term against the user's
+           // explicit lock.
            return <String, String>{
              'source': source,
              'target': target,
-             if (item['locked'] == true || item['locked'] == 'true') 'locked': 'true',
+             if (trustedLocks &&
+                 (item['locked'] == true || item['locked'] == 'true'))
+               'locked': 'true',
              if (int.tryParse('${item['lastUsed']}') != null)
                'lastUsed': '${item['lastUsed']}',
            };
@@ -831,7 +866,10 @@ class _BookMemory {
         .toList(growable: false);
   }
 
-  static List<_ChapterMemory> _chapterMemoryList(Object? value) {
+  static List<_ChapterMemory> _chapterMemoryList(
+    Object? value, {
+    bool trustedLocks = false,
+  }) {
     if (value is! List<dynamic>) {
       return const <_ChapterMemory>[];
     }
@@ -843,6 +881,7 @@ class _BookMemory {
               (dynamic key, dynamic value) =>
                   MapEntry<String, Object?>(key.toString(), value),
             ),
+            trustedLocks: trustedLocks,
           ),
         )
         .where((_ChapterMemory chapter) => !chapter.isEmpty)
@@ -870,9 +909,14 @@ class _BookMemory {
     for (final entry in incoming) {
       final key = entry['source']!.toLowerCase();
       final previous = merged[key];
+      final bool previousLocked = previous?['locked'] == 'true';
+      final bool incomingLocked = entry['locked'] == 'true';
       merged[key] = {
         ...entry,
-        if (previous?['locked'] == 'true') ...previous!,
+        // A previously user-locked target survives model updates, but an
+        // explicit new user lock always replaces the old one: user intent
+        // outranks both model declarations and earlier locks.
+        if (previousLocked && !incomingLocked) ...previous!,
         'lastUsed': '${++clock}',
       };
     }
@@ -910,24 +954,36 @@ class _ChapterMemory {
   const _ChapterMemory({
     required this.title,
     required this.summary,
+    this.path = '',
     this.continuityNotes = const <String>[],
     this.glossary = const <Map<String, String>>[],
   });
 
-  factory _ChapterMemory.fromJson(Map<String, Object?> json) {
+  factory _ChapterMemory.fromJson(
+    Map<String, Object?> json, {
+    bool trustedLocks = false,
+  }) {
     return _ChapterMemory(
       title: _BookMemory._stringValue(json['title']),
       summary: _BookMemory._stringValue(json['summary']),
+      path: _BookMemory._stringValue(json['path']),
       continuityNotes: _BookMemory._stringList(
         json['continuityNotes'],
         limit: _EpubBookMemory._memoryListLimit,
       ),
-      glossary: _BookMemory._glossaryList(json['glossary']),
+      glossary: _BookMemory._glossaryList(
+        json['glossary'],
+        trustedLocks: trustedLocks,
+      ),
     );
   }
 
   final String title;
   final String summary;
+
+  /// Source chapter path, recorded so a positional memory snapshot can tell
+  /// which chapter an entry belongs to. Optional: older checkpoints omit it.
+  final String path;
   final List<String> continuityNotes;
   final List<Map<String, String>> glossary;
 
@@ -941,6 +997,7 @@ class _ChapterMemory {
     return <String, Object?>{
       if (title.trim().isNotEmpty) 'title': title.trim(),
       if (summary.trim().isNotEmpty) 'summary': summary.trim(),
+      if (path.trim().isNotEmpty) 'path': path.trim(),
       'continuityNotes': continuityNotes,
       'glossary': glossary,
     };
@@ -959,7 +1016,7 @@ class _BookMemoryCheckpoint {
 
   String get key => sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
 
-  Future<({ _BookMemory memory, Set<String> completedChapterPaths })?> load() async {
+  Future<({ _BookMemory memory, Set<String> completedChapterPaths, List<({String path, _BookMemory memory})> timeline })?> load() async {
     try {
       final state = await cacheStore.loadJobState(key);
       if (state == null) {
@@ -974,10 +1031,25 @@ class _BookMemoryCheckpoint {
         AppLogger.warn('Book memory checkpoint schema/chunkSize mismatch; discarding.', tag: 'book-memory');
         return null;
       }
+      final memoryJson = decoded['memory'] as Map<String, dynamic>;
+      // A checkpoint whose envelope is intact but whose memory internals
+      // are damaged (wrong types, malformed glossary entries) must be
+      // discarded, not silently normalized to empty values: the caller
+      // rebuilds the memory via the API instead of translating blind.
+      if (!_isIntactMemoryJson(memoryJson)) {
+        AppLogger.warn('Book memory checkpoint internals damaged; discarding.', tag: 'book-memory');
+        return null;
+      }
+      final rawPaths = decoded['completedChapterPaths'];
+      if (rawPaths != null && rawPaths is! List) {
+        AppLogger.warn('Book memory checkpoint chapter list damaged; discarding.', tag: 'book-memory');
+        return null;
+      }
       return (
-        memory: _BookMemory.fromJson(decoded['memory'] as Map<String, dynamic>),
-        completedChapterPaths: (decoded['completedChapterPaths'] as List<dynamic>? ?? [])
+        memory: _BookMemory.fromJson(memoryJson, trustedLocks: true),
+        completedChapterPaths: ((rawPaths as List<dynamic>?) ?? [])
             .whereType<String>().toSet(),
+        timeline: _timelineFromJson(decoded['memoryTimeline']),
       );
     } catch (error) {
       AppLogger.warn('Book memory checkpoint unreadable (${error.runtimeType}); discarding.', tag: 'book-memory');
@@ -985,8 +1057,65 @@ class _BookMemoryCheckpoint {
     }
   }
 
+  /// Structural integrity check for the memory payload: every present key
+  /// must have the expected JSON type, and glossary / recent-chapter
+  /// entries must be well-formed objects. Lenient parsing happens later;
+  /// this gate decides whether the checkpoint is trustworthy at all.
+  static bool _isIntactMemoryJson(Map<String, dynamic> memory) {
+    if (memory['bookSummary'] != null && memory['bookSummary'] is! String) {
+      return false;
+    }
+    if (memory['styleGuide'] != null && memory['styleGuide'] is! List) {
+      return false;
+    }
+    if (memory['styleProfile'] != null && memory['styleProfile'] is! Map) {
+      return false;
+    }
+    final glossary = memory['glossary'];
+    if (glossary != null) {
+      if (glossary is! List) return false;
+      for (final entry in glossary) {
+        if (entry is! Map ||
+            entry['source'] is! String ||
+            entry['target'] is! String) {
+          return false;
+        }
+      }
+    }
+    final recentChapters = memory['recentChapters'];
+    if (recentChapters != null) {
+      if (recentChapters is! List) return false;
+      for (final entry in recentChapters) {
+        if (entry is! Map) return false;
+      }
+    }
+    return true;
+  }
+
+  /// Positional memory history: after each chapter's rolling-memory update,
+  /// the snapshot is appended in book order. A retranslated earlier chapter
+  /// later looks up the newest entry before its own position instead of
+  /// receiving memory that already contains later chapters.
+  static List<({String path, _BookMemory memory})> _timelineFromJson(Object? raw) {
+    if (raw is! List) return const [];
+    final timeline = <({String path, _BookMemory memory})>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final Map map = entry;
+      final path = map['path'];
+      final memory = map['memory'];
+      if (path is! String || path.isEmpty || memory is! Map<String, dynamic>) {
+        continue;
+      }
+      if (!_isIntactMemoryJson(memory)) continue;
+      timeline.add((path: path, memory: _BookMemory.fromJson(memory, trustedLocks: true)));
+    }
+    return timeline;
+  }
+
   Future<void> save(_BookMemory memory, {
     Set<String> completedChapterPaths = const {},
+    List<({String path, _BookMemory memory})> timeline = const [],
     String schema = EpubChapterTranslator.qualityCacheSchemaVersion,
   }) => cacheStore.saveJobState(JobResumeState(
     jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
@@ -996,6 +1125,10 @@ class _BookMemoryCheckpoint {
     currentChapter: jsonEncode({
       'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
       'memory': memory.toJson(), 'completedChapterPaths': completedChapterPaths.toList(),
+      'memoryTimeline': [
+        for (final entry in timeline)
+          {'path': entry.path, 'memory': entry.memory.toJson()},
+      ],
       'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
     }),
     updatedAtIso8601: DateTime.now().toIso8601String(),
@@ -1011,6 +1144,17 @@ class _ChapterSourceSpool {
   Directory? _directory;
   bool _ownsDirectory = false;
 
+  /// JSON codecs run on a worker isolate. These stay static and synchronous
+  /// so the [Isolate.run] closure captures only its sendable argument: an
+  /// inline closure inside the async [release]/[restore] scopes would also
+  /// capture the surrounding async context, including the unsendable
+  /// cancellation callback.
+  static Future<String> _encodeJsonOnWorker(Map<String, Object?> payload) =>
+      Isolate.run(() => jsonEncode(payload));
+
+  static Future<Map<String, dynamic>> _decodeJsonOnWorker(String raw) =>
+      Isolate.run(() => jsonDecode(raw) as Map<String, dynamic>);
+
   Future<File> _file(String chapterPath) async {
     if (_directory == null) {
       _directory = await Directory.systemTemp.createTemp('epub-chapter-sources-');
@@ -1021,12 +1165,16 @@ class _ChapterSourceSpool {
 
   Future<InspectedChapter> release(InspectedChapter chapter) async {
     try {
-      await writeFileAtomically(await _file(chapter.path), jsonEncode({
+      final Map<String, Object?> payload = {
         'originalHtml': chapter.originalHtml, 'body': chapter.body,
         'blocks': [for (final block in chapter.blocks) {
           'id': block.id, 'sourceHtml': block.sourceHtml, 'sourceText': block.sourceText,
         }],
-      }));
+      };
+      // Whole-chapter JSON encoding is CPU-bound: run it off the UI isolate
+      // so progress emission and the cancellation watchdog stay responsive.
+      final String json = await _encodeJsonOnWorker(payload);
+      await writeFileAtomically(await _file(chapter.path), json);
       return chapter.copyWith(originalHtml: '', body: '', blocks: [
         for (final block in chapter.blocks) block.copyWith(sourceHtml: '', sourceText: ''),
       ]);
@@ -1037,17 +1185,23 @@ class _ChapterSourceSpool {
     }
   }
 
-  Future<InspectedChapter> restore(InspectedChapter chapter, {bool blocks = true}) async {
+  Future<InspectedChapter> restore(
+    InspectedChapter chapter, {
+    bool blocks = true,
+    bool Function()? isCancelled,
+  }) async {
     if (chapter.originalHtml.isNotEmpty &&
         (!blocks || chapter.blocks.every((b) => b.sourceHtml.isNotEmpty))) {
       return chapter;
     }
+    bool cancelled() => isCancelled?.call() ?? false;
     final file = await _file(chapter.path);
     if (!await file.exists()) {
       // Reload from the guarded archive when the spool is unavailable. Legacy
       // releases still carry originalHtml and only need reparsing.
       var source = chapter;
       if (source.originalHtml.isEmpty) {
+        if (cancelled()) throw const TranslationCancelledException();
         final identity = source.sourceIdentity;
         if (identity == null) {
           throw FormatException('Released chapter has no recoverable source: ${chapter.path}');
@@ -1056,18 +1210,30 @@ class _ChapterSourceSpool {
         final snapshot = await EpubIsolateWorker.loadInspectionSnapshot(
           identity.inputPath, selectEntries: (_, _) => {chapterPath},
         );
+        if (cancelled()) throw const TranslationCancelledException();
         checkEpubSourceHash(snapshot.fingerprint, identity.sha256);
         final bytes = snapshot.files[chapterPath];
         if (bytes == null) throw FormatException('Source chapter not found: $chapterPath');
-        source = source.copyWith(originalHtml: utf8.decode(bytes));
+        // Lenient decode matches the extractor/decoder convention: a damaged
+        // byte must not fail the whole restore.
+        source = source.copyWith(originalHtml: utf8.decode(bytes, allowMalformed: true));
       }
-      final restored = await ChapterSourceRestorer.restoreChapter(chapter: source, isCancelled: () => false);
+      final restored = await ChapterSourceRestorer.restoreChapter(
+        chapter: source,
+        isCancelled: cancelled,
+      );
       final translations = {for (final block in chapter.blocks) block.id: block.translatedHtml};
       return restored.copyWith(blocks: [for (final block in restored.blocks)
         block.copyWith(translatedHtml: translations[block.id]),
       ]);
     }
-    final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    final String raw = await file.readAsString();
+    if (cancelled()) throw const TranslationCancelledException();
+    // Whole-chapter JSON decoding is CPU-bound: keep it off the UI isolate.
+    // The worker entry is a static closure over sendable data only; it must
+    // not be created inside this async scope, whose context also holds the
+    // (unsendable) cancellation callback.
+    final Map<String, dynamic> json = await _decodeJsonOnWorker(raw);
     final sources = {for (final item in json['blocks'] as List<dynamic>)
       (item as Map<String, dynamic>)['id'] as String: item};
     return chapter.copyWith(
@@ -1097,6 +1263,15 @@ class _ChapterSourceSpool {
 class _TranslationRequestBudget {
   static const int bytesPerToken = 4;
   static const double conservativeFactor = 1.2;
+
+  /// Provider-agnostic guard for the max_tokens request parameter: no
+  /// legitimate batch (bounded by the chunk-size planner) needs more output
+  /// than this, while an unbounded estimate risks a provider-side 400 for an
+  /// out-of-range parameter. Providers with a stricter output cap surface a
+  /// context-overflow 400, which takes the shrink fallback instead of
+  /// aborting the run (see TranslationApiClient.isContextOverflowError).
+  static const int maxOutputTokensCeiling = 32768;
+
   static int estimateTokens(String value) =>
       (utf8.encode(value).length / bytesPerToken * conservativeFactor).ceil();
 
@@ -1114,7 +1289,10 @@ class _TranslationRequestBudget {
     final budget = forRequest(data);
     // Equivalent upward budget: the HTML/JSON baseline plus every fixed
     // instruction, including style, locks and idiomatic rules. No private
-    // accounting fields are sent to OpenAI-compatible gateways.
-    data['max_tokens'] = max(256, budget.totalTokens);
+    // accounting fields are sent to OpenAI-compatible gateways. The model
+    // output ceiling keeps a misestimated input from sending a max_tokens
+    // value the provider rejects outright.
+    data['max_tokens'] =
+        min(maxOutputTokensCeiling, max(256, budget.totalTokens));
   }
 }

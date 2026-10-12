@@ -34,6 +34,11 @@ abstract class TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    // Fired on the calling isolate each time a finished chapter's source
+    // strings are spooled to disk and released from the worker's lists, so
+    // UI-side holders (e.g. the dashboard's inspected chapters) can drop
+    // their own references instead of retaining the whole book in memory.
+    void Function(String chapterPath)? onChapterSourcesReleased,
   });
 
   /// Infer a book style profile from front matter / early chapters before translation.

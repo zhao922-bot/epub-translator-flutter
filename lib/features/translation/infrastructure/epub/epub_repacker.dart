@@ -927,10 +927,12 @@ body.epub-translator-cjk [data-translation="true"] {
   };
 
   static final RegExp _wordTokenPattern = RegExp(r'[a-z0-9]+');
-  // Matches both `class="…"` and `class='…'` (older EPUBs use single
-  // quotes); group 2 is the class value, group 1 the quote character.
-  static final RegExp _classAttributePattern = RegExp(
-    '(?<![-\\w])class=(["\'])([\\s\\S]*?)\\1',
+  // One `name="value"` / `name='value'` / `name=value` attribute inside a
+  // tag; group 1 is the attribute name, group 2 the raw value (quotes
+  // included when present). Older EPUBs use single quotes; unquoted values
+  // are legal HTML too.
+  static final RegExp _tagAttributePattern = RegExp(
+    r'''([a-zA-Z_:][\w:.-]*)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)''',
   );
   static final RegExp _nonMarkupTocContentPattern = RegExp(
     r'<!--[\s\S]*?(?:-->|$)|<(script|style)\b[^>]*>[\s\S]*?(?:</\1\s*>|$)',
@@ -942,19 +944,76 @@ body.epub-translator-cjk [data-translation="true"] {
   /// token. A bare prefix test (`class="toc…`) misfires on ordinary
   /// body-text hooks like `class="toc-entry"` / `class="toclevel1"`,
   /// misclassifying a body chapter as a TOC document — its cross-reference
-  /// anchor texts would then be rewritten into chapter titles.
+  /// anchor texts would then be rewritten into chapter titles. Tags are
+  /// scanned quote-aware so `class=` inside another attribute's quoted
+  /// value (e.g. `<p title="class='toc'">`) is not mistaken for a class
+  /// attribute.
   bool _hasTocClassToken(String html) {
-    // Comments and raw-text script/style strings are not class attributes;
-    // data-class/other word-prefixed names must not identify a TOC either.
-    // Keep the legacy class= spelling (no whitespace before '=') and quotes.
+    // Comments and raw-text script/style strings are not class attributes.
     final String markup = html.replaceAll(_nonMarkupTocContentPattern, '');
-    for (final RegExpMatch match in _classAttributePattern.allMatches(markup)) {
-      if (match.group(2)!.split(_whitespaceRunPattern).contains('toc')) {
+    int index = 0;
+    while (index < markup.length) {
+      final int tagStart = markup.indexOf('<', index);
+      if (tagStart < 0) {
+        break;
+      }
+      final int tagEnd = _scanTagEnd(markup, tagStart);
+      if (tagEnd < 0) {
+        break;
+      }
+      if (_tagHasTocClassToken(markup.substring(tagStart, tagEnd + 1))) {
+        return true;
+      }
+      index = tagEnd + 1;
+    }
+    return false;
+  }
+
+  /// Index of the `>` closing the tag opened at [tagStart], skipping `>`
+  /// inside quoted attribute values (e.g. `<p title="a>b">`); -1 when the
+  /// tag never closes.
+  static int _scanTagEnd(String markup, int tagStart) {
+    String? quote;
+    for (int i = tagStart + 1; i < markup.length; i++) {
+      final String char = markup[i];
+      if (quote != null) {
+        if (char == quote) {
+          quote = null;
+        }
+      } else if (char == '"' || char == "'") {
+        quote = char;
+      } else if (char == '>') {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /// True when [tag] (including its angle brackets) declares a class
+  /// attribute whose whitespace-separated tokens contain `toc`. Attribute
+  /// names compare case-insensitively; `data-class` and other
+  /// word-prefixed names are different attributes and never match.
+  static bool _tagHasTocClassToken(String tag) {
+    for (final RegExpMatch match in _tagAttributePattern.allMatches(tag)) {
+      if (match.group(1)!.toLowerCase() != 'class') {
+        continue;
+      }
+      String value = match.group(2)!;
+      if (value.length >= 2 &&
+          ((value.startsWith('"') && value.endsWith('"')) ||
+              (value.startsWith("'") && value.endsWith("'")))) {
+        value = value.substring(1, value.length - 1);
+      }
+      if (value.split(_whitespaceRunPattern).contains('toc')) {
         return true;
       }
     }
     return false;
   }
+
+  /// Test-only: the quote-aware class-token check behind [_isTocLikeChapter].
+  @visibleForTesting
+  bool debugHasTocClassToken(String html) => _hasTocClassToken(html);
 
   bool _isTocLikeChapter(InspectedChapter chapter) {
     // A real TOC stylesheet hook is a whole `toc` class token; keep the

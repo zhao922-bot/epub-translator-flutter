@@ -79,6 +79,7 @@ class _BlockingRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) {
     throw UnimplementedError();
   }
@@ -234,6 +235,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     lastConfirmedStyleProfile = confirmedStyleProfile;
@@ -271,6 +273,7 @@ class _BlockingTranslationRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translationStarted.complete();
     await releaseTranslation.future;
@@ -304,6 +307,7 @@ class _ErrorTranslationRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translationStarted.complete();
     throw await releaseTranslation.future;
@@ -322,6 +326,7 @@ class _WarningTranslationRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     final TranslationJob job = TranslationJob(
@@ -372,6 +377,7 @@ class _AllDegradedTranslationRepository
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     const String error =
@@ -406,6 +412,7 @@ class _CacheProgressRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     onProgress?.call(
       TranslationJob(
@@ -454,6 +461,7 @@ class _FailThenBlockTranslationRepository
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     attempts += 1;
     if (attempts == 1) {
@@ -502,6 +510,7 @@ class _RestorationCancellationRepository
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     onProgress?.call(
       TranslationJob(
@@ -544,6 +553,7 @@ class _StaleCheckpointProgressRepository
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     onProgress?.call(
       TranslationJob(
@@ -686,6 +696,7 @@ class _FailingTranslationRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     throw StateError(
@@ -709,6 +720,7 @@ class _ProgressThenErrorRepository extends _SuccessfulInspectionRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     progress = (completed) => onProgress?.call(
       TranslationJob(
@@ -963,7 +975,7 @@ void main() {
           repository: repository,
           historyStore: store,
         );
-        addTearDown(controller.dispose);
+        addTearDown(controller.debugDispose);
         controller.syncSettings(
           TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
         );
@@ -1004,7 +1016,7 @@ void main() {
           repository: retryRepository,
           historyStore: store,
         );
-        addTearDown(restored.dispose);
+        addTearDown(restored.debugDispose);
         restored.syncSettings(
           TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
         );
@@ -1039,7 +1051,7 @@ void main() {
         repository: repository,
         historyStore: store,
       );
-      addTearDown(controller.dispose);
+      addTearDown(controller.debugDispose);
       controller.syncSettings(
         TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
       );
@@ -2118,7 +2130,7 @@ void main() {
   );
 
   test(
-    'empty regeneration preserves an existing profile without auto-confirming',
+    'empty regeneration preserves an existing profile and auto-confirms generic style',
     () async {
       final repository = _SuccessfulInspectionRepository();
       final controller = TranslationDashboardController(
@@ -2142,7 +2154,10 @@ void main() {
       );
       await controller.generateStyleProfile();
       expect(controller.state.styleProfile, previous);
-      expect(controller.state.styleProfileConfirmed, isFalse);
+      // Empty profile means "generic translation style" and is auto-confirmed
+      // (user-authorized m2 behavior change); the existing profile content is
+      // still preserved, not overwritten with the empty result.
+      expect(controller.state.styleProfileConfirmed, isTrue);
       expect(controller.state.isGeneratingStyleProfile, isFalse);
       expect(
         controller.state.logs.last,
@@ -2623,8 +2638,11 @@ void main() {
       await controller.retryJob('style-disabled-job');
 
       expect(repository.styleGenerateCount, 1);
-      expect(repository.translateCount, 0);
-      expect(controller.state.styleProfileConfirmed, isFalse);
+      // The fake returns an empty profile, which auto-confirms as generic
+      // style (user-authorized m2 behavior change), so translation proceeds
+      // without waiting for manual confirmation.
+      expect(repository.translateCount, 1);
+      expect(controller.state.styleProfileConfirmed, isTrue);
     },
   );
 

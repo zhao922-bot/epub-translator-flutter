@@ -514,6 +514,7 @@ class RetryProbeRepository extends EpubTranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     selections.add(
       chapters.where((c) => c.includeInTranslation).map((c) => c.path).toList(),

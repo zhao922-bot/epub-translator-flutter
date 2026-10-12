@@ -336,7 +336,10 @@ void main() {
         const String existing = 'PREVIOUS_GOOD_BYTES';
         await output.writeAsString(existing, flush: true);
 
-        // Outer pre-check true, before-backup true, after-backup false.
+        // Three shouldCommit gates, all true except the last: before commit
+        // preparation, during message handling inside the isolate, and the
+        // outer commit check just before the backup move (false) — the
+        // commit aborts with the previous good output untouched.
         int checks = 0;
         final bool committed = await EpubIsolateWorker.writeTranslatedEpub(
           inputPath: input.path,

@@ -87,6 +87,9 @@ class AppStrings {
   String get noTranslationYet => isChinese
       ? '此章节尚无可预览的译文。'
       : 'No translated excerpt is available for this chapter yet.';
+  String get previewRecoveryFailed => isChinese
+      ? '预览恢复失败，显示的内容可能不完整。'
+      : 'Preview recovery failed; the shown content may be incomplete.';
   String get reviewStyleFirst => isChinese
       ? '请先确认下方的书籍风格，再开始翻译。'
       : 'Review and confirm the book style below before translating.';

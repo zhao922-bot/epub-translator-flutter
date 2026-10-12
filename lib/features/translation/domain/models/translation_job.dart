@@ -45,6 +45,7 @@ class TranslationJob {
     this.cacheScanScannedBlocks = 0,
     this.cacheScanTotalBlocks = 0,
     this.degradedBlockCount = 0,
+    this.apiDegradedBlocks = 0,
     this.errorMessage,
     this.styleProfile = TranslationStyleProfile.empty,
     this.styleProfileConfirmed = false,
@@ -77,6 +78,13 @@ class TranslationJob {
   final int cacheScanScannedBlocks;
   final int cacheScanTotalBlocks;
   final int degradedBlockCount;
+
+  /// Degraded blocks that entered [completedBlocks] without producing a
+  /// translation (kept their source text after timeout/unparseable
+  /// response/HTTP 413). Unlike [degradedBlockCount] (final-report total),
+  /// this is updated live during the run so throughput (speed/ETA) can
+  /// exclude them: they must not count as API-translated blocks.
+  final int apiDegradedBlocks;
   final String? errorMessage;
   final TranslationStyleProfile styleProfile;
   final bool styleProfileConfirmed;
@@ -147,6 +155,7 @@ class TranslationJob {
       ),
       cacheScanTotalBlocks: _readNonNegativeInt(json['cacheScanTotalBlocks']),
       degradedBlockCount: _readNonNegativeInt(json['degradedBlockCount']),
+      apiDegradedBlocks: _readNonNegativeInt(json['apiDegradedBlocks']),
       errorMessage: _readNullableString(json['errorMessage']),
       styleProfile: _readStyleProfile(json['styleProfile']),
       styleProfileConfirmed: json['styleProfileConfirmed'] as bool? ?? false,
@@ -177,6 +186,7 @@ class TranslationJob {
     int? cacheScanScannedBlocks,
     int? cacheScanTotalBlocks,
     int? degradedBlockCount,
+    int? apiDegradedBlocks,
     Object? errorMessage = _unset,
     TranslationStyleProfile? styleProfile,
     bool? styleProfileConfirmed,
@@ -211,6 +221,7 @@ class TranslationJob {
           cacheScanScannedBlocks ?? this.cacheScanScannedBlocks,
       cacheScanTotalBlocks: cacheScanTotalBlocks ?? this.cacheScanTotalBlocks,
       degradedBlockCount: degradedBlockCount ?? this.degradedBlockCount,
+      apiDegradedBlocks: apiDegradedBlocks ?? this.apiDegradedBlocks,
       errorMessage: identical(errorMessage, _unset)
           ? this.errorMessage
           : errorMessage as String?,
@@ -249,6 +260,7 @@ class TranslationJob {
       'cacheScanScannedBlocks': cacheScanScannedBlocks,
       'cacheScanTotalBlocks': cacheScanTotalBlocks,
       'degradedBlockCount': degradedBlockCount,
+      'apiDegradedBlocks': apiDegradedBlocks,
       'errorMessage': errorMessage,
       if (styleProfileConfirmed) 'styleProfile': styleProfile.toJson(),
       'styleProfileConfirmed': styleProfileConfirmed,

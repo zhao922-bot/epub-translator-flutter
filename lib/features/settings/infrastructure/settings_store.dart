@@ -225,6 +225,15 @@ class SettingsStore {
   Object? get configLoadError => _configLoadError;
   Map<String, String> _credentialBindings = {};
 
+  /// Whether the legacy (pre-schema) credential migration has finished.
+  ///
+  /// While a legacy key still awaits migration, plain saves must not stamp
+  /// `credentialSchemaVersion: 2`: that would permanently disable the legacy
+  /// fallback while the legacy slot still holds the only copy of the key,
+  /// so a failed migration followed by an unrelated save (e.g. a theme
+  /// change) would make the previously usable key disappear on next launch.
+  bool _legacyMigrationComplete = false;
+
   Future<TranslationConfig> load() async {
     try {
       final file = await _settingsFile();
@@ -323,7 +332,16 @@ class SettingsStore {
                     : storedCustomKey)
                 .status ==
             _SecretReadStatus.missing;
-    if ((_pendingPlaintextKeys.isNotEmpty || needsSecureAllocation) &&
+    final bool legacyMigrationNeeded =
+        _allowLegacyMigration &&
+        (_pendingPlaintextKeys.isNotEmpty || needsSecureAllocation);
+    if (!legacyMigrationNeeded) {
+      // Schema already migrated, or no legacy key material at all:
+      // provider slots (or their absence) are authoritative from here on,
+      // so stamping schema 2 on later saves is safe.
+      _legacyMigrationComplete = true;
+    }
+    if (legacyMigrationNeeded &&
         !_legacyMigrationFailed &&
         _legacyMigrationAttempts < _maxLegacyMigrationAttempts) {
       _legacyMigrationAttempts += 1;
@@ -342,6 +360,9 @@ class SettingsStore {
           slotsToSave: migrationSlots,
           explicit: migrationSlots,
         );
+        // The provider slots now hold the keys: the migration write itself
+        // may stamp schema 2.
+        _legacyMigrationComplete = true;
         await _writeSettingsJson(resolvedConfig);
       } on UnsupportedError catch (error) {
         // Deterministic: the platform has no usable secret backend at all
@@ -478,6 +499,10 @@ class SettingsStore {
           }
         : {};
     _allowLegacyMigration = decoded['credentialSchemaVersion'] != 2;
+    // A schema-2 file already migrated: provider slots are authoritative.
+    // Otherwise the flag is decided in [_loadLocked] once the legacy key
+    // material (if any) is known.
+    _legacyMigrationComplete = decoded['credentialSchemaVersion'] == 2;
     _settingsRevision = decoded['settingsRevision'] is int
         ? decoded['settingsRevision'] as int
         : 0;
@@ -576,16 +601,26 @@ class SettingsStore {
     // Validate before touching any secret slot, not just before JSON encoding.
     config.toJson();
     final file = await _settingsFile();
-    await withSettingsFileLock(file, () async {
-      final current = await file.exists() ? await file.readAsString() : null;
-      if (_didLoad && current != _settingsSnapshot) {
-        throw SettingsWriteConflict();
-      }
-      await _saveLocked(
-        config,
-        explicitSecretMutations: explicitSecretMutations,
-      );
-    });
+    try {
+      await withSettingsFileLock(file, () async {
+        final current = await file.exists() ? await file.readAsString() : null;
+        if (_didLoad && current != _settingsSnapshot) {
+          throw SettingsWriteConflict();
+        }
+        await _saveLocked(
+          config,
+          explicitSecretMutations: explicitSecretMutations,
+        );
+      });
+    } on SettingsWriteConflict catch (error) {
+      // A cross-instance conflict leaves this instance's snapshot stale:
+      // every later save would conflict again and the user would be stuck.
+      // Record it as a load error so the controller's recovery path reloads
+      // before the next save, and the settings page can offer an explicit
+      // "reload" action.
+      _configLoadError = error;
+      rethrow;
+    }
   }
 
   Future<void> _saveLocked(
@@ -697,6 +732,14 @@ class SettingsStore {
               customApiBaseUrl: customFailed
                   ? previous.customApiBaseUrl
                   : config.customApiBaseUrl,
+              // A model must never be persisted against an endpoint it was
+              // not saved with: rolling back the endpoint without the model
+              // could land "endpoint A + key A + model B" on disk, and the
+              // next launch would request a model the old endpoint rejects.
+              model: providerFailed ? previous.model : config.model,
+              customModel: customFailed
+                  ? previous.customModel
+                  : config.customModel,
               httpProxy: proxyFailed ? previous.httpProxy : config.httpProxy,
             )
           : config;
@@ -927,7 +970,11 @@ class SettingsStore {
           ...config.toJson(),
           // Provider-specific slots are authoritative after the first write.
           // A failed legacy deletion can never migrate into another provider.
-          'credentialSchemaVersion': 2,
+          // The schema stamp is written only once the legacy migration is
+          // actually complete: stamping it after a failed migration would
+          // permanently disable the legacy fallback while the legacy slot
+          // still holds the only copy of the key.
+          if (_legacyMigrationComplete) 'credentialSchemaVersion': 2,
           'credentialBindings': bindings,
           'settingsRevision': _settingsRevision + 1,
           // Only retain an existing legacy value while migration is pending.
@@ -944,7 +991,9 @@ class SettingsStore {
       await (settingsJsonWriter ?? writeFileAtomically)(file, encoded);
       _settingsSnapshot = encoded;
       _credentialBindings = bindings;
-      _allowLegacyMigration = false;
+      // Only retire the legacy fallback once the migration really finished;
+      // an unrelated save after a failed migration must keep it alive.
+      if (_legacyMigrationComplete) _allowLegacyMigration = false;
       _settingsRevision += 1;
     } catch (error) {
       throw mapSettingsWriteError(file.path, error);

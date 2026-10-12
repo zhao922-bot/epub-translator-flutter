@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../infrastructure/epub/footnote_batch_planner.dart';
 import '../../infrastructure/epub/translation_batch_planner.dart';
 import 'inspected_chapter.dart';
 import 'translation_job.dart';
@@ -184,25 +185,66 @@ class TranslationRunEstimate {
     );
   }
 
+  /// API-translated block count eligible for throughput (speed/ETA) on a
+  /// progress tick.
+  ///
+  /// While the cache-restoration scan is incomplete, `completedBlocks` still
+  /// holds the unverified checkpoint value while `cachedBlocks` grows from
+  /// zero; counting the difference as API work would fabricate throughput
+  /// before a single API call (C-11). Blocks that degraded to their source
+  /// text never produced a translation and are excluded as well (C-12).
+  static int apiTranslatedBlocksForThroughput(TranslationJob? job) {
+    if (job == null) return 0;
+    if (job.phase == TranslationJobPhase.cacheRestoration &&
+        job.cacheScanTotalBlocks > 0 &&
+        job.cacheScanScannedBlocks < job.cacheScanTotalBlocks) {
+      return 0;
+    }
+    return max(
+      0,
+      job.completedBlocks - job.cachedBlocks - job.apiDegradedBlocks,
+    );
+  }
+
   static int _estimateBatchCount(
     List<InspectedChapter> chapters,
     int chunkSize,
   ) {
     // Full-source estimate: pending cache misses and bookMemory are not yet
-    // known. Use the actual planner so title/snippet overhead cannot diverge.
-    return chapters.fold<int>(
-      0,
-      (count, chapter) =>
-          count +
-          const TranslationBatchPlanner()
-              .plan(
-                pendingBlocks: chapter.blocks,
-                chunkSize: chunkSize,
-                chapterBlocks: chapter.blocks,
-                chapterTitle: chapter.title,
-              )
-              .length,
-    );
+    // known. Use the actual planners so title/snippet overhead cannot
+    // diverge. Standalone footnote chapters go through FootnoteBatchPlanner
+    // (up to 12 references per batch, packed across contiguous footnote
+    // files), which yields far fewer batches than per-chapter planning for
+    // note-heavy books.
+    int count = 0;
+    final Map<int, List<ExtractedBlock>> footnotePending =
+        <int, List<ExtractedBlock>>{};
+    for (int i = 0; i < chapters.length; i++) {
+      final InspectedChapter chapter = chapters[i];
+      if (FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter)) {
+        footnotePending[i] = chapter.blocks;
+      } else {
+        count +=
+            const TranslationBatchPlanner()
+                .plan(
+                  pendingBlocks: chapter.blocks,
+                  chunkSize: chunkSize,
+                  chapterBlocks: chapter.blocks,
+                  chapterTitle: chapter.title,
+                )
+                .length;
+      }
+    }
+    if (footnotePending.isNotEmpty) {
+      count += const FootnoteBatchPlanner()
+          .plan(
+            chapters: chapters,
+            pendingBlocksByChapter: footnotePending,
+            chunkSize: chunkSize,
+          )
+          .length;
+    }
+    return count;
   }
 
   static double? _blocksPerMinute(int completedBlocks, Duration? elapsed) {

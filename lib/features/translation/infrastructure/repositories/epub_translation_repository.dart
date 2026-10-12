@@ -239,6 +239,7 @@ class EpubTranslationRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     final CancelToken cancelToken = _beginCancellableRun();
     try {
@@ -251,6 +252,7 @@ class EpubTranslationRepository implements TranslationRepository {
         confirmedStyleProfile: confirmedStyleProfile,
         onProgress: onProgress,
         isCancelled: isCancelled,
+        onChapterSourcesReleased: onChapterSourcesReleased,
       );
     } on TranslationCancelledException {
       rethrow;

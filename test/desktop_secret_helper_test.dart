@@ -55,13 +55,13 @@ void main() {
       );
     }, skip: Platform.isWindows ? 'Needs a POSIX shell.' : null);
 
-    test('throws StateError when the helper executable is missing', () async {
+    test('throws UnsupportedError when the helper executable is missing', () async {
       await expectLater(
         NativePlatformBridge.runDesktopSecretHelperForTest(
           '/nonexistent/definitely-not-a-secret-helper',
           <String>['/nonexistent/definitely-not-a-secret-helper', 'lookup'],
         ),
-        throwsA(isA<StateError>()),
+        throwsA(isA<UnsupportedError>()),
       );
     });
   });

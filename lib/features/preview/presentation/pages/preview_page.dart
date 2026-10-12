@@ -28,6 +28,10 @@ class PreviewPage extends ConsumerWidget {
     );
     final controller = ref.read(translationDashboardProvider.notifier);
     final strings = ref.watch(appStringsProvider);
+    // Recovery runs off the UI isolate and can fail (e.g. the isolate is
+    // killed); surface the failure with a retry entry instead of silently
+    // projecting empty excerpts / "no translation yet".
+    final recovery = ref.watch(previewRecoveryProvider);
     final empty = previewState.inspectedChapters.isEmpty || chapters.isEmpty;
     final safeIndex = empty ? 0 : index.clamp(0, chapters.length - 1);
     if (safeIndex != index) {
@@ -70,75 +74,131 @@ class PreviewPage extends ConsumerWidget {
                 ),
               ),
             )
-          : LayoutBuilder(
-              builder: (context, constraints) {
-                final selected = chapters[safeIndex];
-                final textScale = MediaQuery.textScalerOf(context).scale(1);
-                final wide = constraints.maxWidth >= 800 * textScale;
-                final parallel = constraints.maxWidth >= 1040 * textScale;
-                final checklist = ChapterChecklist(
-                  chapters: chapters,
-                  selectedIndex: safeIndex,
-                  strings: strings,
-                  enabled: !previewState.isRunActive,
-                  selectedBlocks: previewState.inspectedChapters
-                      .where((c) => c.includeInTranslation)
-                      .fold<int>(0, (sum, c) => sum + c.blocks.length),
-                  onSelect: (value) =>
-                      ref.read(previewSelectedIndexProvider.notifier).state =
-                          value,
-                  onToggle: controller.toggleChapterInclusion,
-                  onReset: controller.resetChapterSelection,
-                  onPreset: controller.applyChapterSelectionPreset,
-                );
-                final detail = SingleChildScrollView(
-                  key: ValueKey(selected.path),
-                  padding: const EdgeInsets.only(bottom: 28),
-                  child: ChapterPreviewContent(
-                    chapter: selected,
-                    strings: strings,
-                    parallel: parallel,
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (recovery.hasError)
+                  _PreviewRecoveryErrorBanner(
+                    message: strings.previewRecoveryFailed,
+                    retryLabel: strings.retryJob,
+                    onRetry: () => ref.invalidate(previewRecoveryProvider),
                   ),
-                );
-                if (wide) {
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 20),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        SizedBox(width: 260, child: checklist),
-                        const SizedBox(width: 24),
-                        const VerticalDivider(width: 1),
-                        const SizedBox(width: 24),
-                        Expanded(child: detail),
-                      ],
-                    ),
-                  );
-                }
-                // Reserve a proportion of the available height for the
-                // separator; fixed minimum list heights starve the detail
-                // on short windows (especially with a bottom navigation bar).
-                final separatorHeight = (constraints.maxHeight * .12).clamp(
-                  0.0,
-                  48.0,
-                );
-                final checklistHeight =
-                    ((constraints.maxHeight - separatorHeight) * .46).clamp(
-                      0.0,
-                      300.0,
-                    );
-                return Column(
-                  children: [
-                    SizedBox(height: checklistHeight, child: checklist),
-                    SizedBox(
-                      height: separatorHeight,
-                      child: const Center(child: Divider(height: 1)),
-                    ),
-                    Expanded(child: detail),
-                  ],
-                );
-              },
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final selected = chapters[safeIndex];
+                      final textScale = MediaQuery.textScalerOf(
+                        context,
+                      ).scale(1);
+                      final wide = constraints.maxWidth >= 800 * textScale;
+                      final parallel = constraints.maxWidth >= 1040 * textScale;
+                      final checklist = ChapterChecklist(
+                        chapters: chapters,
+                        selectedIndex: safeIndex,
+                        strings: strings,
+                        enabled: !previewState.isRunActive,
+                        selectedBlocks: previewState.inspectedChapters
+                            .where((c) => c.includeInTranslation)
+                            .fold<int>(0, (sum, c) => sum + c.blocks.length),
+                        onSelect: (value) =>
+                            ref
+                                    .read(previewSelectedIndexProvider.notifier)
+                                    .state =
+                                value,
+                        onToggle: controller.toggleChapterInclusion,
+                        onReset: controller.resetChapterSelection,
+                        onPreset: controller.applyChapterSelectionPreset,
+                      );
+                      final detail = SingleChildScrollView(
+                        key: ValueKey(selected.path),
+                        padding: const EdgeInsets.only(bottom: 28),
+                        child: ChapterPreviewContent(
+                          chapter: selected,
+                          strings: strings,
+                          parallel: parallel,
+                        ),
+                      );
+                      if (wide) {
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 20),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              SizedBox(width: 260, child: checklist),
+                              const SizedBox(width: 24),
+                              const VerticalDivider(width: 1),
+                              const SizedBox(width: 24),
+                              Expanded(child: detail),
+                            ],
+                          ),
+                        );
+                      }
+                      // Reserve a proportion of the available height for the
+                      // separator; fixed minimum list heights starve the detail
+                      // on short windows (especially with a bottom navigation bar).
+                      final separatorHeight = (constraints.maxHeight * .12)
+                          .clamp(0.0, 48.0);
+                      final checklistHeight =
+                          ((constraints.maxHeight - separatorHeight) * .46)
+                              .clamp(0.0, 300.0);
+                      return Column(
+                        children: [
+                          SizedBox(height: checklistHeight, child: checklist),
+                          SizedBox(
+                            height: separatorHeight,
+                            child: const Center(child: Divider(height: 1)),
+                          ),
+                          Expanded(child: detail),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
             ),
+    );
+  }
+}
+
+/// Error banner shown when off-isolate preview recovery failed: the
+/// excerpts below may be empty, and the retry button re-runs recovery.
+class _PreviewRecoveryErrorBanner extends StatelessWidget {
+  const _PreviewRecoveryErrorBanner({
+    required this.message,
+    required this.retryLabel,
+    required this.onRetry,
+  });
+
+  final String message;
+  final String retryLabel;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.errorContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Icon(
+            Icons.error_outline,
+            size: 20,
+            color: theme.colorScheme.onErrorContainer,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onErrorContainer,
+              ),
+            ),
+          ),
+          TextButton(onPressed: onRetry, child: Text(retryLabel)),
+        ],
+      ),
     );
   }
 }

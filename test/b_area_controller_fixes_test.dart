@@ -77,6 +77,7 @@ class _Repository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     final job = _job(inputPath, '$outputDirectory/book_translated.epub')
         .copyWith(
@@ -302,7 +303,11 @@ void main() {
       final clearing = controller.clearJobHistory();
       final clearMs = await store.entered.future;
       final boundary = job('boundary', clearMs * 1000);
-      final late = job('B', clearMs * 1000 + 1);
+      // clearMs is millisecond-truncated while the deletion watermark uses the
+      // true microsecond instant inside that millisecond, so +1us is NOT
+      // reliably after the clear. Use a margin safely beyond the whole
+      // millisecond to construct a genuinely late run.
+      final late = job('B', clearMs * 1000 + 10000);
       await otherStore.save(<TranslationJob>[
         late,
         boundary,

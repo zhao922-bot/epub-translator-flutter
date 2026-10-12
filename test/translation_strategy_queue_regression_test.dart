@@ -337,7 +337,7 @@ void main() {
   );
 
   test(
-    'A4 individual slots have read-only full block and neighbors, unchanged user text',
+    'A4 individual slots have bounded block summary and neighbors, unchanged user text',
     () async {
       final block = _block('a', protected: true);
       final contexts = <Map<String, dynamic>>[];
@@ -347,11 +347,13 @@ void main() {
         users.add(_user(data));
         final message = (data['messages'] as List).firstWhere(
           (message) => (message['content'] as String).startsWith(
-            'Read-only source block context.',
+            'Read-only plain-text summary of the source block.',
           ),
         );
         expect(message['role'], 'system');
         expect(message['content'], contains('never this context'));
+        // The full source HTML must not be re-sent once per slot (#19).
+        expect(message['content'], isNot(contains(block.sourceHtml)));
         contexts.add(
           jsonDecode((message['content'] as String).split('\n').last)
               as Map<String, dynamic>,
@@ -362,9 +364,9 @@ void main() {
         apiClient: api,
       ).translateBlockBatchForTest(dio: Dio(), config: config, blocks: [block]);
       expect(users, [_text, 'Then he rested.']);
-      expect(contexts.map((c) => c['sourceHtml']), [
-        block.sourceHtml,
-        block.sourceHtml,
+      expect(contexts.map((c) => c['blockSummary']), [
+        block.sourceText,
+        block.sourceText,
       ]);
       expect(contexts.map((c) => c['currentSlotId']).toSet(), hasLength(2));
       expect(contexts[0]['previousText'], isNull);

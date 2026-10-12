@@ -362,7 +362,6 @@ void main() {
         'https://user:password@host/v1?key=secret',
         'https://host/v1?key=secret',
         'https://user:password@host/v1',
-        'https://host/v1#secret',
       ]) {
         for (final custom in [false, true]) {
           final config = TranslationConfig.defaults().copyWith(
@@ -375,6 +374,19 @@ void main() {
           expect(secrets.secretMutationCount, count);
         }
       }
+      // Fragments carry no credentials over HTTP and are allowed (#17), but
+      // must round-trip without leaking anything into secrets.
+      final okConfig = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'https://host/v1#section',
+      );
+      await store.save(okConfig);
+      expect(secrets.secretMutationCount, count);
+      // A stale legitimate custom URL (non-credential query) must not block
+      // saving unrelated settings when DeepSeek is selected (#17).
+      final staleLegit = TranslationConfig.defaults().copyWith(
+        customApiBaseUrl: 'https://gateway.example.com/v1?tenant=books',
+      );
+      await store.save(staleLegit);
     },
   );
 

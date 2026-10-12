@@ -64,9 +64,38 @@ class TranslationCacheStore {
   Future<void> _maintenanceTail = Future<void>.value();
   int _writeGeneration = 0;
   int _ineffectivePrunes = 0;
-  DateTime? _retryAfter;
+
+  /// Ineffective-scan backoff deadline. Monotonic (Stopwatch), never wall
+  /// clock: a clock rollback must not stretch the wait past its intended
+  /// duration.
+  final Stopwatch _retryAfterStopwatch = Stopwatch();
+  Duration? _retryAfterDelay;
 
   static const String _envelopePrefix = 'epub-translation-cache-v1:sha256:';
+
+  /// Heuristic for a new-format entry whose corruption hit the envelope
+  /// prefix region: the first line still carries a recognizable fragment —
+  /// a leading run of the envelope prefix, or the `sha256:` marker.
+  /// Translated HTML (what genuine legacy entries contain) never looks like
+  /// this, so a match fails closed (caller retranslates) instead of
+  /// trusting unchecked bytes. False positives only cost a retranslation.
+  static bool _looksLikeDamagedEnvelope(String raw) {
+    final int newline = raw.indexOf('\n');
+    final String firstLine = newline < 0 ? raw : raw.substring(0, newline);
+    // An envelope header line is short (prefix + 64 hex chars); a long
+    // first line is HTML payload, not a damaged header.
+    if (firstLine.length > _envelopePrefix.length + 80) return false;
+    int run = 0;
+    final int checkLength = firstLine.length < _envelopePrefix.length
+        ? firstLine.length
+        : _envelopePrefix.length;
+    for (int i = 0; i < checkLength; i++) {
+      if (firstLine.codeUnitAt(i) != _envelopePrefix.codeUnitAt(i)) break;
+      run++;
+    }
+    if (run >= 8) return true;
+    return firstLine.contains('sha256:');
+  }
 
   @visibleForTesting
   int get estimatedCacheBytesForTest => _estimatedBytes;
@@ -82,18 +111,26 @@ class TranslationCacheStore {
 
   void _resetBackoff() {
     _ineffectivePrunes = 0;
-    _retryAfter = null;
+    _retryAfterDelay = null;
+    _retryAfterStopwatch.reset();
+  }
+
+  bool _backoffActive() {
+    final Duration? delay = _retryAfterDelay;
+    return delay != null && _retryAfterStopwatch.elapsed < delay;
   }
 
   // Writes and eviction share a per-file gate; unrelated keys stay parallel.
-  Future<void> _withFileGate(File file, Future<void> Function() action) {
+  // Also serializes checkpoint saves against checkpoint pruning (see
+  // [saveJobState] / [pruneJobCheckpointsForTest]).
+  Future<T> _withFileGate<T>(File file, Future<T> Function() action) {
     final String key = file.path;
     final Future<void> previous = _fileGates[key] ?? Future<void>.value();
     final Completer<void> gate = Completer<void>();
     _fileGates[key] = gate.future;
     return previous.then((_) async {
       try {
-        await action();
+        return await action();
       } finally {
         gate.complete();
         if (identical(_fileGates[key], gate.future)) {
@@ -121,9 +158,17 @@ class TranslationCacheStore {
     final File file = await _blockCacheFile(cacheKey);
     try {
       final String raw = await file.readAsString();
-      // Legacy entries have no checksum. Trust them to preserve paid progress;
-      // all new writes use the versioned integrity envelope below.
-      if (!raw.startsWith(_envelopePrefix)) return raw;
+      if (!raw.startsWith(_envelopePrefix)) {
+        // A damaged envelope prefix must NOT be trusted as a legacy entry:
+        // legacy entries carry no checksum, so a corrupted new-format entry
+        // would silently return unchecked bytes (and the restoration
+        // scanner would count it as a hit). Fail closed: null triggers a
+        // retranslation.
+        if (_looksLikeDamagedEnvelope(raw)) return null;
+        // Legacy entries have no checksum. Trust them to preserve paid
+        // progress; all new writes use the versioned integrity envelope.
+        return raw;
+      }
       final int newline = raw.indexOf('\n');
       if (newline < 0) return null;
       final String digest = raw.substring(_envelopePrefix.length, newline);
@@ -176,11 +221,22 @@ class TranslationCacheStore {
   void _pruneIfNeeded({bool capacityFollowUp = false}) {
     final DateTime now = _now();
     if (_estimatedBytes <= _capacity) _resetBackoff();
-    if (_maintenancePending ||
-        (_retryAfter != null && now.isBefore(_retryAfter!)) ||
-        (_lastPrune != null &&
-            now.difference(_lastPrune!) < pruneInterval &&
-            _estimatedBytes <= _capacity)) {
+    if (_maintenancePending) {
+      return;
+    }
+    final bool overCapacity = _estimatedBytes > _capacity;
+    final bool intervalActive =
+        _lastPrune != null && now.difference(_lastPrune!) < pruneInterval;
+    // An over-capacity cache outranks the ineffective-scan backoff: without
+    // this, puts keep accepting writes while eviction stalls for up to 60
+    // minutes and the cache grows without bound past the cap. The prune
+    // interval still rate-limits rescans, so a fresh over-capacity
+    // transition (backoff was reset) scans promptly instead of waiting out
+    // a stale backoff.
+    if (intervalActive && (!overCapacity || _backoffActive())) {
+      return;
+    }
+    if (!overCapacity && _backoffActive()) {
       return;
     }
     _maintenancePending = true;
@@ -205,13 +261,22 @@ class TranslationCacheStore {
             // No reclaimable space (or a failed pass): don't rescan on every
             // put. Concurrent writes get one immediate follow-up pass first,
             // but cannot keep no-effect scans spinning indefinitely.
+            // Monotonic clock: a wall-clock rollback must not stretch the
+            // wait.
             _ineffectivePrunes++;
             final int minutes = _ineffectivePrunes >= 5
                 ? 60
                 : 5 * (1 << (_ineffectivePrunes - 1));
-            _retryAfter = _now().add(Duration(minutes: minutes));
+            _retryAfterDelay = Duration(minutes: minutes);
+            _retryAfterStopwatch
+              ..reset()
+              ..start();
           }
           _maintenancePending = false;
+          // A follow-up pass goes through [_pruneIfNeeded]'s guard: an
+          // ineffective pass that armed the backoff is stopped there, while
+          // an effective (or inconclusive) pass chains promptly to keep
+          // evicting.
           if (_estimatedBytes > _capacity) {
             _pruneIfNeeded(capacityFollowUp: true);
           }
@@ -382,9 +447,15 @@ class TranslationCacheStore {
     final File file = await _jobStateFile(state.jobKey);
     await file.parent.create(recursive: true);
     await _sweepStaleTempFiles(file.parent);
-    await writeFileAtomically(
+    // Serialize with checkpoint pruning on the per-file gate: without it,
+    // the prune's stat-then-delete could land after a concurrent save
+    // renamed a fresh checkpoint onto this same path, deleting live state.
+    await _withFileGate(
       file,
-      const JsonEncoder.withIndent('  ').convert(state.toJson()),
+      () => writeFileAtomically(
+        file,
+        const JsonEncoder.withIndent('  ').convert(state.toJson()),
+      ),
     );
     await _pruneOldJobStates();
   }
@@ -444,23 +515,79 @@ class TranslationCacheStore {
     );
     int remaining = entries.length;
     final DateTime activeSince = _now().subtract(const Duration(minutes: 5));
+    final List<({File file, DateTime modified})> candidates = [];
     for (final entry in entries) {
       if (remaining <= maxCheckpoints) break;
       if (!entry.modified.isBefore(activeSince)) continue;
+      candidates.add(entry);
+      remaining--;
+    }
+    // Pair protection: a job checkpoint and its book-memory companion are
+    // kept or deleted together, never split. An active job must not lose
+    // only its memory file while its main checkpoint survives.
+    final Set<String> candidatePaths = {
+      for (final entry in candidates) entry.file.path,
+    };
+    for (final entry in candidates) {
+      final String? matePath = await _pairedCheckpointPath(
+        jobsDir,
+        entry.file,
+      );
+      if (matePath == null ||
+          candidatePaths.contains(matePath) ||
+          !await File(matePath).exists()) {
+        continue;
+      }
+      candidatePaths.remove(entry.file.path);
+    }
+    for (final entry in candidates) {
+      if (!candidatePaths.contains(entry.file.path)) continue;
       try {
-        // A resume/save may have refreshed it since listing. Recheck before
-        // deletion; active checkpoints may temporarily exceed the count cap.
-        final FileStat current = await entry.file.stat();
-        if (current.modified != entry.modified ||
-            !current.modified.isBefore(activeSince)) {
-          continue;
-        }
-        await entry.file.delete();
-        remaining--;
+        // Recheck under the per-file gate shared with [saveJobState]: a
+        // resume/save that refreshed this path after the listing must not
+        // have its fresh checkpoint deleted by this pass. The gate makes
+        // the recheck stat and the delete atomic with respect to saves.
+        await _withFileGate(entry.file, () async {
+          final FileStat current = await entry.file.stat();
+          if (current.modified != entry.modified ||
+              !current.modified.isBefore(activeSince)) {
+            return;
+          }
+          await entry.file.delete();
+        });
       } catch (_) {
         // Best effort; a locked file is left for the next pass.
       }
     }
+  }
+
+  /// Returns the paired checkpoint for [file] (job <-> book-memory
+  /// companion), or null when the file is not a recognized checkpoint pair
+  /// member. The memory companion's envelope carries the original job key in
+  /// `inputFingerprint`; a regular job checkpoint's key is its file stem.
+  Future<String?> _pairedCheckpointPath(
+    Directory jobsDir,
+    File file,
+  ) async {
+    Map<String, dynamic>? json;
+    try {
+      final Object? decoded = jsonDecode(await file.readAsString());
+      if (decoded is Map<String, dynamic>) json = decoded;
+    } catch (_) {
+      return null;
+    }
+    if (json == null) return null;
+    final String stem = path.basenameWithoutExtension(file.path);
+    if (json['status'] == 'book-memory') {
+      final Object? jobKey = json['inputFingerprint'];
+      if (jobKey is String && jobKey.isNotEmpty) {
+        return path.join(jobsDir.path, '$jobKey.json');
+      }
+      return null;
+    }
+    final String memoryKey =
+        sha256.convert(utf8.encode('$stem:book-memory')).toString();
+    return path.join(jobsDir.path, '$memoryKey.json');
   }
 
   Future<void> clearJobState(String jobKey) async {
@@ -489,7 +616,20 @@ class TranslationCacheStore {
 
   Future<Directory> _cacheRoot() async {
     if (_rootOverride != null) return _rootOverride;
-    return _rootFuture ??= (resolveCacheRoot ?? _resolveCacheRoot)();
+    final Future<Directory>? pending = _rootFuture;
+    if (pending != null) return pending;
+    final Future<Directory> future = (resolveCacheRoot ?? _resolveCacheRoot)();
+    _rootFuture = future;
+    try {
+      return await future;
+    } catch (_) {
+      // A transient failure (platform channel hiccup, momentary IO error)
+      // must not poison the root forever: drop the failed future so the
+      // next call retries instead of replaying the same error for every
+      // read, write and checkpoint.
+      if (identical(_rootFuture, future)) _rootFuture = null;
+      rethrow;
+    }
   }
 
   Future<Directory> _resolveCacheRoot() async {

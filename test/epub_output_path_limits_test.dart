@@ -43,20 +43,20 @@ void main() {
   );
 
   group('output filename component limit', () {
-    test('reserves the temporary suffix at the exact UTF-16 boundary', () {
+    test('reserves the recovery suffix at the exact UTF-16 boundary', () {
       final name = EpubChapterTranslator.outputFileNameForTest(
-        'a' * 228,
+        'a' * 224,
         '',
         windows: true,
       );
-      expect(name.length + 22, 255);
-      expect(name, '${'a' * 228}.epub');
+      expect(name.length + 26, 255);
+      expect(name, '${'a' * 224}.epub');
       final shortened = EpubChapterTranslator.outputFileNameForTest(
-        'a' * 229,
+        'a' * 225,
         '',
         windows: true,
       );
-      expect(shortened.length + 22, lessThanOrEqualTo(255));
+      expect(shortened.length + 26, lessThanOrEqualTo(255));
       expect(shortened, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
     });
 
@@ -65,7 +65,7 @@ void main() {
       () {
         final title = '😀' * 150;
         final name = EpubChapterTranslator.outputFileNameForTest(title, '_zh');
-        expect(name.length + 22, lessThanOrEqualTo(255));
+        expect(name.length + 26, lessThanOrEqualTo(255));
         expect(name, contains('_zh_'));
         expect(name.runes, isNot(contains(0xfffd)));
         expect(name, EpubChapterTranslator.outputFileNameForTest(title, '_zh'));
@@ -83,7 +83,7 @@ void main() {
         'book',
         'x' * 300,
       );
-      expect(name.length + 22, lessThanOrEqualTo(255));
+      expect(name.length + 26, lessThanOrEqualTo(255));
       expect(name, startsWith('book'));
       expect(name, endsWith('.epub'));
     });
@@ -119,7 +119,7 @@ void main() {
       );
       expect(name, isNot('${title}_translated.epub'));
       expect(name, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
-      expect(utf8.encode(name).length + 22, lessThanOrEqualTo(255));
+      expect(utf8.encode(name).length + 26, lessThanOrEqualTo(255));
       expect(
         EpubChapterTranslator.outputFileNameForTest(
           title,
@@ -133,7 +133,7 @@ void main() {
         '_zh',
         windows: false,
       );
-      expect(utf8.encode(emoji).length + 22, lessThanOrEqualTo(255));
+      expect(utf8.encode(emoji).length + 26, lessThanOrEqualTo(255));
       expect(emoji.runes, isNot(contains(0xfffd)));
       if (!Platform.isWindows) {
         final temp = await Directory.systemTemp.createTemp('utf8_filename_');
@@ -365,6 +365,7 @@ class _LongPathThrowingTranslator extends EpubChapterTranslator {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) {
     throw WindowsLongPathException(failingPath);
   }

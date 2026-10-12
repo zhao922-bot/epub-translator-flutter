@@ -72,7 +72,14 @@ class ChapterSourceRestorer {
       restored.add(
         chapter.copyWith(
           blocks: blocks,
-          body: _isLegacyPreview(chapter) ? inspected.body : chapter.body,
+          // Legacy previews (translatedBody == null) always need the fresh
+          // excerpt, and so does any chapter whose body was released: a
+          // completed chapter restored from the archive after a lost spool
+          // would otherwise keep an empty body and show a permanently blank
+          // source preview.
+          body: _isLegacyPreview(chapter) || chapter.body.isEmpty
+              ? inspected.body
+              : chapter.body,
         ),
       );
       progress(restored.length, chapters.length);

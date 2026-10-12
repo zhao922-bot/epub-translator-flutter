@@ -12,6 +12,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_inspector.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart';
 
 // Signal actual worker entry before cancellation, avoiding timing assumptions
@@ -76,7 +77,7 @@ File _book(Directory dir, {int present = 8}) {
   for (final entry in files.entries) {
     archive.addFile(ArchiveFile.bytes(entry.key, entry.value));
   }
-  return File('${dir.path}/source.epub')
+  return File(path.join(dir.path, 'source.epub'))
     ..writeAsBytesSync(ZipEncoder().encodeBytes(archive));
 }
 
@@ -181,7 +182,7 @@ void main() {
     'cancel ZIP encoding after temp creation cleans this temp and preserves final',
     () async {
       final input = _book(dir);
-      final output = File('${dir.path}/output.epub')
+      final output = File(path.join(dir.path, 'output.epub'))
         ..writeAsStringSync('original');
       // A large replacement makes encoding last long enough to observe an
       // actual opened temp, rather than cancelling before worker startup.
@@ -267,7 +268,7 @@ void main() {
   }
 
   test('export writes title and navigation even without target tag', () async {
-    final output = '${dir.path}/translated.epub';
+    final output = path.join(dir.path, 'translated.epub');
     expect(
       await EpubIsolateWorker.writeTranslatedEpub(
         inputPath: _book(dir).path,
@@ -284,7 +285,7 @@ void main() {
   });
 
   test('orphan sweep preserves old recovery payload and active temp', () async {
-    final output = File('${dir.path}/output.epub');
+    final output = File(path.join(dir.path, 'output.epub'));
     final orphan = File('${output.path}.tmp.orphan')
       ..writeAsStringSync('orphan');
     final active = File('${output.path}.tmp.active')

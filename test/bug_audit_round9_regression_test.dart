@@ -757,6 +757,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     TranslationStyleProfile? confirmedStyleProfile,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
+    void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
     final job = TranslationJob(

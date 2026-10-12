@@ -249,12 +249,20 @@ $OutputEncoding = $utf8NoBom
     );
   });
 
-  test('returns null for a missing Linux secret without throwing', () async {
-    // Whether or not secret-tool is installed, looking up a never-stored
-    // key must degrade to null so desktop startup is never interrupted.
+  test('missing Linux secret: null with a backend, UnsupportedError without one', () async {
+    // A never-stored key degrades to null only when a secret backend is
+    // actually present. Without secret-tool there is no backend at all:
+    // the bridge reports UnsupportedError (deterministic) instead of
+    // pretending the key is merely missing, so the settings store records
+    // it distinctly from a transient read failure. Either way desktop
+    // startup is never interrupted (the store catches per slot).
     final String name =
         'codex_test_missing_${DateTime.now().microsecondsSinceEpoch}';
-    expect(await NativePlatformBridge.readSecret(name), isNull);
+    try {
+      expect(await NativePlatformBridge.readSecret(name), isNull);
+    } on UnsupportedError {
+      // No secret backend on this machine: the expected new behavior.
+    }
   }, skip: Platform.isLinux ? null : 'Linux-only secret-tool lookup test.');
 
   group('observeWindowsPath', () {
@@ -318,7 +326,7 @@ $OutputEncoding = $utf8NoBom
       NativePlatformBridge.debugWindowsProcessStarter = null;
     });
 
-    test('maps ProcessException to a StateError', () async {
+    test('maps ProcessException to an UnsupportedError', () async {
       String? seenExecutable;
       List<String>? seenArguments;
       NativePlatformBridge.debugWindowsProcessStarter =
@@ -334,8 +342,8 @@ $OutputEncoding = $utf8NoBom
           '-NoProfile',
         ]),
         throwsA(
-          isA<StateError>().having(
-            (StateError e) => e.message,
+          isA<UnsupportedError>().having(
+            (UnsupportedError e) => e.message,
             'message',
             contains('PowerShell'),
           ),

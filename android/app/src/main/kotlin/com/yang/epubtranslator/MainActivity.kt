@@ -611,7 +611,7 @@ class MainActivity : FlutterActivity() {
                 }
                 val looksLikeEpub = selectedName.endsWith(".epub", ignoreCase = true) ||
                     mimeType.equals("application/epub+zip", ignoreCase = true) ||
-                    hasZipMagicBytes(uri, taskGeneration)
+                    hasZipMagicBytes(uri, taskGeneration, copyDeadlineElapsed)
                 if (!importLifecycle.isCurrent(taskGeneration)) {
                     // Same guard after the second round of blocking
                     // provider IPC calls.
@@ -1040,6 +1040,19 @@ class MainActivity : FlutterActivity() {
                 // preserve the existing in-flight protection and sweep quotas.
                 activeShareTargets.add(shareFile.absolutePath)
                 try {
+                    // Fail fast when the disk clearly cannot hold the
+                    // snapshot: mirrors the import pre-check — without this
+                    // the copy runs until an ENOSPC write fails it mid-way,
+                    // wasting the user's wait on a doomed copy.
+                    val sourceSize = source.length()
+                    if (sourceSize > 0 &&
+                        stagingDir.usableSpace < sourceSize + IMPORT_SPACE_MARGIN_BYTES
+                    ) {
+                        throw ImportNoSpaceException(
+                            "Not enough free space to share this EPUB " +
+                                "(needs about ${sourceSize / 1024 / 1024} MB)."
+                        )
+                    }
                     source.copyTo(shareFile, overwrite = true)
                 } catch (error: Exception) {
                     // Don't leave a truncated staging file behind.
@@ -1065,6 +1078,31 @@ class MainActivity : FlutterActivity() {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                             }
                         )
+                        // Record the URI grant: the staging snapshot must not
+                        // be swept while its grant is alive. The grant is
+                        // revoked (and the snapshot deleted) only by the
+                        // 7-day backstop in cleanupOldShareStaging.
+                        try {
+                            val prefs = appContext.getSharedPreferences(
+                                PREFS_NAME,
+                                Context.MODE_PRIVATE,
+                            )
+                            val entries =
+                                prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet())
+                                    ?: emptySet()
+                            prefs.edit().putStringSet(
+                                SHARE_GRANTS_PREF_KEY,
+                                recordShareGrant(
+                                    entries,
+                                    uri.toString(),
+                                    shareFile.absolutePath,
+                                    System.currentTimeMillis(),
+                                ),
+                            ).apply()
+                        } catch (_: Exception) {
+                            // Best effort: without a ledger entry the file
+                            // falls back to the grace-period heuristic.
+                        }
                         result.success(null)
                     } catch (error: Exception) {
                         try {
@@ -1075,19 +1113,38 @@ class MainActivity : FlutterActivity() {
                     }
                 }
             } catch (error: Exception) {
-                replyOnUiThread(result) { result.error("SHARE_FAILED", error.message, null) }
+                replyOnUiThread(result) {
+                    when (error) {
+                        is ImportNoSpaceException ->
+                            result.error("SHARE_NO_SPACE", error.message, null)
+                        else ->
+                            result.error("SHARE_FAILED", error.message, null)
+                    }
+                }
             }
         }
     }
 
     /**
-     * Deletes share staging copies older than 7 days, then enforces a
-     * count/size cap (newest files win, oldest evicted first) so rapid
-     * shares can't pile up unbounded inside the 7-day window. Best effort
-     * only: a failed cleanup must not block sharing.
+     * Sweeps share_staging/ so snapshots don't accumulate forever.
+     *
+     * Deletion follows the URI grants' lifetime, not a fixed grace period:
+     * every share records its grant in the ledger, a snapshot with a live
+     * grant is never quota-evicted, and the 7-day backstop revokes the
+     * grant before deleting the file — so a grant never outlives its file.
+     * The count/size quota counts ALL surviving snapshots (a burst of
+     * shares inside the grace period cannot silently exceed it). Best
+     * effort only: a failed cleanup must not block sharing.
      */
     private fun cleanupOldShareStaging(stagingDir: File) {
         try {
+            val appCtx = applicationContext
+            val prefs = appCtx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            fun readGrants(): Set<String> =
+                prefs.getStringSet(SHARE_GRANTS_PREF_KEY, emptySet()) ?: emptySet()
+            fun writeGrants(grants: Set<String>) {
+                prefs.edit().putStringSet(SHARE_GRANTS_PREF_KEY, grants).apply()
+            }
             val now = System.currentTimeMillis()
             // Drop zero-byte orphans: a claim whose copy died mid-flight
             // (e.g. the process was killed) leaves an empty file that
@@ -1098,37 +1155,58 @@ class MainActivity : FlutterActivity() {
             // chunk lands. Also skip claims registered in
             // activeShareTargets: same-millisecond clock granularity must
             // never let the sweep win over a live claim.
+            var grants = readGrants()
             stagingDir.listFiles()?.forEach { file ->
                 if (file.isFile && file.length() == 0L &&
                     file.absolutePath !in activeShareTargets &&
                     now - file.lastModified() >= SHARE_STAGING_CAP_GRACE_MS
                 ) {
-                    file.delete()
+                    if (file.delete()) {
+                        grants = dropShareGrant(grants, file.absolutePath)
+                    }
                 }
             }
-            val files = stagingDir.listFiles()?.filter { it.isFile }?.toMutableList()
-                ?: return
-            files.filter { it.lastModified() < now - SHARE_STAGING_MAX_AGE_MS }
-                .forEach { it.delete() }
-            // Files younger than the grace period may still have their
-            // chooser open (the target app reads asynchronously), so only
-            // cap-evict files old enough to be safely dead.
-            val evictable = files
-                .filter { it.exists() && now - it.lastModified() >= SHARE_STAGING_CAP_GRACE_MS }
-                .sortedBy { it.lastModified() }
-            var totalBytes = evictable.sumOf { it.length() }
-            var count = evictable.size
-            for (file in evictable) {
-                if (count <= MAX_SHARE_STAGING_FILES && totalBytes <= MAX_SHARE_STAGING_BYTES) {
-                    break
+            val liveFiles = stagingDir.listFiles()?.filter { it.isFile } ?: return
+            // Forget ledger entries whose file is already gone.
+            grants = dropStaleShareGrants(
+                grants,
+                liveFiles.mapTo(mutableSetOf()) { it.absolutePath },
+            )
+            writeGrants(grants)
+            val grantUriByPath = loadShareGrants(grants).mapValues { it.value.uri }
+            val plan = planShareStagingCleanup(
+                liveFiles.map { file ->
+                    ShareStagingEntry(
+                        path = file.absolutePath,
+                        lastModified = file.lastModified(),
+                        length = file.length(),
+                    )
+                },
+                grantUriByPath,
+                now,
+            )
+            // Revoke before deleting: the grant must never outlive its file.
+            for (uri in plan.revokeUris) {
+                try {
+                    appCtx.revokeUriPermission(
+                        Uri.parse(uri),
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                } catch (_: Exception) {
+                    // Best effort: the file still has to go.
                 }
-                val size = file.length()
-                if (!file.delete()) {
-                    break
-                }
-                totalBytes -= size
-                count -= 1
             }
+            for (entry in plan.deleteForAge) {
+                grants = dropShareGrant(grants, entry.path)
+                File(entry.path).delete()
+            }
+            for (entry in plan.evictForCap) {
+                grants = dropShareGrant(grants, entry.path)
+                if (!File(entry.path).delete()) {
+                    break
+                }
+            }
+            writeGrants(grants)
         } catch (_: Exception) {
             // A failed cleanup must not block sharing.
         }
@@ -1489,14 +1567,32 @@ class MainActivity : FlutterActivity() {
      * provider-declared MIME type identifies an EPUB: an EPUB is a ZIP
      * archive, so its first four bytes are PK\x03\x04. A non-EPUB ZIP that
      * slips through is rejected later by the Dart-side structure check.
+     *
+     * The probe stream is registered in [activeImport]: like the copy
+     * stream, a read() wedged inside a stalled cloud provider must be
+     * closable by the pick watchdog / onDestroy. Unregistered, the watchdog
+     * would see no stream and only replace the executor, leaking the
+     * thread, the stream, and the Activity context it pins.
      */
-    private fun hasZipMagicBytes(uri: Uri, taskGeneration: Int): Boolean {
-        return try {
-            contentResolver.openInputStream(uri).use { input ->
-                if (!importLifecycle.isCurrent(taskGeneration)) return@use false
-                if (input == null) {
-                    return@use false
+    private fun hasZipMagicBytes(
+        uri: Uri,
+        taskGeneration: Int,
+        deadlineElapsed: Long,
+    ): Boolean {
+        var holder: ActiveImport? = null
+        try {
+            val stream = contentResolver.openInputStream(uri) ?: return false
+            if (!importLifecycle.isCurrent(taskGeneration)) {
+                try {
+                    stream.close()
+                } catch (_: Exception) {
                 }
+                return false
+            }
+            holder = ActiveImport(stream, deadlineElapsed)
+            activeImport.set(holder)
+            return stream.use { input ->
+                if (!importLifecycle.isCurrent(taskGeneration)) return@use false
                 val header = ByteArray(4)
                 var read = 0
                 while (read < 4) {
@@ -1514,7 +1610,22 @@ class MainActivity : FlutterActivity() {
                     header[3] == 0x04.toByte()
             }
         } catch (_: Exception) {
-            false
+            // The watchdog closes the registered probe stream at the
+            // deadline but (unlike the pre-registration wedge) does NOT
+            // replace the executor, so the generation check below would not
+            // fire: report the deadline expiry explicitly instead of
+            // misreporting INVALID_FILE_TYPE. Mirrors the copy loop's own
+            // elapsed-time check.
+            if (SystemClock.elapsedRealtime() >= deadlineElapsed) {
+                throw ImportStaleException()
+            }
+            return false
+        } finally {
+            // Only clear our own registration: the watchdog may have taken
+            // the holder and closed the stream already (compareAndSet then
+            // no-ops here), and a newer pick's stream must never be
+            // disturbed.
+            holder?.let { activeImport.compareAndSet(it, null) }
         }
     }
 
@@ -2003,15 +2114,6 @@ class MainActivity : FlutterActivity() {
         /** Set once POST_NOTIFICATIONS has been requested on Android 13+. */
         private const val KEY_ASKED_POST_NOTIFICATIONS = "asked_post_notifications"
         private const val SECRET_TRANSFORMATION = "AES/GCM/NoPadding"
-        /** Share staging files older than this are swept unconditionally. */
-        private const val SHARE_STAGING_MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
-        /** Cap for share_staging/: newest files win, oldest evicted first. */
-        private const val MAX_SHARE_STAGING_FILES = 20
-        private const val MAX_SHARE_STAGING_BYTES = 200L * 1024 * 1024
-        /** Staging files younger than this are exempt from the count/size
-         * cap: their chooser may still be open and the target app may not
-         * have read the file yet. */
-        private const val SHARE_STAGING_CAP_GRACE_MS = 5L * 60 * 1000
         /** MediaStore Downloads entries stuck at IS_PENDING=1 older than
          * this are treated as orphans of a killed save and deleted. */
         private const val STALE_PENDING_DOWNLOADS_MS = 60L * 60 * 1000
