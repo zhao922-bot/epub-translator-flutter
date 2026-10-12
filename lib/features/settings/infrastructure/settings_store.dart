@@ -11,6 +11,7 @@ import '../../../shared/platform/native_platform_bridge.dart';
 import '../../../shared/platform/platform_utils.dart';
 import '../../../shared/io/atomic_file_writer.dart';
 import '../../../shared/io/strip_bom.dart';
+import '../../../shared/io/settings_file_lock.dart';
 import '../../translation/domain/models/translation_config.dart';
 import '../../translation/infrastructure/epub_isolate_worker.dart';
 
@@ -39,6 +40,12 @@ abstract class SettingsSecretStore {
 }
 
 enum SettingsSecretSlot { legacy, deepSeek, custom, proxy }
+
+class SettingsWriteConflict implements Exception {
+  @override
+  String toString() =>
+      'Settings changed in another instance; reload before saving.';
+}
 
 /// settings.json could not be written because another program holds a
 /// Windows file lock (sharing violation) on it — e.g. a second app instance,
@@ -141,6 +148,10 @@ class SettingsStore {
   // Compare against this instance's last loaded/saved values. An unchanged
   // local snapshot must not overwrite keys another app instance updated.
   Map<SettingsSecretSlot, String>? _secretSnapshot;
+  String? _settingsSnapshot;
+  TranslationConfig? _loadedConfig;
+  bool _allowLegacyMigration = true;
+  int _settingsRevision = 0;
   final Map<SettingsSecretSlot, String> _pendingPlaintextKeys = {};
 
   /// Set when an Android KeyStore read reported SECRET_KEY_ROTATED (the
@@ -187,6 +198,12 @@ class SettingsStore {
   Object? get configLoadError => _configLoadError;
 
   Future<TranslationConfig> load() async {
+    final file = await _settingsFile();
+    // Endpoint metadata and its secure credentials must be read together.
+    return withSettingsFileLock(file, _loadLocked);
+  }
+
+  Future<TranslationConfig> _loadLocked() async {
     final TranslationConfig config;
     try {
       config = await _loadConfigFromFile();
@@ -199,7 +216,9 @@ class SettingsStore {
     final _SecretReadResult storedApiKey = storedKeys[0];
     final _SecretReadResult storedDeepSeekKey = storedKeys[1];
     final _SecretReadResult storedCustomKey = storedKeys[2];
-    final String legacyKey = storedApiKey.value?.isNotEmpty == true
+    final String legacyKey = !_allowLegacyMigration
+        ? ''
+        : storedApiKey.value?.isNotEmpty == true
         ? storedApiKey.value!
         : config.apiKey;
     final String deepSeekKey = storedDeepSeekKey.value?.isNotEmpty == true
@@ -246,6 +265,7 @@ class SettingsStore {
       _pendingPlaintextKeys[providerSlot] = config.apiKey;
     }
     final bool needsSecureAllocation =
+        _allowLegacyMigration &&
         storedApiKey.value?.isNotEmpty == true &&
         (providerSlot == SettingsSecretSlot.deepSeek
                     ? storedDeepSeekKey
@@ -262,6 +282,10 @@ class SettingsStore {
           ..._pendingPlaintextKeys.keys,
           if (needsSecureAllocation) providerSlot,
         };
+        final file = await _settingsFile();
+        final current = await file.exists() ? await file.readAsString() : null;
+        if (current != _settingsSnapshot) throw SettingsWriteConflict();
+        resolvedConfig.toJson();
         await _saveSecrets(
           resolvedConfig,
           slotsToSave: migrationSlots,
@@ -293,6 +317,7 @@ class SettingsStore {
         );
       }
     }
+    _loadedConfig = resolvedConfig;
     return resolvedConfig;
   }
 
@@ -325,6 +350,8 @@ class SettingsStore {
     lastCorruptBackupPath = null;
     final File file = await _settingsFile();
     if (!await file.exists()) {
+      _settingsSnapshot = null;
+      _settingsRevision = 0;
       didCorruptReset = false;
       lastCorruptBackupPath = null;
       return TranslationConfig.defaults();
@@ -357,6 +384,8 @@ class SettingsStore {
         // so the UI can tell the user where their settings went.
         lastCorruptBackupPath = await _backupCorruptSettingsFile(file);
         if (await file.exists()) rethrow;
+        _settingsSnapshot = null;
+        _settingsRevision = 0;
         didCorruptReset = true;
         AppLogger.error(
           'Failed to parse settings.json; using defaults.',
@@ -377,6 +406,11 @@ class SettingsStore {
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('settings.json is not a JSON object');
     }
+    _settingsSnapshot = raw;
+    _allowLegacyMigration = decoded['credentialSchemaVersion'] != 2;
+    _settingsRevision = decoded['settingsRevision'] is int
+        ? decoded['settingsRevision'] as int
+        : 0;
     return TranslationConfig.fromJson(decoded);
   }
 
@@ -468,6 +502,28 @@ class SettingsStore {
     if (_configLoadError != null) {
       throw StateError('Settings could not be loaded; reload before saving.');
     }
+    // Validate before touching any secret slot, not just before JSON encoding.
+    config.toJson();
+    final file = await _settingsFile();
+    await withSettingsFileLock(file, () async {
+      final current = await file.exists() ? await file.readAsString() : null;
+      if (_didLoad && current != _settingsSnapshot) {
+        throw SettingsWriteConflict();
+      }
+      await _saveLocked(
+        config,
+        explicitSecretMutations: explicitSecretMutations,
+      );
+    });
+  }
+
+  Future<void> _saveLocked(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {
+    if (_configLoadError != null) {
+      throw StateError('Settings could not be loaded; reload before saving.');
+    }
     final Set<SettingsSecretSlot> explicit =
         explicitSecretMutations ??
         (_secretSnapshot == null
@@ -492,10 +548,43 @@ class SettingsStore {
     // throws StateError) must not silently discard the non-secret settings
     // the user just changed. The secret error still propagates so the
     // caller reports the failed key save and the user can retry.
+    bool secretsSaved = false;
     try {
       await _saveSecrets(config, slotsToSave: slotsToSave, explicit: explicit);
+      secretsSaved = true;
     } finally {
-      await _writeSettingsJson(config);
+      // Endpoint and credentials form one unit. A partial secret failure
+      // must not publish a changed endpoint with credentials from an old run.
+      final previous = _loadedConfig;
+      final customFailed =
+          values[SettingsSecretSlot.custom] !=
+          _secretSnapshot?[SettingsSecretSlot.custom];
+      final deepSeekFailed =
+          values[SettingsSecretSlot.deepSeek] !=
+          _secretSnapshot?[SettingsSecretSlot.deepSeek];
+      final proxyFailed =
+          values[SettingsSecretSlot.proxy] !=
+          _secretSnapshot?[SettingsSecretSlot.proxy];
+      final providerFailed =
+          config.apiProviderSelection == ApiProviderSelection.custom
+          ? customFailed
+          : deepSeekFailed;
+      final safeConfig = !secretsSaved && previous != null
+          ? config.copyWith(
+              apiBaseUrl: providerFailed
+                  ? previous.apiBaseUrl
+                  : config.apiBaseUrl,
+              apiProviderSelection: providerFailed
+                  ? previous.apiProviderSelection
+                  : config.apiProviderSelection,
+              customApiBaseUrl: customFailed
+                  ? previous.customApiBaseUrl
+                  : config.customApiBaseUrl,
+              httpProxy: proxyFailed ? previous.httpProxy : config.httpProxy,
+            )
+          : config;
+      await _writeSettingsJson(safeConfig);
+      _loadedConfig = safeConfig;
     }
   }
 
@@ -620,10 +709,8 @@ class SettingsStore {
     try {
       await save;
     } catch (error) {
-      // Proxy backend exceptions may contain the value passed to write.
-      final detail = slot == SettingsSecretSlot.proxy
-          ? error.runtimeType
-          : error;
+      // Secret backend exceptions may contain the value passed to write.
+      final detail = error.runtimeType;
       throw StateError('Failed to save ${_slotLabel(slot)}: $detail');
     }
   }
@@ -663,17 +750,24 @@ class SettingsStore {
     // Atomic write: a kill mid-save must not leave a truncated settings.json
     // behind (that would silently reset all settings on next load).
     try {
-      await writeFileAtomically(
-        file,
-        const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
+      final encoded = const JsonEncoder.withIndent('  ').convert(
+        <String, dynamic>{
           ...config.toJson(),
+          // Provider-specific slots are authoritative after the first write.
+          // A failed legacy deletion can never migrate into another provider.
+          'credentialSchemaVersion': 2,
+          'settingsRevision': _settingsRevision + 1,
           if (_pendingPlaintextKeys.containsKey(SettingsSecretSlot.deepSeek))
             'deepseekApiKey':
                 _pendingPlaintextKeys[SettingsSecretSlot.deepSeek],
           if (_pendingPlaintextKeys.containsKey(SettingsSecretSlot.custom))
             'customApiKey': _pendingPlaintextKeys[SettingsSecretSlot.custom],
-        }),
+        },
       );
+      await writeFileAtomically(file, encoded);
+      _settingsSnapshot = encoded;
+      _allowLegacyMigration = false;
+      _settingsRevision += 1;
     } catch (error) {
       throw mapSettingsWriteError(file.path, error);
     }

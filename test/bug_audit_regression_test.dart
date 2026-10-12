@@ -15,42 +15,50 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:html/parser.dart' as html;
 
 void main() {
-  test(
-    'connection probe preserves custom path and encoded query values',
-    () async {
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      addTearDown(() => server.close(force: true));
-      Uri? observed;
-      server.listen((request) async {
-        observed = request.uri;
-        await request.drain<void>();
-        request.response.headers.contentType = ContentType.json;
-        request.response.write(
-          jsonEncode({
-            'choices': [
-              {
-                'message': {'content': 'OK'},
-              },
-            ],
-          }),
-        );
-        await request.response.close();
-      });
-      await const TranslationApiClient().testConnection(
-        config: TranslationConfig.defaults().copyWith(
-          apiBaseUrl:
-              'http://127.0.0.1:${server.port}/gateway/v1?token=a%2Fb&version=2024',
-          apiKey: 'audit-placeholder',
-        ),
+  test('connection probe preserves a credential-free custom path', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    Uri? observed;
+    server.listen((request) async {
+      observed = request.uri;
+      await request.drain<void>();
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(
+        jsonEncode({
+          'choices': [
+            {
+              'message': {'content': 'OK'},
+            },
+          ],
+        }),
       );
-      expect(observed!.path, '/gateway/v1/chat/completions');
-      expect(observed!.queryParameters, {'token': 'a/b', 'version': '2024'});
-    },
-  );
+      await request.response.close();
+    });
+    await const TranslationApiClient().testConnection(
+      config: TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}/gateway/v1',
+        apiKey: 'audit-placeholder',
+      ),
+    );
+    expect(observed!.path, '/gateway/v1/chat/completions');
+    expect(observed!.queryParameters, isEmpty);
+  });
 
   for (final query in ['', '?token=demo']) {
     test('API request keeps endpoint path with base query "$query"', () async {
       const client = TranslationApiClient();
+      if (query.isNotEmpty) {
+        expect(
+          () => client.buildDio(
+            TranslationConfig.defaults().copyWith(
+              apiBaseUrl: 'https://example.test/v1$query',
+              apiKey: 'audit-placeholder',
+            ),
+          ),
+          throwsFormatException,
+        );
+        return;
+      }
       final dio = client.buildDio(
         TranslationConfig.defaults().copyWith(
           apiBaseUrl: 'https://example.test/v1$query',

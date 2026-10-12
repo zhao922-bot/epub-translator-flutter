@@ -297,18 +297,28 @@ void main() {
       );
     });
 
-    test('preserves query parameters instead of corrupting them', () {
+    test('rejects embedded query credentials before a request', () {
       expect(
-        client.normalizedBaseUrl('https://api.example.com/v1?key=xxx'),
-        'https://api.example.com/v1?key=xxx',
+        () => client.normalizedBaseUrl('https://api.example.com/v1?key=xxx'),
+        throwsFormatException,
       );
     });
 
-    test('appends /v1 after a custom path without touching the query', () {
+    test('appends /v1 after a credential-free custom path', () {
       expect(
-        client.normalizedBaseUrl('https://api.example.com/custom?key=xxx'),
-        'https://api.example.com/custom/v1?key=xxx',
+        client.normalizedBaseUrl('https://api.example.com/custom'),
+        'https://api.example.com/custom/v1',
       );
+    });
+
+    test('rejects userinfo and fragments without echoing credentials', () {
+      for (final url in [
+        'https://user:password@host/v1?key=secret',
+        'https://user:password@host/v1',
+        'https://host/v1#secret',
+      ]) {
+        expect(() => client.normalizedBaseUrl(url), throwsFormatException);
+      }
     });
 
     test('strips a pasted /chat/completions suffix', () {

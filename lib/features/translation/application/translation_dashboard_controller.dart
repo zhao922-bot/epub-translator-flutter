@@ -2624,12 +2624,16 @@ class TranslationDashboardController
     state = state.copyWith(jobHistory: _mergeJobHistory(history));
   }
 
+  // Restart inference is local UI state, never evidence that another process
+  // stopped. Persist the original snapshot until this instance starts a run.
+  final Map<TranslationJob, TranslationJob> _inferredInterruptions = {};
+
   TranslationJob _restoreInterruptedJob(TranslationJob job) {
     if (job.status != TranslationJobStatus.queued &&
         job.status != TranslationJobStatus.running) {
       return job;
     }
-    return job.copyWith(
+    final restored = job.copyWith(
       status: TranslationJobStatus.cancelled,
       currentChapter: _isTranslationRunPhase(job.phase)
           ? _s.jobStatusTranslationInterrupted
@@ -2639,6 +2643,8 @@ class TranslationDashboardController
       // so currentChapter is safe to localize.
       errorMessage: _s.jobInterruptedOnRestart,
     );
+    _inferredInterruptions[restored] = job;
+    return restored;
   }
 
   List<TranslationJob> _mergeJobHistory(List<TranslationJob> jobs) {
@@ -2673,7 +2679,18 @@ class TranslationDashboardController
         merged[job.id] = job;
       }
     }
-    return merged.values.take(20).toList(growable: false);
+    final sorted = merged.values.toList()
+      ..sort((a, b) {
+        int latestTaskTime(TranslationJob job) => job.runStartedAt > 0
+            ? job.runStartedAt
+            : int.tryParse(job.id.split('-').first) ?? 0;
+        final byRun = latestTaskTime(b).compareTo(latestTaskTime(a));
+        if (byRun != 0) return byRun;
+        // Legacy IDs begin with wall-clock milliseconds. Deterministic ID
+        // ordering also makes equal timestamps independent of insertion order.
+        return b.id.compareTo(a.id);
+      });
+    return sorted.take(20).toList(growable: false);
   }
 
   void _persistJobHistory() {
@@ -2712,7 +2729,9 @@ class TranslationDashboardController
     // Snapshot what the merge needs: the merge callback runs inside the
     // store's cross-process lock, so it must be synchronous and cannot read
     // fresh state.
-    final List<TranslationJob> memoryJobs = state.jobHistory;
+    final List<TranslationJob> memoryJobs = state.jobHistory
+        .map((job) => _inferredInterruptions[job] ?? job)
+        .toList(growable: false);
     final int ownClearMs = _ownClearTombstoneMs;
     final int lastSeen = _lastSeenHistoryClearedAt;
     final ({bool written, int fileClearedAt}) result = await store.saveMerged(

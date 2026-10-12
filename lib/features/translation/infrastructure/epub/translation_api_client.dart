@@ -776,12 +776,13 @@ class TranslationApiClient {
   }
 
   /// Normalizes a user-typed API base URL into `<scheme>://<host>[:port]<path>/v1`
-  /// form, preserving query parameters and userinfo. Handles `/V1`
+  /// form. Embedded credentials, query and fragment components are rejected.
+  /// Handles `/V1`
   /// (case-insensitive match, normalized to lowercase because a literal
-  /// `/V1` 404s on case-sensitive servers), trailing slashes, a pasted
-  /// `/chat/completions` suffix, and query strings such as `?key=xxx`
-  /// (which must not be treated as part of the path).
+  /// `/V1` 404s on case-sensitive servers), trailing slashes and a pasted
+  /// `/chat/completions` suffix.
   String normalizedBaseUrl(String value) {
+    TranslationConfig.validateApiUrl(value);
     String trimmed = value.trim();
     if (trimmed.isEmpty) {
       return trimmed;

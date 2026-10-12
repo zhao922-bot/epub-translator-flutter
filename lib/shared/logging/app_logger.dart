@@ -30,8 +30,17 @@ class AppLogger {
     Object? error,
     StackTrace? stackTrace,
   }) {
-    _logger.e(_format(tag, message), error: error, stackTrace: stackTrace);
+    _logger.e(
+      _format(tag, message),
+      error: safeError(error),
+      stackTrace: stackTrace,
+    );
   }
+
+  /// Parser errors can carry the entire input, including old plaintext keys.
+  static Object? safeError(Object? error) => error is FormatException
+      ? 'FormatException (offset: ${error.offset ?? 'unknown'})'
+      : error;
 
   static String _format(String? tag, String message) {
     if (tag == null || tag.isEmpty) {

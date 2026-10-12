@@ -7,6 +7,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:logger/logger.dart';
 
 class _FakeSettingsSecretStore implements SettingsSecretStore {
   String? proxyAuthentication;
@@ -117,8 +118,290 @@ class _FakeSettingsSecretStore implements SettingsSecretStore {
   }
 }
 
+class _PausedCustomSecretStore extends _FakeSettingsSecretStore {
+  Completer<void>? release;
+  final started = Completer<void>();
+  @override
+  Future<void> writeCustomApiKey(String value) async {
+    final gate = release;
+    if (gate != null) {
+      started.complete();
+      await gate.future;
+    }
+    await super.writeCustomApiKey(value);
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  test('P1-8 a load cannot straddle secure key and endpoint writes', () async {
+    final temp = await Directory.systemTemp.createTemp('settings_read_write_');
+    addTearDown(() => temp.delete(recursive: true));
+    final file = File('${temp.path}/settings.json');
+    final secrets = _PausedCustomSecretStore();
+    final a = SettingsStore(
+      settingsFileProvider: () async => file,
+      secretStore: secrets,
+    );
+    final b = SettingsStore(
+      settingsFileProvider: () async => file,
+      secretStore: secrets,
+    );
+    await a.save(
+      TranslationConfig.defaults().copyWith(
+        apiProviderSelection: ApiProviderSelection.custom,
+        apiBaseUrl: 'https://old.example',
+        customApiBaseUrl: 'https://old.example',
+        apiKey: 'old',
+        customApiKey: 'old',
+      ),
+    );
+    final old = await a.load();
+    secrets.release = Completer<void>();
+    final saving = a.save(
+      old.copyWith(
+        apiBaseUrl: 'https://new.example',
+        customApiBaseUrl: 'https://new.example',
+        apiKey: 'new',
+        customApiKey: 'new',
+      ),
+    );
+    await secrets.started.future;
+    var loaded = false;
+    final loading = b.load().then((config) {
+      loaded = true;
+      return config;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(loaded, isFalse);
+    secrets.release!.complete();
+    await saving;
+    final config = await loading;
+    expect(config.apiBaseUrl, 'https://new.example');
+    expect(config.customApiKey, 'new');
+  });
+  test(
+    'P1-7 failed legacy delete cannot cross provider boundaries on restart',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('provider_ownership_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      SettingsStore makeStore() => SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      final store = makeStore();
+      await store.save(
+        TranslationConfig.defaults().copyWith(
+          apiKey: 'official-secret',
+          deepseekApiKey: 'official-secret',
+        ),
+      );
+      final loaded = await store.load();
+      secrets.failDeletes = true;
+      await expectLater(
+        store.save(
+          loaded.copyWith(
+            apiProviderSelection: ApiProviderSelection.custom,
+            apiBaseUrl: 'https://third-party.example',
+            customApiBaseUrl: 'https://third-party.example',
+            apiKey: '',
+            customApiKey: '',
+          ),
+        ),
+        throwsStateError,
+      );
+      expect(secrets.apiKey, 'official-secret');
+      final restarted = await makeStore().load();
+      expect(restarted.apiProviderSelection, ApiProviderSelection.custom);
+      expect(restarted.apiKey, isEmpty);
+      expect(restarted.customApiKey, isEmpty);
+      expect(restarted.deepseekApiKey, 'official-secret');
+      expect(secrets.customApiKey, isNull);
+    },
+  );
+
+  test(
+    'P1-7 explicit provider clear is not resurrected by legacy residue',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('provider_clear_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      final store = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      await store.save(
+        TranslationConfig.defaults().copyWith(
+          apiKey: 'old-secret',
+          deepseekApiKey: 'old-secret',
+        ),
+      );
+      final loaded = await store.load();
+      secrets.failDeletes = true;
+      await expectLater(
+        store.save(loaded.copyWith(apiKey: '', deepseekApiKey: '')),
+        throwsStateError,
+      );
+      final restarted = await SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      ).load();
+      expect(restarted.apiKey, isEmpty);
+      expect(restarted.deepseekApiKey, isEmpty);
+      expect(secrets.apiKey, 'old-secret');
+    },
+  );
+
+  test(
+    'P1-8 stale theme save cannot combine an old endpoint with a new key',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('settings_instances_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      SettingsStore makeStore() => SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      final a = makeStore();
+      await a.save(
+        TranslationConfig.defaults().copyWith(
+          apiProviderSelection: ApiProviderSelection.custom,
+          apiBaseUrl: 'https://old.example',
+          customApiBaseUrl: 'https://old.example',
+          apiKey: 'old-key',
+          customApiKey: 'old-key',
+        ),
+      );
+      final b = makeStore();
+      final aConfig = await a.load();
+      final bConfig = await b.load();
+      await a.save(
+        aConfig.copyWith(
+          apiBaseUrl: 'https://new.example',
+          customApiBaseUrl: 'https://new.example',
+          apiKey: 'new-key',
+          customApiKey: 'new-key',
+        ),
+      );
+      final mutationCount = secrets.secretMutationCount;
+      await expectLater(
+        b.save(bConfig.copyWith(themeMode: AppThemeMode.light)),
+        throwsA(isA<SettingsWriteConflict>()),
+      );
+      expect(secrets.secretMutationCount, mutationCount);
+      final restarted = await makeStore().load();
+      expect(restarted.apiBaseUrl, 'https://new.example');
+      expect(restarted.customApiBaseUrl, 'https://new.example');
+      expect(restarted.apiKey, 'new-key');
+      // A reload lets the caller retry its UI edit against the current version.
+      final refreshed = await b.load();
+      await b.save(refreshed.copyWith(themeMode: AppThemeMode.light));
+      expect((await makeStore().load()).themeMode, AppThemeMode.light);
+    },
+  );
+
+  test(
+    'P1-8 simultaneous saves serialize version checks including key-only edits',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'settings_concurrent_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      final a = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      final b = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      await a.save(
+        TranslationConfig.defaults().copyWith(
+          apiKey: 'old',
+          deepseekApiKey: 'old',
+        ),
+      );
+      final ca = await a.load();
+      final cb = await b.load();
+      final results = await Future.wait([
+        a
+            .save(ca.copyWith(apiKey: 'new', deepseekApiKey: 'new'))
+            .then<Object?>((_) => null, onError: (Object e) => e),
+        b
+            .save(cb.copyWith(themeMode: AppThemeMode.light))
+            .then<Object?>((_) => null, onError: (Object e) => e),
+      ]);
+      expect(results.whereType<SettingsWriteConflict>(), hasLength(1));
+      expect(results.where((e) => e == null), hasLength(1));
+    },
+  );
+
+  test(
+    'P1-9 credential-bearing API URLs never reach JSON or secret mutations',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'api_url_credentials_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File('${temp.path}/settings.json');
+      final secrets = _FakeSettingsSecretStore();
+      final store = SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: secrets,
+      );
+      await store.save(TranslationConfig.defaults());
+      final before = await file.readAsString();
+      final count = secrets.secretMutationCount;
+      for (final url in [
+        'https://user:password@host/v1?key=secret',
+        'https://host/v1?key=secret',
+        'https://user:password@host/v1',
+        'https://host/v1#secret',
+      ]) {
+        for (final custom in [false, true]) {
+          final config = TranslationConfig.defaults().copyWith(
+            apiBaseUrl: custom ? null : url,
+            customApiBaseUrl: custom ? url : null,
+          );
+          expect(config.toJson, throwsFormatException);
+          await expectLater(store.save(config), throwsFormatException);
+          expect(await file.readAsString(), before);
+          expect(secrets.secretMutationCount, count);
+        }
+      }
+    },
+  );
+
+  test('P1-10 corrupt plaintext config logs no source or API key', () async {
+    final temp = await Directory.systemTemp.createTemp('corrupt_secret_logs_');
+    addTearDown(() => temp.delete(recursive: true));
+    final file = File('${temp.path}/settings.json');
+    await file.writeAsString('{"apiKey":"ultra-private-secret", broken}');
+    final output = <String>[];
+    void listener(OutputEvent event) {
+      output.addAll(event.lines);
+      output.add('${event.origin.error}');
+    }
+
+    Logger.addOutputListener(listener);
+    addTearDown(() => Logger.removeOutputListener(listener));
+    final store = SettingsStore(
+      settingsFileProvider: () async => file,
+      secretStore: _FakeSettingsSecretStore(),
+    );
+    await store.load();
+    expect(store.didCorruptReset, isTrue);
+    expect(output.join('\n'), contains('FormatException'));
+    expect(output.join('\n'), contains('offset:'));
+    expect(output.join('\n'), isNot(contains('ultra-private-secret')));
+    expect(output.join('\n'), isNot(contains('apiKey')));
+  });
   test('native proxy authentication uses flutter secure storage', () async {
     FlutterSecureStorage.setMockInitialValues({});
     const store = NativeSettingsSecretStore();

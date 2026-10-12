@@ -797,6 +797,158 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 }
 
 void main() {
+  test(
+    'P1-6 queued restart inference stays local before another instance starts it',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('history_queued_');
+      addTearDown(() => temp.delete(recursive: true));
+      final store = JobHistoryStore(
+        historyFileProvider: () async => File('${temp.path}/history.json'),
+      );
+      const queued = TranslationJob(
+        id: 'queued',
+        inputPath: 'book.epub',
+        outputPath: 'out',
+        status: TranslationJobStatus.queued,
+        progress: 0,
+        runStartedAt: 10,
+        recordRevision: 1,
+      );
+      await store.save([queued]);
+      final b = TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+        historyStore: store,
+      );
+      addTearDown(b.dispose);
+      await b.debugPersistJobHistoryNow();
+      expect((await store.load()).single.status, TranslationJobStatus.queued);
+      await store.save([
+        queued.copyWith(
+          status: TranslationJobStatus.running,
+          recordRevision: 2,
+        ),
+      ]);
+      await b.debugPersistJobHistoryNow();
+      final saved = (await store.load()).single;
+      expect(saved.status, TranslationJobStatus.running);
+      expect(saved.recordRevision, 2);
+    },
+  );
+  test(
+    'P1-5 twenty stale memory jobs cannot evict another instance newest task',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('history_newest_');
+      addTearDown(() => temp.delete(recursive: true));
+      final store = JobHistoryStore(
+        historyFileProvider: () async => File('${temp.path}/history.json'),
+      );
+      final older = List.generate(
+        20,
+        (i) => TranslationJob(
+          id: 'old-$i',
+          inputPath: 'book-$i.epub',
+          outputPath: 'out',
+          status: TranslationJobStatus.completed,
+          progress: 1,
+          runStartedAt: i + 1,
+        ),
+      );
+      await store.save(older);
+      final controller = TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+        historyStore: store,
+      );
+      addTearDown(controller.dispose);
+      await controller.debugPersistJobHistoryNow();
+      const newest = TranslationJob(
+        id: 'other-instance-new',
+        inputPath: 'new.epub',
+        outputPath: 'out',
+        status: TranslationJobStatus.completed,
+        progress: 1,
+        runStartedAt: 100,
+      );
+      await store.save([newest, ...older.skip(1)]);
+      await controller.debugPersistJobHistoryNow();
+      final saved = await store.load();
+      expect(saved, hasLength(20));
+      expect(saved.first.id, newest.id);
+      expect(
+        saved.map((job) => job.runStartedAt),
+        orderedEquals([100, ...List.generate(19, (i) => 20 - i)]),
+      );
+      expect(saved.any((job) => job.id == 'old-0'), isFalse);
+    },
+  );
+
+  test(
+    'P1-6 second instance never persists inferred cancellation of a live run',
+    () async {
+      final temp = await Directory.systemTemp.createTemp('history_live_owner_');
+      addTearDown(() => temp.delete(recursive: true));
+      final store = JobHistoryStore(
+        historyFileProvider: () async => File('${temp.path}/history.json'),
+      );
+      final repository = _ProgressThenErrorRepository();
+      final a = TranslationDashboardController(
+        repository: repository,
+        historyStore: store,
+      );
+      addTearDown(a.dispose);
+      a.syncSettings(
+        TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
+      );
+      a.setInputPath('${temp.path}/book.epub');
+      a.setOutputDirectory(temp.path);
+      await a.startInspection();
+      final run = a.startTranslation();
+      await repository.started.future;
+      await a.debugPersistJobHistoryNow();
+      final initial = (await store.load()).first;
+      final b = TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+        historyStore: store,
+      );
+      addTearDown(b.dispose);
+      await b.debugPersistJobHistoryNow();
+      expect(b.state.jobHistory.first.status, TranslationJobStatus.cancelled);
+      expect((await store.load()).first.status, TranslationJobStatus.running);
+      repository.progress(4);
+      await a.debugPersistJobHistoryNow();
+      final progressed = (await store.load()).first;
+      expect(progressed.recordRevision, greaterThan(initial.recordRevision));
+      await b.debugPersistJobHistoryNow();
+      final retained = (await store.load()).first;
+      expect(retained.status, TranslationJobStatus.running);
+      expect(retained.completedBlocks, 4);
+      expect(retained.recordRevision, progressed.recordRevision);
+      repository.release.complete(
+        StateError('owner finished with real failure'),
+      );
+      await run;
+      await a.debugPersistJobHistoryNow();
+      await b.debugPersistJobHistoryNow();
+      expect((await store.load()).first.status, TranslationJobStatus.failed);
+    },
+  );
+
+  test(
+    'P1-1 confirmed Android bin and zip names with epub suffix pass Dart import',
+    () async {
+      final controller = TranslationDashboardController(
+        repository: _SuccessfulInspectionRepository(),
+      );
+      addTearDown(controller.dispose);
+      for (final name in ['book.bin.epub', 'book.zip.epub', 'book.epub']) {
+        expect(
+          await controller.importDroppedEpubPath('/imports/$name'),
+          isTrue,
+        );
+        expect(controller.state.inputPath, '/imports/$name');
+      }
+    },
+  );
+
   for (final cancelled in [false, true]) {
     test(
       'persisted progress cannot overwrite ${cancelled ? 'cancellation' : 'failure'} on restart',

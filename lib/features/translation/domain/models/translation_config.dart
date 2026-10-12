@@ -183,6 +183,8 @@ class TranslationConfig {
   }
 
   Map<String, dynamic> toJson() {
+    validateApiUrl(apiBaseUrl);
+    validateApiUrl(customApiBaseUrl);
     return <String, dynamic>{
       'apiBaseUrl': apiBaseUrl,
       'model': model,
@@ -205,6 +207,21 @@ class TranslationConfig {
       'lockedGlossary': lockedGlossary,
       'httpProxy': httpProxyAddress,
     };
+  }
+
+  /// API authentication belongs in the secure API-key slot. Query/fragment
+  /// credentials are ambiguous, so reject all query/fragment components.
+  static void validateApiUrl(String value) {
+    final uri = Uri.tryParse(value.trim());
+    if ((uri != null &&
+            (uri.userInfo.isNotEmpty || uri.hasQuery || uri.hasFragment)) ||
+        value.contains('@') ||
+        value.contains('?') ||
+        value.contains('#')) {
+      throw const FormatException(
+        'API URLs must not contain embedded credentials, queries or fragments.',
+      );
+    }
   }
 
   factory TranslationConfig.fromJson(Map<String, dynamic> json) {

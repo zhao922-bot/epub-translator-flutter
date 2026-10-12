@@ -63,6 +63,7 @@ class MainActivity : FlutterActivity() {
          * second reply would throw IllegalStateException.
          */
         val done = AtomicBoolean(false)
+        val watchdog = ImportWatchdog()
         var requestCode: Int = -1
     }
 
@@ -86,10 +87,11 @@ class MainActivity : FlutterActivity() {
     private var pendingSaveCall: MethodCall? = null
     private var pendingSaveResult: MethodChannel.Result? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    /** Native-side backstop for pickEpubFile: NOT cleared when the picker
-     * returns (it doubles as the copy watchdog); cleared when the activity
-     * is destroyed or the picker can't open. */
-    private var pickTimeoutCallback: Runnable? = null
+    /** UI-thread registry includes picker, queued and copying attempts so
+     * teardown can invalidate and answer all of them. */
+    private val importAttempts = mutableSetOf<ImportAttempt>()
+    private val importLifecycle = ImportLifecycle()
+    private val importsDestroyed get() = importLifecycle.destroyed
 
     /**
      * Elapsed-realtime timestamp (SystemClock.elapsedRealtime()) of the
@@ -155,7 +157,7 @@ class MainActivity : FlutterActivity() {
      * thread stays wedged. On the shared single thread, that wedged import
      * would starve every later saveToDownloads/shareFile call; isolated
      * here, a stalled import can only delay the next import: the pick
-     * watchdog ([pickTimeoutCallback]) closes the wedged stream at the
+     * watchdog closes the wedged stream at the
      * deadline (see [activeImport]), so the executor thread is freed and
      * the next import's copy is never stuck behind it forever.
      *
@@ -181,8 +183,7 @@ class MainActivity : FlutterActivity() {
      * would only corrupt a newer pick's state. Volatile because the bump
      * happens on the UI thread while the checks run on executor threads.
      */
-    @Volatile
-    private var importGeneration = 0
+    private val importGeneration get() = importLifecycle.generation
 
     /**
      * Absolute paths of import files referenced by job history, synced from
@@ -191,8 +192,7 @@ class MainActivity : FlutterActivity() {
      * file (bug: the 7-day sweep used to delete it out from under the
      * retry).
      */
-    private val protectedImportPaths: MutableSet<String> =
-        Collections.synchronizedSet(mutableSetOf<String>())
+    private val protectedImportPaths = ProtectedImportPaths()
 
     /**
      * The import copy currently reading on [importExecutor], if any, with
@@ -335,7 +335,7 @@ class MainActivity : FlutterActivity() {
     private fun recreateImportExecutor() {
         val old = importExecutor
         importExecutor = Executors.newSingleThreadExecutor()
-        importGeneration += 1
+        importLifecycle.invalidate()
         old.shutdownNow()
     }
 
@@ -363,6 +363,7 @@ class MainActivity : FlutterActivity() {
             return
         }
         attempt.requestCode = requestCode
+        importAttempts.add(attempt)
         lastImportAttempt.set(attempt)
         pendingPick = attempt
         // The whole pick operation (picker UI + copy) shares the Dart
@@ -388,9 +389,7 @@ class MainActivity : FlutterActivity() {
         //    (picker still open, or the copy task never started); the
         //    running copy task answers its own result via replyToImport(),
         //    whose done-guard makes a double reply impossible.
-        // Note this deliberately does NOT clear pickTimeoutCallback: the
-        // field belongs to whichever pick registered last, and
-        // cancelPickTimeout()/the next pick own it.
+        // Each attempt retains its own watchdog until completion/teardown.
         val timeout = Runnable {
             if (lastImportAttempt.get() !== attempt || attempt.done.get()) {
                 return@Runnable
@@ -444,10 +443,12 @@ class MainActivity : FlutterActivity() {
                         "The file picker timed out after 5 minutes.",
                         null
                     )
+                    cancelPickTimeout(attempt)
+                    importAttempts.remove(attempt)
                 }
             }
         }
-        pickTimeoutCallback = timeout
+        attempt.watchdog.callback = timeout
         mainHandler.postDelayed(timeout, PICK_TIMEOUT_MS)
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -465,7 +466,8 @@ class MainActivity : FlutterActivity() {
             // DocumentsUI). Clear the pending slot, otherwise every later
             // import would wrongly report PICK_IN_PROGRESS until the
             // process dies.
-            cancelPickTimeout()
+            cancelPickTimeout(attempt)
+            importAttempts.remove(attempt)
             pickerRequests.consume(attempt.requestCode)
             pendingPick = null
             attempt.done.set(true)
@@ -477,11 +479,8 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun cancelPickTimeout() {
-        pickTimeoutCallback?.let {
-            mainHandler.removeCallbacks(it)
-            pickTimeoutCallback = null
-        }
+    private fun cancelPickTimeout(attempt: ImportAttempt) {
+        attempt.watchdog.cancel { mainHandler.removeCallbacks(it) }
     }
 
     @Deprecated("Deprecated in Android, still supported by FlutterActivity.")
@@ -543,7 +542,7 @@ class MainActivity : FlutterActivity() {
                 // The watchdog may have failed this attempt while it was
                 // still queued (an executor replacement dropped it from the
                 // old queue): never copy for an already-answered attempt.
-                if (attempt.done.get()) {
+                if (attempt.done.get() || !importLifecycle.isCurrent(taskGeneration)) {
                     return@execute
                 }
                 // The stale-imports sweep runs here, off the UI thread (it
@@ -552,7 +551,7 @@ class MainActivity : FlutterActivity() {
                 cleanupStaleImports()
                 try {
                     val selectedName = queryDisplayName(uri)
-                    if (taskGeneration != importGeneration) {
+                    if (!importLifecycle.isCurrent(taskGeneration)) {
                         // The watchdog replaced the executor while we were
                         // blocked: this pick is past its deadline, so answer
                         // PICK_TIMEOUT (if nobody did) instead of copying.
@@ -568,10 +567,14 @@ class MainActivity : FlutterActivity() {
                 // segment (never blank), which used to make this branch
                 // unreachable for exactly the providers it was written for.
                 val mimeType = contentResolver.getType(uri)
+                if (!importLifecycle.isCurrent(taskGeneration)) {
+                    replyImportTimeout(attempt)
+                    return@execute
+                }
                 val looksLikeEpub = selectedName.endsWith(".epub", ignoreCase = true) ||
                     mimeType.equals("application/epub+zip", ignoreCase = true) ||
-                    hasZipMagicBytes(uri)
-                if (taskGeneration != importGeneration) {
+                    hasZipMagicBytes(uri, taskGeneration)
+                if (!importLifecycle.isCurrent(taskGeneration)) {
                     // Same guard after the second round of blocking
                     // provider IPC calls.
                     replyImportTimeout(attempt)
@@ -595,7 +598,7 @@ class MainActivity : FlutterActivity() {
                     copyDeadlineElapsed,
                     taskGeneration
                 )
-                if (taskGeneration != importGeneration) {
+                if (!importLifecycle.isCurrent(taskGeneration)) {
                     // The executor was replaced mid-copy (a watchdog fired
                     // while we were blocked): this pick is past its
                     // deadline, so delete the finished file instead of
@@ -654,17 +657,13 @@ class MainActivity : FlutterActivity() {
      */
     private fun replyToImport(attempt: ImportAttempt, reply: () -> Unit) {
         if (attempt.done.compareAndSet(false, true)) {
-            // Normal completion (success, user cancel, copy failure): the
-            // watchdog is no longer needed — drop it from the main queue
-            // instead of letting it linger for the full 5 minutes holding
-            // the Activity/Result/ImportAttempt references. Only when it
-            // still belongs to this attempt: a newer pick may already have
-            // registered its own watchdog (the stale one then no-ops via
-            // its lastImportAttempt guard and must be left alone).
-            if (lastImportAttempt.get() === attempt) {
-                cancelPickTimeout()
+            // Cancel this attempt's callback on main, where registration and
+            // teardown also run. A newer attempt's watchdog is never touched.
+            replyOnUiThread(attempt.result) {
+                cancelPickTimeout(attempt)
+                importAttempts.remove(attempt)
+                if (!importsDestroyed) reply()
             }
-            replyOnUiThread(attempt.result, reply)
         }
     }
 
@@ -688,8 +687,7 @@ class MainActivity : FlutterActivity() {
      */
     private fun setProtectedImportPaths(call: MethodCall, result: MethodChannel.Result) {
         val paths = call.argument<List<String>>("paths").orEmpty()
-        protectedImportPaths.clear()
-        protectedImportPaths.addAll(paths.filter { it.isNotBlank() }.toSet())
+        protectedImportPaths.replace(paths)
         result.success(null)
     }
 
@@ -762,6 +760,12 @@ class MainActivity : FlutterActivity() {
             var totalBytes = evictable.sumOf { it.length() }
             var count = evictable.size
             for (file in evictable) {
+                // Protection may have been replaced after building this list.
+                if (file.absolutePath in protectedImportPaths) {
+                    totalBytes -= file.length()
+                    count -= 1
+                    continue
+                }
                 if (count <= MAX_IMPORT_FILES && totalBytes <= MAX_IMPORT_BYTES) {
                     break
                 }
@@ -895,9 +899,10 @@ class MainActivity : FlutterActivity() {
         // reply failures are swallowed: the engine may already be gone.
         // A pending picker timeout must not fire after teardown: the reply
         // would go nowhere and the runnable would leak with the looper.
-        cancelPickTimeout()
-        pendingPick?.let { attempt ->
-            pendingPick = null
+        importLifecycle.destroy()
+        pendingPick = null
+        importAttempts.toList().forEach { attempt ->
+            cancelPickTimeout(attempt)
             // The watchdog is cancelled above, so this is the only path
             // that can still answer this attempt: mark it done so a
             // concurrently-firing watchdog can't double-reply.
@@ -912,6 +917,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+        importAttempts.clear()
         pendingSaveResult?.let { pending ->
             pendingSaveResult = null
             pendingSaveCall = null
@@ -936,7 +942,7 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
         }
-        importExecutor.shutdown()
+        importExecutor.shutdownNow()
         // The translation itself runs in the Dart isolate, and the engine
         // is destroyed with this activity (shouldDestroyEngineWithHost
         // defaults to true; rotation and friends are handled via
@@ -1130,14 +1136,7 @@ class MainActivity : FlutterActivity() {
         deadlineElapsed: Long,
         taskGeneration: Int,
     ): String {
-        var safeName = sanitizeFileName(displayName)
-        if (!safeName.contains('.')) {
-            // Some document providers report no display name, leaving only a
-            // bare document id with no extension. The picker was opened for
-            // EPUBs, so assume .epub instead of producing a file the app
-            // would later reject for missing its suffix.
-            safeName += ".epub"
-        }
+        val safeName = confirmedEpubName(sanitizeFileName(displayName))
         val importsDir = File(filesDir, "imports").apply { mkdirs() }
         // Fail fast when the disk clearly cannot hold the import: without
         // this the copy runs to completion before the first ENOSPC write
@@ -1145,7 +1144,7 @@ class MainActivity : FlutterActivity() {
         // tell" — fall through to the copy, whose write errors still
         // surface as PICK_FAILED.
         val sourceSize = querySourceSize(uri)
-        if (taskGeneration != importGeneration) {
+        if (!importLifecycle.isCurrent(taskGeneration)) {
             // The watchdog replaced the executor while we were blocked in
             // the provider query above: this pick is past its deadline —
             // abort before claiming a target (the caller answers
@@ -1176,7 +1175,7 @@ class MainActivity : FlutterActivity() {
         try {
             contentResolver.openInputStream(uri).use { input ->
                 requireNotNull(input) { "Unable to open selected EPUB." }
-                if (taskGeneration != importGeneration) {
+                if (!importLifecycle.isCurrent(taskGeneration)) {
                     // The watchdog replaced the executor while openInputStream()
                     // was blocked: abort before registering the stream —
                     // this pick is past its deadline (the caller answers
@@ -1191,6 +1190,9 @@ class MainActivity : FlutterActivity() {
                 val holder = ActiveImport(input, deadlineElapsed)
                 activeImport.set(holder)
                 try {
+                    if (!importLifecycle.isCurrent(taskGeneration)) {
+                        throw ImportStaleException()
+                    }
                     FileOutputStream(partFile).use { output ->
                         // Chunked (not input.copyTo) so the copy can abort when
                         // it outlives the Dart 5-minute timeout: continuing would
@@ -1203,6 +1205,9 @@ class MainActivity : FlutterActivity() {
                                 )
                             }
                             val n = input.read(buffer)
+                            if (!importLifecycle.isCurrent(taskGeneration)) {
+                                throw ImportStaleException()
+                            }
                             if (n <= 0) {
                                 break
                             }
@@ -1212,6 +1217,9 @@ class MainActivity : FlutterActivity() {
                 } finally {
                     activeImport.compareAndSet(holder, null)
                 }
+            }
+            if (!importLifecycle.isCurrent(taskGeneration)) {
+                throw ImportStaleException()
             }
             if (!partFile.renameTo(target)) {
                 throw IllegalStateException("Unable to finalize imported EPUB.")
@@ -1471,9 +1479,10 @@ class MainActivity : FlutterActivity() {
      * archive, so its first four bytes are PK\x03\x04. A non-EPUB ZIP that
      * slips through is rejected later by the Dart-side structure check.
      */
-    private fun hasZipMagicBytes(uri: Uri): Boolean {
+    private fun hasZipMagicBytes(uri: Uri, taskGeneration: Int): Boolean {
         return try {
             contentResolver.openInputStream(uri).use { input ->
+                if (!importLifecycle.isCurrent(taskGeneration)) return@use false
                 if (input == null) {
                     return@use false
                 }
@@ -1481,6 +1490,7 @@ class MainActivity : FlutterActivity() {
                 var read = 0
                 while (read < 4) {
                     val n = input.read(header, read, 4 - read)
+                    if (!importLifecycle.isCurrent(taskGeneration)) return@use false
                     if (n <= 0) {
                         break
                     }
