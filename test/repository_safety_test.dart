@@ -2307,13 +2307,9 @@ void main() {
           ),
         ],
       ),
-      throwsA(
-        isA<DioException>().having(
-          (DioException error) => error.response?.statusCode,
-          'status code',
-          413,
-        ),
-      ),
+      completion(<String>[
+        '<p>Translate this sentence.<a href="#note-1"><sup>1</sup></a></p>',
+      ]),
     );
 
     expect(adapter.strictRequestCount, 3);
@@ -2492,13 +2488,12 @@ void main() {
             _footnoteReference(0, 'A normal HTML footnote.'),
           ],
         ),
-        throwsA(
-          isA<DioException>().having(
-            (DioException error) => error.response?.statusCode,
-            'status code',
-            413,
-          ),
-        ),
+        completion(<String, String>{
+          'f0:p-1': _footnoteReference(
+            0,
+            'A normal HTML footnote.',
+          ).block.sourceHtml,
+        }),
       );
 
       expect(adapter.requestCount, 1);

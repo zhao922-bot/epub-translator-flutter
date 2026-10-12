@@ -943,7 +943,7 @@ void main() {
   });
 
   test(
-    'single oversized footnote preserves 413 without resending it',
+    'single oversized footnote reports source degradation without resending it',
     () async {
       final Directory temp = await Directory.systemTemp.createTemp(
         'epub_repository_single_footnote_413_test_',
@@ -977,21 +977,20 @@ void main() {
         config: config,
       );
 
-      await expectLater(
-        repository.translateChapters(
-          inputPath: epubFile.path,
-          outputDirectory: temp.path,
-          config: config,
-          chapters: inspection.chapters,
-        ),
-        throwsA(
-          isA<DioException>().having(
-            (DioException error) => error.response?.statusCode,
-            'statusCode',
-            HttpStatus.requestEntityTooLarge,
-          ),
-        ),
+      final logs = <String>[];
+      final result = await repository.translateChapters(
+        inputPath: epubFile.path,
+        outputDirectory: temp.path,
+        config: config,
+        chapters: inspection.chapters,
+        onProgress: (job, line) => logs.add(line),
       );
+      expect(result.job.degradedBlockCount, 1);
+      expect(
+        result.chapters.single.blocks.single.translatedHtml,
+        '<p>One oversized footnote.</p>',
+      );
+      expect(logs.any((line) => line.contains('HTTP 413')), isTrue);
 
       expect(server.totalRequests, 1);
       expect(server.blockRequestIds, <List<String>>[

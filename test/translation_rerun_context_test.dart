@@ -8,6 +8,8 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_result.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
+import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
@@ -115,6 +117,83 @@ class _Api extends TranslationApiClient {
           },
         ],
       },
+    );
+  }
+}
+
+class _CorrectnessApi extends _Api {
+  _CorrectnessApi({
+    this.cache,
+    this.cancelSlots = false,
+    this.oversizedSlots = false,
+  });
+  final _Cache? cache;
+  final bool cancelSlots;
+  final bool oversizedSlots;
+  final systems = <String>[];
+  final payloads = <Map<String, dynamic>>[];
+
+  @override
+  Future<Response<dynamic>> postChatCompletions({
+    required Dio dio,
+    required Map<String, dynamic> data,
+    CancelToken? cancelToken,
+  }) async {
+    final messages = data['messages'] as List;
+    final system = messages.first['content'] as String;
+    systems.add(system);
+    final user = messages.last['content'] as String;
+    if (!system.startsWith('Translate the book title')) {
+      final payload = jsonDecode(user) as Map<String, dynamic>;
+      payloads.add(payload);
+      if (system.startsWith('Translate only each slot')) {
+        if (oversizedSlots) {
+          final options = RequestOptions();
+          throw DioException(
+            requestOptions: options,
+            type: DioExceptionType.badResponse,
+            response: Response(requestOptions: options, statusCode: 413),
+          );
+        }
+        if (cancelSlots) {
+          // The successful HTML part must already be durably cached here.
+          expect(
+            cache!.values.values.where(
+              (html) => html == '<p>银行</p>' || html == '<p>无上下文</p>',
+            ),
+            hasLength(1),
+          );
+          throw const TranslationCancelledException();
+        }
+        return Response(
+          requestOptions: RequestOptions(),
+          data: {
+            'choices': [
+              {
+                'message': {
+                  'content': jsonEncode({
+                    'blocks': [
+                      for (final block in payload['blocks'] as List)
+                        {
+                          'id': block['id'],
+                          'slots': [
+                            for (final slot in block['slots'] as List)
+                              {'id': slot['id'], 'text': '译文'},
+                          ],
+                        },
+                    ],
+                  }),
+                },
+              },
+            ],
+          },
+        );
+      }
+    }
+    return super.postChatCompletions(
+      dio: dio,
+      data: data,
+      cancelToken: cancelToken,
     );
   }
 }
@@ -324,6 +403,174 @@ void main() {
     );
   });
   tearDown(() => temp.delete(recursive: true));
+
+  test(
+    'A8 confirmed profile still generates initial summary and glossary',
+    () async {
+      final api = _CorrectnessApi();
+      const profile = TranslationStyleProfile(
+        primaryGenre: 'user confirmed fiction',
+        tone: 'quiet',
+      );
+      await EpubChapterTranslator(
+        cacheStore: _Cache(),
+        apiClient: api,
+        repacker: _Repacker(),
+      ).translateChapters(
+        inputPath: input,
+        outputDirectory: temp.path,
+        config: config.copyWith(styleProfileEnabled: true),
+        chapters: [chapters.first],
+        confirmedStyleProfile: profile,
+        cancelToken: CancelToken(),
+      );
+      expect(
+        api.payloads.where((p) => p['kind'] == 'initialBookMemory'),
+        hasLength(1),
+      );
+      final payload = api.payloads.firstWhere((p) => p['blocks'] != null);
+      final memory = (payload['context'] as Map)['bookMemory'] as Map;
+      expect(memory['bookSummary'], 'context');
+      expect((memory['glossary'] as List).first['target'], '银行');
+      expect(
+        (memory['styleProfile'] as Map)['primaryGenre'],
+        profile.primaryGenre,
+      );
+      expect(memory['styleProfileConfirmed'], isTrue);
+    },
+  );
+
+  test('A10 metadata title request includes locked glossary', () async {
+    final api = _CorrectnessApi();
+    await EpubChapterTranslator(
+      cacheStore: _Cache(),
+      apiClient: api,
+      repacker: _Repacker(),
+    ).translateChapters(
+      inputPath: input,
+      outputDirectory: temp.path,
+      config: config.copyWith(lockedGlossary: 'English => 英吉利'),
+      chapters: [chapters.first],
+      cancelToken: CancelToken(),
+    );
+    final titlePrompt = api.systems.singleWhere(
+      (s) => s.startsWith('Translate the book title'),
+    );
+    expect(titlePrompt, contains('English'));
+    expect(titlePrompt, contains('英吉利'));
+    expect(titlePrompt, contains('Locked terminology'));
+  });
+
+  test(
+    'A2 single oversized block is reported explicitly while the book completes',
+    () async {
+      final cache = _Cache();
+      final api = _CorrectnessApi(oversizedSlots: true);
+      final selected = const EpubHtmlExtractor()
+          .inspectChapterBytes(
+            chapterPath: 'one.xhtml',
+            bytes: utf8.encode(
+              '<body><p>bank</p><p>${'Long prose ' * 5000}<a href="#n1">[1]</a></p></body>',
+            ),
+          )
+          .copyWith(
+            category: ChapterCategory.content,
+            includeInTranslation: true,
+          );
+      final logs = <String>[];
+      final result =
+          await EpubChapterTranslator(
+            cacheStore: cache,
+            apiClient: api,
+            repacker: _Repacker(),
+          ).translateChapters(
+            inputPath: input,
+            outputDirectory: temp.path,
+            config: config.copyWith(
+              maxRetries: 1,
+              maxConcurrent: 1,
+              chunkSize: 1,
+            ),
+            chapters: [selected],
+            cancelToken: CancelToken(),
+            onProgress: (job, line) => logs.add(line),
+          );
+      expect(result.job.degradedBlockCount, 1);
+      expect(
+        logs.any(
+          (line) =>
+              line.contains('HTTP 413') && line.contains('source retained'),
+        ),
+        isTrue,
+      );
+      expect(
+        result.chapters.single.blocks.last.translatedHtml,
+        selected.blocks.last.sourceHtml,
+      );
+      expect(cache.values.values, ['<p>银行</p>']);
+    },
+  );
+
+  for (final footnote in [false, true]) {
+    test(
+      'A3 ${footnote ? "footnote" : "body"} mixed batch caches HTML before cancellation and reuses it on resume',
+      () async {
+        final cache = _Cache();
+        final selected = const EpubHtmlExtractor()
+            .inspectChapterBytes(
+              chapterPath: footnote ? 'one-fn.xhtml' : 'one.xhtml',
+              bytes: utf8.encode(
+                '<body><p>bank</p><p>Hello <a href="#n1">[1]</a></p></body>',
+              ),
+            )
+            .copyWith(
+              category: ChapterCategory.content,
+              includeInTranslation: true,
+            );
+        final firstApi = _CorrectnessApi(cache: cache, cancelSlots: true);
+        final runConfig = config.copyWith(chunkSize: 100000, maxConcurrent: 1);
+        await expectLater(
+          EpubChapterTranslator(
+            cacheStore: cache,
+            apiClient: firstApi,
+            repacker: _Repacker(),
+          ).translateChapters(
+            inputPath: input,
+            outputDirectory: temp.path,
+            config: runConfig,
+            chapters: [selected],
+            cancelToken: CancelToken(),
+          ),
+          throwsA(isA<TranslationCancelledException>()),
+        );
+        expect(
+          cache.values.values,
+          contains(footnote ? '<p>无上下文</p>' : '<p>银行</p>'),
+        );
+        final resumedApi = _CorrectnessApi(cache: cache);
+        await EpubChapterTranslator(
+          cacheStore: cache,
+          apiClient: resumedApi,
+          repacker: _Repacker(),
+        ).translateChapters(
+          inputPath: input,
+          outputDirectory: temp.path,
+          config: runConfig,
+          chapters: [selected],
+          cancelToken: CancelToken(),
+        );
+        expect(
+          resumedApi.sourceRequests,
+          isEmpty,
+          reason: 'The paid HTML sub-result must be restored from cache.',
+        );
+        expect(
+          resumedApi.payloads.where((p) => p['blocks'] != null),
+          hasLength(1),
+        );
+      },
+    );
+  }
 
   test(
     'separated footnote runs keep original request IDs and source-to-result mapping',

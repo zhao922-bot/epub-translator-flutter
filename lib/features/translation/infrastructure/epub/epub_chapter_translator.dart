@@ -95,11 +95,13 @@ class EpubChapterTranslator {
     required String chapterPath,
     required String blockId,
     bool apiCounted = false,
+    String? reason,
   }) {
     _run.markDegraded(
       chapterPath: chapterPath,
       blockId: blockId,
       apiCounted: apiCounted,
+      reason: reason,
     );
   }
 
@@ -327,6 +329,7 @@ class EpubChapterTranslator {
     List<ExtractedBlock> contextBefore = const <ExtractedBlock>[],
     List<ExtractedBlock> contextAfter = const <ExtractedBlock>[],
     Map<String, Object?>? bookMemory,
+    Future<void> Function(String id, String html)? onValidated,
   }) {
     _beginDegradedTracking(concurrency: config.maxConcurrent);
     return _strategy.translateBlockBatch(
@@ -343,6 +346,7 @@ class EpubChapterTranslator {
         ),
       ),
       retryDelayOverride: Duration.zero,
+      onValidated: onValidated,
     );
   }
 
@@ -351,6 +355,7 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required List<FootnoteBlockReference> references,
     Map<String, Object?>? bookMemory,
+    Future<void> Function(String id, String html)? onValidated,
   }) {
     _beginDegradedTracking(concurrency: config.maxConcurrent);
     return _strategy._translateFootnoteBatch(
@@ -364,6 +369,7 @@ class EpubChapterTranslator {
         ),
       ),
       retryDelayOverride: Duration.zero,
+      onValidated: onValidated,
     );
   }
 
@@ -753,6 +759,17 @@ class EpubChapterTranslator {
         },
       );
       final cachePutBestEffort = persistence.putBlock;
+      final Map<String, String> validatedCacheWrites = <String, String>{};
+      Future<bool> putValidated(String key, String html) async {
+        // Retain only a digest: completed chapter HTML is released to keep
+        // large-book memory bounded.
+        final String digest = sha256.convert(utf8.encode(html)).toString();
+        if (validatedCacheWrites[key] == digest) return false;
+        final bool written = await cachePutBestEffort(key, html);
+        if (written) validatedCacheWrites[key] = digest;
+        return written;
+      }
+
       final saveResumeStateBestEffort = persistence.save;
 
       if (previousState != null) {
@@ -858,7 +875,7 @@ class EpubChapterTranslator {
               styleProfile: userStyleProfile,
               styleProfileConfirmed: true,
             );
-      bool initialBookMemoryAttempted = userStyleProfile != null;
+      bool initialBookMemoryAttempted = false;
 
       if (userStyleProfile != null && !userStyleProfile.isEmpty) {
         emit(
@@ -1089,7 +1106,7 @@ class EpubChapterTranslator {
             if (cacheable) {
               // Count only successful writes: a swallowed cache failure
               // must not inflate the final "cache writes" report.
-              if (await cachePutBestEffort(
+              if (await putValidated(
                 _blockCacheKey(
                   config,
                   reference.block,
@@ -1157,6 +1174,26 @@ class EpubChapterTranslator {
                   onRequestAttempt: () {
                     requestCount += 1;
                     footnoteRequestCount += 1;
+                  },
+                  onValidated: (String id, String html) async {
+                    final reference = requestBatch.references.firstWhere(
+                      (r) => r.requestId == id,
+                    );
+                    final Stopwatch stopwatch = Stopwatch()..start();
+                    if (await putValidated(
+                      _blockCacheKey(
+                        config,
+                        reference.block,
+                        chapterPath: reference.chapter.path,
+                        inputFingerprint: inputFingerprint,
+                        contextIdentity: contextIdentity,
+                        confirmedStyleProfile: userStyleProfile,
+                      ),
+                      html,
+                    )) {
+                      cacheWriteCount += 1;
+                    }
+                    totalCacheWriteElapsed += stopwatch.elapsed;
                   },
                 );
               } finally {
@@ -1384,6 +1421,26 @@ class EpubChapterTranslator {
                     batch: batch,
                     chapterPath: chapter.path,
                     cancelToken: cancelToken,
+                    onValidated: (String id, String html) async {
+                      final block = batch.blocks.firstWhere((b) => b.id == id);
+                      final Stopwatch stopwatch = Stopwatch()..start();
+                      if (await putValidated(
+                        _blockCacheKey(
+                          config,
+                          block,
+                          chapterPath: chapter.path,
+                          inputFingerprint: inputFingerprint,
+                          contextIdentity: contextIdentity,
+                          confirmedStyleProfile: userStyleProfile,
+                        ),
+                        html,
+                      )) {
+                        chapterCacheWrites += 1;
+                        cacheWriteCount += 1;
+                      }
+                      chapterCacheWriteElapsed += stopwatch.elapsed;
+                      totalCacheWriteElapsed += stopwatch.elapsed;
+                    },
                   );
               apiStopwatch.stop();
               // Persist paid responses before reporting completion,
@@ -1402,7 +1459,7 @@ class EpubChapterTranslator {
               final List<bool> cacheWriteResults =
                   await Future.wait<bool>(<Future<bool>>[
                     for (final int index in cacheableIndexes)
-                      cachePutBestEffort(
+                      putValidated(
                         _blockCacheKey(
                           config,
                           batch.blocks[index],
@@ -1652,7 +1709,10 @@ class EpubChapterTranslator {
         // Scoped keys use \u0000 as the separator; render it readably.
         final String degradedBlockSample = _degradedBlocks
             .take(20)
-            .map((String key) => key.replaceAll('\u0000', ':'))
+            .map(
+              (String key) =>
+                  '${key.replaceAll('\u0000', ':')}${_run.degradedReasons[key] == null ? '' : ' (${_run.degradedReasons[key]})'}',
+            )
             .join(',');
         emit(
           currentJob.copyWith(
@@ -1967,6 +2027,11 @@ class EpubChapterTranslator {
     required String sourceHtml,
     required String translatedHtml,
   }) {
+    translatedHtml = _EpubTranslationStrategy._cleanHtmlResponse(
+      translatedHtml,
+      sourceText: _EpubBookMemory._plainTextFromHtmlFragment(sourceHtml),
+    );
+    _validateNonemptyBody(sourceHtml, translatedHtml);
     final locked = _lockHtmlStructureCore(
       sourceHtml: sourceHtml,
       translatedHtml: translatedHtml,
@@ -2140,10 +2205,17 @@ class EpubChapterTranslator {
     // Flatten smallcaps spans in a clone of the source root.
     final dom.Element flattened = sourceRoot.clone(true);
     bool changed = false;
+    bool retainedSemanticSpan = false;
     for (final dom.Element span
         in flattened.querySelectorAll('span').toList(growable: false)) {
       final String cls = span.className.toLowerCase();
       if (!cls.split(RegExp(r'\s+')).contains('smallcaps')) {
+        continue;
+      }
+      if (_spanHasSemanticAttributes(span)) {
+        span.classes.removeWhere(_isSmallCapsClass);
+        changed = true;
+        retainedSemanticSpan = true;
         continue;
       }
       final List<dom.Node> children = span.nodes.toList(growable: false);
@@ -2153,9 +2225,15 @@ class EpubChapterTranslator {
       span.remove();
       changed = true;
     }
-    if (!changed ||
-        !_htmlStructureMatches(flattened.outerHtml, translatedHtml)) {
+    if (!changed) {
       return null;
+    }
+    if (!_htmlStructureMatches(flattened.outerHtml, translatedHtml)) {
+      if (!retainedSemanticSpan) return null;
+      return _lockHtmlStructureCore(
+        sourceHtml: flattened.outerHtml,
+        translatedHtml: translatedHtml,
+      );
     }
     final String? restored = _restoreProtectedTexts(
       sourceHtml: flattened.outerHtml,
@@ -2817,22 +2895,16 @@ class EpubChapterTranslator {
   /// Used to skip translating book titles that need no translation.
   @visibleForTesting
   static bool titleAlreadyInTargetLanguage(String text, String targetLanguage) {
-    final String normalized = targetLanguage.trim().toLowerCase();
+    final String normalized = normalizeTargetLanguage(targetLanguage);
     final letters = text.replaceAll(
       RegExp(r'[\s\d\p{P}\p{S}]', unicode: true),
       '',
     );
-    if (normalized.contains('japanese') ||
-        normalized == 'ja' ||
-        normalized.contains('日语') ||
-        normalized.contains('日本語')) {
+    if (normalized == 'ja') {
       return RegExp(r'[\u3040-\u30ff]').hasMatch(letters) &&
           RegExp(r'^[\u3040-\u30ff\u3400-\u9fff]+$').hasMatch(letters);
     }
-    if (normalized.contains('korean') ||
-        normalized == 'ko' ||
-        normalized.contains('韩语') ||
-        normalized.contains('한국어')) {
+    if (normalized == 'ko') {
       return RegExp(r'^[\uac00-\ud7a3]+$').hasMatch(letters);
     }
     // Han characters alone cannot distinguish Chinese variants or a Japanese
@@ -2860,7 +2932,7 @@ class EpubChapterTranslator {
         <String, String>{
           'role': 'system',
           'content':
-              'Translate the book title into ${config.targetLanguage}. Return only the translated title, with no explanation, quotes, or formatting.',
+              'Translate the book title into ${config.targetLanguage}. Return only the translated title, with no explanation, quotes, or formatting.${_apiClient.lockedGlossaryInstruction(config)}',
         },
         <String, String>{'role': 'user', 'content': originalTitle},
       ],
@@ -2902,6 +2974,7 @@ class EpubChapterTranslator {
     required ExtractedBlock block,
     required String translatedHtml,
   }) {
+    _validateNonemptyBody(block.sourceHtml, translatedHtml);
     if (!config.residualQualityCheck) {
       return;
     }
@@ -3356,7 +3429,8 @@ class EpubChapterTranslator {
     required String targetLanguage,
   }) {
     if (!_isCjkTargetLanguage(targetLanguage) ||
-        (!sourceHtml.contains('dropcap') && !sourceHtml.contains('small'))) {
+        (!sourceHtml.toLowerCase().contains('dropcap') &&
+            !sourceHtml.toLowerCase().contains('small'))) {
       return sourceHtml;
     }
     final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
@@ -3380,8 +3454,7 @@ class EpubChapterTranslator {
       if (!isDropCap && !isUppercaseSmallCaps) {
         continue;
       }
-      if (span.attributes.containsKey('id') ||
-          span.attributes.containsKey('name')) {
+      if (_spanHasSemanticAttributes(span)) {
         span.classes.removeWhere(
           (token) =>
               token.toLowerCase().startsWith('dropcap') ||
@@ -3407,18 +3480,48 @@ class EpubChapterTranslator {
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
-    final String normalized = targetLanguage.trim().toLowerCase();
-    return normalized.contains('chinese') ||
-        normalized.contains('japanese') ||
-        normalized.contains('korean') ||
-        normalized.contains('中文') ||
-        normalized.contains('汉语') ||
-        normalized.contains('漢語') ||
-        normalized.contains('日语') ||
-        normalized.contains('日語') ||
-        normalized.contains('韩语') ||
-        normalized.contains('韓語');
+    return const {
+      'zh',
+      'ja',
+      'ko',
+    }.contains(normalizeTargetLanguage(targetLanguage));
   }
+
+  static void _validateNonemptyBody(String sourceHtml, String translatedHtml) {
+    bool hasBody(String html) => _textSlotsInFragment(
+      html,
+    ).any((slot) => !slot.protected && slot.text.trim().isNotEmpty);
+    if (hasBody(sourceHtml) && !hasBody(translatedHtml)) {
+      throw const TranslationParseException(
+        'Translated block has empty body text for a nonempty source.',
+      );
+    }
+  }
+
+  /// Canonical language identity for local script and prompt rules.
+  static String normalizeTargetLanguage(String language) {
+    final String value = language.trim().toLowerCase();
+    final String base = value.split(RegExp('[-_]')).first;
+    if (base == 'zh' ||
+        value.contains('chinese') ||
+        RegExp('中文|汉语|漢語').hasMatch(value)) {
+      return 'zh';
+    }
+    if (base == 'ja' ||
+        value.contains('japanese') ||
+        RegExp('日语|日語|日本語').hasMatch(value)) {
+      return 'ja';
+    }
+    if (base == 'ko' ||
+        value.contains('korean') ||
+        RegExp('韩语|韓語|한국어').hasMatch(value)) {
+      return 'ko';
+    }
+    return base;
+  }
+
+  static bool _spanHasSemanticAttributes(dom.Element span) =>
+      span.attributes.keys.any((key) => key != 'class' && key != 'style');
 
   static bool _isSmallCapsClass(String className) {
     final String normalized = className.toLowerCase();

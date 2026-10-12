@@ -19,6 +19,7 @@ class TranslationRunContext {
   final CancelToken cancelToken;
   final TranslationCancellationCheck? isCancelled;
   final Set<String> degradedBlocks = <String>{};
+  final Map<String, String> degradedReasons = <String, String>{};
   int apiDegradedBlocks = 0;
   Timer? _cancellationTimer;
 
@@ -54,13 +55,14 @@ class TranslationRunContext {
     required String chapterPath,
     required String blockId,
     bool apiCounted = false,
+    String? reason,
   }) {
-    final bool added = degradedBlocks.add(
-      EpubRepacker.degradedKeyForBlock(
-        chapterPath: chapterPath,
-        blockId: blockId,
-      ),
+    final String key = EpubRepacker.degradedKeyForBlock(
+      chapterPath: chapterPath,
+      blockId: blockId,
     );
+    final bool added = degradedBlocks.add(key);
+    if (reason != null) degradedReasons[key] = reason;
     if (added && apiCounted) apiDegradedBlocks += 1;
   }
 }

@@ -17,6 +17,7 @@ class _EpubTranslationStrategy {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     int? fallbackWindow,
+    Future<void> Function(String id, String html)? onValidated,
   }) async {
     final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
@@ -48,6 +49,7 @@ class _EpubTranslationStrategy {
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
+        onValidated: onValidated,
       );
       for (int index = 0; index < htmlBlocks.length; index += 1) {
         translatedById[htmlBlocks[index].id] = translatedHtml[index];
@@ -63,6 +65,7 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           apiCounted: true,
+          onValidated: onValidated,
         ),
       );
     }
@@ -79,6 +82,7 @@ class _EpubTranslationStrategy {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     int? fallbackWindow,
+    Future<void> Function(String id, String html)? onValidated,
   }) async {
     final Map<String, dynamic> payloadMap = <String, dynamic>{
       if (!batch.context.isEmpty) 'context': batch.context.toJson(),
@@ -145,6 +149,12 @@ class _EpubTranslationStrategy {
           }
 
           final Map<String, String> translatedById = <String, String>{};
+          final Set<String> requestedIds = batch.blocks
+              .map((block) => block.id)
+              .toSet();
+          if (requestedIds.length != batch.blocks.length) {
+            throw const FormatException('Requested block ids must be unique.');
+          }
           for (final dynamic item in blocksJson) {
             if (item is! Map<String, dynamic>) {
               throw const FormatException(
@@ -156,6 +166,11 @@ class _EpubTranslationStrategy {
             if (id is! String || html is! String || html.trim().isEmpty) {
               throw const FormatException(
                 'Translated batch item is missing id or html.',
+              );
+            }
+            if (!requestedIds.contains(id) || translatedById.containsKey(id)) {
+              throw const FormatException(
+                'Translated batch contains an unknown or duplicate id.',
               );
             }
             translatedById[id] = html.trim();
@@ -182,6 +197,7 @@ class _EpubTranslationStrategy {
                 translatedHtml: locked,
               );
               okById[block.id] = locked;
+              await onValidated?.call(block.id, locked);
             } on FormatException catch (error) {
               // Retry transient quality rejection at batch level. Preserve
               // successfully parsed blocks when only structure is invalid.
@@ -216,6 +232,7 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           fallbackWindow: fallbackWindow,
           cancelToken: cancelToken,
+          onValidated: onValidated,
         );
         for (int index = 0; index < parsed.failedBlocks.length; index += 1) {
           parsed.okById[parsed.failedBlocks[index].id] = retried[index];
@@ -265,6 +282,7 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           fallbackWindow: fallbackWindow,
+          onValidated: onValidated,
         );
       }
       rethrow;
@@ -287,6 +305,7 @@ class _EpubTranslationStrategy {
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
+        onValidated: onValidated,
       );
     }
   }
@@ -302,6 +321,7 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     bool Function()? isCancelled,
     int? fallbackWindow,
+    Future<void> Function(String id, String html)? onValidated,
   }) {
     final int limit = fallbackWindow ?? config.maxConcurrent;
     return const TranslationWorkQueue().map<ExtractedBlock, String>(
@@ -316,7 +336,7 @@ class _EpubTranslationStrategy {
       },
       process: (ExtractedBlock block, int index) async {
         try {
-          return await _translateBlock(
+          final String translated = await _translateBlock(
             dio: dio,
             config: config,
             block: block,
@@ -327,6 +347,13 @@ class _EpubTranslationStrategy {
             styleProfile: styleProfile,
             styleProfileConfirmed: styleProfileConfirmed,
           );
+          if (!owner._isDegradedBlock(
+            chapterPath: chapterPath ?? '',
+            blockId: block.id,
+          )) {
+            await onValidated?.call(block.id, translated);
+          }
+          return translated;
         } catch (error) {
           if (error is TranslationCancelledException ||
               EpubChapterTranslator._isCancelError(error) ||
@@ -361,7 +388,6 @@ class _EpubTranslationStrategy {
     bool styleProfileConfirmed = false,
   }) async {
     Object? lastError;
-    String? lastCleaned;
     String? lastLocked;
     for (int attempt = 1; ; attempt += 1) {
       try {
@@ -414,10 +440,10 @@ class _EpubTranslationStrategy {
           cancelToken: cancelToken,
         );
 
-        final String cleaned = owner._apiClient
-            .extractMessageContent(response.data)
-            .trim();
-        lastCleaned = cleaned;
+        final String cleaned = _cleanHtmlResponse(
+          owner._apiClient.extractMessageContent(response.data),
+          sourceText: block.sourceText,
+        );
         if (cleaned.isEmpty) {
           throw const FormatException(
             'The translation API returned an empty block.',
@@ -475,11 +501,7 @@ class _EpubTranslationStrategy {
     // variant so a quality rejection does not let tag/attribute drift from
     // the raw model reply leak into the EPUB.
     String degradeFallback() {
-      final String? usable =
-          lastLocked ??
-          (lastCleaned != null && lastCleaned.trim().isNotEmpty
-              ? lastCleaned
-              : null);
+      final String? usable = lastLocked;
       return usable ?? block.sourceHtml;
     }
 
@@ -527,6 +549,19 @@ class _EpubTranslationStrategy {
       );
       return degradeFallback();
     }
+    if (lastError is DioException && lastError.response?.statusCode == 413) {
+      owner._markDegradedBlock(
+        chapterPath: chapterPath ?? '',
+        blockId: block.id,
+        apiCounted: true,
+        reason: 'HTTP 413: block exceeds server request limit; source retained',
+      );
+      AppLogger.warn(
+        'Block ${block.id} exceeds the server request limit (HTTP 413); source retained.',
+        tag: 'translate',
+      );
+      return block.sourceHtml;
+    }
     if (lastError is DioException && lastError.error is HandshakeException) {
       final String host = Uri.parse(
         owner._apiClient.normalizedBaseUrl(config.apiBaseUrl),
@@ -551,6 +586,58 @@ class _EpubTranslationStrategy {
     ).hasMatch(message);
   }
 
+  static String _cleanHtmlResponse(String response, {String sourceText = ''}) {
+    String value = response.trim();
+    final Match? fence = RegExp(
+      r'^```(?:html|xhtml)?\s*\n([\s\S]*?)\n```$',
+      caseSensitive: false,
+    ).firstMatch(value);
+    if (fence != null) value = fence.group(1)!.trim();
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      value,
+    );
+    final bool hasMarkup = fragment.nodes.any((node) => node is dom.Element);
+    final bool hasOutsideText = fragment.nodes.any(
+      (node) => node is dom.Text && node.data.trim().isNotEmpty,
+    );
+    if (value.contains('```') ||
+        _hasTranslationExplanationPrefix(value) ||
+        (hasMarkup && hasOutsideText) ||
+        _hasTranslationExplanationPrefix(
+          _EpubBookMemory._plainTextFromHtmlFragment(value),
+        ) ||
+        _hasMarkdownWrapper(value) ||
+        _hasUnexpectedJsonWrapper(
+          sourceText: sourceText,
+          translatedText: value,
+        )) {
+      throw const TranslationParseException(
+        'HTML translation contains wrapper content.',
+      );
+    }
+    return value;
+  }
+
+  static bool _shouldDegradeSingle(Object error, TranslationConfig config) {
+    if (error is TranslationCancelledException ||
+        EpubChapterTranslator._isCancelError(error)) {
+      throw const TranslationCancelledException();
+    }
+    if (TranslationApiClient.isDeterministicHttpError(error)) {
+      throw StateError(
+        TranslationApiClient.deterministicHttpErrorMessage(error, config),
+      );
+    }
+    return error is FormatException ||
+        TranslationApiClient.isRequestTimeout(error) ||
+        (error is DioException && error.response?.statusCode == 413);
+  }
+
+  static String? _oversizedReason(Object error) =>
+      error is DioException && error.response?.statusCode == 413
+      ? 'HTTP 413: block exceeds server request limit; source retained'
+      : null;
+
   static bool _isEmptyTranslationResponse(Object error) {
     return error is FormatException &&
         error.toString().contains(
@@ -565,6 +652,7 @@ class _EpubTranslationStrategy {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+    Future<void> Function(String id, String html)? onValidated,
   }) async {
     final Set<String> requestedIds = batch.references
         .map((FootnoteBlockReference reference) => reference.requestId)
@@ -608,18 +696,23 @@ class _EpubTranslationStrategy {
             retryDelayOverride: retryDelayOverride,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
+            onValidated: onValidated,
           ),
         );
       } on DioException catch (error) {
         // 401/403/404/400 are deterministic configuration errors: fail fast
         // with the precise localized diagnostic instead of burning
         // per-reference fallback requests that would all fail the same way.
+        if (EpubChapterTranslator._isCancelError(error)) {
+          throw const TranslationCancelledException();
+        }
         if (TranslationApiClient.isDeterministicHttpError(error)) {
           throw StateError(
             TranslationApiClient.deterministicHttpErrorMessage(error, config),
           );
         }
-        if (TranslationApiClient.isConnectionTimeout(error)) {
+        if (TranslationApiClient.isConnectionTimeout(error) ||
+            (error.response?.statusCode == 413 && htmlReferences.length == 1)) {
           // A connection timeout is endpoint-wide rather than payload-size
           // related. The batch already retried once, so retain its source
           // blocks instead of multiplying the outage into per-block calls.
@@ -627,8 +720,13 @@ class _EpubTranslationStrategy {
             owner._markDegradedBlock(
               chapterPath: reference.chapter.path,
               blockId: reference.block.id,
+              reason: _oversizedReason(error),
             );
             translatedById[reference.requestId] = reference.block.sourceHtml;
+            AppLogger.warn(
+              'Footnote ${reference.requestId} retained its source (HTTP ${error.response?.statusCode}, ${error.type}).',
+              tag: 'translate',
+            );
           }
         } else {
           // Send and receive timeouts degrade alike: a receive timeout on a
@@ -636,7 +734,7 @@ class _EpubTranslationStrategy {
           // the payload never left — retrying each reference on its own
           // (one that still times out degrades to its source HTML) matches
           // the main block path, which degrades on any request timeout.
-          if (!TranslationApiClient.isRequestTimeout(error)) {
+          if (!TranslationApiClient.shouldFallbackBatchDioException(error)) {
             rethrow;
           }
           // A receive timeout on a large batch can be payload related. Retry
@@ -653,17 +751,23 @@ class _EpubTranslationStrategy {
                   retryDelayOverride: retryDelayOverride,
                   cancelToken: cancelToken,
                   onRequestAttempt: onRequestAttempt,
+                  onValidated: onValidated,
                 ),
               );
-            } on DioException catch (singleError) {
-              if (!TranslationApiClient.isRequestTimeout(singleError)) {
+            } catch (singleError) {
+              if (!_shouldDegradeSingle(singleError, config)) {
                 rethrow;
               }
               owner._markDegradedBlock(
                 chapterPath: reference.chapter.path,
                 blockId: reference.block.id,
+                reason: _oversizedReason(singleError),
               );
               translatedById[reference.requestId] = reference.block.sourceHtml;
+              AppLogger.warn(
+                'Footnote ${reference.requestId} retained its source after ${singleError.runtimeType}.',
+                tag: 'translate',
+              );
             }
           }
         }
@@ -684,12 +788,15 @@ class _EpubTranslationStrategy {
                 retryDelayOverride: retryDelayOverride,
                 cancelToken: cancelToken,
                 onRequestAttempt: onRequestAttempt,
+                onValidated: onValidated,
               ),
             );
-          } on FormatException {
+          } catch (singleError) {
+            if (!_shouldDegradeSingle(singleError, config)) rethrow;
             owner._markDegradedBlock(
               chapterPath: reference.chapter.path,
               blockId: reference.block.id,
+              reason: _oversizedReason(singleError),
             );
             translatedById[reference.requestId] = reference.block.sourceHtml;
           }
@@ -706,6 +813,7 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           onRequestAttempt: onRequestAttempt,
+          onValidated: onValidated,
         ),
       );
     }
@@ -723,6 +831,7 @@ class _EpubTranslationStrategy {
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
+    Future<void> Function(String id, String html)? onValidated,
   }) {
     final Set<String> requestedIds = references
         .map((FootnoteBlockReference reference) => reference.requestId)
@@ -832,6 +941,7 @@ class _EpubTranslationStrategy {
             translatedHtml: locked,
           );
           translatedById[reference.requestId] = locked;
+          await onValidated?.call(reference.requestId, locked);
         }
         return translatedById;
       },
@@ -851,6 +961,7 @@ class _EpubTranslationStrategy {
     // block up front (pass true so degrades are subtracted from the
     // report), the footnote pipeline never counts degrades (leave false).
     bool apiCounted = false,
+    Future<void> Function(String id, String html)? onValidated,
   }) async {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
@@ -868,45 +979,36 @@ class _EpubTranslationStrategy {
         cancelToken: cancelToken,
         onRequestAttempt: onRequestAttempt,
         maxAttemptsOverride: maxBatchAttempts,
+        onValidated: onValidated,
       );
     } on FormatException catch (error) {
       if (requests.length == 1) {
         try {
-          return await _translateProtectedSlotsIndividually(
-            dio: dio,
-            config: config,
-            request: requests.single,
-            context: context,
-            retryDelayOverride: retryDelayOverride,
-            cancelToken: cancelToken,
-            onRequestAttempt: onRequestAttempt,
+          final Map<String, String> translated =
+              await _translateProtectedSlotsIndividually(
+                dio: dio,
+                config: config,
+                request: requests.single,
+                context: context,
+                retryDelayOverride: retryDelayOverride,
+                cancelToken: cancelToken,
+                onRequestAttempt: onRequestAttempt,
+              );
+          await onValidated?.call(
+            requests.single.id,
+            translated[requests.single.id]!,
           );
-        } on FormatException catch (singleError) {
-          if (_isQualityRejection(singleError)) {
+          return translated;
+        } catch (singleError) {
+          if (_shouldDegradeSingle(singleError, config)) {
             owner._markDegradedBlock(
               chapterPath: requests.single.chapterPath,
               blockId: requests.single.block.id,
               apiCounted: apiCounted,
-            );
-            return <String, String>{
-              requests.single.id: requests.single.block.sourceHtml,
-            };
-          }
-          if (singleError is TranslationParseException) {
-            // A deterministic parse failure (empty reply, markdown/HTML
-            // wrapper) on one stubborn slot must not kill the whole book.
-            // The normal block path degrades per block on the same class of
-            // error; do the same here: keep the source text, record the
-            // degrade for the run report, and keep translating.
-            owner._markDegradedBlock(
-              chapterPath: requests.single.chapterPath,
-              blockId: requests.single.block.id,
-              apiCounted: apiCounted,
+              reason: _oversizedReason(singleError),
             );
             AppLogger.warn(
-              'Protected slot block ${requests.single.block.id} kept its '
-              'source text: the translation API returned an unparseable '
-              'response.',
+              'Protected block ${requests.single.block.id} retained its source after ${singleError.runtimeType}.',
               tag: 'translate',
             );
             return <String, String>{
@@ -934,6 +1036,7 @@ class _EpubTranslationStrategy {
               cancelToken: cancelToken,
               onRequestAttempt: onRequestAttempt,
               apiCounted: apiCounted,
+              onValidated: onValidated,
             ),
           );
         }
@@ -953,6 +1056,7 @@ class _EpubTranslationStrategy {
         onRequestAttempt: onRequestAttempt,
         maxBatchAttempts: 1,
         apiCounted: apiCounted,
+        onValidated: onValidated,
       );
       final Map<String, String> right = await _translateProtectedSlotBatch(
         dio: dio,
@@ -964,6 +1068,7 @@ class _EpubTranslationStrategy {
         onRequestAttempt: onRequestAttempt,
         maxBatchAttempts: 1,
         apiCounted: apiCounted,
+        onValidated: onValidated,
       );
       return <String, String>{...left, ...right};
     } on DioException catch (error) {
@@ -991,8 +1096,7 @@ class _EpubTranslationStrategy {
             request.id: request.block.sourceHtml,
         };
       }
-      if (TranslationApiClient.isRequestTimeout(error) &&
-          requests.length == 1) {
+      if (_shouldDegradeSingle(error, config) && requests.length == 1) {
         // A send timeout on a single slot request means the payload never
         // left; degrading to the source text matches the main block path,
         // which degrades on any request timeout instead of aborting the run.
@@ -1000,6 +1104,11 @@ class _EpubTranslationStrategy {
           chapterPath: requests.single.chapterPath,
           blockId: requests.single.block.id,
           apiCounted: apiCounted,
+          reason: _oversizedReason(error),
+        );
+        AppLogger.warn(
+          'Protected block ${requests.single.block.id} retained its source after ${error.runtimeType} (HTTP ${error.response?.statusCode}).',
+          tag: 'translate',
         );
         return <String, String>{
           requests.single.id: requests.single.block.sourceHtml,
@@ -1023,6 +1132,7 @@ class _EpubTranslationStrategy {
       cancelToken: cancelToken,
       onRequestAttempt: onRequestAttempt,
       apiCounted: apiCounted,
+      onValidated: onValidated,
     );
     final Map<String, String> right = await _translateProtectedSlotBatch(
       dio: dio,
@@ -1033,6 +1143,7 @@ class _EpubTranslationStrategy {
       cancelToken: cancelToken,
       onRequestAttempt: onRequestAttempt,
       apiCounted: apiCounted,
+      onValidated: onValidated,
     );
     return <String, String>{...left, ...right};
   }
@@ -1046,6 +1157,7 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     int? maxAttemptsOverride,
+    Future<void> Function(String id, String html)? onValidated,
   }) {
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
@@ -1171,14 +1283,17 @@ class _EpubTranslationStrategy {
               .toList(growable: false);
         }
 
-        return <String, String>{
-          for (final _ProtectedSlotRequest request in requests)
-            request.id: _renderAndValidateProtectedSlots(
-              config: config,
-              request: request,
-              translatedSlots: translatedSlotsById[request.id]!,
-            ),
-        };
+        final Map<String, String> translated = <String, String>{};
+        for (final _ProtectedSlotRequest request in requests) {
+          final String html = _renderAndValidateProtectedSlots(
+            config: config,
+            request: request,
+            translatedSlots: translatedSlotsById[request.id]!,
+          );
+          translated[request.id] = html;
+          await onValidated?.call(request.id, html);
+        }
+        return translated;
       },
     );
   }
@@ -1415,7 +1530,7 @@ class _EpubTranslationStrategy {
           r'^(?:(?:好的|当然|可以|没问题)[，,。.!！\s]*)?(?:(?:以下|下面)是)?(?:译文|翻译(?:结果|内容)?)(?:如下)?\s*[:：]',
         ).hasMatch(value) ||
         RegExp(
-          r"^(?:(?:sure|certainly|of course|okay|ok)[,!.]?\s*)?(?:here(?:'s| is)\s+)?(?:the\s+)?(?:translation|translated text)(?:\s+is)?\s*[:：]",
+          r"^(?:(?:sure|certainly|of course|okay|ok)[,!.]?\s*)?(?:here(?:'s| is)\s+)?(?:the\s+)?(?:translation(?: result)?|translated (?:text|html(?: fragment)?))(?:\s+is)?\s*[:：]",
           caseSensitive: false,
         ).hasMatch(value);
   }
@@ -1435,7 +1550,19 @@ class _EpubTranslationStrategy {
         final String source = sourceText.trim();
         return !(source.startsWith('"') && source.endsWith('"'));
       }
-      return true;
+      if (decoded is Map || decoded is List) return true;
+      // Numbers and booleans are ordinary text when the source is also a
+      // scalar, rather than evidence of a JSON protocol response.
+      if (decoded is num || decoded is bool) {
+        try {
+          final Object? source = jsonDecode(sourceText.trim());
+          return !((decoded is num && source is num) ||
+              (decoded is bool && source is bool));
+        } on FormatException {
+          return true;
+        }
+      }
+      return decoded == null && sourceText.trim() != 'null';
     } on FormatException {
       return false;
     }
@@ -1508,7 +1635,7 @@ class _EpubTranslationStrategy {
         '"clearing forest land"), translate it into ${config.targetLanguage} '
         'and, on its first occurrence in the book, keep the original term '
         'inside full-width parentheses as a gloss, for example '
-        'assarting（伐林开垦）. On later occurrences use only the translated '
+        '伐林开垦（assarting） (translated term followed by original term). On later occurrences use only the translated '
         'form without parentheses. Keep the gloss term inside the same inline '
         'text run and exact same element as the translated term would occupy.';
   }
@@ -1521,12 +1648,9 @@ class _EpubTranslationStrategy {
   /// the rule is stated explicitly. Prompt-level only: a model can still
   /// deviate, but in practice the explicit instruction holds.
   String _chineseSecondPersonInstruction({required TranslationConfig config}) {
-    final String normalized = config.targetLanguage.trim().toLowerCase();
     final bool isChinese =
-        normalized.contains('chinese') ||
-        normalized.contains('中文') ||
-        normalized.contains('汉语') ||
-        normalized.contains('漢語');
+        EpubChapterTranslator.normalizeTargetLanguage(config.targetLanguage) ==
+        'zh';
     if (!isChinese) {
       return '';
     }
