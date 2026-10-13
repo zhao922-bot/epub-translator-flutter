@@ -154,6 +154,10 @@ typedef _ConflictedEdit = ({
   TranslationConfig Function(TranslationConfig) update,
   Set<SettingsSecretSlot> explicitSecretMutations,
   Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
+  // P2-#28: field names this transformation modifies, computed at queue
+  // time by diffing. Used to drop stale earlier entries when a later entry
+  // successfully persists newer values for the same fields.
+  Set<String> changedFields,
   ({
     ApiProviderSelection providerSelection,
     String apiBaseUrl,
@@ -162,6 +166,67 @@ typedef _ConflictedEdit = ({
   })
   credentialRoute,
 });
+
+/// Returns the names of [TranslationConfig] fields that differ between
+/// [before] and [after]. Used by P2-#28 to detect when a later successful
+/// replay supersedes an earlier queued edit touching the same fields.
+Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
+  final changed = <String>{};
+  if (before.apiBaseUrl != after.apiBaseUrl) changed.add('apiBaseUrl');
+  if (before.apiKey != after.apiKey) changed.add('apiKey');
+  if (before.model != after.model) changed.add('model');
+  if (before.apiProviderSelection != after.apiProviderSelection) {
+    changed.add('apiProviderSelection');
+  }
+  if (before.deepseekApiKey != after.deepseekApiKey) {
+    changed.add('deepseekApiKey');
+  }
+  if (before.customApiBaseUrl != after.customApiBaseUrl) {
+    changed.add('customApiBaseUrl');
+  }
+  if (before.customApiKey != after.customApiKey) changed.add('customApiKey');
+  if (before.customModel != after.customModel) changed.add('customModel');
+  if (before.uiLanguage != after.uiLanguage) changed.add('uiLanguage');
+  if (before.themeMode != after.themeMode) changed.add('themeMode');
+  if (before.targetLanguage != after.targetLanguage) {
+    changed.add('targetLanguage');
+  }
+  if (before.bilingual != after.bilingual) changed.add('bilingual');
+  if (before.chunkSize != after.chunkSize) changed.add('chunkSize');
+  if (before.maxConcurrent != after.maxConcurrent) {
+    changed.add('maxConcurrent');
+  }
+  if (before.timeoutSeconds != after.timeoutSeconds) {
+    changed.add('timeoutSeconds');
+  }
+  if (before.maxRetries != after.maxRetries) changed.add('maxRetries');
+  if (before.retryDelaySeconds != after.retryDelaySeconds) {
+    changed.add('retryDelaySeconds');
+  }
+  if (before.outputSuffix != after.outputSuffix) changed.add('outputSuffix');
+  if (before.residualQualityCheck != after.residualQualityCheck) {
+    changed.add('residualQualityCheck');
+  }
+  if (before.styleProfileEnabled != after.styleProfileEnabled) {
+    changed.add('styleProfileEnabled');
+  }
+  if (before.textScale != after.textScale) changed.add('textScale');
+  if (before.lockedGlossary != after.lockedGlossary) {
+    changed.add('lockedGlossary');
+  }
+  if (before.httpProxy != after.httpProxy) changed.add('httpProxy');
+  return changed;
+}
+
+/// Field names that carry secrets. P2-#28's field-overlap drop never
+/// removes entries touching these; the stricter P2-#27 persisted-slots
+/// check owns secret superseding.
+const _secretRelatedFields = <String>{
+  'apiKey',
+  'deepseekApiKey',
+  'customApiKey',
+  'httpProxy',
+};
 
 class SettingsController extends StateNotifier<TranslationConfig> {
   SettingsController(
@@ -232,6 +297,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// The latest debounced (slider) transformation not yet flushed. Slider
   /// setters are absolute, so chaining keeps the effective transformation.
   TranslationConfig Function(TranslationConfig)? _debouncedEdit;
+
+  /// P2-#28: field names modified by [_debouncedEdit], computed when the
+  /// debounced edit is recorded. Needed when the flush save conflicts and
+  /// the transformation is queued for replay.
+  Set<String>? _debouncedChangedFields;
 
   int providerSelectionRevision = 0;
 
@@ -350,6 +420,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       _debouncedEdit = previous == null
           ? update
           : (TranslationConfig config) => update(previous(config));
+      // P2-#28: accumulate changed fields for the chained transformation.
+      final updateFields = _changedFields(prevState, next);
+      _debouncedChangedFields = previous == null
+          ? updateFields
+          : {...?_debouncedChangedFields, ...updateFields};
       final completion = _sliderCompletion ??= Completer<bool>();
       _sliderTimer = Timer(
         const Duration(milliseconds: 400),
@@ -362,12 +437,21 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _sliderTimer?.cancel();
     final debounced = _debouncedEdit;
     _debouncedEdit = null;
+    final debouncedFields = _debouncedChangedFields;
+    _debouncedChangedFields = null;
     // A non-debounced edit flushes a pending slider edit implicitly: the
     // recorded replay must compose both transformations, otherwise the
     // slider's value would be lost on conflict-replay.
+    //
+    // P2-#29: during a conflict replay, the queued [update] is older than
+    // the just-swallowed slider edit — apply the slider last so the newer
+    // user intent wins. (In the non-replay path the non-debounced edit is
+    // newer, so the original order stands.)
     final effectiveUpdate = debounced == null
         ? update
-        : (TranslationConfig config) => update(debounced(config));
+        : isConflictReplay
+            ? (TranslationConfig config) => debounced(update(config))
+            : (TranslationConfig config) => update(debounced(config));
     // P2-#29: the swallowed slider transformation must also be applied to
     // the state being saved, not just recorded for replay — otherwise the
     // save persists the pre-slider value. Slider setters are absolute, so
@@ -391,6 +475,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
                     update: debounced,
                     explicitSecretMutations: const <SettingsSecretSlot>{},
                     secretMutationsFor: null,
+                    // P2-#28: use the fields recorded when the slider edit
+                    // was made; recomputing against prevState now would be
+                    // empty (the slider value is already in prevState).
+                    changedFields: debouncedFields ?? const <String>{},
                     credentialRoute: (
                       providerSelection: state.apiProviderSelection,
                       apiBaseUrl: state.apiBaseUrl,
@@ -402,6 +490,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
               update: effectiveUpdate,
               explicitSecretMutations: explicitSecretMutations,
               secretMutationsFor: secretMutationsFor,
+              // P2-#28: effectiveNext is effectiveUpdate(prevState).
+              changedFields: _changedFields(prevState, effectiveNext),
               credentialRoute: credentialRoute,
             ),
     );
@@ -420,6 +510,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _sliderCompletion = null;
     final debounced = _debouncedEdit;
     _debouncedEdit = null;
+    final debouncedFields = _debouncedChangedFields;
+    _debouncedChangedFields = null;
     if (completion == null) return true;
     final bool ok = await _saveUpdate(
       state,
@@ -430,6 +522,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
               update: debounced,
               explicitSecretMutations: const <SettingsSecretSlot>{},
               secretMutationsFor: null,
+              // P2-#28: fields recorded when the slider edit was made.
+              changedFields: debouncedFields ?? const <String>{},
               credentialRoute: (
                 providerSelection: state.apiProviderSelection,
                 apiBaseUrl: state.apiBaseUrl,
@@ -601,14 +695,27 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             // save — dropping it would lose the key edit.
             final Set<SettingsSecretSlot> persisted =
                 _store.lastPersistedSecretSlots;
+            // P2-#28: fields this successful save changed (excluding
+            // secret-related fields, which the P2-#27 check owns).
+            final Set<String> justChanged = edit.changedFields.difference(
+              _secretRelatedFields,
+            );
             for (int j = 0; j < i; j++) {
+              final other = pending[j];
+              // P2-#28: drop earlier entries that touch the same non-secret
+              // fields, whether or not they were applied in this pass. Their
+              // transformations are stale — replaying them would revert the
+              // newer values just persisted.
+              final bool staleByFieldOverlap = justChanged.isNotEmpty &&
+                  other.changedFields.any(justChanged.contains);
               final int? appliedAt = appliedGeneration[j];
-              if (appliedAt != null &&
-                  appliedAt == _stateGeneration &&
-                  pending[j].credentialRoute.secretSlots.every(
-                    persisted.contains,
-                  )) {
-                _conflictedEdits.remove(pending[j]);
+              if (staleByFieldOverlap ||
+                  (appliedAt != null &&
+                      appliedAt == _stateGeneration &&
+                      other.credentialRoute.secretSlots.every(
+                        persisted.contains,
+                      ))) {
+                _conflictedEdits.remove(other);
               }
             }
           }
@@ -632,6 +739,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
         update: edit.update,
         explicitSecretMutations: edit.explicitSecretMutations,
         secretMutationsFor: edit.secretMutationsFor,
+        changedFields: edit.changedFields,
         credentialRoute: (
           providerSelection: state.apiProviderSelection,
           apiBaseUrl: state.apiBaseUrl,
