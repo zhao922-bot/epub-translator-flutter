@@ -2,23 +2,30 @@ import 'dart:async';
 import 'dart:io';
 
 // The OS file lock below serializes *processes* (advisory flock on
-// POSIX, mandatory LockFileEx on Windows). It does NOT serialize Dart
-// isolates in the same process: on POSIX, flock locks are associated with
-// the open file description and a process never blocks on its own lock,
-// so two isolates opening the same lock file would both succeed.
+// POSIX, mandatory LockFileEx on Windows). On POSIX it does NOT serialize
+// Dart isolates in the same process: flock locks are associated with the
+// open file description and a process never blocks on its own lock, so two
+// isolates opening the same lock file would both succeed. (On Windows the
+// mandatory lock is per-handle, so same-process isolates do conflict
+// there.)
 //
-// Cross-isolate mutual exclusion is provided by the in-process future
-// chain ([_settingsWriters]) instead: isolates in one process share the
-// same Dart heap, so chaining on a shared future serializes them. (A
-// chain keyed by absolute path also covers two File objects pointing at
-// the same path.)
+// The in-process future chain ([_settingsWriters]) serializes concurrent
+// callers within a *single isolate* only: Dart isolates do not share a
+// heap, so each isolate has its own top-level [_settingsWriters] map and
+// chaining on it cannot exclude another isolate. (A chain keyed by
+// absolute path still covers two File objects pointing at the same path
+// within the isolate.)
+//
+// Net effect: same-isolate callers are serialized by the future chain,
+// separate processes by the OS lock. Same-process cross-isolate writers
+// are NOT mutually excluded on POSIX — a known limitation, not a
+// guarantee (quality-#57: an earlier comment wrongly claimed the future
+// chain provided cross-isolate mutual exclusion).
 //
 // P2-#31: `IsolateNameServer`-based locking was considered and rejected:
 // it only works between isolates that explicitly register (spawned
 // isolates don't share it by default), it cannot serialize against a
-// second *process*, and a forgotten port mapping leaks the lock. The
-// future chain + OS lock combination covers same-process isolates and
-// separate processes with no registration protocol.
+// second *process*, and a forgotten port mapping leaks the lock.
 final Map<String, Future<void>> _settingsWriters = {};
 
 Future<T> withSettingsFileLock<T>(

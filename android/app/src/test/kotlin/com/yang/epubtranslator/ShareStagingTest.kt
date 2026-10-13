@@ -277,8 +277,10 @@ class ShareStagingTest {
     }
 
     @Test fun cleanupRevokeFailureDoesNotPropagate() {
-        // P2-#11: a revoke that throws must not fail the whole cleanup or
-        // disturb the ledger (the files are already gone at that point).
+        // P2-#17: a revoke that throws must not fail the whole cleanup —
+        // but its ledger entry is now RESTORED instead of dropped, so the
+        // persisted grant is not leaked without a record and a later sweep
+        // retries the revoke (see retryOrphanedGrantRevokes).
         val plan = ShareStagingCleanupPlan(
             deleteForAge = listOf(ShareStagingEntry("/s/old.epub", 1L, 10L)),
             revokeUris = listOf("content://u/old"),
@@ -291,7 +293,45 @@ class ShareStagingTest {
             deleteFile = { true },
             revokeUri = { throw RuntimeException("revoke exploded") },
         )
-        assertTrue(remaining.isEmpty())
+        assertEquals(setOf("content://u/old|/s/old.epub|1"), remaining)
+    }
+
+    @Test fun cleanupRevokeFailureThenOrphanRetrySucceeds() {
+        // P2-#17: the restored entry is picked up by
+        // retryOrphanedGrantRevokes on the next sweep (the file is already
+        // gone) and dropped once its revoke finally succeeds.
+        val plan = ShareStagingCleanupPlan(
+            deleteForAge = listOf(ShareStagingEntry("/s/old.epub", 1L, 10L)),
+            revokeUris = listOf("content://u/old"),
+            evictForCap = emptyList(),
+        )
+        val afterFailedRevoke = executeShareStagingCleanup(
+            plan = plan,
+            grantUriByPath = mapOf("/s/old.epub" to "content://u/old"),
+            grants = setOf("content://u/old|/s/old.epub|1"),
+            deleteFile = { true },
+            revokeUri = { throw RuntimeException("revoke exploded") },
+        )
+        assertEquals(setOf("content://u/old|/s/old.epub|1"), afterFailedRevoke)
+        val revoked = mutableListOf<String>()
+        val afterRetry = retryOrphanedGrantRevokes(
+            grants = afterFailedRevoke,
+            livePaths = emptySet(),
+            revokeUri = { revoked.add(it) },
+        )
+        assertEquals(listOf("content://u/old"), revoked)
+        assertTrue(afterRetry.isEmpty())
+    }
+
+    @Test fun orphanRetryKeepsEntryWhenRevokeFailsAgain() {
+        // P2-#17: an orphan whose revoke keeps failing stays in the ledger
+        // for the sweep after that.
+        val afterRetry = retryOrphanedGrantRevokes(
+            grants = setOf("content://u/old|/s/old.epub|1"),
+            livePaths = emptySet(),
+            revokeUri = { throw RuntimeException("still failing") },
+        )
+        assertEquals(setOf("content://u/old|/s/old.epub|1"), afterRetry)
     }
 
     @Test fun cleanupDeleteThrowIsTreatedAsFailureAndContinues() {

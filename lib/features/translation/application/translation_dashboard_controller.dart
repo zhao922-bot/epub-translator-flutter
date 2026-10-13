@@ -261,6 +261,13 @@ class TranslationDashboardController
   final Future<void> Function(String path)? windowsPathObserverOverride;
   bool _cancelRequested = false;
   int _cancellationRevision = 0;
+  // P1-#3: translation-run generation for progress callbacks. The previous
+  // run's wind-down (terminal emits, checkpoint saves) can outlive the run:
+  // once its terminal job lands, a new run may start while the old task
+  // still awaits saveJobState, and its late emits must not overwrite the
+  // new run's state. Bumped on every run launch; onProgress ignores
+  // callbacks captured under an older generation.
+  int _translationRunGeneration = 0;
   // Synchronous re-entrancy guards: checked and set before the first await so
   // a rapid double-tap cannot start two overlapping async flows.
   bool _styleProfileInFlight = false;
@@ -1370,6 +1377,9 @@ class TranslationDashboardController
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
     _translationStopwatch = Stopwatch()..start();
+    // P1-#3: capture the generation for this run's progress callbacks (the
+    // callback below drops anything from an older generation).
+    final int runGeneration = ++_translationRunGeneration;
     final TranslationJob? currentJob = state.job;
     final bool currentJobIsResumable =
         currentJob != null &&
@@ -1510,6 +1520,13 @@ class TranslationDashboardController
           if (!mounted || _cancelRequested) {
             return;
           }
+          // P1-#3: the previous run's wind-down (terminal emits, checkpoint
+          // saves) can still be awaiting while this run is active. Its late
+          // emits carry the old job and must not overwrite the new run's
+          // state — only the current generation may apply progress.
+          if (runGeneration != _translationRunGeneration) {
+            return;
+          }
           final TranslationJob progressJob = _translationHistoryJob(
             _verifiedCacheProgress(job.copyWith(errorMessage: null)),
           );
@@ -1633,6 +1650,14 @@ class TranslationDashboardController
             ),
         ],
       );
+      // P2-#18: the terminal estimate above was built against the
+      // pre-terminal chapter list, but state now carries result.chapters.
+      // Re-key the frozen static cache to the current list so the first
+      // post-terminal change (e.g. chunkSize) rescales from the anchor
+      // instead of falling into the P2-#7 "selection changed after release"
+      // branch that would ignore it. The frozen totals describe both lists
+      // (same selection, sources released on both sides).
+      _estimateStaticChaptersKey = result.chapters;
       _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
     } catch (error) {
@@ -2130,6 +2155,11 @@ class TranslationDashboardController
     if (_logIfRunActive(_s.logRunAlreadyActiveGeneric)) {
       return false;
     }
+    // P2-#26: wait for the initial history load before deriving the
+    // deletion watermark. _maxObservedRunStartedAtUs only covers the file's
+    // jobs once the load completes; deriving the watermark earlier lets a
+    // clock rollback slip pre-rollback records past the clear.
+    await _initialJobHistoryLoad;
     _historyClearRevision += 1;
     // Our own clear is the newest tombstone by definition; keep it
     // strictly monotonic so a same-millisecond double clear cannot tie.
@@ -2153,19 +2183,27 @@ class TranslationDashboardController
       watermarkUs = _historyClearWatermarkUs + 1;
     }
     _historyClearWatermarkUs = watermarkUs;
-    // Set synchronously, before any await: a persist that read the file
-    // before this clear must save verbatim (not merge) so it cannot
-    // resurrect the entries being cleared. Reset once our clear's save has
-    // landed — afterwards the file carries our tombstone and the merge path
-    // is safe again.
+    // Set before the clear's save is queued (no await in between): a persist
+    // that read the file before this clear must save verbatim (not merge)
+    // so it cannot resurrect the entries being cleared. Reset once our
+    // clear's save has landed — afterwards the file carries our tombstone
+    // and the merge path is safe again. (The initial-history-load await at
+    // the top of this method only lets already-queued work settle; the
+    // tombstone still precedes every write this clear issues.)
     _ownClearTombstoneMs = _lastSeenHistoryClearedAt;
     _ownClearWatermarkUs = _historyClearWatermarkUs;
     final clearMs = _ownClearTombstoneMs;
     final clearUs = _ownClearWatermarkUs;
-    state = state.copyWith(
-      jobHistory: const <TranslationJob>[],
-      logs: <String>[...state.logs, _s.logClearedHistory],
-    );
+    // D3: a clear initiated before dispose must still land its tombstone
+    // on disk even if dispose() runs while the initial-load await above
+    // is in flight. Skip the state update when disposed (ChangeNotifier
+    // throws on state access after dispose), but always do the disk write.
+    if (mounted) {
+      state = state.copyWith(
+        jobHistory: const <TranslationJob>[],
+        logs: <String>[...state.logs, _s.logClearedHistory],
+      );
+    }
     // Wait for the chained save to actually land the tombstone on disk.
     // _pendingHistorySave swallows errors by design (it is a shared chain),
     // so await the error-propagating future instead: on disk failure the
@@ -2753,29 +2791,44 @@ class TranslationDashboardController
     if (!identical(sourceChapters, _estimateStaticChaptersKey) ||
         chunkSize != _estimateStaticChunkSizeKey ||
         staticPart == null) {
-      final bool sourcesReleased = !sourceChapters.any(
-        (chapter) =>
-            chapter.blocks.any((block) => block.sourceText.isNotEmpty),
-      );
+      // P2-#19: the frozen/release decision only looks at selected chapters.
+      // The estimate itself is computed from selected chapters only (see
+      // TranslationRunEstimate.staticPart), so an unselected chapter that
+      // kept its sources must not un-freeze the totals into a zeros
+      // rebuild. For an empty selection, consult the frozen key's chapters:
+      // if their sources are gone (post-release) we cannot recalculate and
+      // must keep the frozen totals (P2-#7); if sources exist (pre-release)
+      // recalculate to zeros (m17).
+      final selectedChapters = sourceChapters
+          .where((chapter) => chapter.includeInTranslation)
+          .toList();
+      final List<InspectedChapter> releaseCheckChapters =
+          selectedChapters.isNotEmpty
+          ? selectedChapters
+          : (_estimateStaticChaptersKey ?? sourceChapters);
+      final bool sourcesReleased =
+          releaseCheckChapters.isNotEmpty &&
+          !releaseCheckChapters.any(
+            (chapter) =>
+                chapter.blocks.any((block) => block.sourceText.isNotEmpty),
+          );
       if (sourcesReleased && staticPart != null) {
         if (identical(sourceChapters, _estimateStaticChaptersKey)) {
-          // P2-#9: released sources cannot be replanned. Approximate the new
-          // batch count by scaling the frozen count inversely with chunk
-          // size, preserving all source-derived totals from before the
-          // release. P2-#8: when the chunk size returns to the anchor it was
-          // frozen at, restore the original batch count directly — chained
-          // re-scaling compounds ceil() rounding (1 -> 12).
-          final int batches =
-              chunkSize == _estimateAnchorChunkSize &&
-                  _estimateAnchorBatches >= 0
-              ? _estimateAnchorBatches
-              : max(
-                  1,
-                  (staticPart.estimatedApiBatches *
-                          _estimateStaticChunkSizeKey /
-                          chunkSize)
-                      .ceil(),
-                );
+          // P2-#20: always scale the batch count from the anchor's original
+          // values, never from the already-scaled staticPart — chained
+          // ceil() rounding drifts (6000→4000→6000 yielded 1→2→2). When the
+          // estimate was first frozen after the sources were already
+          // released there is no planned anchor yet; the frozen estimate
+          // itself becomes the anchor.
+          if (_estimateAnchorBatches < 0) {
+            _estimateAnchorChunkSize = _estimateStaticChunkSizeKey;
+            _estimateAnchorBatches = staticPart.estimatedApiBatches;
+          }
+          final int batches = max(
+            1,
+            (_estimateAnchorBatches * _estimateAnchorChunkSize / chunkSize)
+                .ceil(),
+          );
           staticPart = TranslationRunEstimate(
             selectedChapters: staticPart.selectedChapters,
             totalBlocks: staticPart.totalBlocks,
@@ -3066,8 +3119,21 @@ class TranslationDashboardController
       // pass would otherwise write them back and resurrect the cleared
       // history. The active run is unaffected: it is tracked via state.job
       // and re-inserted into the history on completion.
+      //
+      // P2-#25: drop only the snapshot's entries. Jobs appended to
+      // state.jobHistory while the save was in flight are newer than the
+      // snapshot and must survive — clearing the whole list would delete
+      // a run that just completed.
       if (state.jobHistory.isNotEmpty) {
-        state = state.copyWith(jobHistory: const <TranslationJob>[]);
+        final Set<String> snapshotIds = <String>{
+          for (final TranslationJob job in memoryJobs) job.id,
+        };
+        final List<TranslationJob> remaining = state.jobHistory
+            .where((job) => !snapshotIds.contains(job.id))
+            .toList(growable: false);
+        if (remaining.length != state.jobHistory.length) {
+          state = state.copyWith(jobHistory: remaining);
+        }
       }
     }
   }

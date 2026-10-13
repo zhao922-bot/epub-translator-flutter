@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart';
 import 'package:html/parser.dart' as html_parser;
 import 'epub/epub_html_extractor.dart';
@@ -18,6 +19,50 @@ class TranslationResidualFinding {
         'Possible untranslated source-language token "${token ?? ''}" '
             'remains adjacent to CJK text in block $blockId.',
     };
+  }
+}
+
+/// Rune-level view of a string: the rune at each index plus the UTF-16
+/// offset where it starts, so linear scans can navigate by rune while
+/// reporting UTF-16 offsets (what the RegExp-based callers used).
+/// Backs the backtracking-free gloss scans (性能-#51).
+class _RuneCursor {
+  _RuneCursor(String text) {
+    int offset = 0;
+    while (offset < text.length) {
+      final int unit = text.codeUnitAt(offset);
+      int rune = unit;
+      int width = 1;
+      if (unit >= 0xD800 && unit <= 0xDBFF && offset + 1 < text.length) {
+        final int low = text.codeUnitAt(offset + 1);
+        if (low >= 0xDC00 && low <= 0xDFFF) {
+          rune = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+          width = 2;
+        }
+      }
+      offsets.add(offset);
+      runes.add(rune);
+      offset += width;
+    }
+  }
+
+  final List<int> offsets = <int>[];
+  final List<int> runes = <int>[];
+
+  /// Rune index containing UTF-16 [offset] (binary search). Callers pass
+  /// `String.indexOf` hits, which always sit on a rune boundary.
+  int runeIndexAt(int offset) {
+    int lo = 0;
+    int hi = offsets.length;
+    while (lo < hi) {
+      final int mid = (lo + hi) >> 1;
+      if (offsets[mid] <= offset) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo - 1;
   }
 }
 
@@ -538,7 +583,9 @@ class TranslationQuality {
     // exempted as "pure citation metadata".
     int allCapsWords = 0;
     for (final String word in words) {
-      if (word.length > 1 &&
+      // P2-#11: single-letter words count too — "THIS IS A TEST" is a
+      // four-word all-caps sentence, not citation metadata.
+      if (word.isNotEmpty &&
           word == word.toUpperCase() &&
           RegExp(r'[A-Z]').hasMatch(word)) {
         allCapsWords++;
@@ -668,41 +715,224 @@ class TranslationQuality {
   /// the offsets up per token keeps the exemption tied to the glossed
   /// occurrence instead of exempting other bare words that merely share
   /// the paragraph or the parentheses.
+  ///
+  /// 性能-#51: the parenthesized directions are linear rune scans, not
+  /// regexes. The old direction-1 pattern
+  /// `([$cjkRange]\s*[（(](?:[$nonLatin]*))($latinToken)...` was cubic on
+  /// long unclosed paren runs (measured ~6s at n=800): `-` sits in both the
+  /// filler class and the token class, so the two stars and the token split
+  /// the same run three ways. Direction-2's
+  /// `(?:[$nonLatin]*)[$cjkRange](?:[$nonLatin]*)` was quadratic for the
+  /// same reason (adjacent stars around one CJK char). Each rune below is
+  /// visited a constant number of times.
+  // Parens delimiting a term gloss: （ U+FF08 / ( U+0028, ） U+FF09 / ) U+0029.
+  static const int _glossOpenFull = 0xFF08;
+  static const int _glossOpenAscii = 0x28;
+  static const int _glossCloseFull = 0xFF09;
+  static const int _glossCloseAscii = 0x29;
+
+  /// One filler rune inside a clean gloss: whitespace, CJK, or the
+  /// punctuation the old `[$nonLatin]` class allowed
+  /// (`.,;:，；：、-–—`). O(1), no backtracking.
+  static bool _isGlossFillerRune(int rune) {
+    if (_isGlossSpaceRune(rune) || _isCjkRune(rune)) {
+      return true;
+    }
+    switch (rune) {
+      case 0x2E: // .
+      case 0x2C: // ,
+      case 0x3B: // ;
+      case 0x3A: // :
+      case 0xFF0C: // ，
+      case 0xFF1B: // ；
+      case 0xFF1A: // ：
+      case 0x3001: // 、
+      case 0x2D: // -
+      case 0x2013: // –
+      case 0x2014: // —
+        return true;
+    }
+    return false;
+  }
+
+  /// `\s` with unicode semantics, matching what the old patterns used.
+  static bool _isGlossSpaceRune(int rune) {
+    switch (rune) {
+      case 0x09: // \t
+      case 0x0A: // \n
+      case 0x0B: // \v
+      case 0x0C: // \f
+      case 0x0D: // \r
+      case 0x20: // space
+      case 0xA0: // nbsp
+      case 0x1680:
+      case 0x2000:
+      case 0x2001:
+      case 0x2002:
+      case 0x2003:
+      case 0x2004:
+      case 0x2005:
+      case 0x2006:
+      case 0x2007:
+      case 0x2008:
+      case 0x2009:
+      case 0x200A:
+      case 0x2028:
+      case 0x2029:
+      case 0x202F:
+      case 0x205F:
+      case 0x3000:
+      case 0xFEFF:
+        return true;
+    }
+    return false;
+  }
+
+  /// One rune of a latin token: `[A-Za-z0-9'’\-]`.
+  static bool _isLatinTokenRune(int rune) =>
+      (rune >= 0x41 && rune <= 0x5A) || // A-Z
+      (rune >= 0x61 && rune <= 0x7A) || // a-z
+      (rune >= 0x30 && rune <= 0x39) || // 0-9
+      rune == 0x27 || // '
+      rune == 0x2019 || // ’
+      rune == 0x2D; // -
+
   static Set<int> _glossedTermTokenStarts(String text) {
-    // Mirrors the CJK ranges used across the quality checks.
+    final _RuneCursor cursor = _RuneCursor(text);
+    final Set<int> starts = <int>{};
+    _collectGlossDirection1(cursor, starts);
+    _collectGlossDirection2(cursor, starts);
+    // Quoted term labels with target-script context, e.g. “agoric开放系统”.
+    // Kept as a regex: measured linear (no nested or overlapping stars).
     const String cjkRange =
         r'\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}';
-    // Inside a clean gloss only non-latin material may surround the term.
-    const String nonLatin =
-        r'\s\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}.,;:，；：、\-–—';
     const String latinToken = r"[A-Za-z0-9'’\-]+";
-    final Set<int> starts = <int>{};
-    // Each pattern captures the text preceding the token as group 1 and the
-    // token itself as group 2, so the token's start offset is
-    // match.start + group(1).length.
-    void collect(String pattern) {
-      for (final RegExpMatch match
-          in RegExp(pattern, unicode: true).allMatches(text)) {
-        starts.add(match.start + (match.group(1)?.length ?? 0));
-      }
-    }
-    // Direction 1: translated term first, original in parentheses, e.g.
-    // 伐林开垦（assarting）.
-    collect(
-      '([$cjkRange]\\s*[（(](?:[$nonLatin]*))($latinToken)(?:[$nonLatin]*)[）)]',
-    );
-    // Direction 2: original term first, Chinese gloss in parentheses, e.g.
-    // job-coachman（临时马车夫）.
-    collect(
-      '()($latinToken)\\s*[（(](?:[$nonLatin]*)[$cjkRange](?:[$nonLatin]*)[）)]',
-    );
-    // Quoted term labels with target-script context, e.g. “agoric开放系统”.
-    collect(
+    final RegExp quotedPattern = RegExp(
       '([“「『"](?=[^”」』"]*[$cjkRange])(?:[^”」』"A-Za-z0-9\'’\\-]*))'
       '($latinToken)(?:[^”」』"A-Za-z0-9\'’\\-]*)[”」』"]',
+      unicode: true,
     );
+    for (final RegExpMatch match in quotedPattern.allMatches(text)) {
+      starts.add(match.start + (match.group(1)?.length ?? 0));
+    }
     return starts;
   }
+
+  /// Direction 1: `CJK（term）` / `CJK(term)` — the parens hold the token
+  /// plus only filler (CJK, whitespace, punctuation). Records the token's
+  /// UTF-16 start offset.
+  static void _collectGlossDirection1(_RuneCursor cursor, Set<int> starts) {
+    final List<int> runes = cursor.runes;
+    int i = 0;
+    while (i < runes.length) {
+      if (runes[i] != _glossOpenAscii && runes[i] != _glossOpenFull) {
+        i++;
+        continue;
+      }
+      // The open paren must be preceded (through whitespace) by CJK.
+      int j = i - 1;
+      while (j >= 0 && _isGlossSpaceRune(runes[j])) {
+        j--;
+      }
+      if (j < 0 || !_isCjkRune(runes[j])) {
+        i++;
+        continue;
+      }
+      // Filler*, token+, filler*, closer. `-` is both filler and a token
+      // rune, so remember the last filler `-`: if no token follows the
+      // greedy filler run, the old regex backtracked exactly one step and
+      // let the token start there (e.g. `中(中文-：)` glosses `-`). One
+      // step suffices: an earlier `-` start extends the same maximal latin
+      // run, so its post-token check is identical.
+      int k = i + 1;
+      int lastDash = -1;
+      while (k < runes.length && _isGlossFillerRune(runes[k])) {
+        if (runes[k] == 0x2D) {
+          lastDash = k;
+        }
+        k++;
+      }
+      int tokenStart = k;
+      while (k < runes.length && _isLatinTokenRune(runes[k])) {
+        k++;
+      }
+      if (k == tokenStart && lastDash >= 0) {
+        tokenStart = lastDash;
+        k = lastDash;
+        while (k < runes.length && _isLatinTokenRune(runes[k])) {
+          k++;
+        }
+      }
+      if (k == tokenStart) {
+        i++;
+        continue;
+      }
+      while (k < runes.length && _isGlossFillerRune(runes[k])) {
+        k++;
+      }
+      if (k < runes.length &&
+          (runes[k] == _glossCloseAscii || runes[k] == _glossCloseFull)) {
+        starts.add(cursor.offsets[tokenStart]);
+        i = k + 1;
+      } else {
+        i++;
+      }
+    }
+  }
+
+  /// Direction 2: `term（CJK…）` — the token precedes the paren and the
+  /// parens hold filler with at least one CJK char. Records the token's
+  /// UTF-16 start offset.
+  static void _collectGlossDirection2(_RuneCursor cursor, Set<int> starts) {
+    final List<int> runes = cursor.runes;
+    int i = 0;
+    while (i < runes.length) {
+      if (!_isLatinTokenRune(runes[i])) {
+        i++;
+        continue;
+      }
+      final int tokenStart = i;
+      while (i < runes.length && _isLatinTokenRune(runes[i])) {
+        i++;
+      }
+      int k = i;
+      while (k < runes.length && _isGlossSpaceRune(runes[k])) {
+        k++;
+      }
+      if (k >= runes.length ||
+          (runes[k] != _glossOpenAscii && runes[k] != _glossOpenFull)) {
+        continue;
+      }
+      k++;
+      bool seenCjk = false;
+      bool ok = true;
+      while (k < runes.length &&
+          runes[k] != _glossCloseAscii &&
+          runes[k] != _glossCloseFull) {
+        if (!_isGlossFillerRune(runes[k])) {
+          ok = false;
+          break;
+        }
+        if (_isCjkRune(runes[k])) {
+          seenCjk = true;
+        }
+        k++;
+      }
+      if (ok && seenCjk && k < runes.length) {
+        starts.add(cursor.offsets[tokenStart]);
+      }
+    }
+  }
+
+  /// Test hook for 性能-#51: the linear gloss scans.
+  @visibleForTesting
+  static Set<int> glossedTermTokenStartsForTest(String text) =>
+      _glossedTermTokenStarts(text);
+
+  /// Test hook for 性能-#51: the linear parenthesized-gloss check.
+  @visibleForTesting
+  static bool isParenthesizedTermGlossForTest(String text, String token) =>
+      _isParenthesizedTermGloss(text, token);
 
   /// Whether [token] appears inside parentheses/quotes that are immediately
   /// preceded by CJK context, i.e. a translator gloss such as
@@ -710,40 +940,90 @@ class TranslationQuality {
   /// a deliberate first-occurrence gloss rather than bare untranslated text,
   /// so it should be allowed to stay next to Chinese.
   static bool _isParenthesizedTermGloss(String text, String token) {
-    final String escaped = RegExp.escape(token);
-    // Direction 1: translated term first, original inside parentheses, e.g.
-    // 伐林开垦（assarting） or 伐林开垦(assarting). P2-#18: the parentheses
-    // may only hold the glossed term itself (plus CJK, whitespace and
-    // punctuation) — other latin words inside mean the parens hold more
-    // than a clean term gloss, so a bare residual sharing them is not
-    // exempted.
-    const String nonLatinInGloss =
-        r'\s\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}.,;:，；：、\-–—';
-    final RegExp translatedFirstPattern = RegExp(
-      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]\s*[（(]'
-      '[$nonLatinInGloss]*'
-      '$escaped'
-      '[$nonLatinInGloss]*'
-      r'[）)]',
-      unicode: true,
-    );
-    if (translatedFirstPattern.hasMatch(text)) {
-      return true;
+    if (token.isEmpty) {
+      return false;
     }
-    // Direction 2: retained original term first, Chinese gloss inside
-    // parentheses, e.g. job-coachman（临时马车夫）. The parenthesized content
-    // must contain CJK so this is clearly a translated gloss rather than an
-    // untranslated term followed by unrelated punctuation.
-    final RegExp retainedFirstPattern = RegExp(
-      '$escaped'
-      r'\s*[（(]'
-      r'[^）)]*'
-      r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]'
-      r'[^）)]*'
-      r'[）)]',
-      unicode: true,
-    );
-    return retainedFirstPattern.hasMatch(text);
+    // 性能-#51: linear rune scans. The old direction-2 regex
+    // `token\s*[（(][^）)]*<CJK>[^）)]*[）)]` backtracked quadratically on
+    // long unclosed parenthesized runs (measured 233ms at n=1600 for a
+    // single hasMatch — the two [^）)]* split the same run around each CJK
+    // char); direction-1 shared the shape around the token, and hasMatch
+    // retried at every position. indexOf finds occurrences natively and
+    // each is checked with one bounded walk.
+    final _RuneCursor cursor = _RuneCursor(text);
+    final int tokenRuneLength = token.runes.length;
+    int from = 0;
+    while (true) {
+      final int occurrence = text.indexOf(token, from);
+      if (occurrence < 0) {
+        return false;
+      }
+      final int start = cursor.runeIndexAt(occurrence);
+      final int end = start + tokenRuneLength;
+      if (_glossParensAfterToken(cursor, end) ||
+          _glossParensBeforeToken(cursor, start, end)) {
+        return true;
+      }
+      from = occurrence + 1;
+    }
+  }
+
+  /// Direction 2 of [_isParenthesizedTermGloss]: [tokenEnd] is followed by
+  /// optional whitespace and an open paren whose content (up to the close
+  /// paren) holds at least one CJK char. Each rune is visited once.
+  static bool _glossParensAfterToken(_RuneCursor cursor, int tokenEnd) {
+    final List<int> runes = cursor.runes;
+    int i = tokenEnd;
+    while (i < runes.length && _isGlossSpaceRune(runes[i])) {
+      i++;
+    }
+    if (i >= runes.length ||
+        (runes[i] != _glossOpenAscii && runes[i] != _glossOpenFull)) {
+      return false;
+    }
+    i++;
+    bool seenCjk = false;
+    while (i < runes.length &&
+        runes[i] != _glossCloseAscii &&
+        runes[i] != _glossCloseFull) {
+      if (_isCjkRune(runes[i])) {
+        seenCjk = true;
+      }
+      i++;
+    }
+    return seenCjk && i < runes.length;
+  }
+
+  /// Direction 1 of [_isParenthesizedTermGloss]: an open paren preceded
+  /// (through whitespace) by CJK sits immediately before the token, with
+  /// only gloss filler between the paren and the token, and filler plus a
+  /// close paren after the token.
+  static bool _glossParensBeforeToken(
+    _RuneCursor cursor,
+    int tokenStart,
+    int tokenEnd,
+  ) {
+    final List<int> runes = cursor.runes;
+    int i = tokenStart - 1;
+    while (i >= 0 && _isGlossFillerRune(runes[i])) {
+      i--;
+    }
+    if (i < 0 || (runes[i] != _glossOpenAscii && runes[i] != _glossOpenFull)) {
+      return false;
+    }
+    i--;
+    while (i >= 0 && _isGlossSpaceRune(runes[i])) {
+      i--;
+    }
+    if (i < 0 || !_isCjkRune(runes[i])) {
+      return false;
+    }
+    int j = tokenEnd;
+    while (j < runes.length && _isGlossFillerRune(runes[j])) {
+      j++;
+    }
+    return j < runes.length &&
+        (runes[j] == _glossCloseAscii || runes[j] == _glossCloseFull);
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -2228,9 +2508,20 @@ class TranslationQuality {
   /// P2-#20: short lowercase signage/instruction phrases that must never be
   /// mistaken for transliterated terms (e.g. `<p>do not enter</p>` left
   /// untranslated). Compared against the stripped text node.
+  /// Test hook for P2-#12: boundary-punctuation stripping before the
+  /// common-instruction-phrase denylist lookup.
+  @visibleForTesting
+  static bool isCommonInstructionPhraseForTest(String text) =>
+      _isCommonInstructionPhrase(text);
+
   static bool _isCommonInstructionPhrase(String text) {
-    final String normalized =
-        text.replaceAll(RegExp(r'\s+'), ' ').trim().toLowerCase();
+    // P2-#12: strip boundary punctuation before matching, so "no smoking:"
+    // and "keep out;" are still recognized instead of being exempted.
+    final String normalized = text
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'^[\p{P}]+|[\p{P}]+$', unicode: true), '');
     return _commonInstructionPhrases.contains(normalized);
   }
 

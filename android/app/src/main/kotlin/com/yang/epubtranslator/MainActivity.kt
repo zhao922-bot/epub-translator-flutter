@@ -31,6 +31,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.lang.ref.WeakReference
 import java.security.KeyStore
 import java.util.Collections
 import java.util.concurrent.Executors
@@ -352,6 +353,24 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * Atomically re-checks the task's generation and registers its holder
+     * (P2-#16). The P2-#9 check-then-set ([checkImportRegistration] followed
+     * by [activeImport].set) had a race: a watchdog executor replacement
+     * landing between the check and the set let a stale task overwrite a
+     * newer import's holder, orphaning the newer stream from watchdog
+     * un-wedging. Both halves run under [ImportLifecycle.registrationLock],
+     * which [recreateImportExecutor] also holds while bumping the
+     * generation, so a stale generation can never register after a
+     * replacement.
+     */
+    private fun registerImportHolder(taskGeneration: Int, holder: ActiveImport) {
+        synchronized(importLifecycle.registrationLock) {
+            checkImportRegistration(importLifecycle, taskGeneration)
+            activeImport.set(holder)
+        }
+    }
+
+    /**
      * Replaces [importExecutor] with a fresh single thread. Called by the
      * pick watchdog when it fires with no stream registered (see
      * [activeImport]): the copy is then wedged in a provider IPC call that
@@ -368,13 +387,17 @@ class MainActivity : FlutterActivity() {
      * running.
      *
      * Runs on the UI thread: pick watchdogs are the only callers and they
-     * always run on [mainHandler], so no extra synchronization is needed
-     * around the field reassignment itself.
+     * always run on [mainHandler]. The generation bump itself is additionally
+     * serialized under [ImportLifecycle.registrationLock] so it cannot land
+     * between a task's generation re-check and its holder registration
+     * (P2-#16).
      */
     private fun recreateImportExecutor() {
         val old = importExecutor
-        importExecutor = Executors.newSingleThreadExecutor()
-        importLifecycle.invalidate()
+        synchronized(importLifecycle.registrationLock) {
+            importExecutor = Executors.newSingleThreadExecutor()
+            importLifecycle.invalidate()
+        }
         old.shutdownNow()
     }
 
@@ -1230,11 +1253,19 @@ class MainActivity : FlutterActivity() {
                 }
             }
             val liveFiles = stagingDir.listFiles()?.filter { it.isFile } ?: return@synchronized
+            val livePaths = liveFiles.mapTo(mutableSetOf()) { it.absolutePath }
+            // P2-#17: retry revokes for grants whose files are already gone
+            // (a previous sweep deleted the file while its revoke failed,
+            // or the process died in between). Entries are dropped only
+            // when their revoke succeeds; the rest stay for the next sweep.
+            grants = retryOrphanedGrantRevokes(grants, livePaths) { uri ->
+                appCtx.revokeUriPermission(
+                    Uri.parse(uri),
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
             // Forget ledger entries whose file is already gone.
-            grants = dropStaleShareGrants(
-                grants,
-                liveFiles.mapTo(mutableSetOf()) { it.absolutePath },
-            )
+            grants = dropStaleShareGrants(grants, livePaths)
             writeGrants(grants)
             val grantUriByPath = loadShareGrants(grants).mapValues { it.value.uri }
             val plan = planShareStagingCleanup(
@@ -1329,14 +1360,13 @@ class MainActivity : FlutterActivity() {
                 // read() throws IOException, and the single importExecutor
                 // thread is freed for the next import.
                 val holder = ActiveImport(input, deadlineElapsed)
-                // P2-#9: re-check the generation immediately before
-                // registering. This task may have been suspended between the
-                // check above and this set while the watchdog replaced the
-                // executor and a newer import registered its own holder; an
-                // unconditional set() would overwrite the newer registration
-                // and orphan its stream from watchdog un-wedging.
-                checkImportRegistration(importLifecycle, taskGeneration)
-                activeImport.set(holder)
+                // P2-#9/P2-#16: re-check the generation and register
+                // atomically. This task may have been suspended between the
+                // check above and this registration while the watchdog
+                // replaced the executor and a newer import registered its
+                // own holder; a stale registration would overwrite it and
+                // orphan its stream from watchdog un-wedging.
+                registerImportHolder(taskGeneration, holder)
                 try {
                     if (!importLifecycle.isCurrent(taskGeneration)) {
                         throw ImportStaleException()
@@ -1651,12 +1681,13 @@ class MainActivity : FlutterActivity() {
                 return false
             }
             holder = ActiveImport(stream, deadlineElapsed)
-            // P2-#9: same generation race as the copy task's registration
+            // P2-#16: same generation race as the copy task's registration
             // above — a stale probe must not overwrite a newer import's
-            // holder. Bow out instead (the caller's generation check right
-            // after this call still reports PICK_TIMEOUT).
+            // holder. Check and register atomically; on a stale generation
+            // bow out instead (the caller's generation check right after
+            // this call still reports PICK_TIMEOUT).
             try {
-                checkImportRegistration(importLifecycle, taskGeneration)
+                registerImportHolder(taskGeneration, holder)
             } catch (_: ImportStaleException) {
                 try {
                     stream.close()
@@ -1664,7 +1695,6 @@ class MainActivity : FlutterActivity() {
                 }
                 return false
             }
-            activeImport.set(holder)
             return stream.use { input ->
                 if (!importLifecycle.isCurrent(taskGeneration)) return@use false
                 val header = ByteArray(4)
@@ -1703,26 +1733,47 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** Runs a KeyStore/secret op off the UI thread and replies on it. */
+    /**
+     * Runs a KeyStore/secret op off the UI thread and replies on it.
+     *
+     * P-#45: [SecretExecutor] is process-lifetime, so the queued Runnable
+     * must not strongly capture the Activity — a queued op would otherwise
+     * pin a destroyed Activity until it runs. The op is a receiver lambda
+     * (no captured `this`) and the Runnable holds the Activity only weakly:
+     * if it is gone when the op runs, the call fails on the UI thread
+     * instead of leaking the Activity or hanging Dart.
+     */
     private fun runSecretOp(
         result: MethodChannel.Result,
         errorCode: String,
-        op: () -> Any?,
+        op: MainActivity.() -> Any?,
     ) {
+        val activityRef = WeakReference(this)
         SecretExecutor.execute {
+            val activity = activityRef.get()
+            if (activity == null) {
+                secretOpMainHandler.post {
+                    result.error(
+                        errorCode,
+                        "Activity was destroyed before the secret operation ran.",
+                        null,
+                    )
+                }
+                return@execute
+            }
             try {
-                val value = op()
-                replyOnUiThread(result) { result.success(value) }
+                val value = activity.op()
+                activity.replyOnUiThread(result) { result.success(value) }
             } catch (error: SecretKeyRotatedException) {
                 // Distinct from a generic read failure: the key itself was
                 // regenerated (see getOrCreateSecretKey), so Dart must tell
                 // the user to re-enter their keys instead of reporting a
                 // transient error.
-                replyOnUiThread(result) {
+                activity.replyOnUiThread(result) {
                     result.error("SECRET_KEY_ROTATED", error.message, null)
                 }
             } catch (error: Exception) {
-                replyOnUiThread(result) { result.error(errorCode, error.message, null) }
+                activity.replyOnUiThread(result) { result.error(errorCode, error.message, null) }
             }
         }
     }
@@ -2173,6 +2224,12 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val TAG = "EpubTranslator"
+        /**
+         * Process-lifetime main-thread handler for secret-op replies (P-#45):
+         * the Activity may be gone by the time a queued secret op runs, so
+         * the failure reply cannot go through the Activity's handler.
+         */
+        private val secretOpMainHandler = Handler(Looper.getMainLooper())
         private const val PICKER_REQUEST_CODES_STATE = "epub_picker_request_codes"
         private const val REQUEST_WRITE_DOWNLOADS = 6002
         private const val REQUEST_POST_NOTIFICATIONS = 6003

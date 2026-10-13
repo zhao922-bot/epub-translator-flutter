@@ -178,6 +178,36 @@ internal fun planShareStagingCleanup(
 }
 
 /**
+ * Retries revoking URI grants whose staging files are already gone
+ * (P2-#17): a previous sweep may have deleted the file while its revoke
+ * failed, or the process may have died between the delete and the revoke.
+ * Returns the updated ledger: an entry is dropped only when its revoke
+ * succeeds; a failed revoke keeps its entry so a later sweep retries it
+ * instead of leaking the persisted grant forever.
+ *
+ * Pure except for the injected [revokeUri] callback, so the retry stays
+ * unit-testable without Android stubs.
+ */
+internal fun retryOrphanedGrantRevokes(
+    grants: Set<String>,
+    livePaths: Set<String>,
+    revokeUri: (String) -> Unit,
+): Set<String> {
+    var remaining = grants
+    for ((path, grant) in loadShareGrants(grants)) {
+        if (path in livePaths) continue
+        try {
+            revokeUri(grant.uri)
+        } catch (_: Exception) {
+            // Keep the entry: the next sweep retries the revoke.
+            continue
+        }
+        remaining = dropShareGrant(remaining, path)
+    }
+    return remaining
+}
+
+/**
  * Executes a [ShareStagingCleanupPlan] (P2-#11): deletes the planned files
  * and drops their ledger entries first, then revokes the URI grants of the
  * files actually deleted — never before. Revoking first meant a failed
@@ -185,6 +215,11 @@ internal fun planShareStagingCleanup(
  * but without the target app's read permission. A single stuck file never
  * blocks the rest: failures are skipped and their ledger entries kept, so a
  * later sweep retries them with the grant still valid.
+ *
+ * P2-#17: a failed revoke restores its ledger entry instead of dropping
+ * it — the persisted URI grant would otherwise leak with no record left
+ * to retry it. [retryOrphanedGrantRevokes] picks those entries up on the
+ * next sweep even though their files are already gone.
  *
  * Pure except for the injected [deleteFile]/[revokeUri] callbacks, so the
  * ordering stays unit-testable without Android stubs. Returns the updated
@@ -198,7 +233,7 @@ internal fun executeShareStagingCleanup(
     revokeUri: (String) -> Unit,
 ): Set<String> {
     var remaining = grants
-    val revokedUris = mutableListOf<String>()
+    val revokedUris = mutableListOf<Pair<String, String>>()
     for (entry in plan.deleteForAge + plan.evictForCap) {
         val deleted = try {
             deleteFile(entry.path)
@@ -207,14 +242,23 @@ internal fun executeShareStagingCleanup(
         }
         if (deleted) {
             remaining = dropShareGrant(remaining, entry.path)
-            grantUriByPath[entry.path]?.let { revokedUris.add(it) }
+            grantUriByPath[entry.path]?.let { revokedUris.add(entry.path to it) }
         }
     }
-    for (uri in revokedUris) {
+    val failedRevokes = mutableListOf<String>()
+    for ((path, uri) in revokedUris) {
         try {
             revokeUri(uri)
         } catch (_: Exception) {
-            // Best effort: the file is already gone.
+            // Best effort, but the persisted grant must not leak without a
+            // record: remember the path so its ledger entry is restored
+            // below and a later sweep retries the revoke.
+            failedRevokes.add(path)
+        }
+    }
+    for (path in failedRevokes) {
+        grants.firstOrNull { parseShareGrant(it)?.filePath == path }?.let {
+            remaining = remaining + it
         }
     }
     return remaining

@@ -88,6 +88,17 @@ class _SecretReadResult {
   final String? value;
 }
 
+/// Tracks one in-flight credential backend operation (P1-#4). [settled]
+/// completes after [_SettingsStore._saveSecret] has updated the in-memory
+/// snapshot/statuses (or decided the operation was stale), so a stale
+/// operation's watcher can wait for the final state before repairing.
+class _InflightCredentialOp {
+  _InflightCredentialOp(this.op, this.settled);
+
+  final Future<void> op;
+  final Future<void> settled;
+}
+
 class NativeSettingsSecretStore implements SettingsSecretStore {
   const NativeSettingsSecretStore();
 
@@ -196,6 +207,37 @@ class SettingsStore {
   /// read-first [save]). Guards [_saveSecret] against deleting keys whose
   /// state was never observed.
   bool _didLoad = false;
+
+  /// Generation of credential backend operations, bumped at the start of
+  /// every [_saveSecrets] call. `Future.timeout` cannot cancel the backend
+  /// operation — the platform write keeps running and may land after a
+  /// retried save already stored a newer value. The generation lets a late
+  /// completion recognize itself as stale so it neither touches in-memory
+  /// state nor silently wins in the backend (P1-#4).
+  int _credentialGeneration = 0;
+
+  /// In-flight credential backend operations by slot. A timed-out save
+  /// releases the settings file lock while its backend write is still
+  /// running; a retried save may then issue a newer operation for the same
+  /// slot. The record lets a stale operation's watcher wait for the newer
+  /// one to fully settle (snapshot updated) before repairing, so the repair
+  /// always targets the final value (P1-#4).
+  final Map<SettingsSecretSlot, _InflightCredentialOp>
+  _inflightCredentialOps = <SettingsSecretSlot, _InflightCredentialOp>{};
+
+  /// Secret slots actually persisted by the most recent [_saveSecrets] call,
+  /// as opposed to skipped as unreadable. Lets the settings controller's
+  /// conflict-replay drop only entries that really landed (P2-#27): a key
+  /// entry skipped because its slot read failed must stay queued even when
+  /// a later non-credential save succeeds.
+  Set<SettingsSecretSlot> _lastPersistedSecretSlots =
+      <SettingsSecretSlot>{};
+
+  /// Slots persisted by the last [_saveSecrets] call. Lets the settings
+  /// controller's conflict-replay drop only queue entries whose secret
+  /// slots really landed (a slot skipped as unreadable is not persisted).
+  Set<SettingsSecretSlot> get lastPersistedSecretSlots =>
+      Set<SettingsSecretSlot>.unmodifiable(_lastPersistedSecretSlots);
 
   /// Whether the legacy plaintext key migration already failed
   /// deterministically: a secret backend that is explicitly unsupported must
@@ -654,7 +696,12 @@ class SettingsStore {
     TranslationConfig config, {
     Set<SettingsSecretSlot>? explicitSecretMutations,
   }) async {
-    if (_configLoadError != null) {
+    final Object? loadError = _configLoadError;
+    if (loadError != null) {
+      // P2-#35: a conflict-induced load error is recoverable — surface it
+      // as a conflict so the caller queues the edit for replay instead of
+      // dropping it with a StateError. Genuine load failures still refuse.
+      if (loadError is SettingsWriteConflict) throw loadError;
       throw StateError('Settings could not be loaded; reload before saving.');
     }
     // Validate before touching any secret slot, not just before JSON encoding.
@@ -885,6 +932,13 @@ class SettingsStore {
     required Set<SettingsSecretSlot> slotsToSave,
     required Set<SettingsSecretSlot> explicit,
   }) async {
+    // P1-#4: a new credential operation generation starts here, so a
+    // backend write from an earlier (timed-out) call that lands late is
+    // recognized as stale and cannot overwrite the values saved now.
+    _credentialGeneration++;
+    // P2-#27: which slots really landed (vs. skipped as unreadable). Only
+    // landed slots count as persisted for conflict-replay superseding.
+    final Set<SettingsSecretSlot> persisted = <SettingsSecretSlot>{};
     // The slots are independent (separate files / keychain items); on Windows
     // each write spawns a PowerShell process, so run them concurrently rather
     // than serially. _saveSecret touches only its own slot's read status.
@@ -895,6 +949,7 @@ class SettingsStore {
         _saveSecretTagged(
           SettingsSecretSlot.proxy,
           failures,
+          persisted,
           _saveSecret(
             SettingsSecretSlot.proxy,
             _proxySecret(config),
@@ -910,6 +965,7 @@ class SettingsStore {
         _saveSecretTagged(
           SettingsSecretSlot.legacy,
           failures,
+          persisted,
           _saveSecret(
             SettingsSecretSlot.legacy,
             config.apiKey,
@@ -925,6 +981,7 @@ class SettingsStore {
         _saveSecretTagged(
           SettingsSecretSlot.deepSeek,
           failures,
+          persisted,
           _saveSecret(
             SettingsSecretSlot.deepSeek,
             config.deepseekApiKey,
@@ -940,6 +997,7 @@ class SettingsStore {
         _saveSecretTagged(
           SettingsSecretSlot.custom,
           failures,
+          persisted,
           _saveSecret(
             SettingsSecretSlot.custom,
             config.customApiKey,
@@ -956,6 +1014,7 @@ class SettingsStore {
     // just the first one.
     await Future.wait(pending, eagerError: false);
     if (failures.isNotEmpty) throw SettingsSecretSaveException(failures);
+    _lastPersistedSecretSlots = persisted;
     if (slotsToSave.isNotEmpty && _rotatedSlots.isEmpty) {
       _secretKeyRotated = false;
     }
@@ -965,13 +1024,15 @@ class SettingsStore {
   /// save says which key was not persisted. Partial writes are possible
   /// (other slots may already have been saved when one slot throws), so
   /// naming the exact slot matters for the "save failed" message.
+  /// [persisted] collects the slots whose write actually landed (P2-#27).
   Future<void> _saveSecretTagged(
     SettingsSecretSlot slot,
     Map<SettingsSecretSlot, Object> failures,
-    Future<void> save,
+    Set<SettingsSecretSlot> persisted,
+    Future<bool> save,
   ) async {
     try {
-      await save;
+      if (await save) persisted.add(slot);
     } catch (error) {
       // Secret backend exceptions may contain the value passed to write.
       failures[slot] = error;
@@ -1062,7 +1123,11 @@ class SettingsStore {
   static String _keyFingerprint(String key) =>
       sha256.convert(utf8.encode(key.trim())).toString();
 
-  Future<void> _saveSecret(
+  /// Saves one secret slot. Returns true when the value actually landed in
+  /// the backend (false when the write was skipped as unreadable, or when
+  /// the operation turned out stale because a newer save started while it
+  /// was in flight).
+  Future<bool> _saveSecret(
     SettingsSecretSlot slot,
     String value, {
     required Set<SettingsSecretSlot> explicit,
@@ -1071,21 +1136,124 @@ class SettingsStore {
   }) async {
     if (_secretReadStatuses[slot] == _SecretReadStatus.readFailure &&
         !explicit.contains(slot)) {
-      return;
+      return false;
     }
     final String trimmed = value.trim();
-    if (trimmed.isEmpty) {
-      // P2-#32: bound the backend call; a hung delete must not wedge the
-      // settings file lock either.
-      await delete().timeout(_secretOpTimeout);
-      _secretReadStatuses[slot] = _SecretReadStatus.missing;
-    } else {
-      await write(trimmed).timeout(_secretOpTimeout);
-      _secretReadStatuses[slot] = _SecretReadStatus.value;
+    final int opGeneration = _credentialGeneration;
+    final Future<void> backendOp =
+        trimmed.isEmpty ? delete() : write(trimmed);
+    final Completer<void> settled = Completer<void>();
+    _inflightCredentialOps[slot] = _InflightCredentialOp(
+      backendOp,
+      settled.future,
+    );
+    // P1-#4: Future.timeout has no cancellation semantics — the backend
+    // operation keeps running after the timeout fires and may land after a
+    // retried save already stored a newer value. Watch the raw future: a
+    // stale completion must not touch in-memory state, and the current
+    // snapshot value is re-asserted so the late write cannot silently win.
+    _watchCredentialOp(
+      slot,
+      opGeneration,
+      write: write,
+      delete: delete,
+      backendOp: backendOp,
+    );
+    try {
+      // Bound the backend call; a hung write must not wedge the settings
+      // file lock either. On timeout the exception propagates (the
+      // operation is recorded as failed) — the watcher above repairs the
+      // backend if the abandoned write lands late.
+      await backendOp.timeout(_secretOpTimeout);
+      if (opGeneration != _credentialGeneration) {
+        // A newer save started while this operation was in flight: this
+        // completion is stale. In-memory state belongs to the newer save;
+        // the watcher re-asserts the backend.
+        return false;
+      }
+      if (trimmed.isEmpty) {
+        _secretReadStatuses[slot] = _SecretReadStatus.missing;
+      } else {
+        _secretReadStatuses[slot] = _SecretReadStatus.value;
+      }
+      _secretSnapshot?[slot] = trimmed;
+      _pendingPlaintextKeys.remove(slot);
+      _rotatedSlots.remove(slot);
+      return true;
+    } finally {
+      if (identical(_inflightCredentialOps[slot]?.op, backendOp)) {
+        _inflightCredentialOps.remove(slot);
+      }
+      // Completed after the snapshot/status updates above: a stale
+      // operation's watcher waiting on [settled] sees the final state.
+      settled.complete();
     }
-    _secretSnapshot?[slot] = trimmed;
-    _pendingPlaintextKeys.remove(slot);
-    _rotatedSlots.remove(slot);
+  }
+
+  /// Watches a credential backend operation for late completion (P1-#4).
+  /// When the operation was issued under [opGeneration] but a newer save
+  /// has since started, its landing value is outdated — re-assert the
+  /// current snapshot value so the stale write cannot silently overwrite
+  /// the newer one. Best effort and never throws.
+  void _watchCredentialOp(
+    SettingsSecretSlot slot,
+    int opGeneration, {
+    required Future<void> Function(String value) write,
+    required Future<void> Function() delete,
+    required Future<void> backendOp,
+  }) {
+    unawaited(
+      backendOp.then((_) async {
+        if (opGeneration == _credentialGeneration) return;
+        // A newer operation for this slot may still be settling; wait for
+        // it (bounded) so the re-assert targets the final snapshot value,
+        // not a mid-save one.
+        final _InflightCredentialOp? newer = _inflightCredentialOps[slot];
+        if (newer != null && !identical(newer.op, backendOp)) {
+          try {
+            await newer.settled.timeout(_secretOpTimeout);
+          } catch (_) {
+            // Best effort; re-assert anyway.
+          }
+        }
+        _reassertCredentialSlot(slot, write: write, delete: delete);
+      }).catchError((Object _) {
+        // A failed backend operation changes nothing; nothing to repair.
+      }),
+    );
+  }
+
+  /// Re-asserts the current in-memory credential value for [slot] into the
+  /// backend (P1-#4). Called when a stale operation landed late; writes the
+  /// value that is current now, so even a late re-assert is harmless. The
+  /// re-assert itself is watched: if a still-newer save starts mid-flight,
+  /// its watcher takes over the repair.
+  void _reassertCredentialSlot(
+    SettingsSecretSlot slot, {
+    required Future<void> Function(String value) write,
+    required Future<void> Function() delete,
+  }) {
+    final Map<SettingsSecretSlot, String>? snapshot = _secretSnapshot;
+    if (snapshot == null) return;
+    final String current = snapshot[slot] ?? '';
+    final int opGeneration = _credentialGeneration;
+    final Future<void> backendOp =
+        current.isEmpty ? delete() : write(current);
+    _watchCredentialOp(
+      slot,
+      opGeneration,
+      write: write,
+      delete: delete,
+      backendOp: backendOp,
+    );
+    unawaited(
+      backendOp.timeout(_secretOpTimeout).catchError((Object error) {
+        AppLogger.error(
+          'Credential re-assert failed: ${error.runtimeType}',
+          tag: 'settings',
+        );
+      }),
+    );
   }
 
   static String _pendingProxyUrl(String secret) {

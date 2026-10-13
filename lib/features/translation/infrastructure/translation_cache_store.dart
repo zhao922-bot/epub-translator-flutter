@@ -80,6 +80,14 @@ class TranslationCacheStore {
   final Map<String, Future<void>> _fileGates = <String, Future<void>>{};
   Map<String, int>? _scanChanges;
   int _estimatedBytes = 0;
+
+  /// Temp-file bytes counted by the last full scan (P2-#32). Fresh `.tmp`
+  /// files occupy disk but are transient (in-flight writes) or swept when
+  /// stale; evicting paid cache entries to make room for them is futile,
+  /// and a light pass that does so must not clear the ineffective-scan
+  /// backoff — otherwise the backoff flaps and every cycle evicts more
+  /// valid cache around the same unreclaimable temps.
+  int _lastScanTempBytes = 0;
   DateTime? _lastPrune;
   bool _maintenancePending = false;
   Future<void> _maintenanceTail = Future<void>.value();
@@ -140,12 +148,34 @@ class TranslationCacheStore {
     _retryAfterStopwatch.reset();
   }
 
+  /// Clears the backoff only when the last full scan saw no temp pressure
+  /// (P2-#32). A light pass that evicts valid entries around persistent
+  /// temps must not clear a backoff armed for unreclaimable space —
+  /// otherwise the next over-capacity put runs another futile full scan
+  /// and the backoff flaps, evicting valid cache each cycle. Only a full
+  /// scan (which reconciles temps, updating [_lastScanTempBytes]) or the
+  /// backoff's own expiry may clear temp-driven backoff.
+  void _resetBackoffIfNoTempPressure() {
+    if (_lastScanTempBytes == 0) _resetBackoff();
+  }
+
   /// Clears the ineffective-scan backoff. Tests use fake time for [now] but
   /// the backoff runs on a real (monotonic) Stopwatch, so time-travel cannot
   /// expire it. Call this to simulate "the backoff elapsed and the quota is
   /// now met", as happens in real usage when the estimate is updated.
   @visibleForTesting
   void resetBackoffForTest() => _resetBackoff();
+
+  /// Resets the job-checkpoint prune throttle. The throttle runs on a real
+  /// (monotonic) Stopwatch, so fake-time tests cannot expire it by
+  /// time-travel. Call this to simulate "the throttle elapsed".
+  /// (perf-#53)
+  @visibleForTesting
+  void resetJobPruneThrottleForTest() {
+    _jobPruneStopwatch
+      ..stop()
+      ..reset();
+  }
 
   bool _backoffActive() {
     final Duration? delay = _retryAfterDelay;
@@ -182,7 +212,9 @@ class TranslationCacheStore {
       _rollbackChecked.remove(key);
     }
     _scanChanges?[key] = size;
-    if (_estimatedBytes <= _capacity) _resetBackoff();
+    // P2-#32: a light pass evicting valid entries around persistent temps
+    // must not clear the backoff (see [_resetBackoffIfNoTempPressure]).
+    if (_estimatedBytes <= _capacity) _resetBackoffIfNoTempPressure();
   }
 
   /// Marks [path] as most-recently written for lightweight eviction order.
@@ -286,7 +318,9 @@ class TranslationCacheStore {
   void _pruneIfNeeded({bool capacityFollowUp = false}) {
     if (suspendAutoMaintenanceForTest) return;
     final DateTime now = _now();
-    if (_estimatedBytes <= _capacity) _resetBackoff();
+    // P2-#32: see [_resetBackoffIfNoTempPressure] — a temp-driven backoff
+    // survives transient under-capacity until a full scan reconciles.
+    if (_estimatedBytes <= _capacity) _resetBackoffIfNoTempPressure();
     if (_maintenancePending) {
       return;
     }
@@ -345,8 +379,16 @@ class TranslationCacheStore {
           // capacity (unreclaimable files remain) must not clear the
           // backoff, or the follow-up would schedule a full scan on every
           // put, defeating the backoff (C-15).
+          // P2-#32: a full scan reconciles temps, so its under-capacity
+          // verdict is trustworthy and clears unconditionally; a light
+          // pass must not clear temp-driven backoff (its evictions merely
+          // work around persistent temps).
           if (_estimatedBytes <= _capacity) {
-            _resetBackoff();
+            if (scanned) {
+              _resetBackoff();
+            } else {
+              _resetBackoffIfNoTempPressure();
+            }
           } else if (!scanned ||
               generation == _writeGeneration ||
               capacityFollowUp) {
@@ -398,8 +440,14 @@ class TranslationCacheStore {
   Future<int> _enforceQuotaLightly() async {
     final int targetBytes = (_capacity * 0.9).toInt();
     int deletedBytes = 0;
+    // P2-#32: drive the light pass by valid bytes only. Temp files counted
+    // by the last full scan are transient (in-flight writes) or swept when
+    // stale; evicting paid cache entries to make room for them is futile,
+    // so they must not inflate the eviction target.
+    bool overTarget() =>
+        _estimatedBytes - _lastScanTempBytes > targetBytes;
     for (final String filePath in _evictionOrder.toList()) {
-      if (_estimatedBytes <= targetBytes) break;
+      if (!overTarget()) break;
       final int? recorded = _sizes[filePath];
       if (recorded == null || recorded <= 0) {
         _evictionOrder.remove(filePath);
@@ -408,7 +456,7 @@ class TranslationCacheStore {
       final File file = File(filePath);
       try {
         await _withFileGate(file, () async {
-          if (_estimatedBytes <= targetBytes) return;
+          if (!overTarget()) return;
           final FileStat current = await file.stat();
           // Changed since recorded (rewritten, or touched externally): the
           // recorded size is stale, so leave it for a full scan.
@@ -594,17 +642,35 @@ class TranslationCacheStore {
             if (checked != null &&
                 checked.modified == entry.modified &&
                 checked.size == entry.size) {
-              // Perf-#42: same bytes as the last check — reuse the digest
-              // instead of re-reading and re-hashing. Re-stat first so a
-              // concurrent replacement cannot slip different bytes under
-              // the memoized (mtime, size).
+              // P2-#31: (mtime, size) alone cannot prove the content is
+              // unchanged — an external rewrite with the same size and a
+              // preserved mtime would reuse a stale digest and corrupt
+              // rollback detection. Verify by re-hashing and comparing
+              // with the memoized digest; on mismatch the content really
+              // changed, so refresh the memo with the fresh digest.
               final FileStat current = await entry.file.stat();
               if (current.type != FileSystemEntityType.file ||
                   current.size != entry.size ||
                   current.modified != entry.modified) {
                 return;
               }
-              digest = checked.digest;
+              final Digest fresh = await sha256
+                  .bind(entry.file.openRead())
+                  .first;
+              final FileStat after = await entry.file.stat();
+              if (after.type != FileSystemEntityType.file ||
+                  after.size != entry.size ||
+                  after.modified != entry.modified) {
+                return;
+              }
+              if (fresh != checked.digest) {
+                _rollbackChecked[key] = _RollbackCheck(
+                  modified: entry.modified,
+                  size: entry.size,
+                  digest: fresh,
+                );
+              }
+              digest = fresh;
             } else {
               digest = await sha256.bind(entry.file.openRead()).first;
               final FileStat current = await entry.file.stat();
@@ -670,6 +736,10 @@ class TranslationCacheStore {
         }
       }
       _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
+      // P2-#32: remember the temp pressure this scan saw, so the light
+      // pass can exclude it from its eviction target and so temp-driven
+      // backoff is not cleared by light-pass evictions.
+      _lastScanTempBytes = tempBytes;
       // Rebuild the lightweight-eviction order from on-disk mtimes (oldest
       // first) so the backoff-period quota pass evicts approximately LRU
       // without another full scan.
@@ -728,19 +798,24 @@ class TranslationCacheStore {
   /// files. Pruning only removes checkpoints idle for 5+ minutes, so
   /// scanning more than once a minute cannot free anything new.
   static const Duration _jobPruneThrottle = Duration(minutes: 1);
-  DateTime? _lastJobCheckpointPrune;
+
+  /// Monotonic throttle clock for [_pruneOldJobStates] (perf-#53). The wall
+  /// clock must not gate this: a clock rollback would stall pruning until
+  /// the clock catches up.
+  final Stopwatch _jobPruneStopwatch = Stopwatch();
 
   /// Deletes the oldest checkpoints beyond [_maxJobCheckpoints]. Best
   /// effort: checkpoint maintenance must never break a translation run. All
   /// recently active checkpoints (including the one just saved) are protected
   /// for five minutes, even when this temporarily exceeds the count cap.
   Future<void> _pruneOldJobStates() async {
-    final DateTime now = _now();
-    final DateTime? lastPrune = _lastJobCheckpointPrune;
-    if (lastPrune != null && now.difference(lastPrune) < _jobPruneThrottle) {
+    if (_jobPruneStopwatch.isRunning &&
+        _jobPruneStopwatch.elapsed < _jobPruneThrottle) {
       return;
     }
-    _lastJobCheckpointPrune = now;
+    _jobPruneStopwatch
+      ..reset()
+      ..start();
     try {
       final Directory root = await _cacheRoot();
       await pruneJobCheckpointsForTest(
@@ -946,6 +1021,12 @@ class TranslationCacheStore {
   /// member serializes fully before the gates (mtime mismatch → the pair
   /// is kept) or fully after (the fresh file survives). Returns true when
   /// both members were deleted.
+  ///
+  /// P2-#41: the dual gate only prevents concurrent interleaving — if the
+  /// second delete fails, the outer best-effort catch would swallow it and
+  /// leave a half-pair. Snapshot both members first; on a second-delete
+  /// failure restore the first so the pair stays whole (the next pass
+  /// retries). Returns false when the pair was not deleted.
   Future<bool> _deleteCheckpointPair(
     File first,
     DateTime firstListedModified,
@@ -973,8 +1054,22 @@ class TranslationCacheStore {
             return false;
           }
         }
+        final List<int> firstBytes = await ordered[0].file.readAsBytes();
         await ordered[0].file.delete();
-        await ordered[1].file.delete();
+        try {
+          await ordered[1].file.delete();
+        } catch (_) {
+          // Restore the already-deleted first member: a half-pair breaks
+          // the pair invariant (kept or deleted together, never split).
+          // Best effort — if the restore also fails, the next pass treats
+          // the remainder as an orphan singleton.
+          try {
+            await ordered[0].file.writeAsBytes(firstBytes, flush: true);
+          } catch (_) {
+            // Best effort; the next pass will retry the orphan.
+          }
+          return false;
+        }
         return true;
       });
     });

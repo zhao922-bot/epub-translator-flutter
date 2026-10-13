@@ -44,6 +44,13 @@ internal class ImportWatchdog {
 }
 
 internal class ImportLifecycle {
+    /**
+     * Guards the generation check-and-register sequence (P2-#16): the
+     * watchdog's executor replacement and a task's holder registration must
+     * not interleave, or a stale task could slip between the generation
+     * re-check and the set() and overwrite a newer import's holder.
+     */
+    val registrationLock = Any()
     @Volatile var generation = 0
         private set
     @Volatile var destroyed = false
@@ -71,6 +78,11 @@ internal class ImportStaleException :
  * import's registration after the watchdog replaced the executor — on a
  * stale generation this throws [ImportStaleException] instead of
  * registering, so the newer holder (and its watchdog un-wedging) survives.
+ *
+ * P2-#16: prefer [MainActivity.registerImportHolder], which runs this
+ * check and the set() atomically under [ImportLifecycle.registrationLock].
+ * Check-then-set without the lock lets a watchdog executor replacement
+ * land between the two and still overwrite the newer holder.
  */
 internal fun checkImportRegistration(
     lifecycle: ImportLifecycle,

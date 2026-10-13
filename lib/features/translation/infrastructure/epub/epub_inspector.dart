@@ -157,17 +157,31 @@ class EpubInspector {
       s.inspectLogLocatedPackage(opfPath),
     );
 
+    // P2-#24: re-check cancellation after the progress callback above: a
+    // cancel that landed while the snapshot was decoded must surface as a
+    // cancellation, not as a "no chapters" failure below.
+    throwIfCancelled();
+
+    // P-#47: parse the OPF once and share the document between spine
+    // resolution and navigation validation below — each of them used to
+    // re-parse it, and the ZIP worker parses it three more times via
+    // inspectionEntryPaths.
+    final XmlDocument opfDocument = _parseOpfDocument(files, opfPath);
     final ({List<String> chapterPaths, List<String> unresolvedIdRefs}) spine =
-        chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
+        _chapterPathsFromOpfDocument(opfDocument, opfPath);
     final List<String> chapterPaths = spine.chapterPaths;
 
     // The repack isolate strict-decodes the NCX while rendering navigation
     // metadata. Validate its encoding and XML here so a malformed NCX
     // fails loudly during inspection — before any API spend — instead of
     // killing the run after the whole translation was billed.
-    validateNavigationEncodings(files: files, opfPath: opfPath);
+    _validateNavigationEncodings(files, opfPath, opfDocument);
 
     if (chapterPaths.isEmpty) {
+      // P2-#24: a cancelled inspection must surface as a cancellation even
+      // when the spine is empty — the user asked to stop, and the empty
+      // spine may simply be where the cancel landed.
+      throwIfCancelled();
       emit(
         currentJob.copyWith(
           status: TranslationJobStatus.failed,
@@ -252,6 +266,13 @@ class EpubInspector {
           ),
         );
       }
+      // P-#49: drop the processed chapter bytes from the snapshot as the
+      // batches complete — retaining every selected chapter at once peaks
+      // memory at the whole book. Navigation files (container/OPF/NCX) are
+      // not chapter paths, so they are untouched.
+      for (final String chapterPath in batch.keys) {
+        files.remove(chapterPath);
+      }
       throwIfCancelled();
     }
 
@@ -331,16 +352,18 @@ class EpubInspector {
 
   /// Selects inspection payloads in the ZIP worker using the same manifest
   /// resolution rules as the chapter and navigation validators below.
+  ///
+  /// Parses the OPF once and shares the document (P-#47): the spine
+  /// resolver, the NCX resolver and the nav scan below each used to parse
+  /// it separately.
   static Set<String> inspectionEntryPaths(
     Map<String, List<int>> files,
     String opfPath,
   ) {
-    final spine = chapterPathsFromOpfBytes(files: files, opfPath: opfPath);
-    final ncx = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
+    final XmlDocument opf = _parseOpfDocument(files, opfPath);
+    final spine = _chapterPathsFromOpfDocument(opf, opfPath);
+    final ncx = _ncxPathFromOpfDocument(opf, opfPath);
     final paths = <String>{...spine.chapterPaths, ?ncx};
-    final opf = XmlDocument.parse(
-      decodeEpubText(bytes: files[opfPath]!, filePath: opfPath, strict: true),
-    );
     for (final item in opf.descendants.whereType<XmlElement>().where(
       (e) =>
           e.name.local == 'item' &&
@@ -386,9 +409,18 @@ class EpubInspector {
     if (opfBytes == null) {
       return null;
     }
-    final XmlDocument opfDocument = XmlDocument.parse(
-      decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+    return _ncxPathFromOpfDocument(
+      XmlDocument.parse(
+        decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+      ),
+      opfPath,
     );
+  }
+
+  static String? _ncxPathFromOpfDocument(
+    XmlDocument opfDocument,
+    String opfPath,
+  ) {
     final XmlElement? spine = opfDocument.descendants
         .whereType<XmlElement>()
         .cast<XmlElement?>()
@@ -452,7 +484,23 @@ class EpubInspector {
     required Map<String, List<int>> files,
     required String opfPath,
   }) {
-    final String? ncxPath = ncxPathFromOpfBytes(files: files, opfPath: opfPath);
+    final List<int>? opfBytes = files[opfPath];
+    if (opfBytes == null) return;
+    _validateNavigationEncodings(
+      files,
+      opfPath,
+      XmlDocument.parse(
+        decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
+      ),
+    );
+  }
+
+  static void _validateNavigationEncodings(
+    Map<String, List<int>> files,
+    String opfPath,
+    XmlDocument opf,
+  ) {
+    final String? ncxPath = _ncxPathFromOpfDocument(opf, opfPath);
     final List<int>? ncxBytes = ncxPath == null ? null : files[ncxPath];
     if (ncxBytes != null) {
       XmlDocument.parse(
@@ -461,11 +509,6 @@ class EpubInspector {
     }
     // EPUB 3 navigation is now rewritten at export too. Validate it before
     // any paid requests, including when it is absent from the spine.
-    final opfBytes = files[opfPath];
-    if (opfBytes == null) return;
-    final opf = XmlDocument.parse(
-      decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
-    );
     for (final item in opf.descendants.whereType<XmlElement>().where(
       (element) =>
           element.name.local == 'item' &&
@@ -494,23 +537,61 @@ class EpubInspector {
     required Map<String, List<int>> files,
     required String opfPath,
   }) {
+    return _chapterPathsFromOpfDocument(
+      _parseOpfDocument(files, opfPath),
+      opfPath,
+    );
+  }
+
+  /// Parses the OPF once for the document-based helpers below (P-#47).
+  /// Throws the same [FormatException] as [chapterPathsFromOpfBytes] when
+  /// the entry is missing from the snapshot.
+  static XmlDocument _parseOpfDocument(
+    Map<String, List<int>> files,
+    String opfPath,
+  ) {
     final List<int>? opfBytes = files[opfPath];
     if (opfBytes == null) {
       throw FormatException(
         'Invalid EPUB: package document not found at $opfPath.',
       );
     }
-
-    final XmlDocument opfDocument = XmlDocument.parse(
+    return XmlDocument.parse(
       decodeEpubText(bytes: opfBytes, filePath: opfPath, strict: true),
     );
+  }
+
+  /// The OPF package namespace. Manifest entries are honored in this
+  /// namespace, or when the document declares no namespace at all (some
+  /// tools emit bare `<package>` documents, which existing tests cover).
+  static const String _opfNamespaceUri = 'http://www.idpf.org/2007/opf';
+
+  /// True for a [localName] element in the OPF namespace (or a
+  /// namespace-less document) whose parent is the `<manifest>` element
+  /// (P2-#21): matching every descendant by bare local name let a
+  /// foreign-namespace element with a colliding id overwrite the real
+  /// chapter in the manifest map.
+  static bool _isOpfManifestChild(XmlElement element, String localName) {
+    if (element.name.local != localName) return false;
+    final String? ns = element.name.namespaceUri;
+    if (ns != null && ns != _opfNamespaceUri) return false;
+    final XmlNode? parent = element.parent;
+    if (parent is! XmlElement || parent.name.local != 'manifest') {
+      return false;
+    }
+    final String? parentNs = parent.name.namespaceUri;
+    return parentNs == null || parentNs == _opfNamespaceUri;
+  }
+
+  static ({List<String> chapterPaths, List<String> unresolvedIdRefs})
+  _chapterPathsFromOpfDocument(XmlDocument opfDocument, String opfPath) {
     final String opfDirectory = path.posix.dirname(opfPath);
 
     final Map<String, String> manifest = <String, String>{};
     final Map<String, String> mediaTypes = <String, String>{};
     for (final XmlElement item
         in opfDocument.descendants.whereType<XmlElement>()) {
-      if (item.name.local != 'item') {
+      if (!_isOpfManifestChild(item, 'item')) {
         continue;
       }
       final String? id = item.getAttribute('id');

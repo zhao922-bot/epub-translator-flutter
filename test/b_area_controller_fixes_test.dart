@@ -314,16 +314,15 @@ void main() {
       await controller.startInspection();
       expect(identical(controller.debugStaticEstimateCache, frozen), isTrue);
 
-      var previous = frozen;
-      var previousChunkSize = 100;
       for (final chunkSize in <int>[60, 120, 100000]) {
         controller.syncSettings(
           controller.state.config.copyWith(chunkSize: chunkSize),
         );
         final updated = controller.debugStaticEstimateCache!;
-        final scaled =
-            (previous.estimatedApiBatches * previousChunkSize / chunkSize)
-                .ceil();
+        // P2-#20: always scaled from the anchor's original values (chunk
+        // size 100, the frozen batches), never chained from the previously
+        // scaled count — chained ceil() rounding drifts.
+        final scaled = (frozen.estimatedApiBatches * 100 / chunkSize).ceil();
         expect(updated.estimatedApiBatches, scaled < 1 ? 1 : scaled);
         expect(updated.estimatedSourceChars, frozen.estimatedSourceChars);
         expect(updated.estimatedInputTokens, frozen.estimatedInputTokens);
@@ -345,8 +344,6 @@ void main() {
           controller.state.config.copyWith(targetLanguage: 'Japanese'),
         );
         expect(identical(controller.debugStaticEstimateCache, updated), isTrue);
-        previous = updated;
-        previousChunkSize = chunkSize;
       }
     } finally {
       resume.complete();

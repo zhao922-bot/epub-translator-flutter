@@ -208,6 +208,20 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> _pendingSave = Future<void>.value();
   Future<void>? _recoveryLoad;
 
+  /// In-flight [reloadSettings] future, if any (P2-#36). Concurrent reloads
+  /// join it instead of starting a second load.
+  Future<bool>? _reloadInProgress;
+
+  /// Completes when the load phase of the in-flight [reloadSettings]
+  /// finishes (P2-#36). A new edit arriving mid-load waits for the fresh
+  /// snapshot instead of interleaving with [_load] (applied to the old
+  /// snapshot then discarded, or racing the conflict check). Parked edits
+  /// are released as soon as the load finishes — before the conflict
+  /// replay runs — so a debounced slider edit is still pending when the
+  /// replay swallows it (P2-#23), instead of arriving after the whole
+  /// reload and racing the next one.
+  Completer<void>? _reloadLoadPhase;
+
   /// Edits whose save failed with [SettingsWriteConflict]. [reloadSettings]
   /// re-applies them onto the freshly loaded snapshot instead of silently
   /// discarding the user's work. Automatic load recovery uses the same replay
@@ -295,6 +309,19 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     void Function()? onApplied,
   }) async {
     if (!_loaded) await _initialLoad;
+    // P2-#36: an edit arriving while reloadSettings is reading must not
+    // interleave with the load (applied to the old snapshot then discarded
+    // by _load, or racing the conflict check). Wait for the load phase,
+    // then apply onto the fresh snapshot. The wait ends before the
+    // conflict replay runs: a debounced slider edit must still be pending
+    // when the replay swallows it (P2-#23) — parking it for the whole
+    // reload lets it resume after the reload finished and race the next
+    // reload instead, losing the value. Conflict replays run inside the
+    // reload itself and must not wait on it.
+    if (!isConflictReplay) {
+      final Future<void>? ongoingLoad = _reloadLoadPhase?.future;
+      if (ongoingLoad != null) await ongoingLoad;
+    }
     if (!mounted) {
       return false;
     }
@@ -310,7 +337,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       customApiBaseUrl: state.customApiBaseUrl,
       secretSlots: Set<SettingsSecretSlot>.of(slots),
     );
-    final TranslationConfig next = update(state);
+    final TranslationConfig prevState = state;
+    final TranslationConfig next = update(prevState);
     if (!mounted) {
       return false;
     }
@@ -340,8 +368,17 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final effectiveUpdate = debounced == null
         ? update
         : (TranslationConfig config) => update(debounced(config));
+    // P2-#29: the swallowed slider transformation must also be applied to
+    // the state being saved, not just recorded for replay — otherwise the
+    // save persists the pre-slider value. Slider setters are absolute, so
+    // re-applying the composed transformation onto the pre-update snapshot
+    // is idempotent.
+    final TranslationConfig effectiveNext = debounced == null
+        ? next
+        : effectiveUpdate(prevState);
+    if (debounced != null) state = effectiveNext;
     final result = await _saveUpdate(
-      next,
+      effectiveNext,
       slots,
       pendingEdit: isConflictReplay
           // P2-#23: the replayed edit is already queued; it must not be
@@ -372,32 +409,37 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     return result;
   }
 
-  Future<void> flushSliderChanges() async {
+  /// Flushes a pending debounced slider edit. Returns true when there was
+  /// nothing to flush or the save succeeded. On failure the transformation
+  /// was already cleared; a conflict queues it for replay, any other error
+  /// surfaces via [onSaveError] and the caller must not proceed as if the
+  /// value were persisted (P2-#30).
+  Future<bool> flushSliderChanges() async {
     _sliderTimer?.cancel();
     final completion = _sliderCompletion;
     _sliderCompletion = null;
     final debounced = _debouncedEdit;
     _debouncedEdit = null;
-    if (completion == null) return;
-    completion.complete(
-      await _saveUpdate(
-        state,
-        const {},
-        pendingEdit: debounced == null
-            ? null
-            : (
-                update: debounced,
-                explicitSecretMutations: const <SettingsSecretSlot>{},
-                secretMutationsFor: null,
-                credentialRoute: (
-                  providerSelection: state.apiProviderSelection,
-                  apiBaseUrl: state.apiBaseUrl,
-                  customApiBaseUrl: state.customApiBaseUrl,
-                  secretSlots: const <SettingsSecretSlot>{},
-                ),
+    if (completion == null) return true;
+    final bool ok = await _saveUpdate(
+      state,
+      const {},
+      pendingEdit: debounced == null
+          ? null
+          : (
+              update: debounced,
+              explicitSecretMutations: const <SettingsSecretSlot>{},
+              secretMutationsFor: null,
+              credentialRoute: (
+                providerSelection: state.apiProviderSelection,
+                apiBaseUrl: state.apiBaseUrl,
+                customApiBaseUrl: state.customApiBaseUrl,
+                secretSlots: const <SettingsSecretSlot>{},
               ),
-      ),
+            ),
     );
+    completion.complete(ok);
+    return ok;
   }
 
   Future<bool> _saveUpdate(
@@ -449,15 +491,48 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// silently discarded; replaying the closures (rather than restoring the
   /// failed state wholesale) keeps the other instance's unrelated changes
   /// intact. Clears the store's load error on success.
-  Future<void> reloadSettings() async {
-    await _pendingSave;
-    // P2-#26: flush a pending slider (debounced) edit before reloading.
-    // Otherwise _load() replaces the state with the on-disk snapshot and
-    // the just-dragged value is lost — while the flush that fires later
-    // still reports success for a value that was never persisted.
-    await flushSliderChanges();
-    if (!await _load()) return;
-    await _replayConflictedEdits();
+  ///
+  /// Returns true when the load (and replay) completed. A failed
+  /// pre-reload slider flush aborts the reload (P2-#30): the transformation
+  /// was already cleared and cannot be retried, so replacing the state via
+  /// _load() would silently discard it. The flush failure was already
+  /// surfaced via onSaveError.
+  ///
+  /// While a reload is loading, new edits wait for the fresh snapshot
+  /// instead of interleaving with the load (P2-#36). Concurrent
+  /// reloadSettings calls join the in-flight one.
+  Future<bool> reloadSettings() async {
+    final Future<bool>? ongoing = _reloadInProgress;
+    if (ongoing != null) return ongoing;
+    final Completer<bool> done = Completer<bool>();
+    _reloadInProgress = done.future;
+    final Completer<void> loadPhase = Completer<void>();
+    _reloadLoadPhase = loadPhase;
+    bool ok = false;
+    try {
+      await _pendingSave;
+      // P2-#26: flush a pending slider (debounced) edit before reloading.
+      // Otherwise _load() replaces the state with the on-disk snapshot and
+      // the just-dragged value is lost — while the flush that fires later
+      // still reports success for a value that was never persisted.
+      // P2-#30: abort when the flush fails.
+      if (!await flushSliderChanges()) return false;
+      final bool loaded = await _load();
+      // P2-#36: the fresh snapshot is in — release parked edits before the
+      // conflict replay runs, so a debounced slider edit is still pending
+      // when the replay swallows it (P2-#23).
+      _reloadLoadPhase = null;
+      if (!loadPhase.isCompleted) loadPhase.complete();
+      if (!loaded) return false;
+      await _replayConflictedEdits();
+      ok = true;
+      return true;
+    } finally {
+      _reloadLoadPhase = null;
+      if (!loadPhase.isCompleted) loadPhase.complete();
+      _reloadInProgress = null;
+      if (!done.isCompleted) done.complete(ok);
+    }
   }
 
   bool _isReplayBlockedByRouteChange(_ConflictedEdit edit) {
@@ -479,17 +554,23 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _replayingConflictedEdits = true;
     final List<_ConflictedEdit> pending = _conflictedEdits.toList();
     // P2-#22: which queue entries were (re-)applied to the state during
-    // this pass. A later entry's successful save persists the whole state,
-    // including the earlier entries' effects — those earlier entries are
-    // then superseded and must be dropped. Otherwise the next retry would
-    // re-apply the failed first entry's stale transformation over the
-    // second entry's successful values.
-    final List<bool> appliedInPass = List<bool>.filled(pending.length, false);
-    // The state generation at pass start: a recovery load inside an entry's
-    // _update discards earlier entries' optimistic effects (they were never
-    // persisted), so superseded-dropping is only valid when the generation
-    // is unchanged.
-    final int passGeneration = _stateGeneration;
+    // this pass, and at which state generation. A later entry's successful
+    // save persists the whole state, including the earlier entries'
+    // effects — those earlier entries are then superseded and must be
+    // dropped. Otherwise the next retry would re-apply the failed first
+    // entry's stale transformation over the second entry's successful
+    // values.
+    // P2-#28: record the per-entry generation, not just a pass-start
+    // snapshot. A recovery load mid-pass discards earlier entries'
+    // optimistic effects (they were never persisted), so superseded-
+    // dropping is only valid for entries applied at the current generation
+    // — a fixed pass-start generation would wrongly keep entries that were
+    // applied after the load and then superseded, and their next replay
+    // would change the new value back to the old one.
+    final List<int?> appliedGeneration = List<int?>.filled(
+      pending.length,
+      null,
+    );
     int blocked = 0;
     try {
       for (int i = 0; i < pending.length; i++) {
@@ -511,19 +592,23 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             secretMutationsFor: edit.secretMutationsFor,
             // This edit is still queued; a new conflict must not duplicate it.
             isConflictReplay: true,
-            onApplied: () => appliedInPass[i] = true,
+            onApplied: () => appliedGeneration[i] = _stateGeneration,
           )) {
             _conflictedEdits.remove(edit);
-            if (_stateGeneration == passGeneration) {
-              // No recovery load replaced the state during this pass, so
-              // this save persisted every earlier entry applied above:
-              // their intent is durable and they are superseded. (Blocked
-              // entries were never applied — their effects are not in the
-              // saved state — so they stay queued.)
-              for (int j = 0; j < i; j++) {
-                if (appliedInPass[j]) {
-                  _conflictedEdits.remove(pending[j]);
-                }
+            // P2-#27: only drop earlier entries whose effects this save
+            // actually persisted. A key entry skipped as unreadable (its
+            // slot read failed) is not persisted by a later non-credential
+            // save — dropping it would lose the key edit.
+            final Set<SettingsSecretSlot> persisted =
+                _store.lastPersistedSecretSlots;
+            for (int j = 0; j < i; j++) {
+              final int? appliedAt = appliedGeneration[j];
+              if (appliedAt != null &&
+                  appliedAt == _stateGeneration &&
+                  pending[j].credentialRoute.secretSlots.every(
+                    persisted.contains,
+                  )) {
+                _conflictedEdits.remove(pending[j]);
               }
             }
           }
@@ -564,16 +649,33 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// Discards queued conflict edits, including blocked credential replays.
   void discardBlockedConflictReplays() => _conflictedEdits.clear();
 
-  Future<bool> setApiBaseUrl(String value) => _update((config) {
-    final String nextUrl = value.trim();
-    return config.copyWith(
-      apiProviderSelection: ApiProviderSelection.custom,
-      apiBaseUrl: nextUrl,
-      customApiBaseUrl: nextUrl,
-      customApiKey: config.apiKey,
-      customModel: config.model,
-    );
-  });
+  /// Number of queued conflict edits currently blocked by a route change
+  /// (P2-#37). Surfaced so the settings page can display the blocked
+  /// credential queue instead of leaving the user unaware.
+  int get blockedReplayCount =>
+      _conflictedEdits.where(_isReplayBlockedByRouteChange).length;
+
+  Future<bool> setApiBaseUrl(String value) {
+    // P1-#5: capture the active key at edit time. The direct call keeps the
+    // N8 behavior (the user's current key moves to the custom slot), but the
+    // replay closure must not re-read key material from the fresh snapshot —
+    // after a cross-instance conflict that key may belong to another
+    // instance, and binding it here would send another instance's
+    // credential to the user-typed address.
+    final String editTimeKey = state.apiKey;
+    final String editTimeModel = state.model;
+    return _update((config) {
+      final String nextUrl = value.trim();
+      return config.copyWith(
+        apiProviderSelection: ApiProviderSelection.custom,
+        apiBaseUrl: nextUrl,
+        customApiBaseUrl: nextUrl,
+        customApiKey: editTimeKey,
+        apiKey: editTimeKey,
+        customModel: editTimeModel,
+      );
+    });
+  }
 
   Future<bool> setApiKey(String value) => _update(
     (config) {

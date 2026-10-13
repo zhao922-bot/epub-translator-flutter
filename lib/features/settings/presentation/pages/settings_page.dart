@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/logging/app_logger.dart';
 import '../../../../shared/platform/native_platform_bridge.dart';
 import '../../../../shared/platform/windows_elevation_check.dart';
 import '../../../../shared/platform/platform_utils.dart';
@@ -119,6 +120,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
         ref.watch(secretKeyRotatedNoticeProvider) != null;
     final bool writeConflict =
         ref.watch(settingsWriteConflictProvider) != null;
+    // P2-#37: credential replays blocked by a route change must be visible.
+    // The queued edits are retained until the user confirms the new target
+    // or discards them.
+    final bool replayBlocked =
+        ref.watch(settingsReplayBlockedProvider) != null;
 
     // Surface persistence failures (e.g. the secret store timing out): the
     // fields already show the new values, so warn instead of failing silently.
@@ -159,8 +165,40 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   : 'Another instance changed the settings; this page may show stale values and saves will fail. Reload and try again.',
               actionLabel: strings.isChinese ? '重新加载' : 'Reload',
               onAction: () async {
-                await ref.read(settingsProvider.notifier).reloadSettings();
-                ref.read(settingsWriteConflictProvider.notifier).state = null;
+                final bool ok = await ref
+                    .read(settingsProvider.notifier)
+                    .reloadSettings();
+                // P2-#38: keep the conflict notice when reload failed so
+                // the user doesn't lose the recovery entry. P2-#39: the
+                // page may be disposed while the reload is in flight.
+                if (ok && mounted) {
+                  ref.read(settingsWriteConflictProvider.notifier).state =
+                      null;
+                }
+              },
+            ),
+          // 凭据回放被路由保护阻止：队列保留，等待用户确认为当前服务地址
+          // 或放弃。无提示用户会不知晓凭据修改未生效。
+          if (replayBlocked)
+            _SettingsWarningBanner(
+              text: strings.isChinese
+                  ? '有 ${controller.blockedReplayCount} 个凭据修改因服务地址变更被暂缓，等待确认。确认为当前地址后将继续保存，放弃则丢弃这些修改。'
+                  : '${controller.blockedReplayCount} credential change(s) are held back because the service address changed. Confirm to save them against the current address, or discard them.',
+              actionLabel: strings.isChinese ? '确认应用' : 'Apply',
+              onAction: () async {
+                await controller.confirmBlockedConflictReplays();
+                if (mounted) {
+                  ref.read(settingsReplayBlockedProvider.notifier).state =
+                      null;
+                }
+              },
+              secondaryActionLabel: strings.isChinese ? '放弃' : 'Discard',
+              onSecondaryAction: () async {
+                controller.discardBlockedConflictReplays();
+                if (mounted) {
+                  ref.read(settingsReplayBlockedProvider.notifier).state =
+                      null;
+                }
               },
             ),
           // Windows 提权运行：DPAPI 密钥与普通用户不互通，提醒用户。
@@ -631,11 +669,15 @@ class _SettingsWarningBanner extends StatelessWidget {
     required this.text,
     this.actionLabel,
     this.onAction,
+    this.secondaryActionLabel,
+    this.onSecondaryAction,
   });
 
   final String text;
   final String? actionLabel;
   final Future<void> Function()? onAction;
+  final String? secondaryActionLabel;
+  final Future<void> Function()? onSecondaryAction;
 
   @override
   Widget build(BuildContext context) {
@@ -643,6 +685,8 @@ class _SettingsWarningBanner extends StatelessWidget {
     final ColorScheme scheme = theme.colorScheme;
     final String? actionLabel = this.actionLabel;
     final Future<void> Function()? onAction = this.onAction;
+    final String? secondaryActionLabel = this.secondaryActionLabel;
+    final Future<void> Function()? onSecondaryAction = this.onSecondaryAction;
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Card(
@@ -662,10 +706,47 @@ class _SettingsWarningBanner extends StatelessWidget {
                   ),
                 ),
               ),
+              if (secondaryActionLabel != null && onSecondaryAction != null) ...[
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: () {
+                    // P2-#39: an unawaited banner action must not drop
+                    // errors silently.
+                    unawaited(
+                      onSecondaryAction().then(
+                        (_) {},
+                        onError: (Object error) {
+                          AppLogger.error(
+                            'Settings banner action failed: '
+                            '${error.runtimeType}',
+                            tag: 'settings',
+                          );
+                        },
+                      ),
+                    );
+                  },
+                  child: Text(secondaryActionLabel),
+                ),
+              ],
               if (actionLabel != null && onAction != null) ...[
                 const SizedBox(width: 8),
                 TextButton(
-                  onPressed: () => unawaited(onAction()),
+                  onPressed: () {
+                    // P2-#39: an unawaited banner action must not drop
+                    // errors silently.
+                    unawaited(
+                      onAction().then(
+                        (_) {},
+                        onError: (Object error) {
+                          AppLogger.error(
+                            'Settings banner action failed: '
+                            '${error.runtimeType}',
+                            tag: 'settings',
+                          );
+                        },
+                      ),
+                    );
+                  },
                   child: Text(actionLabel),
                 ),
               ],

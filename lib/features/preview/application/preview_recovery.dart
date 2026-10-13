@@ -73,23 +73,78 @@ const previewRecoveryMarkupLimit =
     EpubHtmlExtractor.previewCharacterLimit * 8 + 4096;
 
 class _PreviewRecoveryPayload extends InspectedChapter {
+  /// Parse-free transfer slimming (P-#46). Built on the caller thread
+  /// before compute(): drops the per-block source fields the recovery
+  /// pipeline never reads and drops blocks without translations, so the
+  /// isolate copy no longer grows with the total block count. No DOM
+  /// parsing here — that stays inside the isolate (perf-#35); see
+  /// [_finishSlimming].
   _PreviewRecoveryPayload(InspectedChapter chapter)
     : blockCount = chapter.blocks.length,
       translatedBlockCount = chapter.translatedBlockCount,
       super(
         path: chapter.path,
         title: chapter.title,
-        body: _slimSourceBody(chapter),
-        originalHtml: _slimOriginalHtml(chapter),
-        blocks: _slimTranslations(chapter),
+        body: chapter.body,
+        originalHtml: chapter.originalHtml,
+        blocks: _transferBlocks(chapter),
         category: chapter.category,
         recommendedForTranslation: chapter.recommendedForTranslation,
         includeInTranslation: chapter.includeInTranslation,
       );
 
+  /// Parse-dependent finish, run inside the isolate: bounds the markup and
+  /// derives the exact source excerpt ([_slimSourceBody],
+  /// [_slimOriginalHtml], [_slimTranslations]).
+  _PreviewRecoveryPayload _finishSlimming() => _PreviewRecoveryPayload._slimmed(
+    this,
+    body: _slimSourceBody(this),
+    originalHtml: _slimOriginalHtml(this),
+    blocks: _slimTranslations(this),
+  );
+
+  _PreviewRecoveryPayload._slimmed(
+    _PreviewRecoveryPayload payload, {
+    required super.body,
+    required super.originalHtml,
+    required super.blocks,
+  }) : blockCount = payload.blockCount,
+       translatedBlockCount = payload.translatedBlockCount,
+       super(
+         path: payload.path,
+         title: payload.title,
+         category: payload.category,
+         recommendedForTranslation: payload.recommendedForTranslation,
+         includeInTranslation: payload.includeInTranslation,
+       );
+
   final int blockCount;
   @override
   final int translatedBlockCount;
+}
+
+/// Parse-free block slimming for the transfer payload (P-#46): keeps only
+/// blocks the recovery pipeline reads (translatedHtml, parsed in the
+/// isolate), with id/tagName/sourceHtml dropped. When originalHtml is empty
+/// the source excerpt falls back to the first 12 blocks' sourceText
+/// ([_slimSourceBody]), so those blocks and their sourceText are kept —
+/// the isolate then derives the identical excerpt.
+List<ExtractedBlock> _transferBlocks(InspectedChapter chapter) {
+  final blocks = <ExtractedBlock>[];
+  for (int i = 0; i < chapter.blocks.length; i++) {
+    final block = chapter.blocks[i];
+    final bool excerptBlock = chapter.originalHtml.isEmpty && i < 12;
+    if (block.translatedHtml == null && !excerptBlock) continue;
+    blocks.add(
+      block.copyWith(
+        id: '',
+        tagName: '',
+        sourceHtml: '',
+        sourceText: excerptBlock ? block.sourceText : '',
+      ),
+    );
+  }
+  return blocks;
 }
 
 String _excerptMarkup(String text) {
@@ -107,9 +162,9 @@ String _slimOriginalHtml(InspectedChapter chapter) {
   }
   // A raw prefix is not equivalent to inspection: a long head/skipped subtree
   // may precede the body, and truncation can change block selection or entities.
-  // For oversized HTML, extract the exact bounded body before transfer instead.
-  // This fallback parses on the caller isolate, trading CPU for exact semantics
-  // and a strictly bounded transfer; ordinary markup is parsed in compute.
+  // For oversized HTML the markup is dropped here and the exact bounded body
+  // is derived from the full HTML via _slimSourceBody (inside the isolate);
+  // ordinary markup is parsed in compute.
   return '';
 }
 
@@ -158,15 +213,20 @@ Future<List<PreviewChapter>> _recoverInIsolate(
   List<InspectedChapter> chapters,
 ) => compute(_recoverBatch, chapters);
 
-// perf-#35: the payload slimming does DOM parsing (inspectChapterBytes for
-// oversized source HTML, parseFragment per translated block). It must run
-// here, inside the isolate — building the payloads on the caller (UI)
-// thread before compute() janked on large chapters. The caller transfers
-// the chapters untouched; all parsing cost stays off the UI thread.
+// The parse-dependent slimming (DOM parsing for oversized source HTML and
+// per-block translated markup) runs inside the isolate — building it on the
+// caller (UI) thread before compute() janked on large chapters (perf-#35).
+// The caller only applies the parse-free transfer slimming first
+// (_PreviewRecoveryPayload), so the isolate copy no longer grows with the
+// total block count (P-#46).
 List<PreviewChapter> _recoverBatch(List<InspectedChapter> chapters) => chapters
     .map(
-      (chapter) =>
-          previewChapterFromInspected(_PreviewRecoveryPayload(chapter)),
+      (chapter) => previewChapterFromInspected(
+        (chapter is _PreviewRecoveryPayload
+                ? chapter
+                : _PreviewRecoveryPayload(chapter))
+            ._finishSlimming(),
+      ),
     )
     .toList();
 
@@ -218,30 +278,34 @@ class PreviewRecoveryCache {
       }
     }
     if (missing.isNotEmpty) {
-      // perf-#35: pass the chapters untouched. Payload slimming (which parses
-      // DOM) happens inside the isolate in _recoverBatch, never on the caller
-      // thread — mapping to _PreviewRecoveryPayload here would parse on the
-      // UI thread before compute().
-      final work = _runner(missing)
-          .then((results) {
-            for (var i = 0; i < newEntries.length; i++) {
-              final entry = newEntries[i];
-              // compute cannot be cancelled. Logical cancellation drops results
-              // for switched-away content without applying them even to old entries.
-              if (entry.generation == _generation &&
-                  identical(_entries[entry.chapter.path], entry)) {
-                entry.result = results[i];
-              }
-            }
-          })
-          .catchError((Object error, StackTrace stack) {
-            for (final entry in newEntries) {
-              if (identical(_entries[entry.chapter.path], entry)) {
-                _entries.remove(entry.chapter.path);
-              }
-            }
-            Error.throwWithStackTrace(error, stack);
-          });
+      // P-#46: slim the transfer payload BEFORE compute(): shipping the full
+      // chapter object graphs made the isolate copy grow with the total
+      // block count (per-block sourceText/sourceHtml). This slimming is
+      // parse-free (field drops only); DOM parsing stays inside the isolate
+      // (perf-#35).
+      final work =
+          _runner(<InspectedChapter>[
+                for (final chapter in missing) _PreviewRecoveryPayload(chapter),
+              ])
+              .then((results) {
+                for (var i = 0; i < newEntries.length; i++) {
+                  final entry = newEntries[i];
+                  // compute cannot be cancelled. Logical cancellation drops results
+                  // for switched-away content without applying them even to old entries.
+                  if (entry.generation == _generation &&
+                      identical(_entries[entry.chapter.path], entry)) {
+                    entry.result = results[i];
+                  }
+                }
+              })
+              .catchError((Object error, StackTrace stack) {
+                for (final entry in newEntries) {
+                  if (identical(_entries[entry.chapter.path], entry)) {
+                    _entries.remove(entry.chapter.path);
+                  }
+                }
+                Error.throwWithStackTrace(error, stack);
+              });
       for (final entry in newEntries) {
         entry.ready = work;
       }

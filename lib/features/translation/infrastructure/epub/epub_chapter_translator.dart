@@ -265,6 +265,20 @@ class EpubChapterTranslator {
   static MemorySnapshotCursor memorySnapshotCursorForTest() =>
       MemorySnapshotCursor();
 
+  /// Incremental write-cursor decision for the positional memory timeline
+  /// (性能-#52). Entries are append-only with strictly increasing positions
+  /// — a re-recorded earlier chapter is dropped, never rewritten — so the
+  /// write side only needs the high-water mark instead of rescanning the
+  /// whole timeline per chapter (O(n^2) total). Exactly equivalent to the
+  /// old per-record full scan: an entry is appended iff its position is
+  /// non-null and strictly greater than every previously recorded one.
+  @visibleForTesting
+  static bool shouldRecordMemoryTimelineEntryForTest({
+    required int? position,
+    required int maxRecordedPosition,
+  }) =>
+      position != null && position > maxRecordedPosition;
+
   /// Incremental positional memory snapshot selector (性能-#38).
   ///
   /// Returns the newest timeline entry strictly before [chapterPath]'s
@@ -321,14 +335,42 @@ class EpubChapterTranslator {
   /// chapter, where the live memory is still the initial memory). After a
   /// checkpoint restore with a non-empty timeline the live memory may
   /// already contain later chapters, so a chapter with no earlier entry
-  /// receives no memory rather than leaking future content.
+  /// must not receive the whole live memory (that would leak future
+  /// chapters' glossary/plot/summaries).
+  /// P2-#9: returning null wholesale also dropped the user-confirmed style
+  /// profile (empty memory == empty style). Keep just the style-profile
+  /// slice instead: later-chapter memory stays isolated, but the user's
+  /// confirmed style choices survive.
   @visibleForTesting
   static Map<String, Object?>? memorySnapshotFallbackForTest({
     required bool hasRestoredMemory,
     required bool timelineIsEmpty,
     required Map<String, Object?>? liveMemory,
   }) {
-    return hasRestoredMemory && !timelineIsEmpty ? null : liveMemory;
+    if (!hasRestoredMemory || timelineIsEmpty) {
+      return liveMemory;
+    }
+    return _styleProfileOnlyMemory(liveMemory);
+  }
+
+  /// The user-confirmed style-profile slice of [liveMemory] (the
+  /// `styleProfile`/`styleProfileConfirmed` keys only), or null when there
+  /// is nothing to keep. Used by [memorySnapshotFallbackForTest] (P2-#9).
+  static Map<String, Object?>? _styleProfileOnlyMemory(
+    Map<String, Object?>? liveMemory,
+  ) {
+    if (liveMemory == null) {
+      return null;
+    }
+    final Map<String, Object?> styleOnly = <String, Object?>{};
+    final Object? styleProfile = liveMemory['styleProfile'];
+    if (styleProfile != null) {
+      styleOnly['styleProfile'] = styleProfile;
+    }
+    if (liveMemory['styleProfileConfirmed'] == true) {
+      styleOnly['styleProfileConfirmed'] = true;
+    }
+    return styleOnly.isEmpty ? null : styleOnly;
   }
 
   /// Positional memory snapshot: the newest timeline entry strictly before
@@ -1227,6 +1269,19 @@ class EpubChapterTranslator {
       final List<({String path, _BookMemory memory})> memoryTimeline = [
         ...?restoredMemory?.timeline,
       ];
+      // 性能-#52: incremental write cursor for [recordMemoryTimeline].
+      // Entries are append-only with strictly increasing positions (a
+      // re-recorded earlier chapter is dropped, never rewritten), so the
+      // write side only needs the high-water mark instead of rescanning
+      // the whole timeline per chapter (O(n^2) total for a book).
+      int maxRecordedTimelinePosition = -1;
+      for (final entry in memoryTimeline) {
+        final int? restoredPosition = selectedPositionByPath[entry.path];
+        if (restoredPosition != null &&
+            restoredPosition > maxRecordedTimelinePosition) {
+          maxRecordedTimelinePosition = restoredPosition;
+        }
+      }
       if (restoredMemory != null) {
         bookMemory = restoredMemory.memory;
         initialBookMemoryAttempted = true;
@@ -1277,14 +1332,18 @@ class EpubChapterTranslator {
       /// on for their own snapshots.
       void recordMemoryTimeline(String chapterPath, _BookMemory memory) {
         final int? position = selectedPositionByPath[chapterPath];
-        if (position == null) return;
-        for (final entry in memoryTimeline) {
-          final int? entryPosition = selectedPositionByPath[entry.path];
-          if (entryPosition != null && entryPosition >= position) {
-            return;
-          }
+        // 性能-#52: incremental cursor — only forward progress extends the
+        // timeline. Anything at or behind the high-water mark is a
+        // re-recorded earlier chapter and must not rewrite history that
+        // later chapters already rely on for their own snapshots.
+        if (!EpubChapterTranslator.shouldRecordMemoryTimelineEntryForTest(
+          position: position,
+          maxRecordedPosition: maxRecordedTimelinePosition,
+        )) {
+          return;
         }
         memoryTimeline.add((path: chapterPath, memory: memory));
+        maxRecordedTimelinePosition = position!;
       }
 
       Future<void> persistBookMemory() async {
@@ -2740,13 +2799,46 @@ class EpubChapterTranslator {
     }
 
     final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
-    // P2-#14: a translated slot keeps its protected status only when the tag
-    // that protects it also protects text in the source. A <code> (or
-    // similar) introduced by the model holds real translation text and must
-    // not be dropped as protected content.
-    final Set<String> sourceProtectedTags = _protectedElementTags(sourceDom);
-    bool translatedSlotProtected(_HtmlTextSlot slot) =>
-        _translatedSlotProtected(translatedDom, sourceProtectedTags, slot);
+    // P2-#7: effective protection is positional, not tag-based. A response
+    // protected slot keeps its protected status only when the source has a
+    // protected slot with the same (protecting tag, ordinal within that
+    // tag); a protected-kind element the model introduced (an extra <code>,
+    // a moved marker, ...) holds real translation text and must not be
+    // dropped as protected content. 性能-#42: decided once per slot in a
+    // single pass and cached — the old code walked up the ancestor chain
+    // once per filter pass.
+    final Map<String, int> sourceProtectedCounts =
+        _protectedSlotCountsByTag(rebuilt, sourceSlots);
+    final Map<dom.Text, bool> effectiveProtectedByNode =
+        Map<dom.Text, bool>.identity();
+    final Map<dom.Text, int> writableIndexByNode =
+        Map<dom.Text, int>.identity();
+    final List<String> writableTranslatedTexts = <String>[];
+    int protectedTranslatedCount = 0;
+    final Map<String, int> seenProtectedByTag = <String, int>{};
+    for (final _HtmlTextSlot slot in translatedSlots) {
+      if (!slot.protected) {
+        if (slot.text.isNotEmpty) {
+          writableIndexByNode[slot.node] = writableTranslatedTexts.length;
+          writableTranslatedTexts.add(slot.text);
+        }
+        continue;
+      }
+      final String tag = _nearestProtectingTag(translatedDom, slot.node) ?? '';
+      final int ordinal = seenProtectedByTag[tag] ?? 0;
+      seenProtectedByTag[tag] = ordinal + 1;
+      final bool effective = ordinal < (sourceProtectedCounts[tag] ?? 0);
+      effectiveProtectedByNode[slot.node] = effective;
+      if (slot.text.isEmpty) {
+        continue;
+      }
+      if (effective) {
+        protectedTranslatedCount++;
+      } else {
+        writableIndexByNode[slot.node] = writableTranslatedTexts.length;
+        writableTranslatedTexts.add(slot.text);
+      }
+    }
     // Positional mapping must pair unprotected slots with unprotected
     // slots: protected slots (footnote markers, page breaks, code) keep
     // their source text, so consuming translation texts across the
@@ -2757,26 +2849,23 @@ class EpubChapterTranslator {
     final List<_HtmlTextSlot> writableSourceSlots = sourceSlots
         .where((_HtmlTextSlot slot) => !slot.protected)
         .toList(growable: false);
-    final List<String> writableTranslatedTexts = translatedSlots
-        .where(
-          (_HtmlTextSlot slot) =>
-              !translatedSlotProtected(slot) && slot.text.isNotEmpty,
-        )
-        .map((_HtmlTextSlot slot) => slot.text)
-        .toList(growable: false);
     final int protectedSourceCount =
         sourceSlots.length - writableSourceSlots.length;
-    final int protectedTranslatedCount = translatedSlots
-        .where(
-          (_HtmlTextSlot slot) =>
-              translatedSlotProtected(slot) && slot.text.isNotEmpty,
-        )
-        .length;
 
     if (writableTranslatedTexts.length == writableSourceSlots.length &&
         protectedTranslatedCount == protectedSourceCount) {
+      // P2-#6: standalone whitespace-only text nodes never become slots, so
+      // writing slot texts alone would drop them and glue words the model
+      // separated with standalone whitespace. Fold each into the adjacent
+      // slot text so the written text sequence keeps the response's word
+      // separation.
+      final List<String> finalTexts = _withStandaloneWhitespace(
+        translatedDom,
+        writableTranslatedTexts,
+        writableIndexByNode,
+      );
       for (int index = 0; index < writableSourceSlots.length; index += 1) {
-        writableSourceSlots[index].text = writableTranslatedTexts[index];
+        writableSourceSlots[index].text = finalTexts[index];
       }
       rebuilt.invalidate();
       return rebuilt;
@@ -2785,11 +2874,12 @@ class EpubChapterTranslator {
     // P2-#13: rebuild the plain text from every non-protected text node,
     // including whitespace-only ones that never become slots, so words the
     // model separated with standalone whitespace do not glue together.
-    // Protected source slots retain their text; including translated code or
-    // markers here would duplicate them in the first writable source slot.
+    // Protected source slots retain their text; including genuinely
+    // protected response text here would duplicate it in the first writable
+    // source slot.
     final String translatedPlainText = _unprotectedResponseText(
       translatedDom,
-      sourceProtectedTags,
+      effectiveProtectedByNode,
     );
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
@@ -3433,68 +3523,122 @@ class EpubChapterTranslator {
     }
   }
 
-  /// Tags of elements that protect text in [dom] (footnote markers, page
-  /// breaks, code, ...). The merge fallback uses this so a
-  /// protected-kind element the model introduced in the response is not
-  /// mistaken for source-protected content (P2-#14).
-  static Set<String> _protectedElementTags(_ResponseHtml response) {
-    final Set<String> tags = <String>{};
-    void visit(dom.Node node) {
-      if (node is! dom.Element) {
-        return;
+  /// P2-#7: per-tag counts of protected source slots. A response protected
+  /// slot is effectively protected only when the source has a protected
+  /// slot with the same (protecting tag, ordinal within that tag): the
+  /// identity of protected content is positional, not a tag-name set.
+  static Map<String, int> _protectedSlotCountsByTag(
+    _ResponseHtml dom,
+    List<_HtmlTextSlot> slots,
+  ) {
+    final Map<String, int> counts = <String, int>{};
+    for (final _HtmlTextSlot slot in slots) {
+      if (!slot.protected) {
+        continue;
       }
-      if (response.isProtected(node)) {
-        final String? tag = node.localName;
-        if (tag != null) {
-          tags.add(tag);
-        }
-      }
-      for (final dom.Node child in node.nodes) {
-        visit(child);
-      }
+      final String tag = _nearestProtectingTag(dom, slot.node) ?? '';
+      counts[tag] = (counts[tag] ?? 0) + 1;
     }
-    for (final dom.Node node in response.fragment.nodes) {
-      visit(node);
-    }
-    return tags;
+    return counts;
   }
 
-  /// Whether [slot]'s text counts as protected in the merge fallback: it
-  /// must be protected in the response, and an ancestor carrying that
-  /// protection must have a tag that also protects text in the source
-  /// (P2-#14).
-  static bool _translatedSlotProtected(
-    _ResponseHtml translatedDom,
-    Set<String> sourceProtectedTags,
-    _HtmlTextSlot slot,
+  /// Tag of the nearest ancestor that protects [slotNode]'s text, or null
+  /// when none does. Callers only ask for protected slots, which always
+  /// have a protecting ancestor by construction.
+  static String? _nearestProtectingTag(
+    _ResponseHtml document,
+    dom.Text slotNode,
   ) {
-    if (!slot.protected) {
-      return false;
-    }
-    dom.Node? ancestor = slot.node.parentNode;
+    dom.Node? ancestor = slotNode.parentNode;
     while (ancestor is dom.Element) {
-      if (translatedDom.isProtected(ancestor) &&
-          sourceProtectedTags.contains(ancestor.localName)) {
-        return true;
+      if (document.isProtected(ancestor)) {
+        return ancestor.localName;
       }
       ancestor = ancestor.parentNode;
     }
-    return false;
+    return null;
+  }
+
+  /// P2-#6: folds standalone whitespace-only text nodes (which never become
+  /// slots) into the adjacent writable slot texts, in document order. Each
+  /// whitespace node is appended to the preceding writable slot's text (or
+  /// prepended to the first slot's text when it leads), so the written text
+  /// sequence keeps the response's word separation instead of gluing words.
+  /// [writableIndexByNode] maps each writable slot's text node to its index
+  /// in [writableTexts].
+  static List<String> _withStandaloneWhitespace(
+    _ResponseHtml translatedDom,
+    List<String> writableTexts,
+    Map<dom.Text, int> writableIndexByNode,
+  ) {
+    final List<({int precedingSlot, String data})> gaps =
+        <({int precedingSlot, String data})>[];
+    int lastWritable = -1;
+    void visit(dom.Node node, bool protected) {
+      if (node is dom.Text) {
+        if (node.data.trim().isEmpty) {
+          if (!protected) {
+            gaps.add((precedingSlot: lastWritable, data: node.data));
+          }
+          return;
+        }
+        final int? writableIndex = writableIndexByNode[node];
+        if (writableIndex != null) {
+          lastWritable = writableIndex;
+        }
+        return;
+      }
+      if (node is! dom.Element) {
+        return;
+      }
+      final bool childProtected = protected || translatedDom.isProtected(node);
+      for (final dom.Node child in node.nodes) {
+        visit(child, childProtected);
+      }
+    }
+    for (final dom.Node node in translatedDom.fragment.nodes) {
+      visit(node, false);
+    }
+    if (gaps.isEmpty) {
+      return writableTexts;
+    }
+    final List<String> result = List<String>.from(writableTexts);
+    for (final gap in gaps) {
+      if (result.isEmpty) {
+        break;
+      }
+      if (gap.precedingSlot >= 0 && gap.precedingSlot < result.length) {
+        result[gap.precedingSlot] = result[gap.precedingSlot] + gap.data;
+      } else {
+        result[0] = gap.data + result[0];
+      }
+    }
+    return result;
   }
 
   /// Plain text of the translated DOM for the merge fallback: the data of
-  /// every text node outside [sourceProtectedTags]-protected elements,
-  /// including whitespace-only nodes that never become slots, so words the
-  /// model separated with standalone whitespace do not glue together
-  /// (P2-#13).
+  /// every text node except effectively-protected ones, including
+  /// whitespace-only nodes that never become slots, so words the model
+  /// separated with standalone whitespace do not glue together (P2-#13).
+  /// P2-#7: [effectiveProtectedByNode] carries the per-slot identity
+  /// decision — a protected-kind element the model introduced has no
+  /// source counterpart, so its text is real translation content and is
+  /// kept; only genuinely-protected text is excluded (protected source
+  /// slots retain their text, and including it here would duplicate it in
+  /// the first writable source slot).
   static String _unprotectedResponseText(
     _ResponseHtml translatedDom,
-    Set<String> sourceProtectedTags,
+    Map<dom.Text, bool> effectiveProtectedByNode,
   ) {
     final StringBuffer buffer = StringBuffer();
     void visit(dom.Node node, bool protected) {
       if (node is dom.Text) {
         if (!protected) {
+          buffer.write(node.data);
+          return;
+        }
+        if (node.data.trim().isNotEmpty &&
+            effectiveProtectedByNode[node] == false) {
           buffer.write(node.data);
         }
         return;
@@ -3502,10 +3646,7 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      final bool childProtected =
-          protected ||
-          (translatedDom.isProtected(node) &&
-              sourceProtectedTags.contains(node.localName));
+      final bool childProtected = protected || translatedDom.isProtected(node);
       for (final dom.Node child in node.nodes) {
         visit(child, childProtected);
       }
@@ -3661,6 +3802,7 @@ class EpubChapterTranslator {
     String? slotText,
     int? slotIndex,
     List<String>? slotTexts,
+    List<String>? normalizedSlotTexts,
     String? normalizedBlockText,
   }) =>
       _EpubTranslationStrategy._blockContextSummary(
@@ -3668,6 +3810,7 @@ class EpubChapterTranslator {
         slotText: slotText,
         slotIndex: slotIndex,
         slotTexts: slotTexts,
+        normalizedSlotTexts: normalizedSlotTexts,
         normalizedBlockText: normalizedBlockText,
       );
 
@@ -3774,21 +3917,41 @@ class EpubChapterTranslator {
   }
 
   /// P2-#15: whether [value] contains tag-shaped markup other than a lone
-  /// literal like `<T>` (a single uppercase letter with no attributes and
-  /// no closing tag, plausibly a generic type parameter). Catches unclosed
-  /// tags (`<b>中文书名`) and embedded markup (`<b>中文书名</b>：副标题`)
-  /// that the full-wrapper check misses. A `<` not abutting a letter
-  /// (as in `a < b`) is plain text, not a tag.
+  /// single-letter literal like `<T>` (no attributes and no closing tag,
+  /// plausibly a generic type parameter). P2-#8: the literal must not be a
+  /// real HTML element — `<B>`/`<I>` (or their lowercase forms) are genuine
+  /// HTML tags and stay rejected, unlike `<t>`. Catches unclosed tags
+  /// (`<b>中文书名`) and embedded markup (`<b>中文书名</b>：副标题`) that the
+  /// full-wrapper check misses. A `<` not abutting a letter (as in `a < b`)
+  /// is plain text, not a tag.
   static bool _hasNonLiteralTag(String value) {
     final RegExp tagPattern = RegExp(r'<(/?)([A-Za-z][\w:-]*)(\s[^<>]*)?/?>');
     for (final RegExpMatch match in tagPattern.allMatches(value)) {
-      if (RegExp(r'^<[A-Z]>$').hasMatch(match.group(0)!)) {
+      final RegExpMatch? literal =
+          RegExp(r'^<([A-Za-z])>$').firstMatch(match.group(0)!);
+      if (literal != null &&
+          !_singleLetterHtmlElements.contains(
+            literal.group(1)!.toLowerCase(),
+          )) {
         continue;
       }
       return true;
     }
     return false;
   }
+
+  /// Single-letter HTML element names. A lone `<b>`/`<i>`/... is markup,
+  /// never a literal, so the P2-#15 literal whitelist must not admit it
+  /// (P2-#8).
+  static const Set<String> _singleLetterHtmlElements = <String>{
+    'a',
+    'b',
+    'i',
+    'p',
+    'q',
+    's',
+    'u',
+  };
 
   /// Translates the book's metadata title with a single lightweight API call.
   /// Returns null when translation is unnecessary. Failures are handled by the

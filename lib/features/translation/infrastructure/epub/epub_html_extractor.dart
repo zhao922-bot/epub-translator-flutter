@@ -80,6 +80,40 @@ class EpubHtmlExtractor {
     'samp',
   };
 
+  /// Depth cap for the recursive DOM walks below (P2-#23): pathological
+  /// nesting (thousands of nested elements) would otherwise overflow the
+  /// stack. Past the cap the walkers treat the node as a leaf instead of
+  /// descending — deep content keeps its structure, only its text
+  /// contribution is cut off.
+  static const int _kMaxDomDepth = 128;
+
+  /// Tag name with any namespace prefix stripped and lowercased (P2-#22).
+  /// package:html is an HTML parser, not an XML one: `<x:p>` keeps the
+  /// literal tag name `x:p` instead of resolving the namespace, so every
+  /// tag-name comparison in this file goes through here. Without it,
+  /// prefixed XHTML (`<x:html xmlns:x="...">`, legal in EPUBs) matches
+  /// nothing.
+  static String tagLocalName(dom.Element element) {
+    final String name = element.localName ?? '';
+    final int colon = name.indexOf(':');
+    return colon < 0
+        ? name.toLowerCase()
+        : name.substring(colon + 1).toLowerCase();
+  }
+
+  /// First element under [root] whose stripped tag name is in [names],
+  /// in document order. Used where a CSS selector would miss prefixed
+  /// elements (`x:title`, `x:h1`, …).
+  static dom.Element? _firstByTagName(
+    dom.Document document,
+    Set<String> names,
+  ) {
+    for (final dom.Element element in document.querySelectorAll('*')) {
+      if (names.contains(tagLocalName(element))) return element;
+    }
+    return null;
+  }
+
   InspectedChapter inspectChapterBytes({
     required String chapterPath,
     required List<int> bytes,
@@ -90,14 +124,16 @@ class EpubHtmlExtractor {
     final dom.Document document = html_parser.parse(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(decoded),
     );
-    final String title =
-        document.querySelector('title')?.text.trim().isNotEmpty == true
-        ? document.querySelector('title')!.text.trim()
-        : document
-                  .querySelector('h1, h2, h3')
-                  ?.text
-                  .trim()
-                  .replaceAll(RegExp(r'\s+'), ' ') ??
+    final dom.Element? titleElement = _firstByTagName(document, const {
+      'title',
+    });
+    final String title = titleElement?.text.trim().isNotEmpty == true
+        ? titleElement!.text.trim()
+        : _firstByTagName(document, const {
+                'h1',
+                'h2',
+                'h3',
+              })?.text.trim().replaceAll(RegExp(r'\s+'), ' ') ??
               path.basenameWithoutExtension(chapterPath);
     final ChapterCategory category = categorizeChapter(chapterPath, title);
     final List<ExtractedBlock> blocks = extractBlocks(
@@ -146,10 +182,12 @@ class EpubHtmlExtractor {
     )) {
       final String sourceText = elementText(element);
       index += 1;
+      final String tag = tagLocalName(element);
+      final String tagToken = tag.isEmpty ? 'node' : tag;
       blocks.add(
         ExtractedBlock(
-          id: '${element.localName ?? 'node'}-$index',
-          tagName: element.localName ?? 'node',
+          id: '$tagToken-$index',
+          tagName: tagToken,
           sourceHtml: EpubSemantics.sourceHtmlWithBindings(element),
           sourceText: sourceText,
           isAuthorSignature:
@@ -161,7 +199,7 @@ class EpubHtmlExtractor {
   }
 
   bool _isAuthorSignatureElement(dom.Element element) {
-    if (element.localName != 'p' ||
+    if (tagLocalName(element) != 'p' ||
         element.children.isNotEmpty ||
         !_hasSignatureClass(element) ||
         !_looksLikePersonName(elementText(element))) {
@@ -171,37 +209,48 @@ class EpubHtmlExtractor {
     if (parent == null || !_isSemanticPrefaceContainer(parent)) {
       return false;
     }
-    final List<dom.Element> visibleSiblings = parent.children
-        .where((dom.Element sibling) => elementText(sibling).isNotEmpty)
-        .toList(growable: false);
-    final int candidateIndex = visibleSiblings.indexOf(element);
+    // P-#48: compute each sibling's text once. The old shape re-ran
+    // elementText (a subtree walk) for every sibling on every candidate,
+    // which is O(N^2) over the container's children.
+    final List<(dom.Element, String)> visibleSiblings =
+        <(dom.Element, String)>[];
+    for (final dom.Element sibling in parent.children) {
+      final String text = elementText(sibling);
+      if (text.isNotEmpty) {
+        visibleSiblings.add((sibling, text));
+      }
+    }
+    final int candidateIndex = visibleSiblings.indexWhere(
+      (sibling) => identical(sibling.$1, element),
+    );
     if (candidateIndex <= 0) {
       return false;
     }
 
-    final List<dom.Element> signatureRun = visibleSiblings
+    final List<(dom.Element, String)> signatureRun = visibleSiblings
         .skip(candidateIndex)
         .toList(growable: false);
     final Set<String> sharedSignatureClasses = _signatureClassTokens(
-      signatureRun.first,
+      signatureRun.first.$1,
     );
-    for (final dom.Element sibling in signatureRun.skip(1)) {
-      sharedSignatureClasses.retainAll(_signatureClassTokens(sibling));
+    for (final (dom.Element, String) sibling in signatureRun.skip(1)) {
+      sharedSignatureClasses.retainAll(_signatureClassTokens(sibling.$1));
     }
     if (signatureRun.length != 3 ||
         signatureRun.any(
-          (dom.Element sibling) =>
-              sibling.localName != 'p' || !_hasSignatureClass(sibling),
+          (sibling) =>
+              tagLocalName(sibling.$1) != 'p' ||
+              !_hasSignatureClass(sibling.$1),
         ) ||
         sharedSignatureClasses.isEmpty ||
-        !_looksLikeSignatureDate(elementText(signatureRun[1])) ||
-        !_looksLikeSignatureLocation(elementText(signatureRun[2]))) {
+        !_looksLikeSignatureDate(signatureRun[1].$2) ||
+        !_looksLikeSignatureLocation(signatureRun[2].$2)) {
       return false;
     }
 
-    final dom.Element previous = visibleSiblings[candidateIndex - 1];
-    return !_hasSignatureClass(previous) &&
-        _looksLikeSubstantiveProse(elementText(previous));
+    final (dom.Element, String) previous = visibleSiblings[candidateIndex - 1];
+    return !_hasSignatureClass(previous.$1) &&
+        _looksLikeSubstantiveProse(previous.$2);
   }
 
   bool _hasSignatureClass(dom.Element element) {
@@ -376,12 +425,18 @@ class EpubHtmlExtractor {
   }
 
   List<dom.Element> extractTranslatableElements(dom.Document document) {
-    final body = document.body;
+    // The body is located by stripped tag name so prefixed XHTML
+    // (<x:body>) gets the same unclaimed-text normalization (P2-#22).
+    final dom.Element? body =
+        _firstByTagName(document, const {'body'}) ?? document.body;
     if (body != null) _wrapUnclaimedText(body);
+    // A tag selector cannot match prefixed elements (x:p keeps the literal
+    // tag name in package:html), so filter by stripped tag name instead.
     return document
-        .querySelectorAll(translatableTags.join(', '))
+        .querySelectorAll('*')
         .where(
           (dom.Element element) =>
+              translatableTags.contains(tagLocalName(element)) &&
               !hasTranslatableAncestor(element) &&
               !isInsideSkippedAncestor(element) &&
               !isStandaloneProtectedMarkerElement(element),
@@ -392,9 +447,9 @@ class EpubHtmlExtractor {
   /// Give otherwise unclaimed inline text a stable block boundary. Inspection
   /// and repacking both run this normalization on their own parsed document.
   /// Existing blocks are never merged, and skipped content is never visited.
-  void _wrapUnclaimedText(dom.Element container) {
-    if (translatableTags.contains(container.localName) ||
-        nonTextAncestors.contains(container.localName)) {
+  void _wrapUnclaimedText(dom.Element container, [int depth = 0]) {
+    if (translatableTags.contains(tagLocalName(container)) ||
+        nonTextAncestors.contains(tagLocalName(container))) {
       return;
     }
     const inlineTags = <String>{
@@ -423,14 +478,17 @@ class EpubHtmlExtractor {
       'wbr',
       'img',
     };
-    bool hasUnclaimedText(dom.Node node) {
+    bool hasUnclaimedText(dom.Node node, int nodeDepth) {
+      // P2-#23: past the depth cap, treat the subtree as claimed instead of
+      // descending — deep content keeps its structure, no stack overflow.
+      if (nodeDepth > _kMaxDomDepth) return false;
       if (node is dom.Text) return node.data.trim().isNotEmpty;
       if (node is! dom.Element ||
-          translatableTags.contains(node.localName) ||
-          nonTextAncestors.contains(node.localName)) {
+          translatableTags.contains(tagLocalName(node)) ||
+          nonTextAncestors.contains(tagLocalName(node))) {
         return false;
       }
-      return node.nodes.any(hasUnclaimedText);
+      return node.nodes.any((child) => hasUnclaimedText(child, nodeDepth + 1));
     }
 
     final originalNodes = container.nodes.toList(growable: false);
@@ -440,7 +498,7 @@ class EpubHtmlExtractor {
     final replacement = <dom.Node>[];
     final run = <dom.Node>[];
     void flush() {
-      if (run.any(hasUnclaimedText)) {
+      if (run.any((node) => hasUnclaimedText(node, depth))) {
         final wrapper = dom.Element.tag('span');
         wrapper.nodes.addAll(run);
         replacement.add(wrapper);
@@ -451,11 +509,15 @@ class EpubHtmlExtractor {
     }
 
     for (final node in originalNodes) {
-      if (node is! dom.Element || inlineTags.contains(node.localName)) {
+      if (node is! dom.Element || inlineTags.contains(tagLocalName(node))) {
+        run.add(node);
+      } else if (depth >= _kMaxDomDepth) {
+        // P2-#23: past the depth cap, keep the subtree as-is instead of
+        // descending into it.
         run.add(node);
       } else {
         flush();
-        _wrapUnclaimedText(node);
+        _wrapUnclaimedText(node, depth + 1);
         replacement.add(node);
       }
     }
@@ -512,18 +574,22 @@ class EpubHtmlExtractor {
       'hr',
     };
     final StringBuffer buffer = StringBuffer();
-    void visit(dom.Node node) {
+    void visit(dom.Node node, int nodeDepth) {
+      // P2-#23: stop descending past the depth cap instead of overflowing
+      // the stack on pathological nesting; shallower text is unaffected.
+      if (nodeDepth > _kMaxDomDepth) return;
       if (node is dom.Text) {
         buffer.write(node.data);
       } else if (node is dom.Element) {
-        if (nonTextAncestors.contains(node.localName)) return;
-        if (node.localName == 'br') {
+        final String tag = tagLocalName(node);
+        if (nonTextAncestors.contains(tag)) return;
+        if (tag == 'br') {
           buffer.write(' ');
         } else {
-          final bool isBlock = blockTags.contains(node.localName);
+          final bool isBlock = blockTags.contains(tag);
           if (isBlock) buffer.write(' ');
           for (final dom.Node child in node.nodes) {
-            visit(child);
+            visit(child, nodeDepth + 1);
           }
           if (isBlock) buffer.write(' ');
         }
@@ -531,7 +597,7 @@ class EpubHtmlExtractor {
     }
 
     for (final dom.Node child in element.nodes) {
-      visit(child);
+      visit(child, 1);
     }
     return buffer.toString().replaceAll(RegExp(r'\s+'), ' ').trim();
   }
@@ -539,7 +605,7 @@ class EpubHtmlExtractor {
   bool hasTranslatableAncestor(dom.Element element) {
     dom.Node? current = element.parent;
     while (current is dom.Element) {
-      if (translatableTags.contains(current.localName)) {
+      if (translatableTags.contains(tagLocalName(current))) {
         return true;
       }
       current = current.parent;
@@ -550,7 +616,7 @@ class EpubHtmlExtractor {
   bool isInsideSkippedAncestor(dom.Element element) {
     dom.Node? current = element.parent;
     while (current is dom.Element) {
-      if (nonTextAncestors.contains(current.localName)) {
+      if (nonTextAncestors.contains(tagLocalName(current))) {
         return true;
       }
       current = current.parent;
@@ -559,7 +625,7 @@ class EpubHtmlExtractor {
   }
 
   bool isStandaloneProtectedMarkerElement(dom.Element element) {
-    final String tag = element.localName ?? '';
+    final String tag = tagLocalName(element);
     if (tag != 'span' && tag != 'a') {
       return false;
     }

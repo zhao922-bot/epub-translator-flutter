@@ -778,7 +778,9 @@ Future<void> main(List<String> args) async {
       // Throttled (same `now`): no prune scan.
       expect(await jobFileCount(jobsDir), 25);
 
-      now = now.add(const Duration(minutes: 2));
+      // perf-#53: the throttle runs on a real Stopwatch, so fake time-travel
+      // cannot expire it — reset explicitly to simulate "throttle elapsed".
+      store.resetJobPruneThrottleForTest();
       await store.saveJobState(jobState('live'));
       // Throttle expired: prune runs again.
       expect(await jobFileCount(jobsDir), 20);

@@ -85,12 +85,29 @@ void main() {
         final expected = previewChapterFromInspected(chapter);
         final cache = PreviewRecoveryCache(
           runner: (received) async {
-            // perf-#35: no payload is built on the caller thread — the
-            // runner gets the chapter untouched; the DOM-parsing slimming
-            // happens in the isolate (_recoverBatch), never before
-            // compute().
+            // P-#46: the caller thread applies only parse-free transfer
+            // slimming before compute() — the runner gets a payload, not
+            // the full chapter graph; DOM parsing stays in the isolate
+            // (_recoverBatch), never before compute().
             expect(received, hasLength(1));
-            expect(identical(received.single, chapter), isTrue);
+            final payload = received.single;
+            expect(identical(payload, chapter), isFalse);
+            expect(payload.path, chapter.path);
+            // Parse-free: markup passes through untouched for the isolate
+            // to bound; per-block source fields are dropped.
+            expect(payload.originalHtml, chapter.originalHtml);
+            expect(payload.body, chapter.body);
+            expect(
+              payload.blocks.every(
+                (block) =>
+                    block.id.isEmpty &&
+                    block.tagName.isEmpty &&
+                    block.sourceHtml.isEmpty &&
+                    (chapter.originalHtml.isEmpty ||
+                        block.sourceText.isEmpty),
+              ),
+              isTrue,
+            );
             return recoverBatchForTest(received);
           },
         );

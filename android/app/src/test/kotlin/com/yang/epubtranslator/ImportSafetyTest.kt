@@ -145,4 +145,99 @@ class ImportSafetyTest {
             checkImportRegistration(lifecycle, generation)
         }
     }
+
+    @Test fun registrationLockSerializesCheckSetAndInvalidate() {
+        // P2-#16: the generation re-check and the holder set() must be
+        // atomic under ImportLifecycle.registrationLock, and the executor
+        // recreation (which bumps the generation) must hold the same lock.
+        // This mirrors MainActivity.registerImportHolder /
+        // recreateImportExecutor: without the shared lock, a stale task
+        // could pass the check, invalidate() could land, and the stale set()
+        // would then overwrite the newer generation's holder.
+        val lifecycle = ImportLifecycle()
+        val holder = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+        fun registerImportHolder(taskGeneration: Int, value: String) {
+            synchronized(lifecycle.registrationLock) {
+                checkImportRegistration(lifecycle, taskGeneration)
+                holder.set(value)
+            }
+        }
+
+        fun recreateImportExecutor() {
+            synchronized(lifecycle.registrationLock) {
+                lifecycle.invalidate()
+            }
+        }
+
+        // A stale task passes the check for gen 0, then pauses before set().
+        val checkPassed = CountDownLatch(1)
+        val proceedToSet = CountDownLatch(1)
+        val staleThread = Thread {
+            synchronized(lifecycle.registrationLock) {
+                checkImportRegistration(lifecycle, 0)
+                checkPassed.countDown()
+                proceedToSet.await()
+                holder.set("stale")
+            }
+        }
+        staleThread.start()
+        assertTrue(checkPassed.await(2, TimeUnit.SECONDS))
+
+        // invalidate() (as recreateImportExecutor does) must block until
+        // the in-flight check+set releases the lock — it cannot land
+        // between the check and the set.
+        val invalidated = AtomicBoolean(false)
+        val invalidateThread = Thread {
+            synchronized(lifecycle.registrationLock) {
+                lifecycle.invalidate()
+                invalidated.set(true)
+            }
+        }
+        invalidateThread.start()
+        Thread.sleep(300)
+        assertFalse(
+            "invalidate() must not interleave between check and set",
+            invalidated.get(),
+        )
+
+        // The stale set completes atomically; only then does invalidate run.
+        proceedToSet.countDown()
+        staleThread.join(2000)
+        invalidateThread.join(2000)
+        assertEquals("stale", holder.get())
+        assertTrue(invalidated.get())
+
+        // Generation is now 1: a stale gen-0 registration is refused and
+        // cannot overwrite the holder.
+        registerImportHolder(1, "current")
+        assertEquals("current", holder.get())
+        assertThrows(ImportStaleException::class.java) {
+            registerImportHolder(0, "stale-overwrite")
+        }
+        assertEquals("current", holder.get())
+
+        // recreateImportExecutor bumps under the lock: a racing stale
+        // register either wins fully before the bump or fails after it —
+        // never a torn check-then-set.
+        recreateImportExecutor() // gen 1 -> 2
+        val raced = AtomicBoolean(false)
+        val racer = Thread {
+            try {
+                registerImportHolder(1, "torn")
+            } catch (e: ImportStaleException) {
+                raced.set(true)
+            }
+        }
+        // Hold the lock across the bump so the racer definitely loses.
+        synchronized(lifecycle.registrationLock) {
+            lifecycle.invalidate() // gen 2 -> 3
+            racer.start()
+            Thread.sleep(200)
+            assertTrue(racer.isAlive) // blocked on the lock
+        }
+        racer.join(2000)
+        assertTrue(raced.get())
+        assertEquals("current", holder.get())
+    }
 }

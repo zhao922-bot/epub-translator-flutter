@@ -35,4 +35,31 @@ class SecretExecutorTest {
         assertTrue(latch.await(10, TimeUnit.SECONDS))
         assertEquals(listOf(0, 1, 2), order)
     }
+
+    @Test fun runSecretOpTakesReceiverLambdaNotCapturingClosure() {
+        // P-#45: the secret op must be MainActivity.() -> Any? (a Function1
+        // with receiver), not () -> Any? (a Function0). A Function0 written
+        // as { useKeyStore() } inside the Activity captures `this`, so the
+        // process-wide SecretExecutor thread would pin the destroyed
+        // Activity. A receiver lambda captures nothing; the Activity is
+        // only reached via WeakReference inside the Runnable.
+        val candidates = MainActivity::class.java.declaredMethods.filter {
+            it.name == "runSecretOp"
+        }
+        assertFalse(candidates.isEmpty())
+        val opParam = candidates
+            .mapNotNull { method ->
+                method.parameterTypes.getOrNull(2)?.let { method to it }
+            }
+            .firstOrNull { (_, type) ->
+                type == Function1::class.java || type == Function0::class.java
+            }
+        assertNotNull("runSecretOp must take a function-typed op", opParam)
+        assertEquals(
+            "P-#45: op must be MainActivity.() -> Any? (Function1), not " +
+                "() -> Any? (Function0) which would capture the Activity",
+            Function1::class.java,
+            opParam!!.second,
+        )
+    }
 }

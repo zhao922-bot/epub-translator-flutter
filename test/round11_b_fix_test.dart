@@ -352,7 +352,7 @@ void main() {
   // perf-#35: no payload is built on the caller thread before compute().
   // -------------------------------------------------------------------------
   group('perf-#35 isolate-side slimming', () {
-    test('prepare passes chapters untouched to the runner', () async {
+    test('prepare passes a parse-free payload to the runner (P-#46)', () async {
       final chapter = InspectedChapter(
         path: 'big.xhtml',
         title: 'Big',
@@ -375,10 +375,19 @@ void main() {
         recommendedForTranslation: true,
         includeInTranslation: true,
       );
-      var sawIdentical = false;
+      var sawPayload = false;
       final cache = PreviewRecoveryCache(
         runner: (received) async {
-          sawIdentical = identical(received.single, chapter);
+          // P-#46: the runner now receives the parse-free transfer payload
+          // (same identity fields, slimmed blocks), not the full chapter.
+          final payload = received.single;
+          sawPayload =
+              !identical(payload, chapter) &&
+              payload.path == chapter.path &&
+              payload.title == chapter.title &&
+              payload.originalHtml == chapter.originalHtml &&
+              payload.blocks.single.id.isEmpty &&
+              payload.blocks.single.sourceHtml.isEmpty;
           return received
               .map(
                 (c) => PreviewChapter(
@@ -396,7 +405,7 @@ void main() {
         },
       );
       await cache.prepare([chapter]);
-      expect(sawIdentical, isTrue);
+      expect(sawPayload, isTrue);
     });
   });
 }

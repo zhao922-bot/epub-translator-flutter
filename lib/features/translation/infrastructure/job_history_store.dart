@@ -62,13 +62,17 @@ Future<void> _lockWithTimeout(
   RandomAccessFile lockHandle, {
   Duration timeout = _historyLockTimeout,
 }) async {
-  final DateTime deadline = DateTime.now().add(timeout);
+  // P2-#40: measure the deadline with a monotonic Stopwatch, not the wall
+  // clock. A system clock rollback during the wait must not stretch the
+  // timeout (a ~1-hour rollback would otherwise extend a 10-second wait to
+  // ~1 hour).
+  final Stopwatch waitClock = Stopwatch()..start();
   for (;;) {
     try {
       await lockHandle.lock(FileLock.exclusive);
       return;
     } on FileSystemException {
-      if (!DateTime.now().isBefore(deadline)) {
+      if (waitClock.elapsed >= timeout) {
         throw HistoryLockTimeout(timeout);
       }
       await Future<void>.delayed(const Duration(milliseconds: 100));
@@ -87,8 +91,12 @@ class JobHistoryStore {
   @visibleForTesting
   Future<void> Function()? onBeforeCorruptRenameForTest;
 
-  String _fingerprint(String raw) =>
-      sha256.convert(utf8.encode(raw)).toString();
+  /// Fingerprint of the file's raw bytes. P2-#34: this must be computed on
+  /// the bytes, never on the (possibly lossy) decoded string — two different
+  /// byte sequences can decode to the same string once undecodable bytes
+  /// become U+FFFD, and a concurrently repaired file would then be mistaken
+  /// for unchanged and moved aside.
+  String _fingerprint(List<int> bytes) => sha256.convert(bytes).toString();
 
   Future<List<TranslationJob>> load() async => (await loadWithTombstone()).jobs;
 
@@ -117,22 +125,29 @@ class JobHistoryStore {
       // and a later save would overwrite the original bytes with the
       // substituted text and no backup. Undecodable bytes are untrusted:
       // they take the corrupt-backup path instead.
+      //
+      // Perf-#54: strict-decode exactly once; the lossy decode runs only
+      // when the bytes are genuinely undecodable.
       final List<int> bytes = await file.readAsBytes();
-      final String raw = utf8.decode(bytes, allowMalformed: true);
-      bool undecodable = false;
+      final String raw;
       try {
-        utf8.decode(bytes);
+        raw = utf8.decode(bytes);
       } on FormatException {
-        undecodable = true;
-      }
-      if (undecodable) {
-        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
+        // P2-#33: the corrupt file may still carry a valid clear tombstone;
+        // preserve it so a concurrent instance's saveMerged cannot resurrect
+        // cleared entries.
+        final int preservedClearedAt = await _backupCorruptHistoryFile(
+          expectedFingerprint: _fingerprint(bytes),
+        );
         AppLogger.error(
           'Failed to decode job-history.json as UTF-8; moved aside and '
           'starting fresh.',
           tag: 'history',
         );
-        return (jobs: const <TranslationJob>[], clearedAt: 0);
+        return (
+          jobs: const <TranslationJob>[],
+          clearedAt: preservedClearedAt,
+        );
       }
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
@@ -156,13 +171,19 @@ class JobHistoryStore {
       } catch (parseError) {
         // Preserve genuinely unparseable history, unless another writer has
         // changed it since this read (including repairing its clear tombstone).
-        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
+        // P2-#33: preserve the tombstone so saveMerged applies it.
+        final int preservedClearedAt = await _backupCorruptHistoryFile(
+          expectedFingerprint: _fingerprint(bytes),
+        );
         AppLogger.error(
           'Failed to parse job-history.json; moved aside and starting fresh.',
           tag: 'history',
           error: parseError,
         );
-        return (jobs: const <TranslationJob>[], clearedAt: 0);
+        return (
+          jobs: const <TranslationJob>[],
+          clearedAt: preservedClearedAt,
+        );
       }
     } on FileSystemException catch (error) {
       // Transient IO failure (an antivirus/indexer lock on Windows, a
@@ -190,34 +211,37 @@ class JobHistoryStore {
 
   /// Renames an unparseable history file aside (best effort) so the next
   /// [save] cannot silently destroy it with no recovery path.
-  Future<void> _backupCorruptHistoryFile({
+  ///
+  /// Returns the clear tombstone preserved from the corrupt file (P2-#33),
+  /// or 0 when none could be recovered. A corrupt file may still carry a
+  /// valid tombstone; dropping it would let another instance's [saveMerged]
+  /// resurrect already-cleared entries because it can no longer see the
+  /// tombstone.
+  Future<int> _backupCorruptHistoryFile({
     String? expectedFingerprint,
     bool lockHeld = false,
   }) async {
     try {
       await onBeforeCorruptBackupForTest?.call();
       final File file = await _historyFile();
-      if (!await file.exists()) return;
-      final String raw = utf8.decode(
-        await file.readAsBytes(),
-        allowMalformed: true,
-      );
-      if (expectedFingerprint != null &&
-          _fingerprint(raw) != expectedFingerprint) {
-        return;
+      if (!await file.exists()) return 0;
+      final List<int> bytes = await file.readAsBytes();
+      final String fingerprint = _fingerprint(bytes);
+      if (expectedFingerprint != null && expectedFingerprint != fingerprint) {
+        return 0;
       }
+      // Best-effort tombstone recovery before the rename: the JSON may be
+      // torn but still contain a readable clearedAt.
+      final int preservedClearedAt = _extractTombstoneBestEffort(bytes);
       final String backupPath = path.join(
         file.parent.path,
         'job-history.json.bad-${DateTime.now().microsecondsSinceEpoch}',
       );
       await onBeforeCorruptRenameForTest?.call();
       final File backup = await file.rename(backupPath);
-      final String movedRaw = utf8.decode(
-        await backup.readAsBytes(),
-        allowMalformed: true,
-      );
+      final List<int> movedBytes = await backup.readAsBytes();
       if (expectedFingerprint != null &&
-          _fingerprint(movedRaw) != expectedFingerprint) {
+          expectedFingerprint != _fingerprint(movedBytes)) {
         // A writer replaced the history after the precheck. Preserve the
         // moved contents, without restoring over a newer write or pruning.
         // If no new active file exists, move it back so a repaired history
@@ -235,12 +259,41 @@ class JobHistoryStore {
           backup,
           lockHeld: lockHeld,
         );
-        return;
+        return 0;
       }
       await _pruneCorruptBackups(file.parent);
+      return preservedClearedAt;
     } catch (_) {
       // Best effort only: a failed backup must not break startup.
+      return 0;
     }
+  }
+
+  /// Best-effort recovery of the clear tombstone from a corrupt history
+  /// file's raw bytes (P2-#33). Tries a full JSON parse first, then falls
+  /// back to scanning for the clearedAt field in case the file is torn.
+  /// Never throws.
+  static int _extractTombstoneBestEffort(List<int> bytes) {
+    try {
+      final String raw = utf8.decode(bytes, allowMalformed: true);
+      try {
+        final Object? decoded = jsonDecode(stripLeadingBom(raw));
+        if (decoded is Map<String, dynamic>) {
+          return _readClearedAt(decoded);
+        }
+      } catch (_) {
+        // Torn JSON: fall through to the field scan.
+      }
+      final RegExpMatch? match = RegExp(
+        r'"clearedAt"\s*:\s*(\d+)',
+      ).firstMatch(raw);
+      if (match != null) {
+        return int.tryParse(match.group(1) ?? '') ?? 0;
+      }
+    } catch (_) {
+      // Best effort only.
+    }
+    return 0;
   }
 
   /// Restores [backup] to [file]'s path only if [file] is still absent,
@@ -355,11 +408,10 @@ class JobHistoryStore {
   }) async {
     final File file = await _historyFile();
     await file.parent.create(recursive: true);
+    int preservedClearedAt = 0;
     if (await file.exists()) {
-      final String raw = utf8.decode(
-        await file.readAsBytes(),
-        allowMalformed: true,
-      );
+      final List<int> bytes = await file.readAsBytes();
+      final String raw = utf8.decode(bytes, allowMalformed: true);
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
         if (decoded is Map<String, dynamic> &&
@@ -369,13 +421,22 @@ class JobHistoryStore {
       } on HistoryWriteConflict {
         rethrow;
       } on FormatException {
-        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
+        // P2-#33: preserve the tombstone so this write does not resurrect
+        // cleared entries.
+        preservedClearedAt = await _backupCorruptHistoryFile(
+          expectedFingerprint: _fingerprint(bytes),
+        );
         if (await file.exists()) rethrow;
       }
     }
+    // P2-#33: never move the tombstone backwards; the preserved tombstone
+    // from a corrupt file wins over an older caller value.
+    final int tombstone = preservedClearedAt > clearedAtEpochMs
+        ? preservedClearedAt
+        : clearedAtEpochMs;
     final Map<String, Object?> payload = <String, Object?>{
       'version': 2,
-      'clearedAt': clearedAtEpochMs,
+      'clearedAt': tombstone,
       'jobs': jobs
           .take(20)
           .map((TranslationJob job) => job.toJson())
@@ -438,8 +499,13 @@ class JobHistoryStore {
         int fileClearedAt = 0;
         List<TranslationJob> fileJobs = const <TranslationJob>[];
         if (await file.exists()) {
-          final String raw = await file.readAsString();
+          final List<int> bytes = await file.readAsBytes();
+          // P2-#34: fingerprint the raw bytes, not the decoded string.
+          final String fingerprint = _fingerprint(bytes);
           try {
+            // Strict decode inside the try: undecodable bytes take the
+            // corrupt-backup path like unparseable JSON.
+            final String raw = utf8.decode(bytes);
             final Object? decoded = jsonDecode(stripLeadingBom(raw));
             final int clearedAt = decoded is Map<String, dynamic>
                 ? _readClearedAt(decoded)
@@ -463,8 +529,10 @@ class JobHistoryStore {
           } on FormatException {
             // Only parse failures can start fresh, after preserving evidence.
             // IO failures must propagate: an unreadable file is not empty.
-            await _backupCorruptHistoryFile(
-              expectedFingerprint: _fingerprint(raw),
+            // P2-#33: the corrupt file's tombstone is preserved and applied
+            // to the merge below, so cleared entries cannot be resurrected.
+            fileClearedAt = await _backupCorruptHistoryFile(
+              expectedFingerprint: fingerprint,
               // This method already holds the cross-process history lock
               // (P1-#3: the lock is not re-entrant).
               lockHeld: true,

@@ -1435,7 +1435,21 @@ class _TranslationRequestBudget {
         return null;
       }
       // The retry instruction suffix is prompt scaffolding, not block text.
-      final String text = lastUserContent.split('\n\n[RETRY]').first.trim();
+      // Truncate only a trailing retry marker (P2-#10): the old code cut at
+      // the first "\n\n[RETRY]" anywhere, so a source block literally
+      // containing it (e.g. pasted logs) was truncated mid-text. A marker
+      // is only scaffolding when it trails the message — bare at the very
+      // end, or followed by the retry instruction the client appends.
+      String text = lastUserContent.trim();
+      const String retryMarker = '\n\n[RETRY]';
+      final int retryIndex = text.lastIndexOf(retryMarker);
+      if (retryIndex >= 0) {
+        final String after = text.substring(retryIndex + retryMarker.length);
+        if (after.trim().isEmpty ||
+            after.startsWith(' The previous translation was rejected')) {
+          text = text.substring(0, retryIndex).trim();
+        }
+      }
       return text.isEmpty ? null : text;
     } catch (_) {
       return null;

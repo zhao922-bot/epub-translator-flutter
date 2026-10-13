@@ -1674,6 +1674,12 @@ class _EpubTranslationStrategy {
     final String normalizedBlockText = request.block.sourceText
         .trim()
         .replaceAll(RegExp(r'\s+'), ' ');
+    // 性能-#50: normalize each slot text once per block. Per-slot context
+    // location reuses these instead of each slot renormalizing all
+    // previous slots (K(K-1)/2 total).
+    final List<String> normalizedSlotTexts = request.template.slotTexts
+        .map((String s) => s.trim().replaceAll(RegExp(r'\s+'), ' '))
+        .toList(growable: false);
     final List<String>
     translatedSlots = await const TranslationWorkQueue().map<String, String>(
       request.template.slotTexts,
@@ -1701,6 +1707,7 @@ class _EpubTranslationStrategy {
             request: request,
             slotIndex: index,
             normalizedBlockText: normalizedBlockText,
+            normalizedSlotTexts: normalizedSlotTexts,
             context: context,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
@@ -1743,6 +1750,7 @@ class _EpubTranslationStrategy {
     String? slotText,
     int? slotIndex,
     List<String>? slotTexts,
+    List<String>? normalizedSlotTexts,
     String? normalizedBlockText,
   }) {
     const int limit = _slotContextLimit;
@@ -1758,21 +1766,18 @@ class _EpubTranslationStrategy {
     if (slotText != null && slotText.trim().isNotEmpty) {
       final String needle = slotText.trim().replaceAll(RegExp(r'\s+'), ' ');
       if (needle.isNotEmpty) {
-        // P2-#21: duplicate slot texts must resolve to their own occurrence,
-        // not the first one. The slot id encodes the slot index (s0, s1,
-        // ...); count earlier identical slots to pick the matching
-        // occurrence instead of indexOf's first match.
-        int occurrence = 0;
-        if (slotIndex != null && slotTexts != null) {
-          final int end = min(slotIndex, slotTexts.length);
-          for (int i = 0; i < end; i++) {
-            if (slotTexts[i].trim().replaceAll(RegExp(r'\s+'), ' ') ==
-                needle) {
-              occurrence++;
-            }
-          }
-        }
-        final int found = _indexOfOccurrence(text, needle, occurrence);
+        // P2-#13: locate the slot's own span by walking slot boundaries in
+        // order. Counting raw substring occurrences in the whole block text
+        // (P2-#21's old approach) confused a needle that also appears
+        // inside another slot's text ("world" inside "Hello world") with
+        // the slot's own occurrence and centered the window wrongly.
+        final int found = _indexOfSlotSpan(
+          text,
+          needle: needle,
+          slotIndex: slotIndex,
+          slotTexts: slotTexts,
+          normalizedSlotTexts: normalizedSlotTexts,
+        );
         if (found >= 0) {
           center = found + needle.length ~/ 2;
           located = true;
@@ -1795,17 +1800,50 @@ class _EpubTranslationStrategy {
     return text.substring(start, end);
   }
 
-  /// Index of the [occurrence]-th (0-based) occurrence of [needle] in
-  /// [text], or -1 when there are fewer occurrences. Used to center a
-  /// per-slot context window on the slot's own occurrence when several
-  /// slots share the same text (P2-#21).
-  static int _indexOfOccurrence(String text, String needle, int occurrence) {
+  /// Index in [text] where the [slotIndex]-th slot's own normalized text
+  /// starts, or -1 when it cannot be located. Slots are scanned in order,
+  /// each search starting after the previous slot's span, so the search
+  /// stays within slot boundaries: a needle that also occurs inside
+  /// another slot's text never counts as the slot's own occurrence
+  /// (P2-#13). Duplicate slot texts resolve to their own occurrence, not
+  /// the first one (P2-#21). Without slot identity, falls back to the
+  /// first substring occurrence.
+  ///
+  /// 性能-#50: [normalizedSlotTexts] is computed once per block by the
+  /// caller; when absent each slot is normalized on the fly (kept for the
+  /// test hook and other callers).
+  static int _indexOfSlotSpan(
+    String text, {
+    required String needle,
+    required int? slotIndex,
+    required List<String>? slotTexts,
+    required List<String>? normalizedSlotTexts,
+  }) {
+    if (slotIndex == null || slotIndex < 0) {
+      return text.indexOf(needle);
+    }
+    final List<String>? normalized =
+        normalizedSlotTexts ??
+        slotTexts
+            ?.map((String s) => s.trim().replaceAll(RegExp(r'\s+'), ' '))
+            .toList(growable: false);
+    if (normalized == null || slotIndex >= normalized.length) {
+      return text.indexOf(needle);
+    }
     int fromIndex = 0;
-    for (int i = 0; i <= occurrence; i++) {
-      final int found = text.indexOf(needle, fromIndex);
-      if (found < 0) return -1;
-      if (i == occurrence) return found;
-      fromIndex = found + needle.length;
+    for (int i = 0; i <= slotIndex; i++) {
+      final String slotNeedle = normalized[i];
+      if (slotNeedle.isEmpty) {
+        continue;
+      }
+      final int found = text.indexOf(slotNeedle, fromIndex);
+      if (found < 0) {
+        return -1;
+      }
+      if (i == slotIndex) {
+        return found;
+      }
+      fromIndex = found + slotNeedle.length;
     }
     return -1;
   }
@@ -1821,6 +1859,7 @@ class _EpubTranslationStrategy {
     void Function()? onRequestAttempt,
     String? retryReason,
     String? normalizedBlockText,
+    List<String>? normalizedSlotTexts,
   }) async {
     final String trimmedSource = sourceText.trim();
     if (cancelToken?.isCancelled ?? false) {
@@ -1857,6 +1896,8 @@ class _EpubTranslationStrategy {
         // 性能-#37: cached normalized block text (see
         // [_translateProtectedSlotsIndividuallyOnce]).
         normalizedBlockText: normalizedBlockText,
+        // 性能-#50: cached normalized slot texts (same).
+        normalizedSlotTexts: normalizedSlotTexts,
       ),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0
@@ -1912,7 +1953,11 @@ class _EpubTranslationStrategy {
   /// must not trip the wrapper detector — otherwise it would burn
   /// maxRetries² paid retries across the nested retry layers.
   static final RegExp _slotWrapperTagPattern = RegExp(r'</?[A-Za-z!?][^>]*>');
-  static final RegExp _slotHtmlCommentPattern = RegExp(r'<!--[\s\S]*?-->');
+  // P2-#8: also matches an unterminated comment (`<!-- note` with no
+  // `-->`): the old pattern only caught closed comments, so an unclosed
+  // one slipped through the wrapper checks.
+  static final RegExp _slotHtmlCommentPattern =
+      RegExp(r'<!--[\s\S]*?(-->|$)');
 
   static void _validateIndividualSlotTranslation({
     required String sourceText,
@@ -2132,10 +2177,13 @@ class _EpubTranslationStrategy {
   /// Second-person formality rule for Chinese targets, applied to every
   /// translation path like the terminology gloss rule.
   ///
-  /// Models tend to mix 你 (informal) and 您 (formal) within one book;
-  /// published Chinese translations conventionally use 您 throughout, so
-  /// the rule is stated explicitly. Prompt-level only: a model can still
-  /// deviate, but in practice the explicit instruction holds.
+  /// Second-person formality is a pragmatic judgment, not a fixed rule:
+  /// 按关系选 您/你 — the model chooses between 您 (formal) and 你
+  /// (informal) from the speaker/addressee relationship visible in
+  /// context, rather than defaulting to 您 throughout. Prompt-level only:
+  /// a model can still deviate, but in practice the explicit instruction
+  /// holds. (质量-#56: the old comment wrongly said published translations
+  /// conventionally use 您 throughout, contradicting this rule.)
   String _chineseSecondPersonInstruction({
     required TranslationConfig config,
     String? normalizedTargetLanguage,
