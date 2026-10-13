@@ -14,12 +14,26 @@ class _ReplayStore extends SettingsStore {
   int attemptCount = 0;
   final attempts = <String>[];
 
+  /// Error thrown for [failAttemptNumber]; defaults to StateError.
+  Object Function()? failAttemptErrorFactory;
+
+  /// When true, a save throwing [SettingsWriteConflict] also records a
+  /// load error (like the real store), so the next replay iteration
+  /// auto-recovers via a fresh load — which bumps the state generation and
+  /// makes the P2-#22 applied-generation check stale. Off by default to
+  /// keep the queueing phase of tests free of auto-recovery noise.
+  bool conflictSetsLoadError = false;
+  Object? _loadError;
+
   /// When set, save() waits on this gate (for orchestrating races).
   Completer<void>? saveGate;
   Completer<void>? saveStarted;
 
   @override
-  Future<TranslationConfig> load() async => persisted;
+  Future<TranslationConfig> load() async {
+    _loadError = null;
+    return persisted;
+  }
 
   @override
   Future<void> save(
@@ -35,15 +49,27 @@ class _ReplayStore extends SettingsStore {
       await gate.future;
     }
     if (failAttemptNumber == attemptCount) {
-      throw StateError('injected disk failure');
+      final Object error =
+          failAttemptErrorFactory?.call() ?? StateError('injected disk failure');
+      _recordConflictLoadError(error);
+      throw error;
     }
     final error = saveError;
-    if (error != null) throw error;
+    if (error != null) {
+      _recordConflictLoadError(error);
+      throw error;
+    }
     persisted = config;
   }
 
+  void _recordConflictLoadError(Object error) {
+    if (conflictSetsLoadError && error is SettingsWriteConflict) {
+      _loadError = StateError('stale snapshot after write conflict');
+    }
+  }
+
   @override
-  Object? get configLoadError => null;
+  Object? get configLoadError => _loadError;
 }
 
 void main() {
@@ -136,6 +162,112 @@ void main() {
           reason: 'Slider (newer) must win over queued replay (older)');
       expect(store.persisted.chunkSize, 100,
           reason: 'Persisted value must be the slider value');
+    });
+  });
+
+  group('P2-#28 changedFields includes swallowed slider fields', () {
+    test(
+        'non-replay swallow: B supersedes the stale slider entry A it '
+        'swallowed', () async {
+      // ① Slider 4->8, flush hits a write conflict -> queued as A with
+      // changedFields={chunkSize}.
+      store.saveError = SettingsWriteConflict();
+      final s1 = controller.setChunkSize(8);
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      await s1;
+
+      // ② Slider 8->10, then a bilingual toggle within 400ms swallows the
+      // pending slider; the save conflicts -> queued as B. B's changedFields
+      // must contain chunkSize (the swallowed slider field), not just
+      // bilingual: prevState already holds the slider's optimistic value,
+      // so diffing against the post-swallow state alone misses it.
+      final s2 = controller.setChunkSize(10);
+      await controller.setBilingual(true);
+      await s2;
+
+      // Replay pass 1: A's save conflicts again. The conflict triggers a
+      // mid-pass recovery load, bumping the state generation so the P2-#22
+      // applied-generation check goes stale — only the P2-#28 field-overlap
+      // check can drop A. Then B succeeds, persisting chunkSize=10.
+      store.saveError = null;
+      store.conflictSetsLoadError = true;
+      store.attemptCount = 0;
+      store.failAttemptNumber = 1;
+      store.failAttemptErrorFactory = () => SettingsWriteConflict();
+      await controller.reloadSettings();
+      expect(store.persisted.chunkSize, 10);
+      expect(store.persisted.bilingual, isTrue);
+
+      // Replay pass 2: with the bug, stale A survived (its {chunkSize} did
+      // not overlap B's {bilingual}) and now replays chunkSize=8, silently
+      // rolling back the user's 10.
+      store.failAttemptNumber = null;
+      store.attempts.clear();
+      await controller.reloadSettings();
+      expect(
+        store.persisted.chunkSize,
+        10,
+        reason: 'Stale slider entry A must have been dropped when B succeeded',
+      );
+      expect(
+        store.attempts,
+        isEmpty,
+        reason: 'No queued edits should remain after B superseded A',
+      );
+    });
+
+    test(
+        'replay swallow: justChanged merges slider fields swallowed '
+        'mid-replay', () async {
+      // Queue A (slider 4->8) and C (bilingual toggle) via conflicts.
+      store.saveError = SettingsWriteConflict();
+      final s1 = controller.setChunkSize(8);
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      await s1;
+      await controller.setBilingual(true);
+
+      // Replay pass 1: stall A's save; while stalled, drag the slider to 10
+      // so it is still pending when C's replay swallows it. A's save then
+      // conflicts (mid-pass load bumps the generation, staling the P2-#22
+      // check); C's replay succeeds and persists chunkSize=10 — and must
+      // drop stale A via field overlap on the swallowed slider field.
+      store.saveError = null;
+      store.conflictSetsLoadError = true;
+      store.attemptCount = 0;
+      store.failAttemptNumber = 1;
+      store.failAttemptErrorFactory = () => SettingsWriteConflict();
+      final gate = Completer<void>();
+      store.saveGate = gate;
+      store.saveStarted = Completer<void>();
+      final reload = controller.reloadSettings();
+      await store.saveStarted!.future;
+      // A's replay save is stalled. Move the slider now.
+      final slider = controller.setChunkSize(10);
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      // Release the stalled save; it now fails with a write conflict.
+      gate.complete();
+      await reload;
+      await slider;
+      expect(store.persisted.chunkSize, 10);
+      expect(store.persisted.bilingual, isTrue);
+
+      // Replay pass 2: with the bug, C's justChanged was only {bilingual},
+      // so stale A survived and now rolls chunkSize 10->8.
+      store.failAttemptNumber = null;
+      store.attempts.clear();
+      await controller.reloadSettings();
+      expect(
+        store.persisted.chunkSize,
+        10,
+        reason: 'Stale slider entry A must have been dropped when C\'s replay '
+            'persisted the swallowed slider value',
+      );
+      expect(
+        store.attempts,
+        isEmpty,
+        reason: 'No queued edits should remain after C superseded A',
+      );
     });
   });
 }

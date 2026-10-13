@@ -2859,10 +2859,17 @@ class EpubChapterTranslator {
       // separated with standalone whitespace. Fold each into the adjacent
       // slot text so the written text sequence keeps the response's word
       // separation.
+      final Map<dom.Text, int> writableSourceIndexByNode =
+          Map<dom.Text, int>.identity();
+      for (int index = 0; index < writableSourceSlots.length; index += 1) {
+        writableSourceIndexByNode[writableSourceSlots[index].node] = index;
+      }
       final List<String> finalTexts = _withStandaloneWhitespace(
         translatedDom,
         writableTranslatedTexts,
         writableIndexByNode,
+        rebuilt,
+        writableSourceIndexByNode,
       );
       for (int index = 0; index < writableSourceSlots.length; index += 1) {
         writableSourceSlots[index].text = finalTexts[index];
@@ -3559,26 +3566,23 @@ class EpubChapterTranslator {
     return null;
   }
 
-  /// P2-#6: folds standalone whitespace-only text nodes (which never become
-  /// slots) into the adjacent writable slot texts, in document order. Each
-  /// whitespace node is appended to the preceding writable slot's text (or
-  /// prepended to the first slot's text when it leads), so the written text
-  /// sequence keeps the response's word separation instead of gluing words.
-  /// [writableIndexByNode] maps each writable slot's text node to its index
-  /// in [writableTexts].
-  static List<String> _withStandaloneWhitespace(
-    _ResponseHtml translatedDom,
-    List<String> writableTexts,
+  /// Walks [document] in document order and reports each standalone
+  /// whitespace-only text node (which never becomes a slot) via [onGap],
+  /// keyed by the index of the preceding writable slot ([writableIndexByNode]
+  /// maps each writable slot's text node to its index; -1 when the
+  /// whitespace leads). Whitespace inside protected subtrees is skipped,
+  /// mirroring the slot walk.
+  static void _collectStandaloneWhitespaceGaps(
+    _ResponseHtml document,
     Map<dom.Text, int> writableIndexByNode,
+    void Function(int precedingSlot, String data) onGap,
   ) {
-    final List<({int precedingSlot, String data})> gaps =
-        <({int precedingSlot, String data})>[];
     int lastWritable = -1;
     void visit(dom.Node node, bool protected) {
       if (node is dom.Text) {
         if (node.data.trim().isEmpty) {
           if (!protected) {
-            gaps.add((precedingSlot: lastWritable, data: node.data));
+            onGap(lastWritable, node.data);
           }
           return;
         }
@@ -3591,21 +3595,63 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      final bool childProtected = protected || translatedDom.isProtected(node);
+      final bool childProtected = protected || document.isProtected(node);
       for (final dom.Node child in node.nodes) {
         visit(child, childProtected);
       }
     }
-    for (final dom.Node node in translatedDom.fragment.nodes) {
+    for (final dom.Node node in document.fragment.nodes) {
       visit(node, false);
     }
+  }
+
+  /// P2-#6: folds standalone whitespace-only text nodes (which never become
+  /// slots) into the adjacent writable slot texts, in document order. Each
+  /// whitespace node is appended to the preceding writable slot's text (or
+  /// prepended to the first slot's text when it leads), so the written text
+  /// sequence keeps the response's word separation instead of gluing words.
+  /// [writableIndexByNode] maps each writable slot's text node to its index
+  /// in [writableTexts].
+  ///
+  /// P2-#6 regression: [sourceDom] is the rebuilt (source-clone) DOM whose
+  /// own standalone whitespace nodes survive the write (they never become
+  /// slots), and [writableSourceIndexByNode] maps its writable slots to
+  /// their indices. The writable slot sequences are positionally aligned
+  /// (the branch precondition), so a response gap is skipped when the
+  /// source already has whitespace at the same gap position — folding it
+  /// as well would double the whitespace in the output.
+  static List<String> _withStandaloneWhitespace(
+    _ResponseHtml translatedDom,
+    List<String> writableTexts,
+    Map<dom.Text, int> writableIndexByNode,
+    _ResponseHtml sourceDom,
+    Map<dom.Text, int> writableSourceIndexByNode,
+  ) {
+    final List<({int precedingSlot, String data})> gaps =
+        <({int precedingSlot, String data})>[];
+    _collectStandaloneWhitespaceGaps(
+      translatedDom,
+      writableIndexByNode,
+      (int precedingSlot, String data) =>
+          gaps.add((precedingSlot: precedingSlot, data: data)),
+    );
     if (gaps.isEmpty) {
       return writableTexts;
     }
+    final Set<int> sourceWhitespaceSlots = <int>{};
+    _collectStandaloneWhitespaceGaps(
+      sourceDom,
+      writableSourceIndexByNode,
+      (int precedingSlot, String _) =>
+          sourceWhitespaceSlots.add(precedingSlot),
+    );
     final List<String> result = List<String>.from(writableTexts);
     for (final gap in gaps) {
       if (result.isEmpty) {
         break;
+      }
+      if (sourceWhitespaceSlots.contains(gap.precedingSlot)) {
+        continue;
       }
       if (gap.precedingSlot >= 0 && gap.precedingSlot < result.length) {
         result[gap.precedingSlot] = result[gap.precedingSlot] + gap.data;

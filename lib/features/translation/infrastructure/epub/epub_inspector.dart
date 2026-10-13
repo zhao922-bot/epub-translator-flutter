@@ -366,7 +366,7 @@ class EpubInspector {
     final paths = <String>{...spine.chapterPaths, ?ncx};
     for (final item in opf.descendants.whereType<XmlElement>().where(
       (e) =>
-          e.name.local == 'item' &&
+          _isOpfManifestChild(e, 'item') &&
           (e.getAttribute('properties') ?? '')
               .split(RegExp(r'\s+'))
               .contains('nav'),
@@ -429,8 +429,10 @@ class EpubInspector {
           orElse: () => null,
         );
     final String ncxId = spine?.getAttribute('toc') ?? '';
+    // P2-#21: namespace-gated like _chapterPathsFromOpfDocument — a foreign-
+    // namespace <item> with a colliding id must not hijack the NCX path.
     final items = opfDocument.descendants.whereType<XmlElement>().where(
-      (item) => item.name.local == 'item',
+      (item) => _isOpfManifestChild(item, 'item'),
     );
     final explicit = items
         .where(
@@ -509,9 +511,10 @@ class EpubInspector {
     }
     // EPUB 3 navigation is now rewritten at export too. Validate it before
     // any paid requests, including when it is absent from the spine.
+    // P2-#21: namespace-gated like _chapterPathsFromOpfDocument.
     for (final item in opf.descendants.whereType<XmlElement>().where(
       (element) =>
-          element.name.local == 'item' &&
+          _isOpfManifestChild(element, 'item') &&
           (element.getAttribute('properties') ?? '')
               .split(RegExp(r'\s+'))
               .contains('nav'),

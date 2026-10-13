@@ -647,6 +647,31 @@ void main() {
       );
     });
 
+    test(
+      'P2-#21: foreign-namespace item does not hijack the NCX path',
+      () {
+        // A foreign-namespace <item> with a colliding id must not be
+        // picked up: the real NCX is "toc.ncx", the attacker's is
+        // "evil.ncx".
+        const String opf = '''<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf" xmlns:evil="http://example.com/evil">
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <evil:item id="ncx" href="evil.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="c1"/></spine>
+</package>''';
+        expect(
+          EpubInspector.ncxPathFromOpfBytes(
+            files: filesWithOpf(opf),
+            opfPath: 'OEBPS/content.opf',
+          ),
+          'OEBPS/toc.ncx',
+        );
+      },
+    );
+
     test('non-UTF-8 NCX fails loudly before any paid work', () {
       final Map<String, List<int>> files = filesWithOpf(opfWithNcx);
       files['OEBPS/toc.ncx'] = utf8.encode(

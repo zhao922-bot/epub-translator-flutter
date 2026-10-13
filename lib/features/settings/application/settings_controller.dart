@@ -377,6 +377,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     // applied to the state, so the replay loop can tell which queued edits
     // actually contributed to a later successful save.
     void Function()? onApplied,
+    // P2-#28: invoked (replay path only) with the slider field names
+    // swallowed by this update. The replay loop merges them into
+    // justChanged: the save below persists them too, so earlier queued
+    // entries touching the same fields are stale and must be dropped.
+    void Function(Set<String> swallowedFields)? onSwallowedSlider,
   }) async {
     if (!_loaded) await _initialLoad;
     // P2-#36: an edit arriving while reloadSettings is reading must not
@@ -439,6 +444,14 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _debouncedEdit = null;
     final debouncedFields = _debouncedChangedFields;
     _debouncedChangedFields = null;
+    // P2-#28: report the slider fields swallowed by this update. In the
+    // replay path the save below persists them as well, so the replay loop
+    // merges them into justChanged — otherwise an earlier queued entry
+    // touching the same slider field would survive and revert the newer
+    // value on the next replay.
+    if (isConflictReplay) {
+      onSwallowedSlider?.call(debouncedFields ?? const <String>{});
+    }
     // A non-debounced edit flushes a pending slider edit implicitly: the
     // recorded replay must compose both transformations, otherwise the
     // slider's value would be lost on conflict-replay.
@@ -490,8 +503,16 @@ class SettingsController extends StateNotifier<TranslationConfig> {
               update: effectiveUpdate,
               explicitSecretMutations: explicitSecretMutations,
               secretMutationsFor: secretMutationsFor,
-              // P2-#28: effectiveNext is effectiveUpdate(prevState).
-              changedFields: _changedFields(prevState, effectiveNext),
+              // P2-#28: effectiveNext is effectiveUpdate(prevState). Diff
+              // against the pre-swallow [next] and union the slider fields
+              // recorded when the debounced edit was made: prevState
+              // already holds the slider's optimistic value, so diffing
+              // effectiveNext against prevState alone would miss the
+              // slider fields.
+              changedFields: _changedFields(
+                prevState,
+                next,
+              ).union(debouncedFields ?? const <String>{}),
               credentialRoute: credentialRoute,
             ),
     );
@@ -680,6 +701,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             blocked++;
             continue;
           }
+          // P2-#28: slider fields swallowed by this replayed update. The
+          // successful save persists them too, so they join justChanged
+          // below — otherwise an earlier entry touching the same slider
+          // field would survive and revert the newer value next replay.
+          Set<String> swallowedSliderFields = const <String>{};
           if (await _update(
             edit.update,
             explicitSecretMutations: edit.explicitSecretMutations,
@@ -687,6 +713,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             // This edit is still queued; a new conflict must not duplicate it.
             isConflictReplay: true,
             onApplied: () => appliedGeneration[i] = _stateGeneration,
+            onSwallowedSlider: (fields) => swallowedSliderFields = fields,
           )) {
             _conflictedEdits.remove(edit);
             // P2-#27: only drop earlier entries whose effects this save
@@ -696,10 +723,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             final Set<SettingsSecretSlot> persisted =
                 _store.lastPersistedSecretSlots;
             // P2-#28: fields this successful save changed (excluding
-            // secret-related fields, which the P2-#27 check owns).
-            final Set<String> justChanged = edit.changedFields.difference(
-              _secretRelatedFields,
-            );
+            // secret-related fields, which the P2-#27 check owns), plus
+            // slider fields swallowed during this replay.
+            final Set<String> justChanged = {
+              ...edit.changedFields,
+              ...swallowedSliderFields,
+            }.difference(_secretRelatedFields);
             for (int j = 0; j < i; j++) {
               final other = pending[j];
               // P2-#28: drop earlier entries that touch the same non-secret
