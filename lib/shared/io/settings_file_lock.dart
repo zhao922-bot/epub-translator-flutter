@@ -1,7 +1,24 @@
 import 'dart:async';
 import 'dart:io';
 
-// POSIX file locks are process-scoped, so also serialize stores in this isolate.
+// The OS file lock below serializes *processes* (advisory flock on
+// POSIX, mandatory LockFileEx on Windows). It does NOT serialize Dart
+// isolates in the same process: on POSIX, flock locks are associated with
+// the open file description and a process never blocks on its own lock,
+// so two isolates opening the same lock file would both succeed.
+//
+// Cross-isolate mutual exclusion is provided by the in-process future
+// chain ([_settingsWriters]) instead: isolates in one process share the
+// same Dart heap, so chaining on a shared future serializes them. (A
+// chain keyed by absolute path also covers two File objects pointing at
+// the same path.)
+//
+// P2-#31: `IsolateNameServer`-based locking was considered and rejected:
+// it only works between isolates that explicitly register (spawned
+// isolates don't share it by default), it cannot serialize against a
+// second *process*, and a forgotten port mapping leaks the lock. The
+// future chain + OS lock combination covers same-process isolates and
+// separate processes with no registration protocol.
 final Map<String, Future<void>> _settingsWriters = {};
 
 Future<T> withSettingsFileLock<T>(
@@ -18,13 +35,18 @@ Future<T> withSettingsFileLock<T>(
   try {
     await file.parent.create(recursive: true);
     handle = await lockFile.open(mode: FileMode.append);
-    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    // P2-#33: the acquisition deadline is measured with a monotonic
+    // Stopwatch, not the wall clock: a system clock rollback during the
+    // wait must not stretch the 10-second timeout (a ~1-hour rollback
+    // would otherwise extend it to ~1 hour).
+    final Stopwatch waitClock = Stopwatch()..start();
+    const Duration acquireTimeout = Duration(seconds: 10);
     while (true) {
       try {
         await handle.lock(FileLock.exclusive);
         break;
       } on FileSystemException {
-        if (DateTime.now().isAfter(deadline)) rethrow;
+        if (waitClock.elapsed >= acquireTimeout) rethrow;
         await Future<void>.delayed(const Duration(milliseconds: 100));
       }
     }

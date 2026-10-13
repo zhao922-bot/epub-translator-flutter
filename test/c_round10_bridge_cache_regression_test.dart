@@ -134,10 +134,16 @@ class _CacheFixture {
       // Arm maintenance backoff without allowing automatic eviction.
       onMaintenanceScan: () async => throw StateError('scan paused'),
     );
+    // P2-#29: the light pass now runs during the backoff (it used to be
+    // skipped while the interval was active), so suspend automatic
+    // maintenance while building the fixture — otherwise the setup puts
+    // would evict the files before the test reads their mtimes.
+    store.suspendAutoMaintenanceForTest = true;
     for (final key in keys) {
       await store.putBlockTranslation(key, 'x' * 300);
       await store.waitForMaintenanceForTest();
     }
+    store.suspendAutoMaintenanceForTest = false;
     // Use the normal full scanner below, with its default large scan cap;
     // the light pass still uses the instance's small capacity.
     final scanner = TranslationCacheStore(cacheRoot: root, maxCacheBytes: 300);

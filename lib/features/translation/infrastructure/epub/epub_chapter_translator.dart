@@ -260,6 +260,77 @@ class EpubChapterTranslator {
       {'path': entry.path, 'memory': entry.memory.toJson()},
   ];
 
+  /// Mutable selection state for [selectMemorySnapshotForTest] (性能-#38).
+  @visibleForTesting
+  static MemorySnapshotCursor memorySnapshotCursorForTest() =>
+      MemorySnapshotCursor();
+
+  /// Incremental positional memory snapshot selector (性能-#38).
+  ///
+  /// Returns the newest timeline entry strictly before [chapterPath]'s
+  /// position in [positionByPath], serialized via [serialize], or
+  /// [fallback] when there is none. [cursor] holds mutable selection
+  /// state across calls; chapters are visited in non-decreasing book order
+  /// so each timeline entry is examined once per run (O(n) total, not
+  /// O(n²)). A non-monotonic call resyncs via a fresh scan.
+  ///
+  /// P2-#16: [fallback] must already implement positional snapshot
+  /// isolation (null — not live rolling memory — after a checkpoint
+  /// restore with a non-empty timeline).
+  @visibleForTesting
+  static Map<String, Object?>? selectMemorySnapshotForTest({
+    required List<({String path, Object memory})> timeline,
+    required Map<String, int> positionByPath,
+    required String chapterPath,
+    required MemorySnapshotCursor cursor,
+    required Map<String, Object?> Function(Object memory) serialize,
+    required Map<String, Object?>? Function() fallback,
+  }) {
+    final int? position = positionByPath[chapterPath];
+    if (position == null || position <= 0) {
+      return fallback();
+    }
+    if (position < cursor.lastPosition) {
+      cursor.index = 0;
+      cursor.winner = null;
+      cursor.lastPosition = -1;
+    }
+    cursor.lastPosition = position;
+    while (cursor.index < timeline.length) {
+      final entry = timeline[cursor.index];
+      final int? entryPosition = positionByPath[entry.path];
+      if (entryPosition == null) {
+        cursor.index++;
+        continue;
+      }
+      if (entryPosition >= position) {
+        break;
+      }
+      cursor.winner = entry.memory;
+      cursor.index++;
+    }
+    final Object? winner = cursor.winner;
+    if (winner == null) {
+      return fallback();
+    }
+    return serialize(winner);
+  }
+
+  /// P2-#16: snapshot fallback selection. The live rolling memory is only
+  /// a safe fallback for a fresh run (or a restore that never recorded a
+  /// chapter, where the live memory is still the initial memory). After a
+  /// checkpoint restore with a non-empty timeline the live memory may
+  /// already contain later chapters, so a chapter with no earlier entry
+  /// receives no memory rather than leaking future content.
+  @visibleForTesting
+  static Map<String, Object?>? memorySnapshotFallbackForTest({
+    required bool hasRestoredMemory,
+    required bool timelineIsEmpty,
+    required Map<String, Object?>? liveMemory,
+  }) {
+    return hasRestoredMemory && !timelineIsEmpty ? null : liveMemory;
+  }
+
   /// Positional memory snapshot: the newest timeline entry strictly before
   /// [chapterPath] in [orderedPaths] book order, or [fallback] when none
   /// exists. A retranslated earlier chapter thus never sees rolling memory
@@ -1163,19 +1234,40 @@ class EpubChapterTranslator {
       }
 
       /// Rolling-memory snapshot for [chapter]'s own time position: the
-      /// newest timeline entry strictly before the chapter in book order,
-      /// falling back to the live memory when no earlier entry exists.
+      /// newest timeline entry strictly before the chapter in book order.
       ///
-      /// The winning entry is selected positionally BEFORE serializing, so
-      /// only one entry pays for toJson per chapter (O(1)) instead of the
-      /// whole timeline (O(n^2) over the book).
+      /// 性能-#38: chapters are translated in book order and the timeline
+      /// only appends entries with strictly increasing positions, so the
+      /// selection cursor only moves forward — each timeline entry is
+      /// examined once per run instead of once per chapter (O(n) total,
+      /// not O(n^2)). A non-monotonic call resyncs via a fresh scan.
+      ///
+      /// P2-#16: when no earlier entry exists, the live memory is used as
+      /// the fallback only for a fresh run (or a restore that never
+      /// recorded a chapter, where the live memory is still the initial
+      /// memory). After a checkpoint restore with a non-empty timeline the
+      /// live rolling memory may already contain later chapters, so a
+      /// chapter with no earlier entry receives no memory rather than
+      /// leaking future content (positional snapshot isolation).
+      final MemorySnapshotCursor snapshotCursorState =
+          EpubChapterTranslator.memorySnapshotCursorForTest();
+
+      Map<String, Object?>? snapshotFallback() {
+        return EpubChapterTranslator.memorySnapshotFallbackForTest(
+          hasRestoredMemory: restoredMemory != null,
+          timelineIsEmpty: memoryTimeline.isEmpty,
+          liveMemory: bookMemory?.toJson(),
+        );
+      }
+
       Map<String, Object?>? bookMemorySnapshotFor(InspectedChapter chapter) {
-        return EpubChapterTranslator.memorySnapshotForTest(
+        return EpubChapterTranslator.selectMemorySnapshotForTest(
           timeline: memoryTimeline,
           positionByPath: selectedPositionByPath,
           chapterPath: chapter.path,
-          serialize: (Object? memory) => (memory as _BookMemory).toJson(),
-          fallback: bookMemory?.toJson(),
+          cursor: snapshotCursorState,
+          serialize: (Object memory) => (memory as _BookMemory).toJson(),
+          fallback: snapshotFallback,
         );
       }
 
@@ -2648,6 +2740,13 @@ class EpubChapterTranslator {
     }
 
     final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
+    // P2-#14: a translated slot keeps its protected status only when the tag
+    // that protects it also protects text in the source. A <code> (or
+    // similar) introduced by the model holds real translation text and must
+    // not be dropped as protected content.
+    final Set<String> sourceProtectedTags = _protectedElementTags(sourceDom);
+    bool translatedSlotProtected(_HtmlTextSlot slot) =>
+        _translatedSlotProtected(translatedDom, sourceProtectedTags, slot);
     // Positional mapping must pair unprotected slots with unprotected
     // slots: protected slots (footnote markers, page breaks, code) keep
     // their source text, so consuming translation texts across the
@@ -2659,13 +2758,19 @@ class EpubChapterTranslator {
         .where((_HtmlTextSlot slot) => !slot.protected)
         .toList(growable: false);
     final List<String> writableTranslatedTexts = translatedSlots
-        .where((_HtmlTextSlot slot) => !slot.protected && slot.text.isNotEmpty)
+        .where(
+          (_HtmlTextSlot slot) =>
+              !translatedSlotProtected(slot) && slot.text.isNotEmpty,
+        )
         .map((_HtmlTextSlot slot) => slot.text)
         .toList(growable: false);
     final int protectedSourceCount =
         sourceSlots.length - writableSourceSlots.length;
     final int protectedTranslatedCount = translatedSlots
-        .where((_HtmlTextSlot slot) => slot.protected && slot.text.isNotEmpty)
+        .where(
+          (_HtmlTextSlot slot) =>
+              translatedSlotProtected(slot) && slot.text.isNotEmpty,
+        )
         .length;
 
     if (writableTranslatedTexts.length == writableSourceSlots.length &&
@@ -2677,12 +2782,15 @@ class EpubChapterTranslator {
       return rebuilt;
     }
 
+    // P2-#13: rebuild the plain text from every non-protected text node,
+    // including whitespace-only ones that never become slots, so words the
+    // model separated with standalone whitespace do not glue together.
     // Protected source slots retain their text; including translated code or
     // markers here would duplicate them in the first writable source slot.
-    final String translatedPlainText = translatedSlots
-        .where((_HtmlTextSlot slot) => !slot.protected)
-        .map((_HtmlTextSlot slot) => slot.text)
-        .join();
+    final String translatedPlainText = _unprotectedResponseText(
+      translatedDom,
+      sourceProtectedTags,
+    );
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
         <({_HtmlTextSlot slot, String sourceText})>[];
@@ -3325,6 +3433,89 @@ class EpubChapterTranslator {
     }
   }
 
+  /// Tags of elements that protect text in [dom] (footnote markers, page
+  /// breaks, code, ...). The merge fallback uses this so a
+  /// protected-kind element the model introduced in the response is not
+  /// mistaken for source-protected content (P2-#14).
+  static Set<String> _protectedElementTags(_ResponseHtml response) {
+    final Set<String> tags = <String>{};
+    void visit(dom.Node node) {
+      if (node is! dom.Element) {
+        return;
+      }
+      if (response.isProtected(node)) {
+        final String? tag = node.localName;
+        if (tag != null) {
+          tags.add(tag);
+        }
+      }
+      for (final dom.Node child in node.nodes) {
+        visit(child);
+      }
+    }
+    for (final dom.Node node in response.fragment.nodes) {
+      visit(node);
+    }
+    return tags;
+  }
+
+  /// Whether [slot]'s text counts as protected in the merge fallback: it
+  /// must be protected in the response, and an ancestor carrying that
+  /// protection must have a tag that also protects text in the source
+  /// (P2-#14).
+  static bool _translatedSlotProtected(
+    _ResponseHtml translatedDom,
+    Set<String> sourceProtectedTags,
+    _HtmlTextSlot slot,
+  ) {
+    if (!slot.protected) {
+      return false;
+    }
+    dom.Node? ancestor = slot.node.parentNode;
+    while (ancestor is dom.Element) {
+      if (translatedDom.isProtected(ancestor) &&
+          sourceProtectedTags.contains(ancestor.localName)) {
+        return true;
+      }
+      ancestor = ancestor.parentNode;
+    }
+    return false;
+  }
+
+  /// Plain text of the translated DOM for the merge fallback: the data of
+  /// every text node outside [sourceProtectedTags]-protected elements,
+  /// including whitespace-only nodes that never become slots, so words the
+  /// model separated with standalone whitespace do not glue together
+  /// (P2-#13).
+  static String _unprotectedResponseText(
+    _ResponseHtml translatedDom,
+    Set<String> sourceProtectedTags,
+  ) {
+    final StringBuffer buffer = StringBuffer();
+    void visit(dom.Node node, bool protected) {
+      if (node is dom.Text) {
+        if (!protected) {
+          buffer.write(node.data);
+        }
+        return;
+      }
+      if (node is! dom.Element) {
+        return;
+      }
+      final bool childProtected =
+          protected ||
+          (translatedDom.isProtected(node) &&
+              sourceProtectedTags.contains(node.localName));
+      for (final dom.Node child in node.nodes) {
+        visit(child, childProtected);
+      }
+    }
+    for (final dom.Node node in translatedDom.fragment.nodes) {
+      visit(node, false);
+    }
+    return buffer.toString();
+  }
+
   static bool _isProtectedTextElement(dom.Element element, {String? text}) {
     final String tag = element.localName ?? '';
     if (EpubHtmlExtractor.nonTextAncestors.contains(tag)) return true;
@@ -3461,6 +3652,44 @@ class EpubChapterTranslator {
     bool checkHtmlTags = true,
   }) => _cleanBookTitle(raw, checkHtmlTags: checkHtmlTags);
 
+  /// P2-#21 / 性能-#37: per-slot context summary. [slotIndex]/[slotTexts]
+  /// locate the slot's own occurrence when texts repeat; [normalizedBlockText]
+  /// is the cached normalized block text.
+  @visibleForTesting
+  static String blockContextSummaryForTest(
+    ExtractedBlock block, {
+    String? slotText,
+    int? slotIndex,
+    List<String>? slotTexts,
+    String? normalizedBlockText,
+  }) =>
+      _EpubTranslationStrategy._blockContextSummary(
+        block,
+        slotText: slotText,
+        slotIndex: slotIndex,
+        slotTexts: slotTexts,
+        normalizedBlockText: normalizedBlockText,
+      );
+
+  /// P2-#17: extracts the single block text from a retry request payload,
+  /// or null when the payload is not a recognized single-block fallback.
+  @visibleForTesting
+  static String? singleBlockTextForTest(Map<String, dynamic> data) =>
+      _TranslationRequestBudget._singleBlockText(data);
+
+  /// 性能-#40: bounded preview body for [blocks].
+  @visibleForTesting
+  String previewBodyFromBlocksForTest(
+    List<ExtractedBlock> blocks, {
+    required String fallback,
+  }) =>
+      _previewBodyFromBlocks(blocks, fallback: fallback);
+
+  /// 性能-#40: plain text from [html], truncated to [maxChars] when given.
+  @visibleForTesting
+  String? plainTextFromHtmlForTest(String? html, {int? maxChars}) =>
+      _plainTextFromHtml(html, maxChars: maxChars);
+
   static String _cleanBookTitle(String raw, {bool checkHtmlTags = true}) {
     String value = raw.trim();
     // Peel nested presentation wrappers without changing the title itself.
@@ -3522,11 +3751,16 @@ class EpubChapterTranslator {
     }
     // A paired presentation tag is still a wrapper, even when literal angle
     // brackets (such as a generic type parameter) are allowed in XML text.
+    // P2-#15: the relaxed path must still reject HTML comments and markup
+    // that does not span the whole title (for example "<b>中文书名</b>：副标题"
+    // or an unclosed "<b>"); only a lone literal such as "<T>" stays allowed.
     if (!checkHtmlTags &&
-        RegExp(
-          r'^<([A-Za-z][\w:-]*)\b[^>]*>[\s\S]*</\1\s*>$',
-          caseSensitive: false,
-        ).hasMatch(value)) {
+        (RegExp(
+              r'^<([A-Za-z][\w:-]*)\b[^>]*>[\s\S]*</\1\s*>$',
+              caseSensitive: false,
+            ).hasMatch(value) ||
+            _EpubTranslationStrategy._slotHtmlCommentPattern.hasMatch(value) ||
+            _hasNonLiteralTag(value))) {
       throw const TranslationParseException(
         'Translated book title contains an HTML wrapper.',
       );
@@ -3537,6 +3771,23 @@ class EpubChapterTranslator {
       checkHtmlTags: checkHtmlTags,
     );
     return value;
+  }
+
+  /// P2-#15: whether [value] contains tag-shaped markup other than a lone
+  /// literal like `<T>` (a single uppercase letter with no attributes and
+  /// no closing tag, plausibly a generic type parameter). Catches unclosed
+  /// tags (`<b>中文书名`) and embedded markup (`<b>中文书名</b>：副标题`)
+  /// that the full-wrapper check misses. A `<` not abutting a letter
+  /// (as in `a < b`) is plain text, not a tag.
+  static bool _hasNonLiteralTag(String value) {
+    final RegExp tagPattern = RegExp(r'<(/?)([A-Za-z][\w:-]*)(\s[^<>]*)?/?>');
+    for (final RegExpMatch match in tagPattern.allMatches(value)) {
+      if (RegExp(r'^<[A-Z]>$').hasMatch(match.group(0)!)) {
+        continue;
+      }
+      return true;
+    }
+    return false;
   }
 
   /// Translates the book's metadata title with a single lightweight API call.
@@ -4213,30 +4464,66 @@ class EpubChapterTranslator {
     );
   }
 
+  /// 性能-#40: the translated-body preview is only a UI snippet. Bound it
+  /// by characters (not just block count) so a giant block does not pay
+  /// for a full HTML parse and whitespace normalization.
+  static const int _previewBodyMaxChars = 4000;
+
+  /// Generous HTML-to-text size headroom when truncating a block's HTML
+  /// before parsing it for the preview.
+  static const int _previewHtmlHeadroomFactor = 8;
+
   String _previewBodyFromBlocks(
     List<ExtractedBlock> blocks, {
     required String fallback,
   }) {
-    final Iterable<String> translated = blocks
-        .map((ExtractedBlock block) => _plainTextFromHtml(block.translatedHtml))
-        .whereType<String>()
-        .map((String text) => text.trim())
-        .where((String text) => text.isNotEmpty)
-        .take(12);
-    if (translated.isEmpty) {
+    final StringBuffer preview = StringBuffer();
+    int keptBlocks = 0;
+    int remaining = _previewBodyMaxChars;
+    for (final ExtractedBlock block in blocks) {
+      if (keptBlocks >= 12 || remaining <= 0) {
+        break;
+      }
+      final String? text = _plainTextFromHtml(
+        block.translatedHtml,
+        maxChars: remaining,
+      );
+      final String trimmed = text?.trim() ?? '';
+      if (trimmed.isEmpty) {
+        continue;
+      }
+      if (keptBlocks > 0) {
+        preview.write('\n\n');
+      }
+      preview.write(trimmed);
+      keptBlocks++;
+      remaining -= trimmed.length;
+    }
+    if (keptBlocks == 0) {
       return fallback;
     }
-    return translated.join('\n\n');
+    return preview.toString();
   }
 
-  String? _plainTextFromHtml(String? html) {
+  String? _plainTextFromHtml(String? html, {int? maxChars}) {
     if (html == null || html.trim().isEmpty) {
       return null;
     }
+    // 性能-#40: for a bounded preview, truncate a giant block's HTML before
+    // parsing so the parse and the whitespace normalization below stay
+    // proportional to the preview size, not the block size.
+    final String boundedHtml =
+        maxChars == null || html.length <= maxChars * _previewHtmlHeadroomFactor
+        ? html
+        : html.substring(0, maxChars * _previewHtmlHeadroomFactor);
     final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      html,
+      boundedHtml,
     );
-    return (fragment.text ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+    String text = (fragment.text ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (maxChars != null && text.length > maxChars) {
+      text = text.substring(0, maxChars).trimRight();
+    }
+    return text;
   }
 
   String _formatDuration(Duration duration) {
@@ -4260,6 +4547,15 @@ class EpubChapterTranslator {
         elapsed.inMilliseconds / Duration.millisecondsPerMinute;
     return (blockCount / minutes).toStringAsFixed(1);
   }
+}
+
+/// Mutable selection state for
+/// [EpubChapterTranslator.selectMemorySnapshotForTest] (性能-#38).
+@visibleForTesting
+class MemorySnapshotCursor {
+  int index = 0;
+  Object? winner;
+  int lastPosition = -1;
 }
 
 /// A response-local DOM. Clones and rebuilt skeletons stay in DOM form;

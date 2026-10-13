@@ -527,7 +527,13 @@ body.epub-translator-cjk [data-translation="true"] {
     final sourceLanguage =
         sourceElement.attributes['lang'] ??
         sourceElement.attributes['xml:lang'];
-    return sourceLanguage == markedLanguage &&
+    // P2-#12: BCP 47 language tags are case-insensitive (RFC 5646 §2.1.1).
+    // A case-sensitive comparison here mistook the model's case-normalized
+    // echo (source `lang="en"` → translation `lang="EN"`) for a deliberate
+    // foreign-language mark, leaving translated text tagged as the source
+    // language (e.g. `<p lang="EN">你好</p>` staying "English").
+    return sourceLanguage != null &&
+        sourceLanguage.toLowerCase() == markedLanguage.toLowerCase() &&
         _collapsedText(sourceElement.text) !=
             _collapsedText(fragmentElement.text);
   }

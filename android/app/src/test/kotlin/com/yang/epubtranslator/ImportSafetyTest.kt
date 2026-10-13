@@ -117,4 +117,32 @@ class ImportSafetyTest {
             assertFalse(lifecycle.isCurrent(lifecycle.generation))
         }
     }
+
+    @Test fun staleGenerationRefusesHolderRegistration() {
+        // P2-#9: a copy task that passed the generation check, was parked,
+        // and woke up after the watchdog replaced the executor must NOT
+        // overwrite the new registration via activeImport.set().
+        val lifecycle = ImportLifecycle()
+        val staleGeneration = lifecycle.generation
+        // The current generation registers fine.
+        checkImportRegistration(lifecycle, staleGeneration)
+        // The watchdog invalidates (executor replaced, new task registered).
+        lifecycle.invalidate()
+        checkImportRegistration(lifecycle, lifecycle.generation)
+        // The parked task's generation is now stale: refuse.
+        assertThrows(ImportStaleException::class.java) {
+            checkImportRegistration(lifecycle, staleGeneration)
+        }
+    }
+
+    @Test fun destroyedLifecycleRefusesHolderRegistration() {
+        // P2-#9: same guard at the hasZipMagicBytes probe registration —
+        // a destroyed lifecycle never accepts a registration.
+        val lifecycle = ImportLifecycle()
+        val generation = lifecycle.generation
+        lifecycle.destroy()
+        assertThrows(ImportStaleException::class.java) {
+            checkImportRegistration(lifecycle, generation)
+        }
+    }
 }

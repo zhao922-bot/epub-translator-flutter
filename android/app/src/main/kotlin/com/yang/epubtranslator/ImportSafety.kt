@@ -57,6 +57,28 @@ internal class ImportLifecycle {
         !destroyed && generation == capturedGeneration
 }
 
+/** Thrown when an import task observes a newer executor generation: the
+ * watchdog already replaced the executor, so this pick's result was (or
+ * will be) answered with PICK_TIMEOUT and anything the task does now would
+ * only corrupt a newer pick's state. */
+internal class ImportStaleException :
+    Exception("Import attempt superseded by executor replacement.")
+
+/**
+ * Registration gate for the active-import holder slot (P2-#9): re-checks
+ * the task's captured generation immediately before registering. A task
+ * suspended across a blocking provider call must not overwrite a newer
+ * import's registration after the watchdog replaced the executor — on a
+ * stale generation this throws [ImportStaleException] instead of
+ * registering, so the newer holder (and its watchdog un-wedging) survives.
+ */
+internal fun checkImportRegistration(
+    lifecycle: ImportLifecycle,
+    taskGeneration: Int,
+) {
+    if (!lifecycle.isCurrent(taskGeneration)) throw ImportStaleException()
+}
+
 internal fun confirmedEpubName(safeName: String): String =
     if (safeName.endsWith(".epub", ignoreCase = true)) safeName
     else "$safeName.epub"

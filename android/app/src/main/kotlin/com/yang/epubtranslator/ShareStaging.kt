@@ -34,11 +34,12 @@ internal data class ShareStagingEntry(
 )
 
 /** Which staging files the sweep may delete, and which URI grants to
- * revoke first so a grant never outlives its file. */
+ * revoke after their files are successfully deleted (never before: a grant
+ * must not be revoked for a file that survived deletion). */
 internal data class ShareStagingCleanupPlan(
     /** Files past the max age: deleted unconditionally. */
     val deleteForAge: List<ShareStagingEntry>,
-    /** Grant URIs to revoke before age deletion or quota eviction. */
+    /** Grant URIs to revoke after age deletion or quota eviction succeeds. */
     val revokeUris: List<String>,
     /** Files to evict oldest-first until the quota is met (already ordered). */
     val evictForCap: List<ShareStagingEntry>,
@@ -103,15 +104,16 @@ internal fun dropStaleShareGrants(
  * Plans the share-staging sweep.
  *
  * - Files older than [SHARE_STAGING_MAX_AGE_MS] are deleted unconditionally;
- *   their URI grants (if any) are revoked first so a grant never outlives
- *   its file — cleanup follows the grant's lifetime, not a fixed grace.
+ *   their URI grants (if any) are revoked after successful deletion, so a
+ *   grant is never revoked for a file that survived — cleanup follows the
+ *   grant's lifetime, not a fixed grace.
  * - The count/size quota counts ALL surviving snapshots: a burst of shares
  *   inside the grace period must not let the quota be exceeded silently.
  * - Evict oldest grace-expired, non-active files WITHOUT grants first.
  * - If still over quota, grant-held snapshots beyond the count/byte
  *   exemption caps become evictable oldest-first (lastModified is the
- *   grant-age proxy), with their URIs revoked first. Grants within the
- *   caps and [activeSharePaths] remain quota-protected.
+ *   grant-age proxy), with their URIs revoked after successful deletion.
+ *   Grants within the caps and [activeSharePaths] remain quota-protected.
  */
 internal fun planShareStagingCleanup(
     entries: List<ShareStagingEntry>,
@@ -173,4 +175,47 @@ internal fun planShareStagingCleanup(
         revokeUris = revokeUris,
         evictForCap = evictForCap,
     )
+}
+
+/**
+ * Executes a [ShareStagingCleanupPlan] (P2-#11): deletes the planned files
+ * and drops their ledger entries first, then revokes the URI grants of the
+ * files actually deleted — never before. Revoking first meant a failed
+ * delete (or an aborted loop) left the file on disk with its ledger entry
+ * but without the target app's read permission. A single stuck file never
+ * blocks the rest: failures are skipped and their ledger entries kept, so a
+ * later sweep retries them with the grant still valid.
+ *
+ * Pure except for the injected [deleteFile]/[revokeUri] callbacks, so the
+ * ordering stays unit-testable without Android stubs. Returns the updated
+ * grant ledger.
+ */
+internal fun executeShareStagingCleanup(
+    plan: ShareStagingCleanupPlan,
+    grantUriByPath: Map<String, String>,
+    grants: Set<String>,
+    deleteFile: (String) -> Boolean,
+    revokeUri: (String) -> Unit,
+): Set<String> {
+    var remaining = grants
+    val revokedUris = mutableListOf<String>()
+    for (entry in plan.deleteForAge + plan.evictForCap) {
+        val deleted = try {
+            deleteFile(entry.path)
+        } catch (_: Exception) {
+            false
+        }
+        if (deleted) {
+            remaining = dropShareGrant(remaining, entry.path)
+            grantUriByPath[entry.path]?.let { revokedUris.add(it) }
+        }
+    }
+    for (uri in revokedUris) {
+        try {
+            revokeUri(uri)
+        } catch (_: Exception) {
+            // Best effort: the file is already gone.
+        }
+    }
+    return remaining
 }

@@ -171,14 +171,11 @@ class MainActivity : FlutterActivity() {
      */
     private val saveInFlight = AtomicBoolean(false)
 
-    /** Serializes AndroidKeyStore key creation; concurrent generateKey() on
-     * the same alias throws. */
-    private val keyStoreLock = Any()
-
-    /** Runs KeyStore/secret ops off the UI thread on a single background
-     * thread: avoids unbounded thread creation and serializes reads and
-     * writes of the same secret. Shut down in onDestroy. */
-    private val secretExecutor = Executors.newSingleThreadExecutor()
+    /** KeyStore/secret ops run on the application-scoped [SecretExecutor]
+     * (single background thread, process lifetime): a per-Activity executor
+     * shut down in onDestroy let an old Activity's still-queued op race a
+     * new Activity's executor on the same key alias, breaking the
+     * serialization guarantee. */
 
     /** Runs file IO (Downloads save, share staging) on a single background
      * thread: avoids unbounded thread creation and keeps IO serialized.
@@ -977,7 +974,9 @@ class MainActivity : FlutterActivity() {
             } catch (_: Exception) {
             }
         }
-        secretExecutor.shutdown()
+        // SecretExecutor is process-lifetime and never shut down here: an old
+        // Activity's queued secret ops must still serialize with the new
+        // Activity's (P2-#10).
         // Queued IO finishes; only new submissions are rejected.
         ioExecutor.shutdown()
         // Un-wedge a copy stuck in InputStream.read() before shutting the
@@ -1192,8 +1191,10 @@ class MainActivity : FlutterActivity() {
      * Deletion follows the URI grants' lifetime, not a fixed grace period:
      * every share records its grant in the ledger, a snapshot with a live
      * grant is quota-protected within the count/byte exemption caps. Both
-     * quota eviction and the 7-day backstop revoke the grant before deleting
-     * the file — so a grant never outlives its file.
+     * quota eviction and the 7-day backstop delete the file and drop its
+     * ledger entry first, revoking the grant only after the delete
+     * succeeded — so a grant is never revoked for a file that survived
+     * (P2-#11).
      * The count/size quota counts ALL surviving snapshots (a burst of
      * shares inside the grace period cannot silently exceed it). Best
      * effort only: a failed cleanup must not block sharing.
@@ -1250,27 +1251,18 @@ class MainActivity : FlutterActivity() {
                 // mutable set. Everything here already runs on ioExecutor.
                 activeSharePaths = activeShareTargets.toSet(),
             )
-            // Revoke before deleting: the grant must never outlive its file.
-            for (uri in plan.revokeUris) {
-                try {
+            grants = executeShareStagingCleanup(
+                plan = plan,
+                grantUriByPath = grantUriByPath,
+                grants = grants,
+                deleteFile = { path -> File(path).delete() },
+                revokeUri = { uri ->
                     appCtx.revokeUriPermission(
                         Uri.parse(uri),
                         Intent.FLAG_GRANT_READ_URI_PERMISSION,
                     )
-                } catch (_: Exception) {
-                    // Best effort: the file still has to go.
-                }
-            }
-            for (entry in plan.deleteForAge) {
-                grants = dropShareGrant(grants, entry.path)
-                File(entry.path).delete()
-            }
-            for (entry in plan.evictForCap) {
-                grants = dropShareGrant(grants, entry.path)
-                if (!File(entry.path).delete()) {
-                    break
-                }
-            }
+                },
+            )
             writeGrants(grants)
         } catch (_: Exception) {
             // A failed cleanup must not block sharing.
@@ -1337,6 +1329,13 @@ class MainActivity : FlutterActivity() {
                 // read() throws IOException, and the single importExecutor
                 // thread is freed for the next import.
                 val holder = ActiveImport(input, deadlineElapsed)
+                // P2-#9: re-check the generation immediately before
+                // registering. This task may have been suspended between the
+                // check above and this set while the watchdog replaced the
+                // executor and a newer import registered its own holder; an
+                // unconditional set() would overwrite the newer registration
+                // and orphan its stream from watchdog un-wedging.
+                checkImportRegistration(importLifecycle, taskGeneration)
                 activeImport.set(holder)
                 try {
                     if (!importLifecycle.isCurrent(taskGeneration)) {
@@ -1415,9 +1414,6 @@ class MainActivity : FlutterActivity() {
      * task must abort without copying over a newer pick's file. The caller
      * answers PICK_TIMEOUT via [replyImportTimeout] (guarded against a
      * watchdog that may already have failed it). */
-    private class ImportStaleException :
-        Exception("Import attempt superseded by executor replacement.")
-
     private fun claimUniqueImportTarget(directory: File, fileName: String): File {
         val dotIndex = fileName.lastIndexOf('.')
         val baseName = if (dotIndex > 0) fileName.substring(0, dotIndex) else fileName
@@ -1655,6 +1651,19 @@ class MainActivity : FlutterActivity() {
                 return false
             }
             holder = ActiveImport(stream, deadlineElapsed)
+            // P2-#9: same generation race as the copy task's registration
+            // above — a stale probe must not overwrite a newer import's
+            // holder. Bow out instead (the caller's generation check right
+            // after this call still reports PICK_TIMEOUT).
+            try {
+                checkImportRegistration(importLifecycle, taskGeneration)
+            } catch (_: ImportStaleException) {
+                try {
+                    stream.close()
+                } catch (_: Exception) {
+                }
+                return false
+            }
             activeImport.set(holder)
             return stream.use { input ->
                 if (!importLifecycle.isCurrent(taskGeneration)) return@use false
@@ -1700,7 +1709,7 @@ class MainActivity : FlutterActivity() {
         errorCode: String,
         op: () -> Any?,
     ) {
-        secretExecutor.execute {
+        SecretExecutor.execute {
             try {
                 val value = op()
                 replyOnUiThread(result) { result.success(value) }
@@ -2018,7 +2027,7 @@ class MainActivity : FlutterActivity() {
         val rotated: Boolean,
     )
 
-    private fun getOrCreateSecretKey(): SecretKeyResult = synchronized(keyStoreLock) {
+    private fun getOrCreateSecretKey(): SecretKeyResult = synchronized(SecretExecutor.keyStoreLock) {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         var rotated = false
         val existing = try {
@@ -2073,7 +2082,7 @@ class MainActivity : FlutterActivity() {
      * invalidation at Cipher.init()/doFinal time even when getEntry()
      * succeeded.
      */
-    private fun invalidateSecretKeyEntry() = synchronized(keyStoreLock) {
+    private fun invalidateSecretKeyEntry() = synchronized(SecretExecutor.keyStoreLock) {
         try {
             KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
                 .deleteEntry(SECRET_KEY_ALIAS)

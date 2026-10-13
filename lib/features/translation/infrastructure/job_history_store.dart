@@ -110,12 +110,42 @@ class JobHistoryStore {
       // Windows Notepad writes UTF-8 with BOM; without stripping, a
       // hand-edited job-history.json parses as corrupt, the load returns
       // empty, and the next persist silently wipes the whole history.
-      final String raw = utf8.decode(
-        await file.readAsBytes(),
-        allowMalformed: true,
-      );
+      //
+      // P2-#25: decode strictly first. `allowMalformed` would replace
+      // undecodable bytes inside a JSON string with U+FFFD, and the result
+      // still parses — but the decoded text is not the file's true content,
+      // and a later save would overwrite the original bytes with the
+      // substituted text and no backup. Undecodable bytes are untrusted:
+      // they take the corrupt-backup path instead.
+      final List<int> bytes = await file.readAsBytes();
+      final String raw = utf8.decode(bytes, allowMalformed: true);
+      bool undecodable = false;
+      try {
+        utf8.decode(bytes);
+      } on FormatException {
+        undecodable = true;
+      }
+      if (undecodable) {
+        await _backupCorruptHistoryFile(expectedFingerprint: _fingerprint(raw));
+        AppLogger.error(
+          'Failed to decode job-history.json as UTF-8; moved aside and '
+          'starting fresh.',
+          tag: 'history',
+        );
+        return (jobs: const <TranslationJob>[], clearedAt: 0);
+      }
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
+        // P2-#34: valid JSON with the wrong structure (e.g. "jobs" is a
+        // map instead of a list) must take the corrupt-backup path like
+        // unparseable JSON. The old code silently parsed it as empty
+        // history, and a later saveMerged would then overwrite the file
+        // with no evidence preserved.
+        if (!_isValidHistoryStructure(decoded)) {
+          throw const FormatException(
+            'job-history.json has an invalid structure',
+          );
+        }
         final Object? jobsNode = decoded is Map<String, dynamic>
             ? decoded['jobs']
             : decoded;
@@ -149,9 +179,21 @@ class JobHistoryStore {
     }
   }
 
+  /// P2-#34: the only shapes this store ever writes are a bare job list
+  /// (legacy) and the version-2 envelope whose "jobs" is a list. Anything
+  /// else that parses — a map without a list "jobs", a bare string, `null`
+  /// — is a structural error and must be backed up, never silently treated
+  /// as empty history.
+  static bool _isValidHistoryStructure(Object? decoded) =>
+      decoded is List<dynamic> ||
+      (decoded is Map<String, dynamic> && decoded['jobs'] is List<dynamic>);
+
   /// Renames an unparseable history file aside (best effort) so the next
   /// [save] cannot silently destroy it with no recovery path.
-  Future<void> _backupCorruptHistoryFile({String? expectedFingerprint}) async {
+  Future<void> _backupCorruptHistoryFile({
+    String? expectedFingerprint,
+    bool lockHeld = false,
+  }) async {
     try {
       await onBeforeCorruptBackupForTest?.call();
       final File file = await _historyFile();
@@ -181,15 +223,67 @@ class JobHistoryStore {
         // If no new active file exists, move it back so a repaired history
         // isn't lost from view (P1-#2: the rename must not silently drop a
         // just-fixed history).
-        if (!await file.exists()) {
-          await backup.rename(file.path);
-        }
+        //
+        // P1-#3: the exists() check and the rename must be atomic with
+        // respect to concurrent writers: another instance committing a new
+        // history in between would have its fresh file overwritten by this
+        // stale backup. Re-verify under the cross-process history lock; if
+        // the file appeared, the newer history wins and the backup stays in
+        // place as evidence.
+        await _restoreBackupIfStillAbsent(
+          file,
+          backup,
+          lockHeld: lockHeld,
+        );
         return;
       }
       await _pruneCorruptBackups(file.parent);
     } catch (_) {
       // Best effort only: a failed backup must not break startup.
     }
+  }
+
+  /// Restores [backup] to [file]'s path only if [file] is still absent,
+  /// re-checking under the cross-process history lock so a concurrent
+  /// writer cannot slip a new history in between the check and the rename
+  /// (P1-#3). When the file appeared, the newer history is kept and the
+  /// backup is left in place.
+  ///
+  /// [lockHeld] must be true when the caller already holds the history
+  /// lock ([saveMerged]): the in-process mutex is not re-entrant, and no
+  /// cooperating writer can interleave inside that critical section anyway,
+  /// so a plain re-check suffices there.
+  Future<void> _restoreBackupIfStillAbsent(
+    File file,
+    File backup, {
+    required bool lockHeld,
+  }) async {
+    Future<void> restoreIfAbsent() async {
+      if (await file.exists()) return;
+      await backup.rename(file.path);
+    }
+
+    if (lockHeld) {
+      await restoreIfAbsent();
+      return;
+    }
+    final File lockFile = File('${file.path}.lock');
+    await _withInProcessMutex(lockFile.path, () async {
+      final RandomAccessFile lockHandle = await lockFile.open(
+        mode: FileMode.write,
+      );
+      try {
+        await _lockWithTimeout(lockHandle);
+        await restoreIfAbsent();
+      } finally {
+        try {
+          await lockHandle.unlock();
+        } catch (_) {
+          // Best effort: the close below releases the lock anyway.
+        }
+        await lockHandle.close();
+      }
+    });
   }
 
   /// How many corrupt-history backups to keep. Every genuinely corrupt file
@@ -354,6 +448,14 @@ class JobHistoryStore {
               return (written: false, fileClearedAt: clearedAt);
             }
             fileClearedAt = clearedAt;
+            // P2-#34: like the load path, structurally invalid JSON must be
+            // backed up, not silently merged as empty (which would let this
+            // write overwrite the file with no evidence preserved).
+            if (!_isValidHistoryStructure(decoded)) {
+              throw const FormatException(
+                'job-history.json has an invalid structure',
+              );
+            }
             final Object? jobsNode = decoded is Map<String, dynamic>
                 ? decoded['jobs']
                 : decoded;
@@ -363,6 +465,9 @@ class JobHistoryStore {
             // IO failures must propagate: an unreadable file is not empty.
             await _backupCorruptHistoryFile(
               expectedFingerprint: _fingerprint(raw),
+              // This method already holds the cross-process history lock
+              // (P1-#3: the lock is not re-entrant).
+              lockHeld: true,
             );
             if (await file.exists()) rethrow;
           }

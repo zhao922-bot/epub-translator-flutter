@@ -8,6 +8,7 @@ import '../../translation/domain/models/translation_config.dart';
 import '../../translation/domain/repositories/translation_repository.dart';
 import '../../translation/infrastructure/repositories/epub_translation_repository.dart';
 import '../../translation/infrastructure/epub/translation_api_client.dart';
+import '../../../shared/security/sensitive_text.dart';
 import 'connection_diagnostic.dart';
 import '../infrastructure/settings_store.dart';
 
@@ -220,6 +221,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   int providerSelectionRevision = 0;
 
+  /// Monotonic generation of the in-memory state, bumped every time [_load]
+  /// replaces the state with a freshly read snapshot. Lets
+  /// [_replayConflictedEdits] tell whether a recovery load discarded the
+  /// optimistic effects of queued edits mid-pass (P2-#22).
+  int _stateGeneration = 0;
+
   Future<void> get ready => _initialLoad;
   bool get canTestConnection => _loaded && _store.configLoadError == null;
   bool _loaded = false;
@@ -239,6 +246,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
     _loaded = true;
     state = loaded;
+    _stateGeneration++;
     if (_store.didCorruptReset) {
       onCorruptReset?.call(_store.lastCorruptBackupPath);
     }
@@ -281,6 +289,10 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
     bool debounce = false,
     bool isConflictReplay = false,
+    // P2-#22: invoked synchronously right after the transformation is
+    // applied to the state, so the replay loop can tell which queued edits
+    // actually contributed to a later successful save.
+    void Function()? onApplied,
   }) async {
     if (!_loaded) await _initialLoad;
     if (!mounted) {
@@ -303,6 +315,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return false;
     }
     state = next;
+    onApplied?.call();
     if (debounce) {
       _sliderTimer?.cancel();
       final previous = _debouncedEdit;
@@ -331,7 +344,23 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       next,
       slots,
       pendingEdit: isConflictReplay
-          ? null
+          // P2-#23: the replayed edit is already queued; it must not be
+          // queued again. But a pending slider (debounced) edit swallowed
+          // above is new — if this save conflicts, queue it separately so
+          // the just-dragged value is not lost.
+          ? (debounced == null
+                ? null
+                : (
+                    update: debounced,
+                    explicitSecretMutations: const <SettingsSecretSlot>{},
+                    secretMutationsFor: null,
+                    credentialRoute: (
+                      providerSelection: state.apiProviderSelection,
+                      apiBaseUrl: state.apiBaseUrl,
+                      customApiBaseUrl: state.customApiBaseUrl,
+                      secretSlots: const <SettingsSecretSlot>{},
+                    ),
+                  ))
           : (
               update: effectiveUpdate,
               explicitSecretMutations: explicitSecretMutations,
@@ -422,6 +451,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// intact. Clears the store's load error on success.
   Future<void> reloadSettings() async {
     await _pendingSave;
+    // P2-#26: flush a pending slider (debounced) edit before reloading.
+    // Otherwise _load() replaces the state with the on-disk snapshot and
+    // the just-dragged value is lost — while the flush that fires later
+    // still reports success for a value that was never persisted.
+    await flushSliderChanges();
     if (!await _load()) return;
     await _replayConflictedEdits();
   }
@@ -444,9 +478,22 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (_replayingConflictedEdits || !mounted) return;
     _replayingConflictedEdits = true;
     final List<_ConflictedEdit> pending = _conflictedEdits.toList();
+    // P2-#22: which queue entries were (re-)applied to the state during
+    // this pass. A later entry's successful save persists the whole state,
+    // including the earlier entries' effects — those earlier entries are
+    // then superseded and must be dropped. Otherwise the next retry would
+    // re-apply the failed first entry's stale transformation over the
+    // second entry's successful values.
+    final List<bool> appliedInPass = List<bool>.filled(pending.length, false);
+    // The state generation at pass start: a recovery load inside an entry's
+    // _update discards earlier entries' optimistic effects (they were never
+    // persisted), so superseded-dropping is only valid when the generation
+    // is unchanged.
+    final int passGeneration = _stateGeneration;
     int blocked = 0;
     try {
-      for (final edit in pending) {
+      for (int i = 0; i < pending.length; i++) {
+        final edit = pending[i];
         if (!mounted) break;
         try {
           // Leave failed, blocked and unprocessed edits in their original
@@ -464,8 +511,21 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             secretMutationsFor: edit.secretMutationsFor,
             // This edit is still queued; a new conflict must not duplicate it.
             isConflictReplay: true,
+            onApplied: () => appliedInPass[i] = true,
           )) {
             _conflictedEdits.remove(edit);
+            if (_stateGeneration == passGeneration) {
+              // No recovery load replaced the state during this pass, so
+              // this save persisted every earlier entry applied above:
+              // their intent is durable and they are superseded. (Blocked
+              // entries were never applied — their effects are not in the
+              // saved state — so they stay queued.)
+              for (int j = 0; j < i; j++) {
+                if (appliedInPass[j]) {
+                  _conflictedEdits.remove(pending[j]);
+                }
+              }
+            }
           }
         } catch (error) {
           if (mounted) onSaveError?.call(error);
@@ -646,7 +706,12 @@ class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
       if (!mounted || revision != _revision) {
         return;
       }
-      state = AsyncData<String?>(result);
+      // P1-#5: a successful probe response can echo the request, including
+      // the current API key — redact it like the error path does, so the
+      // displayed result can never leak the key via screenshot or copy.
+      state = AsyncData<String?>(
+        SensitiveText.redact(result, configuredApiKey: config.apiKey),
+      );
     } catch (error, stackTrace) {
       if (!mounted || revision != _revision) {
         return;

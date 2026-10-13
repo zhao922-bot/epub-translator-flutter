@@ -234,6 +234,16 @@ class SettingsStore {
   /// change) would make the previously usable key disappear on next launch.
   bool _legacyMigrationComplete = false;
 
+  /// Whether the loaded config came from a successfully parsed settings.json
+  /// (as opposed to defaults after a missing/corrupt file). The legacy key's
+  /// provider association is only trustworthy in that case (P1-#4).
+  bool _configFromParsedFile = false;
+
+  /// How long a single secret-store read/write/delete may take before it is
+  /// treated as failed (P2-#32). A hung backend must not hold the settings
+  /// file lock forever and wedge every later settings operation.
+  static const Duration _secretOpTimeout = Duration(seconds: 30);
+
   Future<TranslationConfig> load() async {
     try {
       final file = await _settingsFile();
@@ -291,15 +301,23 @@ class SettingsStore {
         : storedApiKey.value?.isNotEmpty == true
         ? storedApiKey.value!
         : config.apiKey;
+    // P1-#4: a legacy key may only fill the provider slot it belongs to.
+    // When settings.json was missing or corrupt, the loaded config is
+    // defaults and its provider selection is not the user's — filling the
+    // legacy key into the default DeepSeek slot would re-bind a Custom
+    // user's credential to api.deepseek.com and persist it there.
+    final bool providerTrusted = _configFromParsedFile;
     final String deepSeekKey = storedDeepSeekKey.value?.isNotEmpty == true
         ? storedDeepSeekKey.value!
-        : config.apiProviderSelection == ApiProviderSelection.deepseek &&
+        : providerTrusted &&
+              config.apiProviderSelection == ApiProviderSelection.deepseek &&
               legacyKey.isNotEmpty
         ? legacyKey
         : config.deepseekApiKey;
     final String customKey = storedCustomKey.value?.isNotEmpty == true
         ? storedCustomKey.value!
-        : config.apiProviderSelection == ApiProviderSelection.custom &&
+        : providerTrusted &&
+              config.apiProviderSelection == ApiProviderSelection.custom &&
               legacyKey.isNotEmpty
         ? legacyKey
         : config.customApiKey;
@@ -336,6 +354,10 @@ class SettingsStore {
     }
     final bool needsSecureAllocation =
         _allowLegacyMigration &&
+        // P1-#4: without a trustworthy provider association (missing/corrupt
+        // settings.json), a legacy key must not be allocated to the default
+        // provider's slot.
+        providerTrusted &&
         storedApiKey.value?.isNotEmpty == true &&
         (providerSlot == SettingsSecretSlot.deepSeek
                     ? storedDeepSeekKey
@@ -459,6 +481,9 @@ class SettingsStore {
   Future<TranslationConfig> _loadConfigFromFile() async {
     didCorruptReset = false;
     lastCorruptBackupPath = null;
+    // P1-#4: reset per load; only a successfully parsed file establishes a
+    // trustworthy provider association for the legacy key.
+    _configFromParsedFile = false;
     final File file = await _settingsFile();
     if (!await file.exists()) {
       _credentialBindings = {};
@@ -472,6 +497,7 @@ class SettingsStore {
       final TranslationConfig config = await _readConfigFile(file);
       didCorruptReset = false;
       lastCorruptBackupPath = null;
+      _configFromParsedFile = true;
       return config;
     } catch (error) {
       // A transient Windows lock (antivirus/OneDrive sharing violation)
@@ -483,6 +509,7 @@ class SettingsStore {
         final TranslationConfig config = await _readConfigFile(file);
         didCorruptReset = false;
         lastCorruptBackupPath = null;
+        _configFromParsedFile = true;
         return config;
       } catch (retryError) {
         // An unreadable file is not corrupt. Keep it in place and refuse
@@ -596,7 +623,10 @@ class SettingsStore {
     Future<String?> Function() read,
   ) async {
     try {
-      final String? value = await read();
+      // P2-#32: a secret backend that never completes must not hold the
+      // settings file lock forever. The timeout surfaces as a read failure
+      // (the slot stays protected, never treated as "missing").
+      final String? value = await read().timeout(_secretOpTimeout);
       // Normalize once: callers check `value?.isNotEmpty`, so a
       // whitespace-only stored secret must not count as a valid key.
       final String? trimmed = value?.trim();
@@ -1045,10 +1075,12 @@ class SettingsStore {
     }
     final String trimmed = value.trim();
     if (trimmed.isEmpty) {
-      await delete();
+      // P2-#32: bound the backend call; a hung delete must not wedge the
+      // settings file lock either.
+      await delete().timeout(_secretOpTimeout);
       _secretReadStatuses[slot] = _SecretReadStatus.missing;
     } else {
-      await write(trimmed);
+      await write(trimmed).timeout(_secretOpTimeout);
       _secretReadStatuses[slot] = _SecretReadStatus.value;
     }
     _secretSnapshot?[slot] = trimmed;

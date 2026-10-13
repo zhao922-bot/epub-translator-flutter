@@ -453,29 +453,40 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   // ---------------------------------------------------------------------------
 
   /// Builds the argv for `security -i` (interactive mode). Writes go through
-  /// the interactive shell instead of the bare `-w` flag: the full command,
-  /// with the shell-quoted password (see [macosSecretStoreCommand]), is fed
-  /// via stdin, so the secret never appears in argv (visible via `ps`) and
-  /// never passes through readpassphrase(3), which prefers /dev/tty over the
-  /// pipe when a controlling terminal exists.
+  /// the interactive command reader instead of the bare `-w` flag: the full
+  /// command, with the password quoted for `security -i`'s own tokenizer
+  /// (see [securityInteractiveQuote]), is fed via stdin, so the secret never
+  /// appears in argv (visible via `ps`) and never passes through
+  /// readpassphrase(3), which prefers /dev/tty over the pipe when a
+  /// controlling terminal exists.
   @visibleForTesting
   static List<String> macosSecretStoreArgs() {
     return <String>['security', '-i'];
   }
 
-  /// Wraps [value] in POSIX single quotes, escaping embedded single quotes as
-  /// `'\''`. `security -i` executes its stdin as shell commands, so every
-  /// value on the command line must be quoted this way: double quotes would
-  /// still let `$`, backticks and `\` be interpreted.
+  /// Quotes [value] for `security -i`'s line tokenizer (Apple's
+  /// `split_line`), which is NOT a POSIX shell: lines are split on
+  /// whitespace, double-quoted segments group into one token, and a
+  /// backslash escapes `"` and `\`. Single quotes have no special meaning
+  /// there.
+  ///
+  /// The previous POSIX single-quote wrapping was incompatible with this
+  /// tokenizer: `security -i` stripped the backslash, so an API key like
+  /// `ab\cd` was stored as `abcd` (P2-#30). Double-quote the value and
+  /// escape backslashes and double quotes inside.
   @visibleForTesting
-  static String posixShellQuote(String value) {
-    return "'${value.replaceAll("'", r"'\''")}'";
+  static String securityInteractiveQuote(String value) {
+    final String escaped = value
+        .replaceAll(r'\', r'\\')
+        .replaceAll('"', r'\"');
+    return '"$escaped"';
   }
 
   /// Builds the complete `add-generic-password` command line fed to
   /// `security -i`'s stdin. `-U` updates an existing item instead of failing
-  /// with "already exists". All values are POSIX-shell-quoted because
-  /// `security -i` parses stdin as shell commands.
+  /// with "already exists". All values are quoted with
+  /// [securityInteractiveQuote] because `security -i` parses stdin with its
+  /// own tokenizer, not a shell.
   @visibleForTesting
   static String macosSecretStoreCommand(
     String service,
@@ -483,10 +494,10 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     String password,
   ) {
     return 'add-generic-password'
-        ' -a ${posixShellQuote(account)}'
-        ' -s ${posixShellQuote(service)}'
+        ' -a ${securityInteractiveQuote(account)}'
+        ' -s ${securityInteractiveQuote(service)}'
         ' -U'
-        ' -w ${posixShellQuote(password)}';
+        ' -w ${securityInteractiveQuote(password)}';
   }
 
   /// Rejects multiline values loudly: the keychain cannot store them, and a

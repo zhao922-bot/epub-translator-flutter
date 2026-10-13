@@ -158,8 +158,23 @@ Future<List<PreviewChapter>> _recoverInIsolate(
   List<InspectedChapter> chapters,
 ) => compute(_recoverBatch, chapters);
 
-List<PreviewChapter> _recoverBatch(List<InspectedChapter> chapters) =>
-    chapters.map(previewChapterFromInspected).toList();
+// perf-#35: the payload slimming does DOM parsing (inspectChapterBytes for
+// oversized source HTML, parseFragment per translated block). It must run
+// here, inside the isolate — building the payloads on the caller (UI)
+// thread before compute() janked on large chapters. The caller transfers
+// the chapters untouched; all parsing cost stays off the UI thread.
+List<PreviewChapter> _recoverBatch(List<InspectedChapter> chapters) => chapters
+    .map(
+      (chapter) =>
+          previewChapterFromInspected(_PreviewRecoveryPayload(chapter)),
+    )
+    .toList();
+
+/// Test-only: the isolate entry point above, callable on the test thread to
+/// assert the slim-then-project pipeline without spawning an isolate.
+@visibleForTesting
+List<PreviewChapter> recoverBatchForTest(List<InspectedChapter> chapters) =>
+    _recoverBatch(chapters);
 
 /// One current content version per chapter, scoped to the provider container.
 /// Metadata/selection changes reuse excerpts; changed source or translations
@@ -203,7 +218,11 @@ class PreviewRecoveryCache {
       }
     }
     if (missing.isNotEmpty) {
-      final work = _runner(missing.map(_PreviewRecoveryPayload.new).toList())
+      // perf-#35: pass the chapters untouched. Payload slimming (which parses
+      // DOM) happens inside the isolate in _recoverBatch, never on the caller
+      // thread — mapping to _PreviewRecoveryPayload here would parse on the
+      // UI thread before compute().
+      final work = _runner(missing)
           .then((results) {
             for (var i = 0; i < newEntries.length; i++) {
               final entry = newEntries[i];

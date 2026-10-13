@@ -21,6 +21,9 @@ class FootnoteBatchPlanner {
   final int maxReferencesPerBatch;
   final TranslationBatchPlanner batchPlanner;
 
+  /// Chapter title carried by every footnote batch's read-only context.
+  static const String batchChapterTitle = '跨文件脚注';
+
   List<FootnoteTranslationBatch> plan({
     required List<InspectedChapter> chapters,
     required Map<int, List<ExtractedBlock>> pendingBlocksByChapter,
@@ -33,6 +36,13 @@ class FootnoteBatchPlanner {
     final List<FootnoteTranslationBatch> batches = <FootnoteTranslationBatch>[];
     List<FootnoteBlockReference> current = <FootnoteBlockReference>[];
     int currentBudget = 0;
+    // 性能-#41: the shared read-only context (batch chapter title plus the
+    // bookMemory summary) rides in every request payload, so it must come
+    // out of the same per-batch budget — otherwise the real payload
+    // exceeds chunkSize. Mirrors TranslationBatchPlanner's fixed overhead.
+    final int sharedContextOverhead =
+        batchChapterTitle.length +
+        TranslationBatchPlanner.serializedJsonSize(bookMemory);
 
     // Keep original indices (checkpoint/cache request IDs depend on them),
     // but visit only this run, never the rest of the book. Empty entries keep
@@ -63,7 +73,9 @@ class FootnoteBatchPlanner {
           in pendingBlocksByChapter[chapterIndex]!) {
         final int blockBudget = batchPlanner.blockBudgetFor(block);
         final bool exceedsBudget =
-            current.isNotEmpty && currentBudget + blockBudget > safeChunkSize;
+            current.isNotEmpty &&
+            currentBudget + blockBudget + sharedContextOverhead >
+                safeChunkSize;
         final bool reachedReferenceLimit =
             current.isNotEmpty && current.length >= safeMaxReferences;
         if (exceedsBudget || reachedReferenceLimit) {
@@ -157,7 +169,7 @@ class FootnoteBatchPlanner {
     return FootnoteTranslationBatch(
       List<FootnoteBlockReference>.unmodifiable(references),
       context: TranslationBatchContext(
-        chapterTitle: '跨文件脚注',
+        chapterTitle: batchChapterTitle,
         bookMemory: bookMemory,
       ),
     );

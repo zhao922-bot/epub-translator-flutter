@@ -81,31 +81,36 @@ void main() {
           'api_key',
           'plain-value-123',
         ),
-        "add-generic-password -a 'api_key' -s 'epub-translator' "
-        "-U -w 'plain-value-123'",
+        'add-generic-password -a "api_key" -s "epub-translator" '
+        '-U -w "plain-value-123"',
       );
     });
 
-    test('shell-quotes values containing spaces and shell metacharacters', () {
+    test('quotes values for security -i split_line tokenizer', () {
       expect(
         NativePlatformBridge.macosSecretStoreCommand(
           'epub-translator',
           'my key',
           "p'a ss\$x`y`\\z\"q",
         ),
-        "add-generic-password -a 'my key' -s 'epub-translator' "
-        "-U -w 'p'\\''a ss\$x`y`\\z\"q'",
+        'add-generic-password -a "my key" -s "epub-translator" '
+        '-U -w "p\'a ss\$x`y`\\\\z\\"q"',
       );
     });
 
-    test('posixShellQuote wraps in single quotes and escapes quotes', () {
-      expect(NativePlatformBridge.posixShellQuote('simple'), "'simple'");
-      expect(NativePlatformBridge.posixShellQuote("it's"), r"'it'\''s'");
-      expect(NativePlatformBridge.posixShellQuote(''), "''");
-      // Everything else passes through untouched inside single quotes.
+    test('securityInteractiveQuote escapes backslash and double quote', () {
+      expect(NativePlatformBridge.securityInteractiveQuote('simple'), '"simple"');
+      // Single quotes are literal inside security -i double quotes.
+      expect(NativePlatformBridge.securityInteractiveQuote("it's"), '"it\'s"');
+      expect(NativePlatformBridge.securityInteractiveQuote(''), '""');
+      // P2-#30: a backslash must survive the round trip, not be stripped.
       expect(
-        NativePlatformBridge.posixShellQuote('a b\$c`d`\\e"f'),
-        "'a b\$c`d`\\e\"f'",
+        NativePlatformBridge.securityInteractiveQuote(r'ab\cd'),
+        r'"ab\\cd"',
+      );
+      expect(
+        NativePlatformBridge.securityInteractiveQuote('a"b\\c'),
+        r'"a\"b\\c"',
       );
     });
 

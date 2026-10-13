@@ -232,4 +232,97 @@ class ShareStagingTest {
             io.shutdownNow()
         }
     }
+
+    @Test fun cleanupDeletesFirstRevokesAfterAndNeverAbortsEarly() {
+        // P2-#11: cleanup must delete the files and drop the ledger rows
+        // BEFORE revoking URI permissions, and one failed delete must not
+        // abort the remaining entries. The stuck file keeps both its data
+        // and its grant (revoke is skipped for failed deletes).
+        val plan = ShareStagingCleanupPlan(
+            deleteForAge = listOf(ShareStagingEntry("/s/old.epub", 1L, 10L)),
+            revokeUris = listOf("content://u/old"),
+            evictForCap = listOf(
+                ShareStagingEntry("/s/stuck.epub", 2L, 10L),
+                ShareStagingEntry("/s/quota.epub", 3L, 10L),
+            ),
+        )
+        val grants = setOf(
+            "content://u/old|/s/old.epub|1",
+            "content://u/stuck|/s/stuck.epub|2",
+            "content://u/quota|/s/quota.epub|3",
+        )
+        val deleted = mutableListOf<String>()
+        val revoked = mutableListOf<String>()
+        val remaining = executeShareStagingCleanup(
+            plan = plan,
+            grantUriByPath = mapOf(
+                "/s/old.epub" to "content://u/old",
+                "/s/stuck.epub" to "content://u/stuck",
+                "/s/quota.epub" to "content://u/quota",
+            ),
+            grants = grants,
+            deleteFile = { path ->
+                deleted.add(path)
+                path != "/s/stuck.epub" // the stuck file fails to delete
+            },
+            revokeUri = { uri -> revoked.add(uri) },
+        )
+        // Every entry is attempted despite the mid-sequence failure.
+        assertEquals(listOf("/s/old.epub", "/s/stuck.epub", "/s/quota.epub"), deleted)
+        // URI permissions are revoked only after their files were deleted;
+        // the stuck file's grant survives because its delete failed.
+        assertEquals(listOf("content://u/old", "content://u/quota"), revoked)
+        // The ledger drops exactly the deleted files.
+        assertEquals(setOf("content://u/stuck|/s/stuck.epub|2"), remaining)
+    }
+
+    @Test fun cleanupRevokeFailureDoesNotPropagate() {
+        // P2-#11: a revoke that throws must not fail the whole cleanup or
+        // disturb the ledger (the files are already gone at that point).
+        val plan = ShareStagingCleanupPlan(
+            deleteForAge = listOf(ShareStagingEntry("/s/old.epub", 1L, 10L)),
+            revokeUris = listOf("content://u/old"),
+            evictForCap = emptyList(),
+        )
+        val remaining = executeShareStagingCleanup(
+            plan = plan,
+            grantUriByPath = mapOf("/s/old.epub" to "content://u/old"),
+            grants = setOf("content://u/old|/s/old.epub|1"),
+            deleteFile = { true },
+            revokeUri = { throw RuntimeException("revoke exploded") },
+        )
+        assertTrue(remaining.isEmpty())
+    }
+
+    @Test fun cleanupDeleteThrowIsTreatedAsFailureAndContinues() {
+        // P2-#11: a deleteFile that throws counts as a failed delete —
+        // the entry is skipped and the rest still run.
+        val plan = ShareStagingCleanupPlan(
+            deleteForAge = listOf(
+                ShareStagingEntry("/s/boom.epub", 1L, 10L),
+                ShareStagingEntry("/s/fine.epub", 2L, 10L),
+            ),
+            revokeUris = listOf("content://u/fine"),
+            evictForCap = emptyList(),
+        )
+        val revoked = mutableListOf<String>()
+        val remaining = executeShareStagingCleanup(
+            plan = plan,
+            grantUriByPath = mapOf(
+                "/s/boom.epub" to "content://u/boom",
+                "/s/fine.epub" to "content://u/fine",
+            ),
+            grants = setOf(
+                "content://u/boom|/s/boom.epub|1",
+                "content://u/fine|/s/fine.epub|2",
+            ),
+            deleteFile = { path ->
+                if (path == "/s/boom.epub") throw RuntimeException("delete exploded")
+                true
+            },
+            revokeUri = { uri -> revoked.add(uri) },
+        )
+        assertEquals(listOf("content://u/fine"), revoked)
+        assertEquals(setOf("content://u/boom|/s/boom.epub|1"), remaining)
+    }
 }

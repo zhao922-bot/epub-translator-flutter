@@ -2724,6 +2724,14 @@ class TranslationDashboardController
   int _estimateStaticChunkSizeKey = -1;
   TranslationRunEstimate? _estimateStaticCache;
 
+  // P2-#8: the chunk size and batch count the frozen estimate was planned
+  // from (full sources). Scaling released-source estimates compounds ceil()
+  // rounding, so changing chunkSize away and back drifts (1 -> 12); when
+  // the chunk size returns to this anchor the original batch count is
+  // restored directly instead of being re-scaled.
+  int _estimateAnchorChunkSize = -1;
+  int _estimateAnchorBatches = -1;
+
   /// Test-only: the memoized static estimate. Regression tests assert that
   /// progress ticks reuse the same instance (no re-scan of the book) while
   /// chapter or chunk-size changes invalidate it.
@@ -2745,33 +2753,53 @@ class TranslationDashboardController
     if (!identical(sourceChapters, _estimateStaticChaptersKey) ||
         chunkSize != _estimateStaticChunkSizeKey ||
         staticPart == null) {
-      if (identical(sourceChapters, _estimateStaticChaptersKey) &&
-          staticPart != null &&
-          !sourceChapters.any(
-            (chapter) =>
-                chapter.blocks.any((block) => block.sourceText.isNotEmpty),
-          )) {
-        // P2-#9: released sources cannot be replanned. Approximate the new
-        // batch count by scaling the frozen count inversely with chunk size,
-        // preserving all source-derived totals from before the release.
-        staticPart = TranslationRunEstimate(
-          selectedChapters: staticPart.selectedChapters,
-          totalBlocks: staticPart.totalBlocks,
-          estimatedSourceChars: staticPart.estimatedSourceChars,
-          estimatedInputTokens: staticPart.estimatedInputTokens,
-          estimatedApiBatches: max(
-            1,
-            (staticPart.estimatedApiBatches *
-                    _estimateStaticChunkSizeKey /
-                    chunkSize)
-                .ceil(),
-          ),
-        );
+      final bool sourcesReleased = !sourceChapters.any(
+        (chapter) =>
+            chapter.blocks.any((block) => block.sourceText.isNotEmpty),
+      );
+      if (sourcesReleased && staticPart != null) {
+        if (identical(sourceChapters, _estimateStaticChaptersKey)) {
+          // P2-#9: released sources cannot be replanned. Approximate the new
+          // batch count by scaling the frozen count inversely with chunk
+          // size, preserving all source-derived totals from before the
+          // release. P2-#8: when the chunk size returns to the anchor it was
+          // frozen at, restore the original batch count directly — chained
+          // re-scaling compounds ceil() rounding (1 -> 12).
+          final int batches =
+              chunkSize == _estimateAnchorChunkSize &&
+                  _estimateAnchorBatches >= 0
+              ? _estimateAnchorBatches
+              : max(
+                  1,
+                  (staticPart.estimatedApiBatches *
+                          _estimateStaticChunkSizeKey /
+                          chunkSize)
+                      .ceil(),
+                );
+          staticPart = TranslationRunEstimate(
+            selectedChapters: staticPart.selectedChapters,
+            totalBlocks: staticPart.totalBlocks,
+            estimatedSourceChars: staticPart.estimatedSourceChars,
+            estimatedInputTokens: staticPart.estimatedInputTokens,
+            estimatedApiBatches: batches,
+          );
+        } else {
+          // P2-#7: the chapter selection changed after the sources were
+          // released (run finished/cancelled). The new list cannot be
+          // replanned — every sourceText is empty — so keep the frozen
+          // estimate instead of recomputing zeros that would collapse the
+          // character and cost totals. staticPart stays as the frozen
+          // estimate; only the memo keys advance below.
+        }
       } else {
         staticPart = TranslationRunEstimate.staticPart(
           sourceChapters,
           chunkSize: chunkSize,
         );
+        // P2-#8 anchor: the batch count actually planned from full sources
+        // at this chunk size.
+        _estimateAnchorChunkSize = chunkSize;
+        _estimateAnchorBatches = staticPart.estimatedApiBatches;
       }
       _estimateStaticChaptersKey = sourceChapters;
       _estimateStaticChunkSizeKey = chunkSize;

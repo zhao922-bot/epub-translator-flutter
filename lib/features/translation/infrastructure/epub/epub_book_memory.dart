@@ -1363,21 +1363,54 @@ class _TranslationRequestBudget {
   }
 
   /// Returns the source text when the request payload carries exactly one
-  /// translatable block, else null. Every batch payload is a JSON object
-  /// with a top-level "blocks" array; non-batch requests (memory, style
-  /// profile, ...) never match and keep the default ceiling.
+  /// translatable block, else null. Batch payloads are JSON objects with a
+  /// top-level "blocks" array; the single-block HTML fallback and the
+  /// protected-slot text fallback carry the block as a raw (non-JSON) user
+  /// message, recognized by their distinctive system prompts (P2-#17).
+  /// Other non-batch requests (memory, style profile, ...) never match and
+  /// keep the default ceiling.
   static String? _singleBlockText(Map<String, dynamic> data) {
     try {
       final messages = data['messages'];
       if (messages is! List) return null;
+      String? lastUserContent;
+      bool sawBlocksPayload = false;
+      bool htmlFragmentFallback = false;
+      bool slotTextFallback = false;
       for (final message in messages) {
-        if (message is! Map || message['role'] != 'user') continue;
+        if (message is! Map) continue;
         final content = message['content'];
         if (content is! String) continue;
-        final decoded = jsonDecode(content);
-        if (decoded is! Map) continue;
+        if (message['role'] == 'system') {
+          // The batch payloads share the "You translate EPUB HTML fragments"
+          // prefix with the single-block fallback; they are told apart by
+          // the JSON "blocks" payload detected below.
+          if (content.startsWith('You translate EPUB HTML fragments into ')) {
+            htmlFragmentFallback = true;
+          } else if (content.startsWith(
+            'Read-only plain-text summary of the source block.',
+          )) {
+            slotTextFallback = true;
+          }
+          continue;
+        }
+        if (message['role'] != 'user') continue;
+        lastUserContent = content;
+        // A non-JSON user message is not a batch payload, but may still be
+        // a raw fallback block; keep scanning instead of aborting.
+        Map? decoded;
+        try {
+          final dynamic parsed = jsonDecode(content);
+          if (parsed is Map) decoded = parsed;
+        } catch (_) {
+          // Not JSON: not a batch payload, but may still be a raw fallback
+          // block; keep scanning instead of aborting.
+        }
+        if (decoded == null) continue;
         final blocks = decoded['blocks'];
-        if (blocks is! List || blocks.length != 1) continue;
+        if (blocks is! List) continue;
+        sawBlocksPayload = true;
+        if (blocks.length != 1) continue;
         final block = blocks.single;
         if (block is! Map) continue;
         final html = block['html'];
@@ -1392,7 +1425,18 @@ class _TranslationRequestBudget {
           if (texts.isNotEmpty) return texts.join('\n');
         }
       }
-      return null;
+      // P2-#17: fallback requests carry a single raw block in the user
+      // message. Without recognition the adaptive ceiling stays at the
+      // default and a giant block is truncated mid-translation. Batch-shaped
+      // payloads (even multi-block ones) keep the default ceiling.
+      if (lastUserContent == null ||
+          sawBlocksPayload ||
+          (!htmlFragmentFallback && !slotTextFallback)) {
+        return null;
+      }
+      // The retry instruction suffix is prompt scaffolding, not block text.
+      final String text = lastUserContent.split('\n\n[RETRY]').first.trim();
+      return text.isEmpty ? null : text;
     } catch (_) {
       return null;
     }

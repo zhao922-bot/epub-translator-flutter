@@ -194,7 +194,13 @@ class TranslationBatchPlanner {
 
   /// Serialized size of the bookMemory summary, as it will appear in the
   /// request payload's context object.
-  int _serializedJsonSize(Map<String, Object?>? value) {
+  int _serializedJsonSize(Map<String, Object?>? value) =>
+      serializedJsonSize(value);
+
+  /// Public form of [_serializedJsonSize] for planners that share the
+  /// request window (e.g. the footnote planner): the shared context must
+  /// come out of the same per-batch budget (性能-#41).
+  static int serializedJsonSize(Map<String, Object?>? value) {
     if (value == null || value.isEmpty) {
       return 0;
     }

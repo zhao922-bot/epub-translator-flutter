@@ -116,7 +116,7 @@ void main() {
   );
 
   test(
-    'C-15: over-capacity rescans outrank the backoff (no hour-long stall)',
+    'C-15: backoff skips full rescans but light quota passes prevent stalls',
     () async {
       var now = DateTime.now();
       int scans = 0;
@@ -153,17 +153,26 @@ void main() {
         await put();
       }
       expect(scans, baseline);
-      // After the interval, an over-capacity put rescans even though the
-      // previous pass was ineffective and armed the backoff: eviction must
-      // not stall for up to an hour while writes keep growing the cache.
-      // Repeated ineffective passes rescan every interval without
-      // escalating into hour-long stalls.
+      // P2-#29: while the backoff is armed, over-capacity puts run the
+      // lightweight quota pass instead of a full rescan — the full scan was
+      // proven unable to reclaim space (the .tmp.live file is unreclaimable),
+      // so walking the whole tree again would only burn IO. Eviction must
+      // still not stall: the light pass keeps enforcing the quota.
+      final lightBaseline = store.lightPruneCountForTest;
       for (int i = 0; i < 4; i++) {
         now = now.add(const Duration(minutes: 5));
         await put();
-        expect(scans, baseline + 1 + i);
+        // Full scans are skipped while the backoff is armed...
+        expect(scans, baseline);
+        // ...but the lightweight quota pass still runs (no hour-long stall).
+        expect(store.lightPruneCountForTest, lightBaseline + 1 + i);
       }
       await File(temp).delete();
+      // The backoff runs on a real Stopwatch, so the fake-time travel above
+      // cannot expire it. In real usage the store itself deletes the temp
+      // file (updating the estimate), and the next light pass clears the
+      // backoff once the quota is met. Simulate that here.
+      store.resetBackoffForTest();
       now = now.add(const Duration(minutes: 5));
       await put();
       expect(store.estimatedCacheBytesForTest, lessThanOrEqualTo(200));

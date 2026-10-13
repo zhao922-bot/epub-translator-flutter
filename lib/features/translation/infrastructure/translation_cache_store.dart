@@ -61,6 +61,14 @@ class TranslationCacheStore {
   // same-size external rewrite, even if several files roll back together.
   final Map<String, Digest> _contentDigests = <String, Digest>{};
 
+  /// Perf-#42: digest-check memo for lone rollback entries. A file whose
+  /// mtime rolled back but whose content is unchanged can never join a
+  /// rollback cohort later; re-hashing it on every maintenance scan is
+  /// wasted IO. Remember the (mtime, size, digest) it was last checked at;
+  /// a later scan reuses the digest while the file is unchanged instead of
+  /// re-reading and re-hashing it.
+  final Map<String, _RollbackCheck> _rollbackChecked = <String, _RollbackCheck>{};
+
   /// Block-cache paths in oldest-first eviction order (insertion order).
   /// Writes move their path to the end; a full scan rebuilds it from
   /// on-disk mtimes. Used by the backoff-period quota pass
@@ -113,6 +121,10 @@ class TranslationCacheStore {
   @visibleForTesting
   int get estimatedCacheBytesForTest => _estimatedBytes;
 
+  /// P2-#24/perf-#42: the mtime baseline for [path], or null when unknown.
+  @visibleForTesting
+  DateTime? mtimeBaselineForTest(String path) => _mtimes[path];
+
   @visibleForTesting
   Future<void> waitForMaintenanceForTest() async {
     Future<void> tail;
@@ -127,6 +139,13 @@ class TranslationCacheStore {
     _retryAfterDelay = null;
     _retryAfterStopwatch.reset();
   }
+
+  /// Clears the ineffective-scan backoff. Tests use fake time for [now] but
+  /// the backoff runs on a real (monotonic) Stopwatch, so time-travel cannot
+  /// expire it. Call this to simulate "the backoff elapsed and the quota is
+  /// now met", as happens in real usage when the estimate is updated.
+  @visibleForTesting
+  void resetBackoffForTest() => _resetBackoff();
 
   bool _backoffActive() {
     final Duration? delay = _retryAfterDelay;
@@ -160,6 +179,7 @@ class TranslationCacheStore {
     if (size == 0) {
       _mtimes.remove(key);
       _contentDigests.remove(key);
+      _rollbackChecked.remove(key);
     }
     _scanChanges?[key] = size;
     if (_estimatedBytes <= _capacity) _resetBackoff();
@@ -245,10 +265,26 @@ class TranslationCacheStore {
     _pruneIfNeeded();
   }
 
+  /// Minimum interval between backoff-period lightweight quota passes
+  /// (P2-#29). Without it, every put while over capacity during the backoff
+  /// would trigger a pass, and the follow-up chain below would keep them
+  /// spinning.
+  static const Duration _lightPruneThrottle = Duration(minutes: 1);
+  DateTime? _lastLightPrune;
+
   /// Schedules an initial baseline scan, then maintenance on writes when the
   /// time interval expires or estimated capacity is exceeded. Pending requests
   /// are coalesced; failures cannot break a translation run.
+  ///
+  /// Tests can set [suspendAutoMaintenanceForTest] to build a fixture without
+  /// background maintenance interfering (P2-#29 made the light pass run
+  /// during the backoff, so "arm backoff without eviction" fixtures need an
+  /// explicit suspension).
+  @visibleForTesting
+  bool suspendAutoMaintenanceForTest = false;
+
   void _pruneIfNeeded({bool capacityFollowUp = false}) {
+    if (suspendAutoMaintenanceForTest) return;
     final DateTime now = _now();
     if (_estimatedBytes <= _capacity) _resetBackoff();
     if (_maintenancePending) {
@@ -258,21 +294,34 @@ class TranslationCacheStore {
     final bool intervalActive =
         _lastPrune != null && now.difference(_lastPrune!) < pruneInterval;
     final bool backoffActive = _backoffActive();
-    if (intervalActive && (!overCapacity || backoffActive)) {
-      return;
-    }
-    if (!overCapacity && backoffActive) {
-      return;
-    }
     // Over capacity while the ineffective-scan backoff is armed: the full
     // scan was proven unable to reclaim space (its targets are locked or
     // otherwise unreclaimable), so walking the whole tree again would only
-    // burn IO every interval. Skip the scan, but still enforce the quota
-    // with a lightweight pass over in-memory-known entries — without this
-    // the cache would grow without bound for the backoff's duration.
-    // A fresh over-capacity transition (backoff was reset) still scans
-    // promptly instead of waiting out a stale backoff.
+    // burn IO every interval.
+    //
+    // P2-#29: the backoff skips the full scan, but a put that finds the
+    // cache over capacity still runs the lightweight quota pass — the old
+    // `intervalActive && backoffActive` early return let the cache grow
+    // without bound for the whole backoff. The follow-up chain
+    // (capacityFollowUp) stays gated so an unreclaimable cache cannot spin
+    // light passes in a loop; future puts re-trigger it, throttled below.
+    // An over-capacity put with no backoff still scans promptly.
     final bool lightOnly = overCapacity && backoffActive;
+    if (!overCapacity && backoffActive) {
+      return;
+    }
+    if (intervalActive &&
+        (!overCapacity || (backoffActive && capacityFollowUp))) {
+      return;
+    }
+    if (lightOnly) {
+      final DateTime? lastLight = _lastLightPrune;
+      if (lastLight != null &&
+          now.difference(lastLight) < _lightPruneThrottle) {
+        return;
+      }
+      _lastLightPrune = now;
+    }
     _maintenancePending = true;
     _lastPrune = now;
     // Start on a separate event turn, and never join this future from put.
@@ -280,18 +329,23 @@ class TranslationCacheStore {
       (_) => Future<void>(() async {
         final int generation = _writeGeneration;
         bool scanned = false;
-        int deletedBytes = 0;
         try {
           if (lightOnly) {
-            deletedBytes = await _enforceQuotaLightly();
+            lightPruneCountForTest++;
+            await _enforceQuotaLightly();
           } else {
-            deletedBytes = await _scanAndPrune(await _cacheRoot(), _capacity);
+            await _scanAndPrune(await _cacheRoot(), _capacity);
             scanned = true;
           }
         } catch (_) {
           // Cache maintenance must never break translation.
         } finally {
-          if (_estimatedBytes <= _capacity || deletedBytes > 0) {
+          // P2-#29: only reset the backoff when the quota is actually met.
+          // A light pass that deletes bytes but leaves the cache over
+          // capacity (unreclaimable files remain) must not clear the
+          // backoff, or the follow-up would schedule a full scan on every
+          // put, defeating the backoff (C-15).
+          if (_estimatedBytes <= _capacity) {
             _resetBackoff();
           } else if (!scanned ||
               generation == _writeGeneration ||
@@ -334,6 +388,12 @@ class TranslationCacheStore {
   /// are never touched here.
   @visibleForTesting
   Future<int> enforceQuotaLightlyForTest() => _enforceQuotaLightly();
+
+  /// Number of backoff-period lightweight quota passes executed (P2-#29).
+  /// Lets tests assert that over-capacity puts during the backoff still
+  /// enforce the quota via the light pass instead of stalling.
+  @visibleForTesting
+  int lightPruneCountForTest = 0;
 
   Future<int> _enforceQuotaLightly() async {
     final int targetBytes = (_capacity * 0.9).toInt();
@@ -512,6 +572,11 @@ class TranslationCacheStore {
       // event. A lone rollback (or a real rewrite) stays fail-closed. Read
       // contents only to establish a baseline or reconcile changed mtimes.
       final Map<Duration, List<_CacheEntry>> rollbacks = {};
+      // P2-#24: keys whose digest could not be read during this scan. Their
+      // mtime baseline must not advance below: that would pair the new
+      // mtime with a stale digest, a permanently wrong baseline that later
+      // scans would never re-hash (the "unchanged" early-continue above).
+      final Set<String> digestReadFailed = <String>{};
       for (final _CacheEntry entry in entries) {
         final String key = entry.file.path;
         if (!scannedSizes.containsKey(key) || changes.containsKey(key)) {
@@ -524,12 +589,37 @@ class TranslationCacheStore {
         try {
           await _withFileGate(entry.file, () async {
             if (changes.containsKey(key)) return;
-            final Digest digest = await sha256.bind(entry.file.openRead()).first;
-            final FileStat current = await entry.file.stat();
-            if (current.type != FileSystemEntityType.file ||
-                current.size != entry.size ||
-                current.modified != entry.modified) {
-              return;
+            final _RollbackCheck? checked = _rollbackChecked[key];
+            final Digest digest;
+            if (checked != null &&
+                checked.modified == entry.modified &&
+                checked.size == entry.size) {
+              // Perf-#42: same bytes as the last check — reuse the digest
+              // instead of re-reading and re-hashing. Re-stat first so a
+              // concurrent replacement cannot slip different bytes under
+              // the memoized (mtime, size).
+              final FileStat current = await entry.file.stat();
+              if (current.type != FileSystemEntityType.file ||
+                  current.size != entry.size ||
+                  current.modified != entry.modified) {
+                return;
+              }
+              digest = checked.digest;
+            } else {
+              digest = await sha256.bind(entry.file.openRead()).first;
+              final FileStat current = await entry.file.stat();
+              if (current.type != FileSystemEntityType.file ||
+                  current.size != entry.size ||
+                  current.modified != entry.modified) {
+                return;
+              }
+              // Memoize this (mtime, size, digest): a later scan with an
+              // unchanged file reuses it instead of hashing again.
+              _rollbackChecked[key] = _RollbackCheck(
+                modified: entry.modified,
+                size: entry.size,
+                digest: digest,
+              );
             }
             if (known != null && entry.modified.isBefore(known)) {
               if (_sizes[key] == entry.size && _contentDigests[key] == digest) {
@@ -543,6 +633,7 @@ class TranslationCacheStore {
           });
         } catch (_) {
           // Unreadable or concurrently replaced entries cannot prove rollback.
+          digestReadFailed.add(key);
         }
       }
       final Set<String> clockRollbackPaths = {
@@ -564,9 +655,13 @@ class TranslationCacheStore {
         (String path, DateTime _) => !scannedSizes.containsKey(path),
       );
       _contentDigests.removeWhere((key, _) => !scannedSizes.containsKey(key));
+      _rollbackChecked.removeWhere((key, _) => !scannedSizes.containsKey(key));
       for (final _CacheEntry entry in entries) {
         if (!scannedSizes.containsKey(entry.file.path)) continue;
         if (changes.containsKey(entry.file.path)) continue;
+        // P2-#24: a failed digest read leaves the old digest behind; the
+        // mtime baseline must not advance past it.
+        if (digestReadFailed.contains(entry.file.path)) continue;
         final DateTime? known = _mtimes[entry.file.path];
         if (known == null ||
             entry.modified.isAfter(known) ||
@@ -627,11 +722,25 @@ class TranslationCacheStore {
   /// grow without bound.
   static const int _maxJobCheckpoints = 20;
 
+  /// Minimum interval between job-checkpoint prune scans (perf-#43).
+  /// [saveJobState] runs on every block save during a translation run;
+  /// scanning the jobs directory on every save is O(S×N) for S saves and N
+  /// files. Pruning only removes checkpoints idle for 5+ minutes, so
+  /// scanning more than once a minute cannot free anything new.
+  static const Duration _jobPruneThrottle = Duration(minutes: 1);
+  DateTime? _lastJobCheckpointPrune;
+
   /// Deletes the oldest checkpoints beyond [_maxJobCheckpoints]. Best
   /// effort: checkpoint maintenance must never break a translation run. All
   /// recently active checkpoints (including the one just saved) are protected
   /// for five minutes, even when this temporarily exceeds the count cap.
   Future<void> _pruneOldJobStates() async {
+    final DateTime now = _now();
+    final DateTime? lastPrune = _lastJobCheckpointPrune;
+    if (lastPrune != null && now.difference(lastPrune) < _jobPruneThrottle) {
+      return;
+    }
+    _lastJobCheckpointPrune = now;
     try {
       final Directory root = await _cacheRoot();
       await pruneJobCheckpointsForTest(
@@ -643,8 +752,12 @@ class TranslationCacheStore {
     }
   }
 
-  /// Deletes the oldest checkpoint files in [jobsDir] beyond
-  /// [maxCheckpoints] (oldest first by modification time).
+  /// Deletes the oldest checkpoints in [jobsDir] beyond [maxCheckpoints]
+  /// (oldest first by modification time).
+  ///
+  /// P2-#28: [maxCheckpoints] counts tasks, not files. A job's main
+  /// checkpoint and its book-memory companion are one task; counting files
+  /// would prune 20 two-file jobs down to ~10 pairs.
   @visibleForTesting
   Future<void> pruneJobCheckpointsForTest(
     Directory jobsDir, {
@@ -666,26 +779,50 @@ class TranslationCacheStore {
         // A file that vanishes mid-scan is simply skipped.
       }
     }
-    if (entries.length <= maxCheckpoints) {
+    // Group files into tasks: a main checkpoint stem is its job key, and a
+    // book-memory file's name derives from it
+    // (`sha256("$stem:book-memory")`, mirroring [_pairedCheckpointPath]),
+    // so both land in the same group without reading file contents.
+    // Orphans (a memory file whose main is gone) form singleton groups.
+    final Map<String, String> memoryNameToJobKey = <String, String>{};
+    for (final entry in entries) {
+      final String stem = path.basenameWithoutExtension(entry.file.path);
+      memoryNameToJobKey[sha256
+          .convert(utf8.encode('$stem:book-memory'))
+          .toString()] = stem;
+    }
+    final Map<String, List<({File file, DateTime modified})>> groups =
+        <String, List<({File file, DateTime modified})>>{};
+    for (final entry in entries) {
+      final String stem = path.basenameWithoutExtension(entry.file.path);
+      final String groupKey = memoryNameToJobKey[stem] ?? stem;
+      (groups[groupKey] ??= <({File file, DateTime modified})>[]).add(entry);
+    }
+    if (groups.length <= maxCheckpoints) {
       return;
     }
     final Map<String, DateTime> listedModified = {
       for (final entry in entries) entry.file.path: entry.modified,
     };
-    entries.sort(
-      (
-        ({File file, DateTime modified}) a,
-        ({File file, DateTime modified}) b,
-      ) => a.modified.compareTo(b.modified),
-    );
-    int remaining = entries.length;
+    // Oldest tasks first; a task is as recent as its freshest file.
+    final List<List<({File file, DateTime modified})>> tasks = groups.values
+        .toList()
+      ..sort(
+        (
+          List<({File file, DateTime modified})> a,
+          List<({File file, DateTime modified})> b,
+        ) => _newestModified(a).compareTo(_newestModified(b)),
+      );
+    int remaining = tasks.length;
     final DateTime activeSince = _now().subtract(const Duration(minutes: 5));
     final List<({File file, DateTime modified})> candidates = [];
-    for (final entry in entries) {
+    for (final task in tasks) {
       if (remaining <= maxCheckpoints) break;
-      if (!entry.modified.isBefore(activeSince)) continue;
-      candidates.add(entry);
       remaining--;
+      for (final entry in task) {
+        if (!entry.modified.isBefore(activeSince)) continue;
+        candidates.add(entry);
+      }
     }
     // Pair protection: a job checkpoint and its book-memory companion are
     // kept or deleted together, never split. An active job must not lose
@@ -706,45 +843,141 @@ class TranslationCacheStore {
       candidatePaths.remove(entry.file.path);
     }
     await onListedForTest?.call();
+    // P2-#27: delete checkpoint pairs atomically. The two members used to
+    // be deleted under separate per-file gates: a concurrent save
+    // refreshing the second member between the two deletions made its
+    // mtime recheck fail, leaving a broken half-pair. Members whose mate
+    // is also a candidate are now deleted together under both gates
+    // (acquired in path order so concurrent prunes cannot deadlock); a
+    // refresh of either member aborts the whole pair deletion.
+    final Set<String> pairHandled = <String>{};
     for (final entry in candidates) {
-      if (!candidatePaths.contains(entry.file.path)) continue;
+      final String entryPath = entry.file.path;
+      if (!candidatePaths.contains(entryPath) ||
+          !pairHandled.add(entryPath)) {
+        continue;
+      }
       try {
-        // Recheck under the per-file gate shared with [saveJobState]: a
-        // resume/save that refreshed this path after the listing must not
-        // have its fresh checkpoint deleted by this pass. The gate makes
-        // the recheck stat and the delete atomic with respect to saves.
-        await _withFileGate(entry.file, () async {
-          final FileStat current = await entry.file.stat();
-          if (current.modified != entry.modified ||
-              !current.modified.isBefore(activeSince)) {
-            return;
-          }
-          final String? matePath = await _pairedCheckpointPath(
-            jobsDir,
+        final String? matePath = await _pairedCheckpointPath(
+          jobsDir,
+          entry.file,
+        );
+        final DateTime? mateListedModified = matePath == null
+            ? null
+            : listedModified[matePath];
+        final bool pairDelete =
+            matePath != null &&
+            mateListedModified != null &&
+            candidatePaths.contains(matePath) &&
+            pairHandled.add(matePath);
+        if (pairDelete) {
+          if (await _deleteCheckpointPair(
             entry.file,
-          );
-          if (matePath != null) {
-            final DateTime? listedMateModified = listedModified[matePath];
-            final File mateFile = File(matePath);
-            if (await mateFile.exists()) {
-              final DateTime mateModified = (await mateFile.stat()).modified;
-              if (listedMateModified == null ||
-                  mateModified != listedMateModified) {
-                return;
-              }
-            } else if (listedMateModified != null) {
-              return;
-            }
+            entry.modified,
+            File(matePath),
+            mateListedModified,
+            activeSince,
+          )) {
+            // A mate removed by this pass is expected to be absent; an
+            // externally vanished or refreshed mate must still block
+            // deletion (handled inside the pair delete's recheck).
+            listedModified.remove(entryPath);
+            listedModified.remove(matePath);
           }
-          await entry.file.delete();
-          // A mate removed by this pass is expected to be absent; an
-          // externally vanished or refreshed mate must still block deletion.
-          listedModified.remove(entry.file.path);
-        });
+        } else {
+          // Recheck under the per-file gate shared with [saveJobState]: a
+          // resume/save that refreshed this path after the listing must not
+          // have its fresh checkpoint deleted by this pass. The gate makes
+          // the recheck stat and the delete atomic with respect to saves.
+          final bool deleted = await _withFileGate(entry.file, () async {
+            final FileStat current = await entry.file.stat();
+            if (current.modified != entry.modified ||
+                !current.modified.isBefore(activeSince)) {
+              return false;
+            }
+            final String? matePath = await _pairedCheckpointPath(
+              jobsDir,
+              entry.file,
+            );
+            if (matePath != null) {
+              final DateTime? listedMateModified = listedModified[matePath];
+              final File mateFile = File(matePath);
+              if (await mateFile.exists()) {
+                final DateTime mateModified = (await mateFile.stat()).modified;
+                if (listedMateModified == null ||
+                    mateModified != listedMateModified) {
+                  return false;
+                }
+              } else if (listedMateModified != null) {
+                return false;
+              }
+            }
+            await entry.file.delete();
+            return true;
+          });
+          if (deleted) {
+            // A mate removed by this pass is expected to be absent; an
+            // externally vanished or refreshed mate must still block
+            // deletion.
+            listedModified.remove(entryPath);
+          }
+        }
       } catch (_) {
         // Best effort; a locked file is left for the next pass.
       }
     }
+  }
+
+  /// Newest modification time in a checkpoint task group.
+  static DateTime _newestModified(
+    List<({File file, DateTime modified})> task,
+  ) {
+    DateTime newest = task.first.modified;
+    for (final entry in task.skip(1)) {
+      if (entry.modified.isAfter(newest)) newest = entry.modified;
+    }
+    return newest;
+  }
+
+  /// Deletes both members of a checkpoint pair atomically (P2-#27). Both
+  /// per-file gates are held — acquired in path order so two concurrent
+  /// prunes cannot deadlock — then both mtimes are re-verified and only
+  /// then are both files deleted. A concurrent save refreshing either
+  /// member serializes fully before the gates (mtime mismatch → the pair
+  /// is kept) or fully after (the fresh file survives). Returns true when
+  /// both members were deleted.
+  Future<bool> _deleteCheckpointPair(
+    File first,
+    DateTime firstListedModified,
+    File second,
+    DateTime secondListedModified,
+    DateTime activeSince,
+  ) async {
+    final List<({File file, DateTime listedModified})> ordered =
+        <({File file, DateTime listedModified})>[
+          (file: first, listedModified: firstListedModified),
+          (file: second, listedModified: secondListedModified),
+        ]..sort(
+          (
+            ({File file, DateTime listedModified}) a,
+            ({File file, DateTime listedModified}) b,
+          ) => a.file.path.compareTo(b.file.path),
+        );
+    return _withFileGate(ordered[0].file, () async {
+      return _withFileGate(ordered[1].file, () async {
+        for (final item in ordered) {
+          final FileStat current = await item.file.stat();
+          if (current.type != FileSystemEntityType.file ||
+              current.modified != item.listedModified ||
+              !current.modified.isBefore(activeSince)) {
+            return false;
+          }
+        }
+        await ordered[0].file.delete();
+        await ordered[1].file.delete();
+        return true;
+      });
+    });
   }
 
   /// Returns the paired checkpoint for [file] (job <-> book-memory
@@ -841,4 +1074,17 @@ class _CacheEntry {
   final File file;
   final int size;
   final DateTime modified;
+}
+
+/// Perf-#42: memo of a digest check for a rollback-suspect entry.
+class _RollbackCheck {
+  const _RollbackCheck({
+    required this.modified,
+    required this.size,
+    required this.digest,
+  });
+
+  final DateTime modified;
+  final int size;
+  final Digest digest;
 }

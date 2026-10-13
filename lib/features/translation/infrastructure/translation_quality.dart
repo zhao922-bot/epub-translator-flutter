@@ -248,14 +248,18 @@ class TranslationQuality {
     final List<String> unexemptedSourceTexts = <String>[];
 
     if (sourceCandidates.length == translatedCandidates.length) {
+      // 性能-#39: the whole translated body text is scanned once here, not
+      // once per candidate. Clearing a retained title below only removes the
+      // title text inside the brackets, so the bracket presence observed
+      // here stays valid for every candidate.
+      final bool hasChineseTitleMarker = RegExp(
+        r'[《「『〈》」』〉]',
+      ).hasMatch(translatedDocument.body?.text ?? '');
       for (int index = 0; index < sourceCandidates.length; index += 1) {
         final Element sourceCandidate = sourceCandidates[index];
         final Element translatedCandidate = translatedCandidates[index];
         final String sourceText = _normalizeText(sourceCandidate.text);
         final String translatedText = _normalizeText(translatedCandidate.text);
-        final bool hasChineseTitleMarker = RegExp(
-          r'[《「『〈》」』〉]',
-        ).hasMatch(translatedDocument.body?.text ?? '');
         final bool canExempt =
             sourceCandidate.localName == translatedCandidate.localName &&
             _elementStructurePath(sourceCandidate) ==
@@ -528,6 +532,21 @@ class TranslationQuality {
       }
       return false;
     }
+    // P2-#19: an all-caps run of sentence length is body prose, not
+    // metadata. A lone all-caps surname (YARDENI) or acronym stays allowed,
+    // but several all-caps words in a row are a sentence that must not be
+    // exempted as "pure citation metadata".
+    int allCapsWords = 0;
+    for (final String word in words) {
+      if (word.length > 1 &&
+          word == word.toUpperCase() &&
+          RegExp(r'[A-Z]').hasMatch(word)) {
+        allCapsWords++;
+      }
+    }
+    if (allCapsWords >= 4) {
+      return false;
+    }
     return true;
   }
 
@@ -609,6 +628,11 @@ class TranslationQuality {
       return null;
     }
     final String strippedText = _stripNonLinguisticTokens(text);
+    // P2-#18 + 性能-#39: collect the glossed token occurrences in a single
+    // pass. The exemption then applies only to the glossed occurrence
+    // itself — not to other bare tokens sharing the paragraph (or the same
+    // parentheses) — and no per-token whole-text scan is needed.
+    final Set<int> glossedTokenStarts = _glossedTermTokenStarts(strippedText);
     for (final RegExpMatch match in RegExp(
       r"[A-Za-z0-9'’\-]+",
     ).allMatches(strippedText)) {
@@ -625,16 +649,59 @@ class TranslationQuality {
       final int? followingRune = _runeAt(strippedText, match.end);
       if ((precedingRune != null && _isCjkRune(precedingRune)) ||
           (followingRune != null && _isCjkRune(followingRune))) {
-        if (_isParenthesizedTermGloss(text, token)) {
-          continue;
-        }
-        if (_isQuotedTermGloss(text, token)) {
+        if (glossedTokenStarts.contains(match.start)) {
           continue;
         }
         return token;
       }
     }
     return null;
+  }
+
+  /// Start offsets (in [text]) of latin token occurrences that sit inside a
+  /// clean term gloss, computed in a single pass (性能-#39).
+  ///
+  /// A clean gloss is `CJK（term）` / `CJK(term)` whose parentheses hold
+  /// nothing but the term (plus CJK, whitespace and punctuation), a quoted
+  /// term label whose quotes hold nothing but the term (plus target-script
+  /// context, e.g. `“agoric开放系统”`), or `term（CJK…）`. P2-#18: looking
+  /// the offsets up per token keeps the exemption tied to the glossed
+  /// occurrence instead of exempting other bare words that merely share
+  /// the paragraph or the parentheses.
+  static Set<int> _glossedTermTokenStarts(String text) {
+    // Mirrors the CJK ranges used across the quality checks.
+    const String cjkRange =
+        r'\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}';
+    // Inside a clean gloss only non-latin material may surround the term.
+    const String nonLatin =
+        r'\s\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}.,;:，；：、\-–—';
+    const String latinToken = r"[A-Za-z0-9'’\-]+";
+    final Set<int> starts = <int>{};
+    // Each pattern captures the text preceding the token as group 1 and the
+    // token itself as group 2, so the token's start offset is
+    // match.start + group(1).length.
+    void collect(String pattern) {
+      for (final RegExpMatch match
+          in RegExp(pattern, unicode: true).allMatches(text)) {
+        starts.add(match.start + (match.group(1)?.length ?? 0));
+      }
+    }
+    // Direction 1: translated term first, original in parentheses, e.g.
+    // 伐林开垦（assarting）.
+    collect(
+      '([$cjkRange]\\s*[（(](?:[$nonLatin]*))($latinToken)(?:[$nonLatin]*)[）)]',
+    );
+    // Direction 2: original term first, Chinese gloss in parentheses, e.g.
+    // job-coachman（临时马车夫）.
+    collect(
+      '()($latinToken)\\s*[（(](?:[$nonLatin]*)[$cjkRange](?:[$nonLatin]*)[）)]',
+    );
+    // Quoted term labels with target-script context, e.g. “agoric开放系统”.
+    collect(
+      '([“「『"](?=[^”」』"]*[$cjkRange])(?:[^”」』"A-Za-z0-9\'’\\-]*))'
+      '($latinToken)(?:[^”」』"A-Za-z0-9\'’\\-]*)[”」』"]',
+    );
+    return starts;
   }
 
   /// Whether [token] appears inside parentheses/quotes that are immediately
@@ -645,12 +712,18 @@ class TranslationQuality {
   static bool _isParenthesizedTermGloss(String text, String token) {
     final String escaped = RegExp.escape(token);
     // Direction 1: translated term first, original inside parentheses, e.g.
-    // 伐林开垦（assarting） or 伐林开垦(assarting).
+    // 伐林开垦（assarting） or 伐林开垦(assarting). P2-#18: the parentheses
+    // may only hold the glossed term itself (plus CJK, whitespace and
+    // punctuation) — other latin words inside mean the parens hold more
+    // than a clean term gloss, so a bare residual sharing them is not
+    // exempted.
+    const String nonLatinInGloss =
+        r'\s\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}.,;:，；：、\-–—';
     final RegExp translatedFirstPattern = RegExp(
       r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]\s*[（(]'
-      r'[^）)]*'
+      '[$nonLatinInGloss]*'
       '$escaped'
-      r'[^）)]*'
+      '[$nonLatinInGloss]*'
       r'[）)]',
       unicode: true,
     );
@@ -671,23 +744,6 @@ class TranslationQuality {
       unicode: true,
     );
     return retainedFirstPattern.hasMatch(text);
-  }
-
-  /// Whether [token] is retained inside a translated quote that also contains
-  /// target-script context, for example `“agoric开放系统”`. Quoted technical
-  /// terms are source-owned labels, not standalone untranslated prose.
-  static bool _isQuotedTermGloss(String text, String token) {
-    final String escaped = RegExp.escape(token);
-    final RegExp quotedPattern = RegExp(
-      r'[“「『"]'
-      r'(?=[^”」』"]*[぀-ヿ㐀-鿿가-힯])'
-      r'[^”」』"]*'
-      '$escaped'
-      r'[^”」』"]*'
-      r'[”」』"]',
-      caseSensitive: false,
-    );
-    return quotedPattern.hasMatch(text);
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -1037,55 +1093,62 @@ class TranslationQuality {
     if (_looksLikeImperativeOrNotice(title)) {
       return false;
     }
-    return _hasExplicitWorkReferenceContext(document, element) ||
-        _hasAttributedWorkContext(document, element) ||
-        _hasDescriptiveWorkContext(document, element) ||
-        _hasBibliographicContext(document, element, title) ||
-        _hasSubjectWorkContext(document, element) ||
-        _hasNamedPublicationContext(document, element) ||
-        _hasSerialWorkTitleContext(document, element, title) ||
-        _isOnlyTitleInSemanticBlock(element, title);
-  }
-
-  static bool _hasExplicitWorkReferenceContext(
-    Document document,
-    Element element,
-  ) {
-    final String precedingText = _sourceTextBeforeNode(
+    // 性能-#39: the text around the candidate is traversed once here and
+    // shared by every context check below, instead of re-traversed per
+    // check (O(checks × text)). The 120-char window is a suffix of the
+    // full preceding text, so one traversal serves both.
+    final String precedingFull = _sourceTextBeforeNode(
       document,
       element,
-    ).toLowerCase();
+      maxLength: null,
+    );
+    final String precedingText = precedingFull.length <= 120
+        ? precedingFull
+        : precedingFull.substring(precedingFull.length - 120);
+    final String followingText = _sourceTextAfterNode(document, element);
+    return _hasExplicitWorkReferenceContext(precedingText) ||
+        _hasAttributedWorkContext(precedingText, followingText) ||
+        _hasDescriptiveWorkContext(precedingText) ||
+        _hasBibliographicContext(
+          precedingFull,
+          followingText,
+          semanticBlock,
+          title,
+        ) ||
+        _hasSubjectWorkContext(followingText) ||
+        _hasNamedPublicationContext(precedingText) ||
+        _hasSerialWorkTitleContext(element, precedingText, semanticBlock, title) ||
+        _isOnlyTitleInSemanticBlock(semanticBlock, title);
+  }
+
+  static bool _hasExplicitWorkReferenceContext(String precedingText) {
+    final String lower = precedingText.toLowerCase();
     return RegExp(
       r'(?:\bauthors?\s+of|\bwriters?\s+of|\b(?:book|novel|work|essay|article|report|study|volume|memoir|guide|paper|newsletter|magazine|journal)(?:\s+(?:called|named|titled))?|\b(?:read|reading)|\bwent\s+into)\s*(?:[:\-–—]\s*)?$',
-    ).hasMatch(precedingText);
+    ).hasMatch(lower);
   }
 
-  static bool _hasAttributedWorkContext(Document document, Element element) {
-    final String precedingText = _sourceTextBeforeNode(
-      document,
-      element,
-    ).toLowerCase();
-    if (!RegExp(r'(?:^|\s)(?:in|within)\s*$').hasMatch(precedingText)) {
+  static bool _hasAttributedWorkContext(
+    String precedingText,
+    String followingText,
+  ) {
+    final String lower = precedingText.toLowerCase();
+    if (!RegExp(r'(?:^|\s)(?:in|within)\s*$').hasMatch(lower)) {
       return false;
     }
-    final String followingText = _sourceTextAfterNode(document, element);
     return RegExp(
       r"^[,;:]?\s*[A-Z][A-Za-z'’\-]*(?:\s+[A-Z][A-Za-z'’\-]*){0,3}\s+(?:argues?|contends?|describes?|explains?|maintains?|notes?|observes?|proposes?|writes?)\b",
     ).hasMatch(followingText);
   }
 
-  static bool _hasDescriptiveWorkContext(Document document, Element element) {
-    final String precedingText = _sourceTextBeforeNode(
-      document,
-      element,
-    ).toLowerCase();
+  static bool _hasDescriptiveWorkContext(String precedingText) {
+    final String lower = precedingText.toLowerCase();
     return RegExp(
       r"(?:\b(?:his|her|their|the)\s+)?(?:acclaimed|award-winning|best-selling|celebrated|classic|famous|influential|landmark|seminal)(?:\s+(?:book|essay|memoir|novel|report|study|work))?\s*$",
-    ).hasMatch(precedingText);
+    ).hasMatch(lower);
   }
 
-  static bool _hasSubjectWorkContext(Document document, Element element) {
-    final String followingText = _sourceTextAfterNode(document, element);
+  static bool _hasSubjectWorkContext(String followingText) {
     return RegExp(
       r'^(?:[,;:]?\s*)?(?:'
       r'builds?\s+upon|draws?\s+(?:on|from)|is\s+based\s+on|'
@@ -1098,14 +1161,11 @@ class TranslationQuality {
     ).hasMatch(followingText);
   }
 
-  static bool _hasNamedPublicationContext(Document document, Element element) {
-    final String precedingText = _sourceTextBeforeNode(
-      document,
-      element,
-    ).toLowerCase();
+  static bool _hasNamedPublicationContext(String precedingText) {
+    final String lower = precedingText.toLowerCase();
     return RegExp(
       r'(?:\b(?:our|the|his|her|their)\s+)?(?:newsletter|magazine|journal|newspaper|column|periodical|publication|bulletin|digest)\b[,:\s]*$',
-    ).hasMatch(precedingText);
+    ).hasMatch(lower);
   }
 
   static bool _clearMatchingAuditedForeignTerms(
@@ -1524,18 +1584,16 @@ class TranslationQuality {
   }
 
   static bool _hasSerialWorkTitleContext(
-    Document document,
     Element element,
+    String precedingText,
+    Element? semanticBlock,
     String title,
   ) {
-    final String precedingText = _sourceTextBeforeNode(
-      document,
-      element,
-    ).toLowerCase();
-    if (!RegExp(r'\b(?:and|or)\s*$').hasMatch(precedingText)) {
+    final String lower = precedingText.toLowerCase();
+    if (!RegExp(r'\b(?:and|or)\s*$').hasMatch(lower)) {
       return false;
     }
-    final Element? block = _nearestSemanticBlock(element);
+    final Element? block = semanticBlock;
     if (block == null) {
       return false;
     }
@@ -1552,11 +1610,12 @@ class TranslationQuality {
   }
 
   static bool _hasBibliographicContext(
-    Document document,
-    Element element,
+    String precedingFull,
+    String followingText,
+    Element? semanticBlock,
     String title,
   ) {
-    final Element? block = _nearestSemanticBlock(element);
+    final Element? block = semanticBlock;
     if (block == null) {
       return false;
     }
@@ -1564,12 +1623,8 @@ class TranslationQuality {
     if (blockText == title) {
       return false;
     }
-    final String before = _sourceTextBeforeNode(
-      document,
-      element,
-      maxLength: null,
-    );
-    final String after = _sourceTextAfterNode(document, element);
+    final String before = precedingFull;
+    final String after = followingText;
     final bool hasYearOrIdentifier = RegExp(
       r'\b(?:18|19|20)\d{2}\b|\bISBN\b|(?:(?:https?|ftp)://|www\.)',
       caseSensitive: false,
@@ -1580,8 +1635,8 @@ class TranslationQuality {
     return hasYearOrIdentifier && hasAuthorLikePrefix;
   }
 
-  static bool _isOnlyTitleInSemanticBlock(Element element, String title) {
-    final Element? block = _nearestSemanticBlock(element);
+  static bool _isOnlyTitleInSemanticBlock(Element? semanticBlock, String title) {
+    final Element? block = semanticBlock;
     if (block == null || _normalizeText(block.text) != title) {
       return false;
     }
@@ -2090,7 +2145,10 @@ class TranslationQuality {
             translatedWords.every(
               (String word) => word == word.toLowerCase(),
             ) &&
-            !RegExp(r'[.!?]').hasMatch(strippedTranslated);
+            !RegExp(r'[.!?]').hasMatch(strippedTranslated) &&
+            // P2-#20: common instruction/signal phrases ("do not enter")
+            // are ordinary untranslated prose, not transliterated terms.
+            !_isCommonInstructionPhrase(strippedTranslated);
         if (isShortLowercaseTransliteration) {
           return false;
         }
@@ -2167,8 +2225,50 @@ class TranslationQuality {
     return false;
   }
 
-  static bool _sameWordsIgnoreCase(List<String> left, List<String> right) {
-    if (left.length != right.length) {
+  /// P2-#20: short lowercase signage/instruction phrases that must never be
+  /// mistaken for transliterated terms (e.g. `<p>do not enter</p>` left
+  /// untranslated). Compared against the stripped text node.
+  static bool _isCommonInstructionPhrase(String text) {
+    final String normalized =
+        text.replaceAll(RegExp(r'\s+'), ' ').trim().toLowerCase();
+    return _commonInstructionPhrases.contains(normalized);
+  }
+
+  static const Set<String> _commonInstructionPhrases = <String>{
+    'do not enter',
+    'no entry',
+    'no admittance',
+    'keep out',
+    'do not disturb',
+    'no smoking',
+    'no trespassing',
+    'do not touch',
+    'no parking',
+    'no photographs',
+    'no photos',
+    'do not feed',
+    'mind the gap',
+    'no littering',
+    'do not litter',
+    'keep off the grass',
+    'staff only',
+    'no exit',
+    'do not cross',
+    'do not lean',
+    'no loitering',
+    'do not block',
+    'keep clear',
+    'do not use',
+    'beware of dog',
+    'do not spit',
+    'no spitting',
+    'keep right',
+    'keep left',
+    'slow down',
+    'give way',
+  };
+
+  static bool _sameWordsIgnoreCase(List<String> left, List<String> right) {    if (left.length != right.length) {
       return false;
     }
     for (int index = 0; index < left.length; index += 1) {

@@ -1186,9 +1186,10 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     int? maxBatchAttempts,
-    // The slot pipeline is shared: the main block pipeline counts every
-    // block up front (pass true so degrades are subtracted from the
-    // report), the footnote pipeline never counts degrades (leave false).
+    // The slot pipeline is shared: both the main block pipeline and the
+    // footnote pipeline count every block up front (pass true so degrades
+    // are subtracted from the report). Callers forward their own pipeline's
+    // value (see [_markDegradedBlock]).
     bool apiCounted = false,
     Future<void> Function(String id, String html)? onValidated,
   }) async {
@@ -1505,6 +1506,12 @@ class _EpubTranslationStrategy {
           }
           final Map<String, String> textBySlotId = <String, String>{};
           final Set<String> expectedSlotIds = request.slotIds.toSet();
+          // 性能-#36: resolve slot ids to indexes through a map instead of
+          // a per-slot indexOf scan (O(n^2) over the slots).
+          final Map<String, int> slotIndexById = <String, int>{
+            for (int index = 0; index < request.slotIds.length; index++)
+              request.slotIds[index]: index,
+          };
           for (final Object? rawSlot in rawSlots) {
             if (rawSlot is! Map<String, dynamic> ||
                 rawSlot.keys.toSet().difference(const <String>{
@@ -1530,9 +1537,8 @@ class _EpubTranslationStrategy {
               );
             }
             _validateIndividualSlotTranslation(
-              sourceText: request
-                  .template
-                  .slotTexts[request.slotIds.indexOf(rawSlotId)],
+              sourceText:
+                  request.template.slotTexts[slotIndexById[rawSlotId]!],
               translatedText: rawText,
               // Batch slots may carry HTML that the renderer escapes;
               // only the non-HTML wrapper checks apply here.
@@ -1663,6 +1669,11 @@ class _EpubTranslationStrategy {
     void Function()? onRequestAttempt,
     String? retryReason,
   }) async {
+    // 性能-#37: normalize the block's source text once; every per-slot
+    // request below would otherwise renormalize the whole block (O(K×M)).
+    final String normalizedBlockText = request.block.sourceText
+        .trim()
+        .replaceAll(RegExp(r'\s+'), ' ');
     final List<String>
     translatedSlots = await const TranslationWorkQueue().map<String, String>(
       request.template.slotTexts,
@@ -1689,6 +1700,7 @@ class _EpubTranslationStrategy {
             sourceText: sourceText,
             request: request,
             slotIndex: index,
+            normalizedBlockText: normalizedBlockText,
             context: context,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
@@ -1726,16 +1738,41 @@ class _EpubTranslationStrategy {
       ? text
       : text.substring(0, _slotContextLimit);
 
-  static String _blockContextSummary(ExtractedBlock block, {String? slotText}) {
+  static String _blockContextSummary(
+    ExtractedBlock block, {
+    String? slotText,
+    int? slotIndex,
+    List<String>? slotTexts,
+    String? normalizedBlockText,
+  }) {
     const int limit = _slotContextLimit;
-    final String text = block.sourceText.trim().replaceAll(RegExp(r'\s+'), ' ');
+    // 性能-#37: the normalized block text is identical for every slot of
+    // the block; callers pass the cached copy so K slots do not each pay
+    // O(block length) for the normalization.
+    final String text =
+        normalizedBlockText ??
+        block.sourceText.trim().replaceAll(RegExp(r'\s+'), ' ');
     if (text.length <= limit) return text;
     int center = text.length ~/ 2;
     bool located = false;
     if (slotText != null && slotText.trim().isNotEmpty) {
       final String needle = slotText.trim().replaceAll(RegExp(r'\s+'), ' ');
       if (needle.isNotEmpty) {
-        final int found = text.indexOf(needle);
+        // P2-#21: duplicate slot texts must resolve to their own occurrence,
+        // not the first one. The slot id encodes the slot index (s0, s1,
+        // ...); count earlier identical slots to pick the matching
+        // occurrence instead of indexOf's first match.
+        int occurrence = 0;
+        if (slotIndex != null && slotTexts != null) {
+          final int end = min(slotIndex, slotTexts.length);
+          for (int i = 0; i < end; i++) {
+            if (slotTexts[i].trim().replaceAll(RegExp(r'\s+'), ' ') ==
+                needle) {
+              occurrence++;
+            }
+          }
+        }
+        final int found = _indexOfOccurrence(text, needle, occurrence);
         if (found >= 0) {
           center = found + needle.length ~/ 2;
           located = true;
@@ -1758,6 +1795,21 @@ class _EpubTranslationStrategy {
     return text.substring(start, end);
   }
 
+  /// Index of the [occurrence]-th (0-based) occurrence of [needle] in
+  /// [text], or -1 when there are fewer occurrences. Used to center a
+  /// per-slot context window on the slot's own occurrence when several
+  /// slots share the same text (P2-#21).
+  static int _indexOfOccurrence(String text, String needle, int occurrence) {
+    int fromIndex = 0;
+    for (int i = 0; i <= occurrence; i++) {
+      final int found = text.indexOf(needle, fromIndex);
+      if (found < 0) return -1;
+      if (i == occurrence) return found;
+      fromIndex = found + needle.length;
+    }
+    return -1;
+  }
+
   Future<String> _translateProtectedSlotTextOnce({
     required Dio dio,
     required TranslationConfig config,
@@ -1768,6 +1820,7 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     String? retryReason,
+    String? normalizedBlockText,
   }) async {
     final String trimmedSource = sourceText.trim();
     if (cancelToken?.isCancelled ?? false) {
@@ -1797,6 +1850,13 @@ class _EpubTranslationStrategy {
       'blockSummary': _blockContextSummary(
         request.block,
         slotText: request.template.slotTexts[slotIndex],
+        // P2-#21: the slot id (s0, s1, ...) encodes the index; duplicate
+        // slot texts resolve to their own occurrence, not the first one.
+        slotIndex: slotIndex,
+        slotTexts: request.template.slotTexts,
+        // 性能-#37: cached normalized block text (see
+        // [_translateProtectedSlotsIndividuallyOnce]).
+        normalizedBlockText: normalizedBlockText,
       ),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0

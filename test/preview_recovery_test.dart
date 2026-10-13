@@ -7,7 +7,6 @@ import 'package:epub_translator_flutter/features/preview/application/preview_rec
 import 'package:epub_translator_flutter/features/preview/domain/models/preview_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
-import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
 
 InspectedChapter legacy({
@@ -36,7 +35,7 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   test(
-    'runner receives bounded recovery payloads with identical excerpts',
+    'perf-#35 runner receives untouched chapters; isolate slims with identical excerpts',
     () async {
       final long = '${'a' * 5998}😀${'文' * 100000}';
       final chapters = [
@@ -85,28 +84,14 @@ void main() {
       for (final chapter in chapters) {
         final expected = previewChapterFromInspected(chapter);
         final cache = PreviewRecoveryCache(
-          runner: (payloads) async {
-            final payload = payloads.single;
-            expect(identical(payload, chapter), isFalse);
-            expect(
-              payload.originalHtml.length,
-              lessThanOrEqualTo(previewRecoveryMarkupLimit),
-            );
-            expect(
-              payload.body.length,
-              lessThanOrEqualTo(EpubHtmlExtractor.previewCharacterLimit),
-            );
-            expect(payload.blocks.length, lessThanOrEqualTo(12));
-            expect(payload.sourceIdentity, isNull);
-            for (final block in payload.blocks) {
-              expect(block.sourceHtml, isEmpty);
-              expect(block.sourceText, isEmpty);
-              expect(
-                block.translatedHtml!.length,
-                lessThanOrEqualTo(previewRecoveryMarkupLimit),
-              );
-            }
-            return payloads.map(previewChapterFromInspected).toList();
+          runner: (received) async {
+            // perf-#35: no payload is built on the caller thread — the
+            // runner gets the chapter untouched; the DOM-parsing slimming
+            // happens in the isolate (_recoverBatch), never before
+            // compute().
+            expect(received, hasLength(1));
+            expect(identical(received.single, chapter), isTrue);
+            return recoverBatchForTest(received);
           },
         );
         await cache.prepare([chapter]);

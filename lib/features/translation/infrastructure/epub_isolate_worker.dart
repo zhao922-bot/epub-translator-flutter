@@ -24,12 +24,15 @@ import 'epub/xhtml_html_compatibility.dart';
 /// Navigation only looks up container, OPF and manifest-selected nav/NCX
 /// entries. Indexing names must not inflate unrelated chapter/media payloads.
 class _LazyArchiveView extends MapBase<String, List<int>> {
-  _LazyArchiveView(Archive archive)
+  _LazyArchiveView(Archive archive, {required this.inputPath})
     : _entries = {
         for (final file in archive)
           if (file.isFile) file.name: file,
       };
 
+  /// Carried for the streaming zip-bomb guard: entry inflation counts actual
+  /// decompressed bytes and reports over-limit entries against this path.
+  final String inputPath;
   final Map<String, ArchiveFile> _entries;
   final Map<String, List<int>> _bytes = {};
 
@@ -37,11 +40,12 @@ class _LazyArchiveView extends MapBase<String, List<int>> {
   List<int>? operator [](Object? key) {
     final file = _entries[key];
     if (file == null) return null;
-    // Reading via rawContent leaves ArchiveFile.isCompressed intact, even
-    // for container.xml, which is read for navigation but copied unchanged.
+    // Reading via the guarded inflate leaves ArchiveFile.isCompressed intact
+    // (nothing is memoized into .content), even for container.xml, which is
+    // read for navigation but copied unchanged.
     return _bytes.putIfAbsent(
       file.name,
-      () => file.rawContent?.getStream().toUint8List() ?? <int>[],
+      () => EpubIsolateWorker._fileBytes(file, inputPath: inputPath),
     );
   }
 
@@ -104,8 +108,18 @@ typedef RecoveryBudgetEntry = ({
   RecoveryBudgetKind kind,
 });
 
+/// Decoded archive plus the entry names that occur more than once in the raw
+/// central directory. The decoder merges duplicates in place (keeping the
+/// first payload but overwriting crc32 with the last duplicate's), so
+/// duplicates are invisible when iterating the decoded [Archive] — they must
+/// be detected from the decoder's raw file headers instead.
+typedef DecodedEpubArchive = ({Archive archive, Set<String> duplicateNames});
+
 /// Pure eviction policy; the ledger counts toward both limits but sorts last.
 /// A complete payload always survives, even when it alone exceeds the budget.
+/// The ledger itself survives while any registered `.tmp.*` fallback payload
+/// does: it is the orphan sweeper's only record of deliberate recovery
+/// copies (P1-#2).
 @visibleForTesting
 List<String> recoveryBudgetDeletions(
   List<RecoveryBudgetEntry> entries, {
@@ -137,7 +151,25 @@ List<String> recoveryBudgetDeletions(
     if (remaining <= _kMaxRecoveryFiles && totalBytes <= _kMaxRecoveryBytes) {
       break;
     }
-    if (exemptNames.contains(entry.name) || (isComplete(entry) && complete == 1)) {
+    // P1-#2: the ledger is the orphan sweeper's only record of which `.tmp.*`
+    // payloads are deliberate recovery copies. Evicting it while a registered
+    // fallback payload survives would let a later process restart sweep the
+    // user's only complete translation as a stale orphan (the in-memory
+    // _retainedRecoveryPaths do not survive restarts) — this is how v1.6.19's
+    // quota cleanup fought the orphan protection. The ledger sorts last, so
+    // every fallback payload has been decided by the time it is evaluated:
+    // it may only go once no registered fallback payload remains. Recovery
+    // spares need no ledger: the orphan sweep never touches `.recovery.*`.
+    final bool ledgerStillNeeded =
+        entry.kind == RecoveryBudgetKind.indexLedger &&
+        ordered.any(
+          (other) =>
+              other.kind == RecoveryBudgetKind.fallbackTmp &&
+              !deletions.contains(other.name),
+        );
+    if (exemptNames.contains(entry.name) ||
+        (isComplete(entry) && complete == 1) ||
+        ledgerStillNeeded) {
       continue;
     }
     deletions.add(entry.name);
@@ -205,6 +237,9 @@ class InputFileLockedException implements Exception {
 /// overall compression ratio is absurd, or the entry count exceeds the cap
 /// (millions of near-empty entries). Rejected BEFORE any entry content is
 /// materialized, so a malicious archive cannot OOM the isolate.
+/// Thrown AGAIN during inflation by [_GuardedInflateStream] when an entry's
+/// ACTUAL decompressed bytes exceed the cap: the preflight only sees the
+/// header-declared sizes, which a malicious entry can under-report.
 /// Catchers build the user-facing message via
 /// `AppStrings.epubDecompressionLimit`.
 class EpubDecompressionLimitException implements Exception {
@@ -224,6 +259,57 @@ class EpubDecompressionLimitException implements Exception {
   String toString() =>
       'EpubDecompressionLimitException: $inputPath expands beyond the '
       'decompression limit ($uncompressedBytes bytes vs $limitBytes allowed).';
+}
+
+/// [OutputStream] that accumulates inflated ZIP-entry bytes and throws
+/// [EpubDecompressionLimitException] the moment the total exceeds
+/// [limitBytes] — instead of growing to a malicious entry's full size first.
+/// The dart:io ZLib decoder writes decompressed output incrementally, so
+/// counting actual bytes as they arrive aborts a lying entry mid-inflate:
+/// the full payload is never materialized. Backs the streaming half of the
+/// zip-bomb guard in [EpubIsolateWorker._fileBytes]; the preflight half
+/// ([EpubIsolateWorker.checkArchiveLimitsForTest]) only sees header-declared
+/// sizes, which an attacker can under-report.
+class _GuardedInflateStream extends OutputMemoryStream {
+  _GuardedInflateStream({
+    required this.inputPath,
+    required this.entryName,
+    required this.compressedBytes,
+    required this.limitBytes,
+  });
+
+  final String inputPath;
+  final String entryName;
+  final int compressedBytes;
+  final int limitBytes;
+
+  Never _overflow(int incoming) => throw EpubDecompressionLimitException(
+    inputPath: '$inputPath!$entryName',
+    compressedBytes: compressedBytes,
+    uncompressedBytes: length + incoming,
+    limitBytes: limitBytes,
+  );
+
+  @override
+  void writeByte(int value) {
+    if (length + 1 > limitBytes) _overflow(1);
+    super.writeByte(value);
+  }
+
+  @override
+  void writeBytes(List<int> bytes, {int? length}) {
+    final int count = length ?? bytes.length;
+    if (this.length + count > limitBytes) _overflow(count);
+    super.writeBytes(bytes, length: length);
+  }
+
+  @override
+  void writeStream(InputStream stream) {
+    // Stored (uncompressed) entries arrive whole via writeStream; the cap
+    // must apply here too, not just to the incremental inflate writes.
+    if (length + stream.length > limitBytes) _overflow(stream.length);
+    super.writeStream(stream);
+  }
 }
 
 /// Heavy ZIP work off the UI isolate (Windows/Android).
@@ -348,13 +434,13 @@ class EpubIsolateWorker {
   ) {
     return (_) {
       final bytes = _readSourceBytesGuarded(inputPath);
-      final archive = _decodeArchiveWithLimits(inputPath, bytes);
+      final archive = _decodeArchiveWithLimits(inputPath, bytes).archive;
       final files = <String, Uint8List>{};
       void read(String name) {
         if (files.containsKey(name)) return;
         final file = archive.find(name);
         if (file == null || !file.isFile) return;
-        final content = _fileBytes(file);
+        final content = _fileBytes(file, inputPath: inputPath);
         // Stored ZIP entries are views into the entire source archive. Detach
         // those views so transferring a tiny OPF cannot retain the whole ZIP.
         // Inflated entries with an exact-sized buffer need no second copy.
@@ -433,13 +519,13 @@ class EpubIsolateWorker {
     String? expectedSourceFingerprint,
   }) {
     return Isolate.run(() {
-      final archive = _decodeEpubArchive(inputPath, expectedSourceFingerprint);
+      final archive = _decodeEpubArchive(inputPath, expectedSourceFingerprint).archive;
       try {
         final containerFile = archive.find('META-INF/container.xml');
         if (containerFile == null || !containerFile.isFile) return null;
         final container = xml.XmlDocument.parse(
           decodeEpubText(
-            bytes: _fileBytes(containerFile),
+            bytes: _fileBytes(containerFile, inputPath: inputPath),
             filePath: 'META-INF/container.xml',
             strict: true,
           ),
@@ -454,7 +540,7 @@ class EpubIsolateWorker {
         if (opfFile == null || !opfFile.isFile) return null;
         final opf = xml.XmlDocument.parse(
           decodeEpubText(
-            bytes: _fileBytes(opfFile),
+            bytes: _fileBytes(opfFile, inputPath: inputPath),
             filePath: opfPath,
             strict: true,
           ),
@@ -1468,7 +1554,7 @@ class EpubIsolateWorker {
 
   /// Reads and decodes the source EPUB in a tight scope so the raw download
   /// buffer has no live local reference once decoding returns.
-  static Archive _decodeEpubArchive(
+  static DecodedEpubArchive _decodeEpubArchive(
     String inputPath,
     String? expectedFingerprint,
   ) {
@@ -1485,13 +1571,29 @@ class EpubIsolateWorker {
   static ({Map<String, Uint8List> files, String fingerprint})
   _loadArchiveSnapshotSync(String inputPath) {
     final List<int> bytes = _readSourceBytesGuarded(inputPath);
-    final Archive archive = _decodeArchiveWithLimits(inputPath, bytes);
+    final Archive archive = _decodeArchiveWithLimits(inputPath, bytes).archive;
     final Map<String, Uint8List> files = <String, Uint8List>{};
+    int totalInflatedBytes = 0;
     for (final ArchiveFile file in archive) {
       if (!file.isFile) {
         continue;
       }
-      files[file.name] = Uint8List.fromList(_fileBytes(file));
+      final Uint8List inflated = Uint8List.fromList(
+        _fileBytes(file, inputPath: inputPath),
+      );
+      // The per-entry streaming cap stops a single lying entry mid-inflate,
+      // but many small liars could still add up: enforce the same total cap
+      // on ACTUAL inflated bytes, mirroring the header-declared preflight.
+      totalInflatedBytes += inflated.length;
+      if (totalInflatedBytes > _kMaxEpubUncompressedBytes) {
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: bytes.length,
+          uncompressedBytes: totalInflatedBytes,
+          limitBytes: _kMaxEpubUncompressedBytes,
+        );
+      }
+      files[file.name] = inflated;
     }
     return (files: files, fingerprint: sha256.convert(bytes).toString());
   }
@@ -1608,16 +1710,29 @@ class EpubIsolateWorker {
   /// Decodes ZIP bytes with zip-bomb guards. `archive` decodes lazily, so
   /// the header-declared entry sizes are accumulated BEFORE any entry
   /// content is touched: a malicious archive is rejected without ever
-  /// materializing its payload.
-  static Archive _decodeArchiveWithLimits(String inputPath, List<int> bytes) {
+  /// materializing its payload. Entry inflation itself is guarded separately
+  /// (see [_fileBytes]): the preflight cannot catch entries that lie about
+  /// their declared sizes.
+  static DecodedEpubArchive _decodeArchiveWithLimits(
+    String inputPath,
+    List<int> bytes,
+  ) {
     checkZipEntryCountForTest(inputPath, bytes);
-    final Archive archive = ZipDecoder().decodeBytes(bytes);
+    final ZipDecoder decoder = ZipDecoder();
+    final Archive archive = decoder.decodeBytes(bytes);
     checkArchiveLimitsForTest(
       inputPath: inputPath,
       archive: archive,
       compressedBytes: bytes.length,
     );
-    return archive;
+    final Set<String> seen = <String>{};
+    final Set<String> duplicates = <String>{};
+    for (final ZipFileHeader header in decoder.directory.fileHeaders) {
+      final String? name = header.file?.filename;
+      if (name == null || name.isEmpty) continue;
+      if (!seen.add(name)) duplicates.add(name);
+    }
+    return (archive: archive, duplicateNames: duplicates);
   }
 
   /// The decoder builds *all* central-directory headers before its first
@@ -1763,10 +1878,15 @@ class EpubIsolateWorker {
   }) {
     // Keep source payloads compressed and share their ArchiveFile objects.
     // Only navigation metadata is inflated; output goes straight to disk.
-    final Archive sourceArchive = _decodeEpubArchive(
+    final DecodedEpubArchive decoded = _decodeEpubArchive(
       inputPath,
       expectedSourceFingerprint,
     );
+    final Archive sourceArchive = decoded.archive;
+    // Names occurring more than once in the raw central directory. The
+    // decoder merges duplicates in place, so they cannot be counted from the
+    // decoded archive (a per-archive name count is always 1).
+    final Set<String> duplicateNames = decoded.duplicateNames;
     final Archive repacked = Archive();
 
     // Navigation metadata (OPF language + translated NCX labels) is rendered
@@ -1781,7 +1901,10 @@ class EpubIsolateWorker {
     );
     // Title/label translations remain useful even for unknown language tags;
     // the renderer independently guards language-only changes.
-    final Map<String, List<int>> archiveView = _LazyArchiveView(sourceArchive);
+    final Map<String, List<int>> archiveView = _LazyArchiveView(
+      sourceArchive,
+      inputPath: inputPath,
+    );
     replacements.addAll(
       renderNavigationMetadata(
         archiveFiles: archiveView,
@@ -1803,7 +1926,7 @@ class EpubIsolateWorker {
     String declaredMimetype = '';
     if (mimetypeFile != null) {
       declaredMimetype = utf8
-          .decode(_fileBytes(mimetypeFile), allowMalformed: true)
+          .decode(_fileBytes(mimetypeFile, inputPath: inputPath), allowMalformed: true)
           .trim();
     }
     final List<int> mimetypeBytes = utf8.encode(
@@ -1833,10 +1956,8 @@ class EpubIsolateWorker {
     // both sides agree on which copy survives. Insertion order (first-seen
     // position) is preserved, so entry ordering is unchanged.
     final Map<String, ArchiveFile> dedupedSource = <String, ArchiveFile>{};
-    final Map<String, int> nameCounts = <String, int>{};
     for (final ArchiveFile sourceFile in sourceArchive) {
       dedupedSource[sourceFile.name] = sourceFile;
-      nameCounts[sourceFile.name] = (nameCounts[sourceFile.name] ?? 0) + 1;
     }
 
     for (final ArchiveFile sourceFile in dedupedSource.values) {
@@ -1871,9 +1992,18 @@ class EpubIsolateWorker {
       // then write a CRC that does not match the content. Verify the stored
       // CRC against the payload for duplicates and recompress on mismatch
       // so the encoder writes a correct CRC.
-      if (nameCounts[sourceFile.name]! > 1 &&
-          !_storedCrcMatchesPayload(sourceFile)) {
-        final List<int> payload = _fileBytes(sourceFile);
+      //
+      // The trigger is deliberately NOT a per-archive name count: the
+      // decoder merges duplicates in place, so counting names over the
+      // decoded archive is always 1 and that branch could never fire.
+      // Duplicates are detected from the raw central-directory headers
+      // ([DecodedEpubArchive.duplicateNames]) instead. Deleting the branch
+      // instead would regress the corrupt-CRC protection (see
+      // b_round7_regression_test.dart #28, which asserts valid CRCs in the
+      // repacked output for duplicate entries).
+      if (duplicateNames.contains(sourceFile.name) &&
+          !_storedCrcMatchesPayload(sourceFile, inputPath: inputPath)) {
+        final List<int> payload = _fileBytes(sourceFile, inputPath: inputPath);
         AppLogger.warn(
           'Duplicate entry "${sourceFile.name}" has a CRC mismatch; '
           'recompressing instead of reusing the stored payload.',
@@ -1964,18 +2094,97 @@ class EpubIsolateWorker {
     }
   }
 
-  static List<int> _fileBytes(ArchiveFile file) {
+  /// Inflates [file]'s content, guarding against zip-bomb entries that lie
+  /// about their header-declared size.
+  ///
+  /// The preflight ([checkArchiveLimitsForTest]) only accumulates the
+  /// header-declared [ArchiveFile.size], so a malicious entry can declare a
+  /// tiny size while inflating to gigabytes and sail through it. Lazily
+  /// decoded entries (whose [ArchiveFile.rawContent] is a [ZipFile]) are
+  /// therefore inflated through [_GuardedInflateStream], which counts the
+  /// ACTUAL decompressed bytes as they arrive and throws
+  /// [EpubDecompressionLimitException] the moment the cap is exceeded — the
+  /// inflate aborts mid-stream instead of materializing the payload first.
+  /// Already-materialized entries (built in memory by the repacker) hold no
+  /// attacker-controlled bytes and take the direct path. Like the old
+  /// `rawContent.getStream()` shape, this never memoizes into
+  /// [ArchiveFile.content], so [ArchiveFile.isCompressed] stays intact for
+  /// the repacker's compressed pass-through.
+  static List<int> _fileBytes(ArchiveFile file, {String inputPath = ''}) {
+    final FileContent? raw = file.rawContent;
+    if (raw is ZipFile) {
+      return _inflateZipFileGuarded(
+        inputPath: inputPath,
+        file: file,
+        zipFile: raw,
+        limitBytes: _kMaxEpubUncompressedBytes,
+      );
+    }
     final Object content = file.content;
-    if (content is List<int>) {
+    if (content is Uint8List) {
       return content;
     }
-    if (content is Uint8List) {
+    if (content is List<int>) {
       return content;
     }
     if (content is String) {
       return utf8.encode(content);
     }
-    return file.readBytes()?.toList() ?? <int>[];
+    return <int>[];
+  }
+
+  static Uint8List _inflateZipFileGuarded({
+    required String inputPath,
+    required ArchiveFile file,
+    required ZipFile zipFile,
+    required int limitBytes,
+  }) {
+    final output = _GuardedInflateStream(
+      inputPath: inputPath,
+      entryName: file.name,
+      compressedBytes: zipFile.compressedSize,
+      limitBytes: limitBytes,
+    );
+    // getStream(decompress: false) returns the raw payload stream, decrypting
+    // first when needed (mirroring ZipFile.decompress). The stream position
+    // is restored in finally: ZipFile.decompress does not restore it when the
+    // output throws, and our guard aborts mid-inflate by throwing — without
+    // this, a guarded entry would be left at EOS for any later use.
+    final InputStream compressed = zipFile.getStream(decompress: false);
+    final int savePos = compressed.position;
+    try {
+      if (zipFile.compressionMethod == CompressionType.deflate) {
+        ZLibDecoder().decodeStream(compressed, output, raw: true);
+      } else if (zipFile.compressionMethod == CompressionType.bzip2) {
+        BZip2Decoder().decodeStream(compressed, output);
+      } else {
+        output.writeStream(compressed);
+      }
+    } finally {
+      compressed.setPosition(savePos);
+    }
+    return output.getBytes();
+  }
+
+  /// Visible for testing: inflate [file] with a custom byte cap, proving the
+  /// guard counts actual decompressed bytes rather than header-declared
+  /// sizes (a lying entry declares small but inflates large).
+  @visibleForTesting
+  static List<int> inflateZipFileGuardedForTest({
+    required ArchiveFile file,
+    required String inputPath,
+    required int limitBytes,
+  }) {
+    final FileContent? raw = file.rawContent;
+    if (raw is ZipFile) {
+      return _inflateZipFileGuarded(
+        inputPath: inputPath,
+        file: file,
+        zipFile: raw,
+        limitBytes: limitBytes,
+      );
+    }
+    return _fileBytes(file, inputPath: inputPath);
   }
 
   /// True when the decoded entry's stored CRC32 matches its payload, so the
@@ -1984,13 +2193,20 @@ class EpubIsolateWorker {
   /// entry names can corrupt the stored value (the decoder keeps the first
   /// duplicate's payload but overwrites crc32 with the last duplicate's),
   /// so callers only need this check for duplicates.
-  static bool _storedCrcMatchesPayload(ArchiveFile file) {
+  static bool _storedCrcMatchesPayload(
+    ArchiveFile file, {
+    String inputPath = '',
+  }) {
     final int? stored = file.crc32;
     if (stored == null) {
       return true;
     }
     try {
-      return getCrc32(_fileBytes(file)) == stored;
+      return getCrc32(_fileBytes(file, inputPath: inputPath)) == stored;
+    } on EpubDecompressionLimitException {
+      // A lying entry must abort via the limit handling, not degrade into a
+      // "CRC mismatch → recompress" retry that would inflate it again.
+      rethrow;
     } catch (_) {
       return false;
     }
