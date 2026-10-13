@@ -304,6 +304,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Set<String>? _debouncedChangedFields;
 
   int providerSelectionRevision = 0;
+  int credentialDiscardRevision = 0;
+  TranslationConfig? _lastLoadedConfig;
 
   /// Monotonic generation of the in-memory state, bumped every time [_load]
   /// replaces the state with a freshly read snapshot. Lets
@@ -329,6 +331,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return false;
     }
     _loaded = true;
+    _lastLoadedConfig = loaded;
     state = loaded;
     _stateGeneration++;
     if (_store.didCorruptReset) {
@@ -384,6 +387,14 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     void Function(Set<String> swallowedFields)? onSwallowedSlider,
   }) async {
     if (!_loaded) await _initialLoad;
+    // C-P1-1: capture the credential target before reload or recovery changes state.
+    final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
+    final credentialRoute = (
+      providerSelection: state.apiProviderSelection,
+      apiBaseUrl: state.apiBaseUrl,
+      customApiBaseUrl: state.customApiBaseUrl,
+      secretSlots: Set<SettingsSecretSlot>.of(slots),
+    );
     // P2-#36: an edit arriving while reloadSettings is reading must not
     // interleave with the load (applied to the old snapshot then discarded
     // by _load, or racing the conflict check). Wait for the load phase,
@@ -405,13 +416,6 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       return false;
     }
     if (hadLoadError) await _replayConflictedEdits();
-    final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
-    final credentialRoute = (
-      providerSelection: state.apiProviderSelection,
-      apiBaseUrl: state.apiBaseUrl,
-      customApiBaseUrl: state.customApiBaseUrl,
-      secretSlots: Set<SettingsSecretSlot>.of(slots),
-    );
     final TranslationConfig prevState = state;
     final TranslationConfig next = update(prevState);
     if (!mounted) {
@@ -788,8 +792,34 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// promises to discard "these" (the N blocked credential edits), and the
   /// method name says "blocked" — clearing the whole queue would silently
   /// drop unrelated pending edits.
-  void discardBlockedConflictReplays() =>
-      _conflictedEdits.removeWhere(_isReplayBlockedByRouteChange);
+  void discardBlockedConflictReplays() {
+    if (!mounted) return;
+    final blocked = _conflictedEdits
+        .where(_isReplayBlockedByRouteChange)
+        .toList();
+    if (blocked.isEmpty) return;
+    final slots = <SettingsSecretSlot>{
+      for (final edit in blocked) ...edit.credentialRoute.secretSlots,
+    };
+    _conflictedEdits.removeWhere(blocked.contains);
+    // C-P1-4: failed commits remain dirty in the text field and may also
+    // remain in optimistic state. Discard both, using the fresh load that
+    // established the changed route, before another full-state save.
+    final loaded = _lastLoadedConfig!;
+    credentialDiscardRevision++;
+    state = state.copyWith(
+      apiKey: slots.contains(SettingsSecretSlot.legacy) ? loaded.apiKey : null,
+      deepseekApiKey: slots.contains(SettingsSecretSlot.deepSeek)
+          ? loaded.deepseekApiKey
+          : null,
+      customApiKey: slots.contains(SettingsSecretSlot.custom)
+          ? loaded.customApiKey
+          : null,
+      httpProxy: slots.contains(SettingsSecretSlot.proxy)
+          ? loaded.httpProxy
+          : null,
+    );
+  }
 
   /// Number of queued conflict edits currently blocked by a route change
   /// (P2-#37). Surfaced so the settings page can display the blocked

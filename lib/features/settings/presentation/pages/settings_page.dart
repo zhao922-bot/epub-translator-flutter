@@ -271,7 +271,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   value: config.apiKey,
                   onChanged: controller.setApiKey,
                   onCommit: controller.setApiKey,
-                  resetKey: controller.providerSelectionRevision,
+                  resetKey: (
+                    controller.providerSelectionRevision,
+                    controller.credentialDiscardRevision,
+                  ),
                   obscureText: true,
                   canToggleObscureText: true,
                   enabled: !isRunActive,

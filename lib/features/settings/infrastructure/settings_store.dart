@@ -1233,26 +1233,44 @@ class SettingsStore {
     required Future<void> Function(String value) write,
     required Future<void> Function() delete,
   }) {
-    final Map<SettingsSecretSlot, String>? snapshot = _secretSnapshot;
-    if (snapshot == null) return;
-    final String current = snapshot[slot] ?? '';
-    final int opGeneration = _credentialGeneration;
-    final Future<void> backendOp =
-        current.isEmpty ? delete() : write(current);
-    _watchCredentialOp(
-      slot,
-      opGeneration,
-      write: write,
-      delete: delete,
-      backendOp: backendOp,
-    );
     unawaited(
-      backendOp.timeout(_secretOpTimeout).catchError((Object error) {
-        AppLogger.error(
-          'Credential re-assert failed: ${error.runtimeType}',
-          tag: 'settings',
-        );
-      }),
+      (() async {
+        try {
+          final File file = await _settingsFile();
+          await withSettingsFileLock(file, () async {
+            final current = await file.exists()
+                ? await file.readAsString()
+                : null;
+            if (_didLoad && current != _settingsSnapshot) {
+              AppLogger.warn(
+                'Credential re-assert skipped: settings changed in another instance.',
+                tag: 'settings',
+              );
+              return;
+            }
+            final Map<SettingsSecretSlot, String>? snapshot = _secretSnapshot;
+            if (snapshot == null) return;
+            final String value = snapshot[slot] ?? '';
+            final int opGeneration = _credentialGeneration;
+            final Future<void> backendOp = value.isEmpty
+                ? delete()
+                : write(value);
+            _watchCredentialOp(
+              slot,
+              opGeneration,
+              write: write,
+              delete: delete,
+              backendOp: backendOp,
+            );
+            await backendOp.timeout(_secretOpTimeout);
+          });
+        } catch (error) {
+          AppLogger.error(
+            'Credential re-assert failed: ${error.runtimeType}',
+            tag: 'settings',
+          );
+        }
+      })(),
     );
   }
 

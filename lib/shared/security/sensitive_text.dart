@@ -17,7 +17,25 @@ class SensitiveText {
       (Match match) => '${match.group(1)}[redacted]',
     );
     redacted = redacted.replaceAllMapped(
-      RegExp(r'(api[_-]?key\s*[:=]\s*)[^\s,\}\]]+', caseSensitive: false),
+      RegExp(
+        r'(Proxy-Authorization\s*[:=]\s*[A-Za-z][A-Za-z0-9_-]*[ \t]+)[^\r\n]+',
+        caseSensitive: false,
+      ),
+      (Match match) => '${match.group(1)}[redacted]',
+    );
+    redacted = redacted.replaceAllMapped(
+      RegExp(
+        r'''([?&](?:key|api_key|apikey|token|access_token|access-token|auth_token|secret|client_secret|password|passwd|pwd)=)[^&#\s"'<>]*''',
+        caseSensitive: false,
+      ),
+      (Match match) => '${match.group(1)}***',
+    );
+    redacted = redacted.replaceAllMapped(
+      // Query credentials are already masked; don't consume their neighbours.
+      RegExp(
+        r'(api[_-]?key\s*[:=]\s*)(?!\*\*\*)[^\s,\}\]]+',
+        caseSensitive: false,
+      ),
       (Match match) => '${match.group(1)}[redacted]',
     );
     redacted = redacted.replaceAll(
@@ -26,6 +44,12 @@ class SensitiveText {
     );
     redacted = redacted.replaceAllMapped(
       RegExp(r'(https?://)[^\s/]+@', caseSensitive: false),
+      (Match match) => '${match.group(1)}[redacted]@',
+    );
+    redacted = redacted.replaceAllMapped(
+      RegExp(
+        r'''(^|[\s"'(<>=])[^\s:/@"'<>]+:[^\s/"'<>]+@(?=(?:[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\]|[A-Za-z0-9_-]+(?=:\d+|/)))''',
+      ),
       (Match match) => '${match.group(1)}[redacted]@',
     );
     return redacted;

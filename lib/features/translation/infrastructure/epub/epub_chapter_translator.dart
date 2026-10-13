@@ -4594,6 +4594,36 @@ class EpubChapterTranslator {
         'Translated block has empty body text for a nonempty source.',
       );
     }
+
+    // A-P1-1: reject a translation that carries no linguistic content for a
+    // long source (e.g. the API returned only punctuation for a full
+    // paragraph). Only obvious body loss is rejected: any translated word
+    // passes, so legitimate short translations (titles) and tiny
+    // translations in existing tests are unaffected.
+    if (_linguisticBodyLength(sourceDom) >= 200 &&
+        _linguisticBodyLength(translatedDom) == 0) {
+      throw const TranslationParseException(
+        'Translated block has no linguistic content for a long source.',
+      );
+    }
+  }
+
+  /// Matches every rune that is not a letter or number, used to measure how
+  /// much linguistic content a translated body actually carries.
+  static final RegExp _nonLinguisticChars = RegExp(
+    r'[^\p{L}\p{N}]',
+    unicode: true,
+  );
+
+  /// Counts letters/digits across scripts in the non-protected slots,
+  /// ignoring whitespace and punctuation.
+  static int _linguisticBodyLength(_ResponseHtml html) {
+    var length = 0;
+    for (final slot in html.slots) {
+      if (slot.protected) continue;
+      length += slot.text.replaceAll(_nonLinguisticChars, '').runes.length;
+    }
+    return length;
   }
 
   /// Canonical language identity for local script and prompt rules.

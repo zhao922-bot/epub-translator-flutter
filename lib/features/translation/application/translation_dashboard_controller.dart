@@ -1596,6 +1596,12 @@ class TranslationDashboardController
         },
       );
       if (!mounted) return true;
+      // B-P1-3: a newer run may have started while this run was suspended
+      // (e.g. at checkpoint persistence). Its terminal state must not
+      // overwrite the newer run — drop it untouched.
+      if (runGeneration != _translationRunGeneration) {
+        return true;
+      }
       // A returned terminal result means the repository already committed the
       // EPUB. A cancellation arriving afterward cannot undo that output.
       final bool failedResult =
@@ -1662,6 +1668,12 @@ class TranslationDashboardController
       _translationStopwatch?.stop();
     } catch (error) {
       if (!mounted) return true;
+      // B-P1-3: a newer run may have started while this run was suspended
+      // (e.g. at checkpoint persistence). Its terminal state must not
+      // overwrite the newer run — drop it untouched.
+      if (runGeneration != _translationRunGeneration) {
+        return true;
+      }
       if (_handleCancellation(error)) {
         // The run started and was then cancelled; report it as started.
         return true;
@@ -1717,8 +1729,12 @@ class TranslationDashboardController
       _translationStopwatch?.stop();
     } finally {
       // C-M7: completion, failure and cancellation (including the early
-      // `return true` in the catch path above) all stop the service here.
-      _stopTranslationForegroundService();
+      // `return true` in the catch path above) all stop the service here —
+      // but only while this run is still the current generation. A stale
+      // run's finally must not stop the newer run's foreground service.
+      if (runGeneration == _translationRunGeneration) {
+        _stopTranslationForegroundService();
+      }
     }
     return true;
   }

@@ -1744,6 +1744,11 @@ class EpubIsolateWorker {
   /// Cap on the header-declared uncompressed total across all entries.
   static const int _kMaxEpubUncompressedBytes = 512 * 1024 * 1024;
 
+  /// The decoder eagerly inflates Unix symlink paths before our size checks.
+  /// At deflate's maximum expansion ratio (~1032:1), this bounds each such
+  /// allocation to roughly 64 MiB, well below the uncompressed cap.
+  static const int _kMaxSymlinkCompressedBytes = 64 * 1024;
+
   /// Cap on total-uncompressed / compressed-bytes. Real books sit far below
   /// this (text compresses ~3-5x, images barely at all); a classic 42.zip
   /// style bomb is many orders of magnitude above it.
@@ -1853,6 +1858,7 @@ class EpubIsolateWorker {
     List<int> bytes,
   ) {
     checkZipEntryCountForTest(inputPath, bytes);
+    checkSymlinkEntrySizesForTest(inputPath, bytes);
     final ZipDecoder decoder = ZipDecoder();
     final Archive archive = decoder.decodeBytes(bytes);
     checkArchiveLimitsForTest(
@@ -1948,6 +1954,78 @@ class EpubIsolateWorker {
       offset += length;
     }
     if (actualCount != count) invalid();
+  }
+
+  /// Checks raw central-directory sizes before the decoder eagerly reads
+  /// Unix symlink payloads. Small legitimate symlinks remain supported.
+  @visibleForTesting
+  static void checkSymlinkEntrySizesForTest(String inputPath, List<int> bytes) {
+    Never invalid() => throw const FormatException('Invalid ZIP directory.');
+    int u16(int at) {
+      if (at < 0 || at + 2 > bytes.length) invalid();
+      return bytes[at] | (bytes[at + 1] << 8);
+    }
+
+    int u32(int at) => u16(at) | (u16(at + 2) << 16);
+    int u64(int at) {
+      final low = u32(at);
+      if (u32(at + 4) != 0) invalid();
+      return low;
+    }
+
+    // Mirror the EOCD/ZIP64 locator handling in checkZipEntryCountForTest.
+    int end = bytes.length - 22;
+    final int searchStart = bytes.length - 22 - 65535;
+    while (end >= 0 && end >= searchStart) {
+      if (u32(end) == 0x06054b50 && end + 22 + u16(end + 20) == bytes.length) {
+        break;
+      }
+      end--;
+    }
+    if (end < 0 || end < searchStart) invalid();
+    if (u16(end + 4) != 0 || u16(end + 6) != 0) invalid();
+    int size = u32(end + 12);
+    int offset = u32(end + 16);
+    int directoryBoundary = end;
+    if (end >= 20 && u32(end - 20) == 0x07064b50) {
+      final locator = end - 20;
+      if (u32(locator + 4) != 0 || u32(locator + 16) != 1) invalid();
+      final zip64 = u64(locator + 8);
+      if (zip64 + 56 > locator || u32(zip64) != 0x06064b50) invalid();
+      final recordSize = u64(zip64 + 4);
+      if (recordSize < 44 || zip64 + 12 + recordSize != locator) invalid();
+      if (u32(zip64 + 16) != 0 || u32(zip64 + 20) != 0) invalid();
+      size = u64(zip64 + 40);
+      offset = u64(zip64 + 48);
+      directoryBoundary = zip64;
+    }
+    final directoryEnd = offset + size;
+    if (directoryEnd != directoryBoundary) invalid();
+    while (offset < directoryEnd) {
+      if (offset + 46 > directoryEnd || u32(offset) != 0x02014b50) {
+        invalid();
+      }
+      final length =
+          46 + u16(offset + 28) + u16(offset + 30) + u16(offset + 32);
+      if (offset + length > directoryEnd) invalid();
+      final versionMadeBy = u16(offset + 4);
+      final externalFileAttributes = u32(offset + 38);
+      if ((versionMadeBy >> 8) == 3 &&
+          ((externalFileAttributes >> 16) & 0xf000) == 0xa000) {
+        final compressedSize = u32(offset + 20);
+        // Reject ZIP64 placeholders too; a path never needs ZIP64 sizes.
+        if (compressedSize == 0xffffffff ||
+            compressedSize > _kMaxSymlinkCompressedBytes) {
+          throw EpubDecompressionLimitException(
+            inputPath: inputPath,
+            compressedBytes: compressedSize,
+            uncompressedBytes: -1,
+            limitBytes: _kMaxSymlinkCompressedBytes,
+          );
+        }
+      }
+      offset += length;
+    }
   }
 
   /// Visible for testing: the pure limit check behind
@@ -2100,6 +2178,19 @@ class EpubIsolateWorker {
     // and reused instead of inflating twice.
     final Map<ArchiveFile, List<int>> duplicateBytesCache =
         <ArchiveFile, List<int>>{};
+    int duplicateCacheBytes = 0;
+    void onDuplicateCacheInsert(ArchiveFile file, List<int> inserted) {
+      final int compressedBytes = file.rawContent is ZipFile
+          ? (file.rawContent as ZipFile).compressedSize
+          : inserted.length;
+      duplicateCacheBytes = checkDuplicateCacheBudgetForTest(
+        currentTotalBytes: duplicateCacheBytes,
+        insertedBytes: inserted,
+        inputPath: inputPath,
+        compressedBytes: compressedBytes,
+      );
+    }
+
     for (final ArchiveFile sourceFile in dedupedSource.values) {
       if (sourceFile.name == 'mimetype') {
         continue;
@@ -2145,11 +2236,13 @@ class EpubIsolateWorker {
             sourceFile,
             inputPath: inputPath,
             bytesCache: duplicateBytesCache,
+            onCacheInsert: onDuplicateCacheInsert,
           )) {
         final List<int> payload = _fileBytes(
           sourceFile,
           inputPath: inputPath,
           bytesCache: duplicateBytesCache,
+          onCacheInsert: onDuplicateCacheInsert,
         );
         AppLogger.warn(
           'Duplicate entry "${sourceFile.name}" has a CRC mismatch; '
@@ -2261,6 +2354,7 @@ class EpubIsolateWorker {
     ArchiveFile file, {
     String inputPath = '',
     Map<ArchiveFile, List<int>>? bytesCache,
+    void Function(ArchiveFile file, List<int> inserted)? onCacheInsert,
     // Test-only: shrinks the per-entry inflate cap (P2-#14) so the guard is
     // exercisable without a 512 MiB bomb.
     int? limitBytesOverride,
@@ -2277,12 +2371,16 @@ class EpubIsolateWorker {
       if (bytesCache != null) {
         return bytesCache.putIfAbsent(
           file,
-          () => _inflateZipFileGuarded(
-            inputPath: inputPath,
-            file: file,
-            zipFile: raw,
-            limitBytes: limit,
-          ),
+          () {
+            final List<int> bytes = _inflateZipFileGuarded(
+              inputPath: inputPath,
+              file: file,
+              zipFile: raw,
+              limitBytes: limit,
+            );
+            onCacheInsert?.call(file, bytes);
+            return bytes;
+          },
         );
       }
       return _inflateZipFileGuarded(
@@ -2392,7 +2490,35 @@ class EpubIsolateWorker {
     ArchiveFile file, {
     String inputPath = '',
     Map<ArchiveFile, List<int>>? bytesCache,
-  }) => _fileBytes(file, inputPath: inputPath, bytesCache: bytesCache);
+    void Function(ArchiveFile file, List<int> inserted)? onCacheInsert,
+  }) => _fileBytes(
+    file,
+    inputPath: inputPath,
+    bytesCache: bytesCache,
+    onCacheInsert: onCacheInsert,
+  );
+
+  /// Checks the cumulative inflated payload retained by the duplicate cache.
+  @visibleForTesting
+  static int checkDuplicateCacheBudgetForTest({
+    required int currentTotalBytes,
+    required List<int> insertedBytes,
+    required String inputPath,
+    required int compressedBytes,
+    int? budgetBytesOverride,
+  }) {
+    final int next = currentTotalBytes + insertedBytes.length;
+    final int budget = budgetBytesOverride ?? _kMaxEpubUncompressedBytes;
+    if (next > budget) {
+      throw EpubDecompressionLimitException(
+        inputPath: inputPath,
+        compressedBytes: compressedBytes,
+        uncompressedBytes: next,
+        limitBytes: budget,
+      );
+    }
+    return next;
+  }
 
   /// Visible for testing: inflate [file] with a custom byte cap, proving the
   /// guard counts actual decompressed bytes rather than header-declared
@@ -2425,6 +2551,7 @@ class EpubIsolateWorker {
     ArchiveFile file, {
     String inputPath = '',
     Map<ArchiveFile, List<int>>? bytesCache,
+    void Function(ArchiveFile file, List<int> inserted)? onCacheInsert,
   }) {
     final int? stored = file.crc32;
     if (stored == null) {
@@ -2432,7 +2559,12 @@ class EpubIsolateWorker {
     }
     try {
       return getCrc32(
-            _fileBytes(file, inputPath: inputPath, bytesCache: bytesCache),
+            _fileBytes(
+              file,
+              inputPath: inputPath,
+              bytesCache: bytesCache,
+              onCacheInsert: onCacheInsert,
+            ),
           ) ==
           stored;
     } on EpubDecompressionLimitException {
