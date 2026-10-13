@@ -784,6 +784,11 @@ class AppStrings {
       ? '存储空间不足，无法导入该文件。请清理空间后重试。'
       : 'Not enough storage space to import this file. Free up space and retry.';
 
+  /// The selected EPUB exceeds the 256 MiB import limit (B-2).
+  String get logFileTooLarge => isChinese
+      ? '所选文件超过 256 MiB 上限，无法导入。请选择较小的文件。'
+      : 'The selected file exceeds the 256 MiB limit and cannot be imported. Please choose a smaller file.';
+
   /// The Windows file dialog itself cannot handle the over-long path: the
   /// PowerShell host is not covered by the app's longPathAware manifest
   /// entry, so this fails even when the system long-path policy is on.

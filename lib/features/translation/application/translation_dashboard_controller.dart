@@ -2411,6 +2411,9 @@ class TranslationDashboardController
     if (error is PlatformException && error.code == 'PICK_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }
+    if (error is PlatformException && error.code == 'PICK_TOO_LARGE') {
+      return _s.logFileTooLarge;
+    }
     return genericLog(_safeErrorText(error));
   }
 

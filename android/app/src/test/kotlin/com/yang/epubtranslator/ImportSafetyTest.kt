@@ -240,4 +240,18 @@ class ImportSafetyTest {
         assertTrue(raced.get())
         assertEquals("current", holder.get())
     }
+
+    @Test fun sizeLimitThrowsImportTooLargeException() {
+        // B-2: the size limit must throw a distinct type so MainActivity can
+        // map it to PICK_TOO_LARGE for a localized message.
+        val limit = ImportSizeLimit()
+        val e1 = assertThrows(ImportTooLargeException::class.java) {
+            limit.checkKnownSize(MAX_IMPORT_BYTES + 1)
+        }
+        assertTrue(e1 is IllegalArgumentException)
+        val limit2 = ImportSizeLimit()
+        assertThrows(ImportTooLargeException::class.java) {
+            limit2.acceptChunk((MAX_IMPORT_BYTES + 1).toInt())
+        }
+    }
 }

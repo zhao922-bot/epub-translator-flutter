@@ -672,6 +672,45 @@ void main() {
       },
     );
 
+    test(
+      'B-1: worker nav/NCX lookup ignores foreign-namespace items',
+      () {
+        // The worker-side repack must mirror the inspector: a
+        // foreign-namespace <item> with a colliding id must not hijack the
+        // NCX lookup during renderNavigationMetadata.
+        const String opf = '''<?xml version="1.0" encoding="UTF-8"?>
+<package version="3.0" xmlns="http://www.idpf.org/2007/opf" xmlns:evil="http://example.com/evil">
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <evil:item id="ncx" href="evil.ncx" media-type="application/x-dtbncx+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="c1"/></spine>
+</package>''';
+        final Map<String, List<int>> archive = <String, List<int>>{
+          'META-INF/container.xml': utf8.encode(
+            '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+          ),
+          'OEBPS/content.opf': utf8.encode(opf),
+          'OEBPS/toc.ncx': utf8.encode(
+            '<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><docTitle><text>Real Title</text></docTitle></ncx>',
+          ),
+          'OEBPS/evil.ncx': utf8.encode(
+            '<?xml version="1.0" encoding="UTF-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><docTitle><text>Evil Title</text></docTitle></ncx>',
+          ),
+        };
+        final Map<String, String> result =
+            EpubIsolateWorker.renderNavigationMetadata(
+              archiveFiles: archive,
+              labelsByPath: <String, String>{'OEBPS/ch1.xhtml': 'Chapter 1'},
+              languageTag: 'zh-CN',
+            );
+        // The real toc.ncx must be the one synchronized, not evil.ncx.
+        expect(result.containsKey('OEBPS/toc.ncx'), isTrue);
+        expect(result.containsKey('OEBPS/evil.ncx'), isFalse);
+      },
+    );
+
     test('non-UTF-8 NCX fails loudly before any paid work', () {
       final Map<String, List<int>> files = filesWithOpf(opfWithNcx);
       files['OEBPS/toc.ncx'] = utf8.encode(

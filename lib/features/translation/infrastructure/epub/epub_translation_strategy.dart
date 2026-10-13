@@ -956,35 +956,22 @@ class _EpubTranslationStrategy {
             ),
           );
         } else {
-          translatedById.addAll(
-            await _mapTranslations(
-              htmlReferences,
-              config: config,
-              cancelToken: cancelToken,
-              process: (FootnoteBlockReference reference) async {
-                try {
-                  return await _translateFootnoteHtmlBatch(
-                    dio: dio,
-                    config: config,
-                    references: <FootnoteBlockReference>[reference],
-                    context: batch.context,
-                    retryDelayOverride: retryDelayOverride,
-                    cancelToken: cancelToken,
-                    onRequestAttempt: onRequestAttempt,
-                    onValidated: onValidated,
-                  );
-                } catch (singleError) {
-                  if (!_shouldDegradeSingle(singleError, config)) rethrow;
-                  owner._markDegradedBlock(
-                    chapterPath: reference.chapter.path,
-                    blockId: reference.block.id,
-                    apiCounted: true,
-                    reason: _oversizedReason(singleError),
-                  );
-                  return {reference.requestId: reference.block.sourceHtml};
-                }
-              },
-            ),
+          // Single reference: the batch already exhausted its retries inside
+          // runRetried before this FormatException escaped, so re-sending the
+          // identical payload would just burn another full retry cycle for
+          // the same failure. Degrade directly to the source HTML instead
+          // of re-billing the request (A-1: was 6 paid requests).
+          final FootnoteBlockReference reference = htmlReferences.single;
+          owner._markDegradedBlock(
+            chapterPath: reference.chapter.path,
+            blockId: reference.block.id,
+            apiCounted: true,
+            reason: null,
+          );
+          translatedById[reference.requestId] = reference.block.sourceHtml;
+          AppLogger.warn(
+            'Footnote ${reference.requestId} retained its source after FormatException.',
+            tag: 'translate',
           );
         }
       }

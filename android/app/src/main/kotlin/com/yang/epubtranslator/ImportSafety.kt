@@ -5,15 +5,19 @@ import java.io.File
 
 internal const val MAX_IMPORT_BYTES = 256L * 1024 * 1024
 
+/** Thrown when the selected EPUB exceeds the import size limit (B-2). */
+internal class ImportTooLargeException :
+    IllegalArgumentException("Selected EPUB exceeds the 256 MiB import limit.")
+
 internal class ImportSizeLimit(private val maximum: Long = MAX_IMPORT_BYTES) {
     private var copied = 0L
     fun checkKnownSize(size: Long) {
-        if (size > maximum) throw IllegalArgumentException("Selected EPUB exceeds the 256 MiB import limit.")
+        if (size > maximum) throw ImportTooLargeException()
     }
     fun acceptChunk(size: Int) {
         require(size >= 0)
         if (size.toLong() > maximum - copied) {
-            throw IllegalArgumentException("Selected EPUB exceeds the 256 MiB import limit.")
+            throw ImportTooLargeException()
         }
         copied += size
     }

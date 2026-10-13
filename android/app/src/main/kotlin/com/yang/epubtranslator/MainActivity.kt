@@ -690,6 +690,8 @@ class MainActivity : FlutterActivity() {
                     when {
                         error is ImportNoSpaceException ->
                             result.error("PICK_NO_SPACE", error.message, null)
+                        error is ImportTooLargeException ->
+                            result.error("PICK_TOO_LARGE", error.message, null)
                         SystemClock.elapsedRealtime() > copyDeadlineElapsed ->
                             // Past the deadline — most likely the
                             // watchdog closed our stream, so report the

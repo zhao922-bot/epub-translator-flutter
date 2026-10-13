@@ -783,8 +783,13 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     await _replayConflictedEdits();
   }
 
-  /// Discards queued conflict edits, including blocked credential replays.
-  void discardBlockedConflictReplays() => _conflictedEdits.clear();
+  /// Discards only the queued conflict edits currently blocked by a route
+  /// change (C-1). Non-blocked queued edits are retained: the UI banner
+  /// promises to discard "these" (the N blocked credential edits), and the
+  /// method name says "blocked" — clearing the whole queue would silently
+  /// drop unrelated pending edits.
+  void discardBlockedConflictReplays() =>
+      _conflictedEdits.removeWhere(_isReplayBlockedByRouteChange);
 
   /// Number of queued conflict edits currently blocked by a route change
   /// (P2-#37). Surfaced so the settings page can display the blocked

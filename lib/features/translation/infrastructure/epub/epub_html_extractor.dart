@@ -1,5 +1,3 @@
-import 'dart:isolate';
-
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
@@ -26,21 +24,6 @@ class EpubHtmlExtractor {
     final int last = text.codeUnitAt(end - 1);
     if (last >= 0xD800 && last <= 0xDBFF) end -= 1;
     return '${text.substring(0, end)}…';
-  }
-
-  /// Decode and build DOMs away from the caller isolate. Only this batch's
-  /// bytes and the extractor cross the boundary, never the full archive or
-  /// progress/cancellation callbacks. The synchronous API remains shared by
-  /// repacking and by custom extractors.
-  Future<List<InspectedChapter>> inspectChapterBatch({
-    required Map<String, List<int>> chapters,
-  }) {
-    return Isolate.run(
-      () => <InspectedChapter>[
-        for (final entry in chapters.entries)
-          inspectChapterBytes(chapterPath: entry.key, bytes: entry.value),
-      ],
-    );
   }
 
   static const Set<String> translatableTags = <String>{

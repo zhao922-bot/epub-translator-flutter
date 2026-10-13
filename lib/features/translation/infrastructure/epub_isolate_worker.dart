@@ -331,6 +331,23 @@ class _GuardedChunkSink implements ChunkedConversionSink<List<int>> {
 class EpubIsolateWorker {
   const EpubIsolateWorker._();
 
+  static const String _opfNamespaceUri = 'http://www.idpf.org/2007/opf';
+
+  /// Mirrors `EpubInspector._isOpfManifestChild`: only matches OPF-manifest
+  /// `<item>` elements, so a foreign-namespace `<item>` cannot hijack the
+  /// nav/NCX lookup during repack (B-1).
+  static bool _isOpfManifestChild(xml.XmlElement element, String localName) {
+    if (element.name.local != localName) return false;
+    final String? ns = element.name.namespaceUri;
+    if (ns != null && ns != _opfNamespaceUri) return false;
+    final xml.XmlNode? parent = element.parent;
+    if (parent is! xml.XmlElement || parent.name.local != 'manifest') {
+      return false;
+    }
+    final String? parentNs = parent.name.namespaceUri;
+    return parentNs == null || parentNs == _opfNamespaceUri;
+  }
+
   /// Runs CPU-only preparation with progress messages. Cancellation sends an
   /// immediate isolate control message, so even a single huge DOM parse can
   /// be stopped. File-producing work must reserve its temp path in the parent
@@ -882,7 +899,7 @@ class EpubIsolateWorker {
     };
     for (final item in opf.descendants.whereType<xml.XmlElement>().where(
       (element) =>
-          element.name.local == 'item' &&
+          _isOpfManifestChild(element, 'item') &&
           (element.getAttribute('properties') ?? '')
               .split(RegExp(r'\s+'))
               .contains('nav'),
@@ -930,7 +947,7 @@ class EpubIsolateWorker {
         .firstOrNull;
     final String ncxId = spine?.getAttribute('toc') ?? '';
     final items = opf.descendants.whereType<xml.XmlElement>().where(
-      (item) => item.name.local == 'item',
+      (item) => _isOpfManifestChild(item, 'item'),
     );
     final explicit = items
         .where(
