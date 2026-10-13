@@ -73,6 +73,43 @@ void main() {
   });
   tearDown(() => temp.delete(recursive: true));
 
+  for (final prefix in ['', 'opf:']) {
+    test('spine filters nested and foreign itemrefs (prefix=$prefix)', () {
+      final files = <String, List<int>>{
+        'OPS/book.opf': utf8.encode('''
+<${prefix}package xmlns="http://www.idpf.org/2007/opf"
+    xmlns:opf="http://www.idpf.org/2007/opf" xmlns:foreign="urn:foreign">
+  <${prefix}manifest>
+    <${prefix}item id="first" href="first.xhtml" media-type="application/xhtml+xml"/>
+    <${prefix}item id="second" href="second.xhtml" media-type="application/xhtml+xml"/>
+    <${prefix}item id="ignored" href="ignored.xhtml" media-type="application/xhtml+xml"/>
+  </${prefix}manifest>
+  <${prefix}itemref idref="ignored"/>
+  <foreign:spine><${prefix}itemref idref="ignored"/></foreign:spine>
+  <${prefix}spine>
+    <foreign:itemref idref="ignored"/>
+    <${prefix}wrapper><${prefix}itemref idref="ignored"/></${prefix}wrapper>
+    <foreign:itemref idref="foreign-missing"/>
+    <${prefix}wrapper><${prefix}itemref idref="nested-missing"/></${prefix}wrapper>
+    <${prefix}itemref idref="second"/>
+    <${prefix}itemref idref="first"/>
+    <${prefix}itemref idref="real-missing"/>
+  </${prefix}spine>
+</${prefix}package>'''),
+      };
+      final result = EpubInspector.chapterPathsFromOpfBytes(
+        files: files,
+        opfPath: 'OPS/book.opf',
+      );
+      expect(result.chapterPaths, ['OPS/second.xhtml', 'OPS/first.xhtml']);
+      expect(result.unresolvedIdRefs, ['real-missing']);
+      expect(
+        EpubInspector.inspectionEntryPaths(files, 'OPS/book.opf'),
+        unorderedEquals(['OPS/second.xhtml', 'OPS/first.xhtml']),
+      );
+    });
+  }
+
   test(
     'illustrated book transfers only inspection entries and never inflates binary resources',
     () async {

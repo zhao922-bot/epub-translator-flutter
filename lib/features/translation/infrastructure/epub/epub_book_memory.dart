@@ -101,11 +101,13 @@ class _EpubBookMemory {
     required TranslationConfig config,
     required _BookMemory currentMemory,
     required InspectedChapter chapter,
+    Set<String> degradedBlockIds = const <String>{},
     CancelToken? cancelToken,
   }) async {
     final String chapterText = _chapterMemoryText(
       chapter,
       preferTranslated: true,
+      degradedBlockIds: degradedBlockIds,
     );
     if (chapterText.isEmpty) {
       return currentMemory;
@@ -623,6 +625,7 @@ class _EpubBookMemory {
   static String _chapterMemoryText(
     InspectedChapter chapter, {
     bool preferTranslated = false,
+    Set<String> degradedBlockIds = const <String>{},
   }) {
     final StringBuffer excerpt = StringBuffer();
     final RegExp whitespace = RegExp(r'\s');
@@ -631,6 +634,14 @@ class _EpubBookMemory {
     // copying into a bounded buffer, rather than joining the entire chapter
     // and allocating another whole-chapter string to normalize it.
     for (final ExtractedBlock block in chapter.blocks) {
+      if (degradedBlockIds.contains(
+        EpubRepacker.degradedKeyForBlock(
+          chapterPath: chapter.path,
+          blockId: block.id,
+        ),
+      )) {
+        continue;
+      }
       final String? translatedHtml = block.translatedHtml;
       final String text =
           preferTranslated &&
@@ -740,7 +751,7 @@ class _BookMemory {
         trustedLocks: trustedLocks,
       ),
       styleProfile: styleProfile,
-      styleProfileConfirmed: json['styleProfileConfirmed'] == true,
+      styleProfileConfirmed: trustedLocks && json['styleProfileConfirmed'] == true,
     );
   }
 
@@ -782,6 +793,9 @@ class _BookMemory {
   }
 
   _BookMemory mergeChapter(_ChapterMemory chapter) {
+    if (chapter.isEmpty) {
+      return this;
+    }
     final List<_ChapterMemory> mergedRecent = <_ChapterMemory>[
       ...recentChapters,
       chapter,

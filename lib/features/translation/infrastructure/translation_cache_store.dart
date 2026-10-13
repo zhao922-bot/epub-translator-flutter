@@ -78,6 +78,8 @@ class TranslationCacheStore {
   final Set<String> _evictionOrder = <String>{};
 
   final Map<String, Future<void>> _fileGates = <String, Future<void>>{};
+  // Checkpoints this instance saved; an external replacement must survive clear.
+  final Map<String, FileStat> _savedJobStats = <String, FileStat>{};
   Map<String, int>? _scanChanges;
   int _estimatedBytes = 0;
 
@@ -592,7 +594,7 @@ class TranslationCacheStore {
         );
         final int targetBytes = (maxBytes * 0.9).toInt();
         for (final _CacheEntry entry in entries) {
-          if (totalBytes <= targetBytes) break;
+          if (totalBytes - tempBytes <= targetBytes) break;
           try {
             await _withFileGate(entry.file, () async {
               // Never delete a replacement written since this scan began.
@@ -743,13 +745,15 @@ class TranslationCacheStore {
       // Rebuild the lightweight-eviction order from on-disk mtimes (oldest
       // first) so the backoff-period quota pass evicts approximately LRU
       // without another full scan.
-      final List<_CacheEntry> byAge = entries.toList()
+      final List<String> byAge = scannedSizes.keys.toList()
         ..sort(
-          (_CacheEntry a, _CacheEntry b) => a.modified.compareTo(b.modified),
+          (String a, String b) => (_mtimes[a] ?? DateTime(1970)).compareTo(
+            _mtimes[b] ?? DateTime(1970),
+          ),
         );
       _evictionOrder
         ..clear()
-        ..addAll(byAge.map((_CacheEntry entry) => entry.file.path));
+        ..addAll(byAge);
       return deletedBytes;
     } finally {
       _scanChanges = null;
@@ -778,10 +782,13 @@ class TranslationCacheStore {
     // renamed a fresh checkpoint onto this same path, deleting live state.
     await _withFileGate(
       file,
-      () => writeFileAtomically(
-        file,
-        const JsonEncoder.withIndent('  ').convert(state.toJson()),
-      ),
+      () async {
+        await writeFileAtomically(
+          file,
+          const JsonEncoder.withIndent('  ').convert(state.toJson()),
+        );
+        _savedJobStats[file.path] = await file.stat();
+      },
     );
     await _pruneOldJobStates();
   }
@@ -1110,9 +1117,16 @@ class TranslationCacheStore {
     // a clear racing a concurrent save could delete a checkpoint the save
     // just wrote, discarding already-paid translation progress.
     await _withFileGate(file, () async {
-      if (await file.exists()) {
-        await file.delete();
+      final FileStat? saved = _savedJobStats[file.path];
+      if (saved == null) return;
+      final FileStat current = await file.stat();
+      if (current.type != FileSystemEntityType.file ||
+          current.modified != saved.modified ||
+          current.size != saved.size) {
+        return;
       }
+      await file.delete();
+      _savedJobStats.remove(file.path);
     });
   }
 

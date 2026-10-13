@@ -645,18 +645,35 @@ class SettingsStore {
   static const int _maxCorruptBackups = 5;
 
   /// Deletes the oldest corrupt-settings backups beyond [_maxCorruptBackups].
-  /// The timestamp suffix sorts chronologically, so the oldest names come
-  /// first.
+  /// Sorts by file modification time (mtime), oldest first, and skips backups
+  /// modified within the last minute.
   Future<void> _pruneCorruptBackups(Directory dir, String prefix) async {
     final List<FileSystemEntity> entries = await dir.list().toList();
-    final List<File> backups =
-        entries
-            .whereType<File>()
-            .where((File f) => path.basename(f.path).startsWith(prefix))
-            .toList()
-          ..sort((File a, File b) => a.path.compareTo(b.path));
+    final now = DateTime.now();
+    final List<({File file, DateTime modified})> backups =
+        <({File file, DateTime modified})>[];
+    for (final File f in entries.whereType<File>()) {
+      if (!path.basename(f.path).startsWith(prefix)) continue;
+      DateTime modified;
+      try {
+        modified = f.statSync().modified;
+      } catch (_) {
+        continue;
+      }
+      // Never delete a backup created within the last minute: the filename
+      // timestamp can lie when the system clock jumps backwards.
+      if (now.difference(modified).inSeconds < 60) continue;
+      backups.add((file: f, modified: modified));
+    }
+    backups.sort(
+      (a, b) => a.modified.compareTo(b.modified),
+    );
     for (int i = 0; i + _maxCorruptBackups < backups.length; i++) {
-      await backups[i].delete();
+      try {
+        await backups[i].file.delete();
+      } catch (_) {
+        // Best effort.
+      }
     }
   }
 
@@ -1013,8 +1030,8 @@ class SettingsStore {
     // the caller sees every failure (each names its own slot) instead of
     // just the first one.
     await Future.wait(pending, eagerError: false);
-    if (failures.isNotEmpty) throw SettingsSecretSaveException(failures);
     _lastPersistedSecretSlots = persisted;
+    if (failures.isNotEmpty) throw SettingsSecretSaveException(failures);
     if (slotsToSave.isNotEmpty && _rotatedSlots.isEmpty) {
       _secretKeyRotated = false;
     }
@@ -1158,6 +1175,8 @@ class SettingsStore {
       write: write,
       delete: delete,
       backendOp: backendOp,
+      settled: settled.future,
+      writtenValue: trimmed,
     );
     try {
       // Bound the backend call; a hung write must not wedge the settings
@@ -1201,10 +1220,26 @@ class SettingsStore {
     required Future<void> Function(String value) write,
     required Future<void> Function() delete,
     required Future<void> backendOp,
+    Future<void>? settled,
+    String? writtenValue,
   }) {
     unawaited(
       backendOp.then((_) async {
-        if (opGeneration == _credentialGeneration) return;
+        // Wait for the bounded save to publish its snapshot (or time out).
+        // Even without a later save/generation, a timed-out write can land
+        // after the old fingerprint has already been committed to JSON.
+        if (settled != null) await settled;
+        if (opGeneration == _credentialGeneration) {
+          if (writtenValue != null && _secretSnapshot?[slot] != writtenValue) {
+            AppLogger.warn(
+              'Credential version mismatch after late completion for '
+              '${_slotLabel(slot)}: in-memory and backend secrets differ; '
+              'save settings again to reconcile.',
+              tag: 'settings',
+            );
+          }
+          return;
+        }
         // A newer operation for this slot may still be settling; wait for
         // it (bounded) so the re-assert targets the final snapshot value,
         // not a mid-save one.

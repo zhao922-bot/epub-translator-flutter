@@ -65,6 +65,8 @@ final settingsProvider =
             ref.read(settingsReplayBlockedProvider.notifier).state = (
               id: DateTime.now().microsecondsSinceEpoch,
             ),
+        onReplayProgressChanged: (value) =>
+            ref.read(settingsReplayInProgressProvider.notifier).state = value,
       ),
     );
 
@@ -100,6 +102,7 @@ final settingsWriteConflictProvider = StateProvider<({int id})?>((ref) => null);
 /// target or discards it. Uses the event-record pattern so repeated blocked
 /// replay attempts can each notify the UI.
 final settingsReplayBlockedProvider = StateProvider<({int id})?>((ref) => null);
+final settingsReplayInProgressProvider = StateProvider<bool>((ref) => false);
 
 /// Holds the latest "settings.json was unreadable/corrupt, defaults were
 /// restored" event, if any.
@@ -237,6 +240,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     this.onSecretsRecovered,
     this.onWriteConflict,
     this.onReplayBlocked,
+    this.onReplayProgressChanged,
   }) : super(TranslationConfig.defaults()) {
     _initialLoad = _load();
   }
@@ -266,12 +270,16 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// Called once per replay pass when credential edits need confirmation
   /// because their target service changed.
   final void Function()? onReplayBlocked;
+  final void Function(bool)? onReplayProgressChanged;
   final Set<SettingsSecretSlot> _unresolvedSecretFailures = {};
   Timer? _sliderTimer;
   Completer<bool>? _sliderCompletion;
   late final Future<void> _initialLoad;
   Future<void> _pendingSave = Future<void>.value();
   Future<void>? _recoveryLoad;
+  bool _recoveryLoadPhase = false;
+  Future<bool>? _sliderFlushInProgress;
+  int _noticeRevision = 0;
 
   /// In-flight [reloadSettings] future, if any (P2-#36). Concurrent reloads
   /// join it instead of starting a second load.
@@ -293,10 +301,21 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// path; blocked credential edits remain queued until confirmed or discarded.
   final List<_ConflictedEdit> _conflictedEdits = <_ConflictedEdit>[];
   bool _replayingConflictedEdits = false;
+  bool get isReplayingConflictedEdits => _replayingConflictedEdits;
 
-  /// The latest debounced (slider) transformation not yet flushed. Slider
-  /// setters are absolute, so chaining keeps the effective transformation.
-  TranslationConfig Function(TranslationConfig)? _debouncedEdit;
+  /// Slider setters are absolute and independent: retain just the latest
+  /// setter per field, including no-op setters. Never nest closures per event.
+  final _debouncedSetters = <String, TranslationConfig Function(TranslationConfig)>{};
+  TranslationConfig Function(TranslationConfig)? get _debouncedEdit {
+    if (_debouncedSetters.isEmpty) return null;
+    final setters = _debouncedSetters.values.toList(growable: false);
+    return (config) {
+      for (final setter in setters) {
+        config = setter(config);
+      }
+      return config;
+    };
+  }
 
   /// P2-#28: field names modified by [_debouncedEdit], computed when the
   /// debounced edit is recorded. Needed when the flush save conflicts and
@@ -359,14 +378,31 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   }
 
   Future<bool> _ensureConfigLoaded() async {
-    if (_store.configLoadError == null) return mounted;
-    final recovery = _recoveryLoad ??= _load();
+    if (!_recoveryLoadPhase && _store.configLoadError == null) return mounted;
+    _recoveryLoadPhase = true;
+    final recovery = _recoveryLoad ??= _recoverConfig();
     try {
       await recovery;
     } finally {
-      if (identical(_recoveryLoad, recovery)) _recoveryLoad = null;
+      if (identical(_recoveryLoad, recovery)) {
+        _recoveryLoad = null;
+        _recoveryLoadPhase = false;
+      }
     }
     return mounted && _store.configLoadError == null;
+  }
+
+  Future<void> _recoverConfig() async {
+    // Ordinary recovery replaces the optimistic slider state. Mid-replay
+    // sliders are newer than the queue and must still be swallowed (P2-#29).
+    if (!_replayingConflictedEdits) {
+      _sliderTimer?.cancel();
+      _debouncedSetters.clear();
+      _debouncedChangedFields = null;
+      _sliderCompletion?.complete(false);
+      _sliderCompletion = null;
+    }
+    await _load();
   }
 
   Future<bool> _update(
@@ -374,7 +410,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     Set<SettingsSecretSlot> explicitSecretMutations =
         const <SettingsSecretSlot>{},
     Set<SettingsSecretSlot> Function(TranslationConfig)? secretMutationsFor,
-    bool debounce = false,
+    String? debounceField,
     bool isConflictReplay = false,
     // P2-#22: invoked synchronously right after the transformation is
     // applied to the state, so the replay loop can tell which queued edits
@@ -411,11 +447,13 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     if (!mounted) {
       return false;
     }
-    final bool hadLoadError = _store.configLoadError != null;
+    final bool hadLoadError =
+        _recoveryLoadPhase || _store.configLoadError != null;
     if (hadLoadError && !await _ensureConfigLoaded()) {
       return false;
     }
     if (hadLoadError) await _replayConflictedEdits();
+    if (!mounted) return false;
     final TranslationConfig prevState = state;
     final TranslationConfig next = update(prevState);
     if (!mounted) {
@@ -423,17 +461,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
     state = next;
     onApplied?.call();
-    if (debounce) {
+    if (debounceField != null) {
       _sliderTimer?.cancel();
-      final previous = _debouncedEdit;
-      _debouncedEdit = previous == null
-          ? update
-          : (TranslationConfig config) => update(previous(config));
-      // P2-#28: accumulate changed fields for the chained transformation.
+      _debouncedSetters[debounceField] = update;
+      // P2-#28: accumulate even fields subsequently changed back.
       final updateFields = _changedFields(prevState, next);
-      _debouncedChangedFields = previous == null
-          ? updateFields
-          : {...?_debouncedChangedFields, ...updateFields};
+      (_debouncedChangedFields ??= <String>{}).addAll(updateFields);
       final completion = _sliderCompletion ??= Completer<bool>();
       _sliderTimer = Timer(
         const Duration(milliseconds: 400),
@@ -445,7 +478,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _sliderCompletion = null;
     _sliderTimer?.cancel();
     final debounced = _debouncedEdit;
-    _debouncedEdit = null;
+    _debouncedSetters.clear();
     final debouncedFields = _debouncedChangedFields;
     _debouncedChangedFields = null;
     // P2-#28: report the slider fields swallowed by this update. In the
@@ -529,12 +562,24 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   /// was already cleared; a conflict queues it for replay, any other error
   /// surfaces via [onSaveError] and the caller must not proceed as if the
   /// value were persisted (P2-#30).
-  Future<bool> flushSliderChanges() async {
+  Future<bool> flushSliderChanges() {
+    final ongoing = _sliderFlushInProgress;
+    if (ongoing != null) return ongoing;
+    final flush = _flushSliderChanges();
+    _sliderFlushInProgress = flush;
+    return flush.whenComplete(() {
+      if (identical(_sliderFlushInProgress, flush)) {
+        _sliderFlushInProgress = null;
+      }
+    });
+  }
+
+  Future<bool> _flushSliderChanges() async {
     _sliderTimer?.cancel();
     final completion = _sliderCompletion;
     _sliderCompletion = null;
     final debounced = _debouncedEdit;
-    _debouncedEdit = null;
+    _debouncedSetters.clear();
     final debouncedFields = _debouncedChangedFields;
     _debouncedChangedFields = null;
     if (completion == null) return true;
@@ -566,20 +611,36 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     Set<SettingsSecretSlot> slots, {
     _ConflictedEdit? pendingEdit,
   }) async {
+    final noticeRevision = _noticeRevision;
+    final olderEdits = _conflictedEdits.toList();
     try {
       await _persist(next, explicitSecretMutations: slots);
       // Successful saves must retain blocked or newly conflicted replays.
       _unresolvedSecretFailures.removeAll(slots);
+      final persisted = _store.lastPersistedSecretSlots;
+      _unresolvedSecretFailures.removeAll(persisted);
+      if (pendingEdit != null) {
+        final fields = pendingEdit.changedFields;
+        _conflictedEdits.removeWhere((edit) =>
+            olderEdits.contains(edit) &&
+            !_isReplayBlockedByRouteChange(edit) &&
+            edit.credentialRoute.secretSlots.every(persisted.contains) &&
+            edit.changedFields.any(fields.contains));
+      }
       if (mounted) {
         // Secret read status can change even when the displayed value doesn't.
         if (slots.isNotEmpty) state = state.copyWith();
-        if (_unresolvedSecretFailures.isEmpty) onSaveError?.call(null);
+        if (_unresolvedSecretFailures.isEmpty &&
+            noticeRevision == _noticeRevision) {
+          onSaveError?.call(null);
+        }
         if (slots.isNotEmpty && !_store.secretKeyRotated) {
           onSecretsRecovered?.call();
         }
       }
       return true;
     } catch (error) {
+      _noticeRevision++;
       if (error is SettingsSecretSaveException) {
         _unresolvedSecretFailures.addAll(error.failures.keys);
       } else {
@@ -629,7 +690,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _reloadLoadPhase = loadPhase;
     bool ok = false;
     try {
+      final ongoingFlush = _sliderFlushInProgress;
       await _pendingSave;
+      if (ongoingFlush != null && !await ongoingFlush) return false;
       // P2-#26: flush a pending slider (debounced) edit before reloading.
       // Otherwise _load() replaces the state with the on-disk snapshot and
       // the just-dragged value is lost — while the flush that fires later
@@ -671,6 +734,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<void> _replayConflictedEdits() async {
     if (_replayingConflictedEdits || !mounted) return;
     _replayingConflictedEdits = true;
+    onReplayProgressChanged?.call(true);
     final List<_ConflictedEdit> pending = _conflictedEdits.toList();
     // P2-#22: which queue entries were (re-)applied to the state during
     // this pass, and at which state generation. A later entry's successful
@@ -694,13 +758,17 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     try {
       for (int i = 0; i < pending.length; i++) {
         final edit = pending[i];
+        // New saves arriving during replay can supersede unprocessed entries.
+        await _pendingSave;
         if (!mounted) break;
+        if (!_conflictedEdits.contains(edit)) continue;
         try {
           // Leave failed, blocked and unprocessed edits in their original
           // order, including when recovery cannot load a fresh snapshot.
           if (_store.configLoadError != null && !await _ensureConfigLoaded()) {
             break;
           }
+          if (!_conflictedEdits.contains(edit)) continue;
           if (_isReplayBlockedByRouteChange(edit)) {
             blocked++;
             continue;
@@ -719,7 +787,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             onApplied: () => appliedGeneration[i] = _stateGeneration,
             onSwallowedSlider: (fields) => swallowedSliderFields = fields,
           )) {
-            _conflictedEdits.remove(edit);
+            final toRemove = <_ConflictedEdit>{edit};
             // P2-#27: only drop earlier entries whose effects this save
             // actually persisted. A key entry skipped as unreadable (its
             // slot read failed) is not persisted by a later non-credential
@@ -735,11 +803,14 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             }.difference(_secretRelatedFields);
             for (int j = 0; j < i; j++) {
               final other = pending[j];
+              if (_isReplayBlockedByRouteChange(other)) continue;
               // P2-#28: drop earlier entries that touch the same non-secret
               // fields, whether or not they were applied in this pass. Their
               // transformations are stale — replaying them would revert the
               // newer values just persisted.
-              final bool staleByFieldOverlap = justChanged.isNotEmpty &&
+              final bool staleByFieldOverlap =
+                  other.credentialRoute.secretSlots.every(persisted.contains) &&
+                  justChanged.isNotEmpty &&
                   other.changedFields.any(justChanged.contains);
               final int? appliedAt = appliedGeneration[j];
               if (staleByFieldOverlap ||
@@ -748,9 +819,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
                       other.credentialRoute.secretSlots.every(
                         persisted.contains,
                       ))) {
-                _conflictedEdits.remove(other);
+                toRemove.add(other);
               }
             }
+            // Remove before the next await/contains check; pending is a snapshot.
+            _conflictedEdits.removeWhere(toRemove.contains);
           }
         } catch (error) {
           if (mounted) onSaveError?.call(error);
@@ -759,7 +832,13 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       }
     } finally {
       _replayingConflictedEdits = false;
-      if (blocked > 0 && mounted) onReplayBlocked?.call();
+      if (mounted) {
+        if (blocked > 0) {
+          _noticeRevision++;
+          onReplayBlocked?.call();
+        }
+        onReplayProgressChanged?.call(false);
+      }
     }
   }
 
@@ -827,7 +906,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   int get blockedReplayCount =>
       _conflictedEdits.where(_isReplayBlockedByRouteChange).length;
 
-  Future<bool> setApiBaseUrl(String value) {
+  Future<bool> setApiBaseUrl(String value) async {
+    if (!_loaded) await _initialLoad;
+    if (!mounted) return false;
     // P1-#5: capture the active key at edit time. The direct call keeps the
     // N8 behavior (the user's current key moves to the custom slot), but the
     // replay closure must not re-read key material from the fresh snapshot —
@@ -893,27 +974,27 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setChunkSize(double value) => _update(
     (config) => config.copyWith(chunkSize: value.round()),
-    debounce: true,
+    debounceField: 'chunkSize',
   );
 
   Future<void> setMaxConcurrent(double value) => _update(
     (config) => config.copyWith(maxConcurrent: value.round()),
-    debounce: true,
+    debounceField: 'maxConcurrent',
   );
 
   Future<void> setTimeoutSeconds(double value) => _update(
     (config) => config.copyWith(timeoutSeconds: value.round()),
-    debounce: true,
+    debounceField: 'timeoutSeconds',
   );
 
   Future<void> setMaxRetries(double value) => _update(
     (config) => config.copyWith(maxRetries: value.round()),
-    debounce: true,
+    debounceField: 'maxRetries',
   );
 
   Future<void> setRetryDelaySeconds(double value) => _update(
     (config) => config.copyWith(retryDelaySeconds: value.round()),
-    debounce: true,
+    debounceField: 'retryDelaySeconds',
   );
 
   Future<bool> setOutputSuffix(String value) =>
@@ -927,7 +1008,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setTextScale(double value) => _update(
     (config) => config.copyWith(textScale: value.clamp(0.9, 1.3)),
-    debounce: true,
+    debounceField: 'textScale',
   );
 
   Future<bool> setLockedGlossary(String value) =>

@@ -2302,6 +2302,18 @@ class TranslationDashboardController
     if (error is PlatformException && error.code == 'SAVE_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }
+    if (error is PlatformException) {
+      switch (error.code) {
+        case 'SAVE_IN_PROGRESS':
+          return _s.logSaveInProgress;
+        case 'SAVE_FAILED':
+          return _s.logSaveFailed;
+        case 'SAVE_PERMISSION_DENIED':
+          return _s.logSavePermissionDenied;
+        case 'SAVE_PERMISSION_PERMANENTLY_DENIED':
+          return _s.logSavePermissionPermanentlyDenied;
+      }
+    }
     final String safeError = _safeErrorText(error);
     // H3: the 5-minute Dart-side timeout only stops *waiting* — the
     // native worker keeps running to completion in the background,
@@ -2319,6 +2331,9 @@ class TranslationDashboardController
   /// regress to surfacing the raw English native text.
   @visibleForTesting
   String debugShareErrorLogLine(Object error) {
+    if (error is PlatformException && error.code == 'SHARE_FAILED') {
+      return _s.logShareFailed;
+    }
     if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }
@@ -2330,6 +2345,9 @@ class TranslationDashboardController
   /// failures keep this call site's own message.
   @visibleForTesting
   String debugOpenJobOutputErrorLogLine(Object error) {
+    if (error is PlatformException && error.code == 'SHARE_FAILED') {
+      return _s.logShareFailed;
+    }
     if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }
@@ -2416,6 +2434,10 @@ class TranslationDashboardController
   /// Maps a file-picker failure to its log line. A path the WinForms dialog
   /// itself cannot handle gets an actionable localized message instead of
   /// a raw .NET stack trace; everything else keeps the generic wording.
+  @visibleForTesting
+  String debugPickErrorLogLine(Object error) =>
+      _pickErrorLog(error, _s.logCouldNotSelectEpub);
+
   String _pickErrorLog(Object error, String Function(String error) genericLog) {
     if (error is WindowsLongPathException) {
       AppLogger.warn(
@@ -2429,6 +2451,22 @@ class TranslationDashboardController
     }
     if (error is PlatformException && error.code == 'PICK_TOO_LARGE') {
       return _s.logFileTooLarge;
+    }
+    if (error is PlatformException) {
+      switch (error.code) {
+        case 'PICK_TIMEOUT':
+          return _s.logPickTimeout;
+        case 'PICK_NO_PICKER':
+          return _s.logNoPicker;
+        case 'PICK_IN_PROGRESS':
+          return _s.logPickInProgress;
+        case 'PICK_REQUESTS_EXHAUSTED':
+          return _s.logPickRequestsExhausted;
+        case 'INVALID_FILE_TYPE':
+          return _s.logInvalidFileType;
+        case 'PICK_FAILED':
+          return _s.logPickFailed;
+      }
     }
     return genericLog(_safeErrorText(error));
   }

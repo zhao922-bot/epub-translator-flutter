@@ -1381,7 +1381,7 @@ void main() {
           .convert(
             utf8.encode(
               <Object>[
-                'v15-second-person-and-idiom',
+                'v17-structure-repair',
                 EpubChapterTranslator.qualityCacheSchemaVersion,
                 'https://api.example.test/v1',
                 config.model.trim(),

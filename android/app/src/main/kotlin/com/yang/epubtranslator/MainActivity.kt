@@ -447,10 +447,9 @@ class MainActivity : FlutterActivity() {
         //  - the stream is only closed when the registered holder's own
         //    deadline has passed (compareAndSet fails for a newer pick's
         //    holder and leaves it alone);
-        //  - the result is failed only when nobody else will answer it
-        //    (picker still open, or the copy task never started); the
-        //    running copy task answers its own result via replyToImport(),
-        //    whose done-guard makes a double reply impossible.
+        //  - executor replacement also fails a running streamless copy
+        //    immediately: provider IPC may never return. replyToImport's
+        //    done-guard prevents a late copy completion from replying twice.
         // Each attempt retains its own watchdog until completion/teardown.
         val timeout = Runnable {
             if (lastImportAttempt.get() !== attempt || attempt.done.get()) {
@@ -484,16 +483,19 @@ class MainActivity : FlutterActivity() {
             // when its blocking call returns. Skipped when a stream was just
             // closed above: the close already freed the thread, so replacing
             // would be pointless churn.
+            val pickerOpen = pendingPick === attempt
             if (!closedStream && activeImport.get() == null) {
                 recreateImportExecutor()
+                attempt.watchdog.onExecutorReplaced(
+                    pickerOpen, runningImportAttemptId.get(), attempt.id,
+                ) { replyImportTimeout(attempt) }
             }
             // Fail the result only when nobody else will answer it: the
             // picker still open for this attempt (the copy never started),
             // or the copy task never started because a replacement dropped
-            // it from the old executor's queue. Otherwise the running copy
-            // task owns the reply and reports PICK_TIMEOUT itself on its
-            // deadline check.
-            val pickerOpen = pendingPick === attempt
+            // it from the old executor's queue. A running streamless copy
+            // was answered above; a copy whose stream was closed reports
+            // PICK_TIMEOUT itself. All paths are guarded against double replies.
             if (pickerOpen || runningImportAttemptId.get() != attempt.id) {
                 if (attempt.done.compareAndSet(false, true)) {
                     if (pickerOpen) {
@@ -720,7 +722,7 @@ class MainActivity : FlutterActivity() {
      * — so every import reply path goes through here.
      */
     private fun replyToImport(attempt: ImportAttempt, reply: () -> Unit) {
-        if (attempt.done.compareAndSet(false, true)) {
+        attempt.watchdog.replyOnce(attempt.done) {
             // Cancel this attempt's callback on main, where registration and
             // teardown also run. A newer attempt's watchdog is never touched.
             replyOnUiThread(attempt.result) {
@@ -1260,14 +1262,14 @@ class MainActivity : FlutterActivity() {
             // (a previous sweep deleted the file while its revoke failed,
             // or the process died in between). Entries are dropped only
             // when their revoke succeeds; the rest stay for the next sweep.
-            grants = retryOrphanedGrantRevokes(grants, livePaths) { uri ->
+            val (remainingGrants, failedRevokePaths) = retryOrphanedGrantRevokes(grants, livePaths) { uri ->
                 appCtx.revokeUriPermission(
                     Uri.parse(uri),
                     Intent.FLAG_GRANT_READ_URI_PERMISSION,
                 )
             }
-            // Forget ledger entries whose file is already gone.
-            grants = dropStaleShareGrants(grants, livePaths)
+            // Failed orphan revokes must remain recorded for the next sweep.
+            grants = dropStaleShareGrants(remainingGrants, livePaths + failedRevokePaths)
             writeGrants(grants)
             val grantUriByPath = loadShareGrants(grants).mapValues { it.value.uri }
             val plan = planShareStagingCleanup(

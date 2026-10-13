@@ -66,9 +66,99 @@ class _RuneCursor {
   }
 }
 
+// One traversal per semantic block. Candidate-specific context must stay
+// distinct: a book title and an instruction can occupy the same paragraph.
+class _WorkTitleBlockContext {
+  _WorkTitleBlockContext(Node root) {
+    final buffer = StringBuffer();
+    void collect(Node node) {
+      final start = buffer.length;
+      if (node is Text) buffer.write(' ${node.data}');
+      for (final child in node.nodes) {
+        collect(child);
+      }
+      spans[node] = (start, buffer.length);
+    }
+
+    collect(root);
+    text = buffer.toString();
+  }
+
+  late final String text;
+  final Map<Node, (int, int)> spans = Map.identity();
+}
+
 /// Residual / quality checks for translated blocks (multi-language targets).
 class TranslationQuality {
   const TranslationQuality._();
+
+  static bool _matchesLanguageName(String value, String name) => RegExp(
+    '(?:^|[^\\p{L}\\p{N}])${RegExp.escape(name)}(?=\$|[^\\p{L}\\p{N}])',
+    unicode: true,
+  ).hasMatch(value);
+
+  static String _stripLockedTerms(String text, String glossary) {
+    if (glossary.trim().isEmpty) return text;
+    final terms = <String>{};
+    for (final line in glossary.split('\n')) {
+      // The prompt accepts free text; only explicit, nonempty mappings grant
+      // an exemption. Support the => and = forms used by existing configs.
+      final separator = RegExp(r'=>|=').firstMatch(line);
+      if (separator == null) continue;
+      final source = line.substring(0, separator.start).trim();
+      final target = line.substring(separator.end).trim();
+      if (source.isNotEmpty && target.isNotEmpty) terms.add(source);
+    }
+    final ordered = terms.toList()
+      ..sort((a, b) => b.length.compareTo(a.length));
+    for (final term in ordered) {
+      text = text.replaceAll(
+        RegExp(
+          '(?<![A-Za-z0-9_\u00C0-\u02AF\u0300-\u036F])'
+          '${RegExp.escape(term)}'
+          '(?![A-Za-z0-9_\u00C0-\u02AF\u0300-\u036F])',
+          unicode: true,
+        ),
+        ' ',
+      );
+    }
+    return text;
+  }
+
+  static bool _hasNonLatinSourceResidual(
+    String source,
+    String translated,
+    String targetLanguage,
+  ) {
+    final target = targetLanguage.trim().toLowerCase();
+    if (target.isEmpty) return false;
+    // Require a substantial verbatim source run in a script foreign to the
+    // target. Shared Han characters across CJK languages are not evidence.
+    final patterns = <RegExp>[
+      if (!_isCjkTargetLanguage(target))
+        RegExp(
+          r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]{8,}',
+          unicode: true,
+        ),
+      if (!RegExp(r'^ru(?:[-_]|$)').hasMatch(target) &&
+          !_matchesLanguageName(target, 'russian') &&
+          !target.contains('русский') &&
+          !target.contains('俄'))
+        RegExp(r'[\u0400-\u04FF]{4,}(?:\s+[\u0400-\u04FF]{2,}){2,}'),
+      if (!RegExp(r'^ar(?:[-_]|$)').hasMatch(target) &&
+          !_matchesLanguageName(target, 'arabic') &&
+          !target.contains('العربية') &&
+          !target.contains('阿拉伯'))
+        RegExp(r'[\u0600-\u06FF]{4,}(?:\s+[\u0600-\u06FF]{2,}){2,}'),
+    ];
+    source = _normalizeText(_stripNonLinguisticTokens(source));
+    translated = _normalizeText(_stripNonLinguisticTokens(translated));
+    return patterns.any(
+      (pattern) => pattern
+          .allMatches(translated)
+          .any((match) => source.contains(match.group(0)!)),
+    );
+  }
 
   static bool shouldCheckResidual(String targetLanguage) {
     final String lower = targetLanguage.trim().toLowerCase();
@@ -106,14 +196,10 @@ class TranslationQuality {
       '阿拉伯语',
       '阿拉伯語',
     };
-    if (residualTargets.any(lower.contains)) {
+    if (residualTargets.any((name) => _matchesLanguageName(lower, name))) {
       return true;
     }
-    if (lower.startsWith('zh') ||
-        lower.startsWith('ja') ||
-        lower.startsWith('ko') ||
-        lower.startsWith('ru') ||
-        lower.startsWith('ar')) {
+    if (RegExp(r'^(?:zh|ja|ko|ru|ar)(?:[-_]|$)').hasMatch(lower)) {
       return true;
     }
     return false;
@@ -124,7 +210,17 @@ class TranslationQuality {
     required String translatedText,
     required String targetLanguage,
     Set<String> sourceWorkTitles = const <String>{},
+    String lockedGlossary = '',
   }) {
+    sourceText = _stripLockedTerms(sourceText, lockedGlossary);
+    translatedText = _stripLockedTerms(translatedText, lockedGlossary);
+    if (_hasNonLatinSourceResidual(
+      sourceText,
+      translatedText,
+      targetLanguage,
+    )) {
+      return true;
+    }
     if (!shouldCheckResidual(targetLanguage)) {
       return false;
     }
@@ -193,10 +289,8 @@ class TranslationQuality {
     required String targetLanguage,
     bool allowRetainedAuthorSignature = false,
     bool allowBibliographicRetention = false,
+    String lockedGlossary = '',
   }) {
-    if (!shouldCheckResidual(targetLanguage)) {
-      return null;
-    }
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
     return _findSuspiciousDocumentResidual(
@@ -205,6 +299,7 @@ class TranslationQuality {
       targetLanguage: targetLanguage,
       allowRetainedAuthorSignature: allowRetainedAuthorSignature,
       allowBibliographicRetention: allowBibliographicRetention,
+      lockedGlossary: lockedGlossary,
     );
   }
 
@@ -216,8 +311,8 @@ class TranslationQuality {
     required String targetLanguage,
     bool allowRetainedAuthorSignature = false,
     bool allowBibliographicRetention = false,
+    String lockedGlossary = '',
   }) {
-    if (!shouldCheckResidual(targetLanguage)) return null;
     Document qualityDocument(DocumentFragment fragment) {
       final document = Document();
       final html = Element.tag('html');
@@ -236,6 +331,7 @@ class TranslationQuality {
       targetLanguage: targetLanguage,
       allowRetainedAuthorSignature: allowRetainedAuthorSignature,
       allowBibliographicRetention: allowBibliographicRetention,
+      lockedGlossary: lockedGlossary,
     );
   }
 
@@ -245,6 +341,7 @@ class TranslationQuality {
     required String targetLanguage,
     required bool allowRetainedAuthorSignature,
     required bool allowBibliographicRetention,
+    required String lockedGlossary,
   }) {
     // Capture before any exemption clears source nodes. Previously these
     // heuristics reparsed the original source HTML each time they ran.
@@ -263,6 +360,23 @@ class TranslationQuality {
         }
       }
     }
+    if (lockedGlossary.trim().isNotEmpty) {
+      for (final document in [sourceDocument, translatedDocument]) {
+        for (final node in _textNodes(document)) {
+          node.data = _stripLockedTerms(node.data, lockedGlossary);
+        }
+      }
+    }
+    if (_hasNonLatinSourceResidual(
+      sourceDocument.body?.text ?? '',
+      translatedDocument.body?.text ?? '',
+      targetLanguage,
+    )) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
+    if (!shouldCheckResidual(targetLanguage)) return null;
     // Capture source inline work titles BEFORE any clearing below empties the
     // `<i>/<em>/<cite>` nodes, so retained work titles can be recognised later
     // even when the source copy was scrubbed by term/name handling.
@@ -291,6 +405,7 @@ class TranslationQuality {
         .toSet();
     final List<int> exemptedCandidateIndexes = <int>[];
     final List<String> unexemptedSourceTexts = <String>[];
+    final Map<Node, _WorkTitleBlockContext> workTitleContexts = Map.identity();
 
     if (sourceCandidates.length == translatedCandidates.length) {
       // 性能-#39: the whole translated body text is scanned once here, not
@@ -316,6 +431,7 @@ class TranslationQuality {
                   sourceDocument,
                   sourceCandidate,
                   sourceText,
+                  contexts: workTitleContexts,
                 ) ||
                 hasChineseTitleMarker);
         final bool canExemptCjkGloss =
@@ -332,6 +448,9 @@ class TranslationQuality {
             // CJK book-title marks. Clear only the quality-check copy; the
             // rendered translation remains untouched.
             sourceCandidate.text = '';
+            // Later candidates must see this mutation, just as they did
+            // with uncached context walks.
+            workTitleContexts.clear();
           }
           exemptedCandidateIndexes.add(index);
           continue;
@@ -594,7 +713,18 @@ class TranslationQuality {
     if (allCapsWords >= 4) {
       return false;
     }
-    return true;
+    // Capitalization alone does not distinguish a heading from metadata.
+    // Preserve the established lone-surname case and require citation shape
+    // for multiword entries (cross-reference, locator, or author/year).
+    return words.length == 1 ||
+        RegExp(
+          r'\b(?:ibid|(?:op|loc)\.\s*cit)\b',
+          caseSensitive: false,
+        ).hasMatch(body) ||
+        RegExp(
+          r'(?:[,:(]\s*\d+|\b(?:p|pp|vol|no)\.\s*\d+)',
+          caseSensitive: false,
+        ).hasMatch(body);
   }
 
   static bool _prepareAuthorSignatureForResidualCheck(
@@ -803,13 +933,14 @@ class TranslationQuality {
     _collectGlossDirection1(cursor, starts);
     _collectGlossDirection2(cursor, starts);
     // Quoted term labels with target-script context, e.g. “agoric开放系统”.
-    // Kept as a regex: measured linear (no nested or overlapping stars).
+    // Bound the lookahead and filler scans: repeated opening quotes without
+    // a closer must not rescan an unbounded suffix at every position.
     const String cjkRange =
         r'\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}';
     const String latinToken = r"[A-Za-z0-9'’\-]+";
     final RegExp quotedPattern = RegExp(
-      '([“「『"](?=[^”」』"]*[$cjkRange])(?:[^”」』"A-Za-z0-9\'’\\-]*))'
-      '($latinToken)(?:[^”」』"A-Za-z0-9\'’\\-]*)[”」』"]',
+      '([“「『"](?=[^”」』"]{0,256}[$cjkRange])(?:[^”」』"A-Za-z0-9\'’\\-]{0,256}))'
+      '($latinToken)(?:[^”」』"A-Za-z0-9\'’\\-]{0,256})[”」』"]',
       unicode: true,
     );
     for (final RegExpMatch match in quotedPattern.allMatches(text)) {
@@ -1029,9 +1160,9 @@ class TranslationQuality {
   static bool _isCjkTargetLanguage(String targetLanguage) {
     final String lower = targetLanguage.trim().toLowerCase();
     return RegExp(r'^(?:zh|ja|ko)(?:[-_]|$)').hasMatch(lower) ||
-        lower.contains('chinese') ||
-        lower.contains('japanese') ||
-        lower.contains('korean') ||
+        _matchesLanguageName(lower, 'chinese') ||
+        _matchesLanguageName(lower, 'japanese') ||
+        _matchesLanguageName(lower, 'korean') ||
         lower.contains('中文') ||
         lower.contains('汉语') ||
         lower.contains('漢語') ||
@@ -1061,7 +1192,14 @@ class TranslationQuality {
     if (offset >= text.length) {
       return null;
     }
-    return text.substring(offset).runes.first;
+    final int high = text.codeUnitAt(offset);
+    if (high >= 0xD800 && high <= 0xDBFF && offset + 1 < text.length) {
+      final int low = text.codeUnitAt(offset + 1);
+      if (low >= 0xDC00 && low <= 0xDFFF) {
+        return 0x10000 + ((high - 0xD800) << 10) + low - 0xDC00;
+      }
+    }
+    return high;
   }
 
   static bool _isCjkRune(int rune) {
@@ -1272,30 +1410,6 @@ class TranslationQuality {
             }.contains(words[1]));
   }
 
-  static String _sourceTextAfterNode(Document document, Node target) {
-    final StringBuffer followingText = StringBuffer();
-    bool foundTarget = false;
-
-    void collectAfterTarget(Node node) {
-      if (identical(node, target)) {
-        foundTarget = true;
-        return;
-      }
-      if (foundTarget && node.nodeType == Node.TEXT_NODE) {
-        followingText.write(' ${node.text ?? ''}');
-        return;
-      }
-      for (final Node child in node.nodes) {
-        collectAfterTarget(child);
-      }
-    }
-
-    collectAfterTarget(
-      _nearestSemanticBlock(target) ?? document.body ?? document,
-    );
-    return _normalizeText(followingText.toString());
-  }
-
   static String _sourceTextBeforeNode(
     Document document,
     Node target, {
@@ -1361,8 +1475,9 @@ class TranslationQuality {
   static bool _hasWorkTitleSemantics(
     Document document,
     Element element,
-    String title,
-  ) {
+    String title, {
+    required Map<Node, _WorkTitleBlockContext> contexts,
+  }) {
     final Element? semanticBlock = _nearestSemanticBlock(element);
     if (semanticBlock != null && _hasSignatureSemantics(semanticBlock)) {
       return false;
@@ -1377,15 +1492,21 @@ class TranslationQuality {
     // shared by every context check below, instead of re-traversed per
     // check (O(checks × text)). The 120-char window is a suffix of the
     // full preceding text, so one traversal serves both.
-    final String precedingFull = _sourceTextBeforeNode(
-      document,
-      element,
-      maxLength: null,
+    final root = semanticBlock ?? document.body ?? document;
+    final context = contexts.putIfAbsent(
+      root,
+      () => _WorkTitleBlockContext(root),
+    );
+    final span = context.spans[element]!;
+    final String precedingFull = _normalizeText(
+      context.text.substring(0, span.$1),
     );
     final String precedingText = precedingFull.length <= 120
         ? precedingFull
         : precedingFull.substring(precedingFull.length - 120);
-    final String followingText = _sourceTextAfterNode(document, element);
+    final String followingText = _normalizeText(
+      context.text.substring(span.$2),
+    );
     return _hasExplicitWorkReferenceContext(precedingText) ||
         _hasAttributedWorkContext(precedingText, followingText) ||
         _hasDescriptiveWorkContext(precedingText) ||
@@ -1397,7 +1518,12 @@ class TranslationQuality {
         ) ||
         _hasSubjectWorkContext(followingText) ||
         _hasNamedPublicationContext(precedingText) ||
-        _hasSerialWorkTitleContext(element, precedingText, semanticBlock, title) ||
+        _hasSerialWorkTitleContext(
+          element,
+          precedingText,
+          semanticBlock,
+          title,
+        ) ||
         _isOnlyTitleInSemanticBlock(semanticBlock, title);
   }
 
@@ -1915,7 +2041,10 @@ class TranslationQuality {
     return hasYearOrIdentifier && hasAuthorLikePrefix;
   }
 
-  static bool _isOnlyTitleInSemanticBlock(Element? semanticBlock, String title) {
+  static bool _isOnlyTitleInSemanticBlock(
+    Element? semanticBlock,
+    String title,
+  ) {
     final Element? block = semanticBlock;
     if (block == null || _normalizeText(block.text) != title) {
       return false;
@@ -2419,6 +2548,11 @@ class TranslationQuality {
         // untranslated sentence. Only very short lowercase runs qualify so
         // title-case proper names such as `Peter Thiel` or `Los Angeles`
         // and full English sentences still fail.
+        if (_looksLikeSentenceOrInstruction(strippedTranslated) ||
+            _isCommonInstructionPhrase(strippedTranslated) ||
+            RegExp(r'[.!?。！？]').hasMatch(strippedTranslated)) {
+          return true;
+        }
         final bool isShortLowercaseTransliteration =
             translatedWords.isNotEmpty &&
             translatedWords.length <= 4 &&
@@ -2497,7 +2631,10 @@ class TranslationQuality {
         (String word) => word == word.toLowerCase(),
       );
       final double sourceCoverage = run.length / sourceWords.length;
-      if (hasTargetLanguageContext && allLowercase && sourceCoverage < 0.75) {
+      if (hasTargetLanguageContext &&
+          allLowercase &&
+          run.length <= 4 &&
+          sourceCoverage < 0.75) {
         continue;
       }
       return true;
@@ -2559,7 +2696,8 @@ class TranslationQuality {
     'give way',
   };
 
-  static bool _sameWordsIgnoreCase(List<String> left, List<String> right) {    if (left.length != right.length) {
+  static bool _sameWordsIgnoreCase(List<String> left, List<String> right) {
+    if (left.length != right.length) {
       return false;
     }
     for (int index = 0; index < left.length; index += 1) {

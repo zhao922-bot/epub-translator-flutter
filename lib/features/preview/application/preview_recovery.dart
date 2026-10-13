@@ -23,19 +23,19 @@ PreviewChapter previewChapterFromInspected(InspectedChapter chapter) {
                 bytes: utf8.encode(chapter.originalHtml),
               )
               .body
-        : chapter is _PreviewRecoveryPayload
+        : chapter.body.isNotEmpty
         ? chapter.body
         : chapter.blocks.take(12).map((b) => b.sourceText).join('\n\n').trim();
     translated = chapter.blocks
         .map((b) => b.translatedHtml)
         .whereType<String>()
+        .take(12)
         .map(
           (html) => (XhtmlHtmlCompatibility.parseFragment(html).text ?? '')
               .replaceAll(RegExp(r'\s+'), ' ')
               .trim(),
         )
         .where((text) => text.isNotEmpty)
-        .take(12)
         .join('\n\n');
   }
   return projectPreviewChapter(chapter, source: source, translated: translated);
@@ -124,13 +124,14 @@ class _PreviewRecoveryPayload extends InspectedChapter {
 }
 
 /// Parse-free block slimming for the transfer payload (P-#46): keeps only
-/// blocks the recovery pipeline reads (translatedHtml, parsed in the
+/// the first 12 translated blocks (translatedHtml, parsed in the
 /// isolate), with id/tagName/sourceHtml dropped. When originalHtml is empty
 /// the source excerpt falls back to the first 12 blocks' sourceText
 /// ([_slimSourceBody]), so those blocks and their sourceText are kept —
 /// the isolate then derives the identical excerpt.
 List<ExtractedBlock> _transferBlocks(InspectedChapter chapter) {
   final blocks = <ExtractedBlock>[];
+  var translatedCount = 0;
   for (int i = 0; i < chapter.blocks.length; i++) {
     final block = chapter.blocks[i];
     final bool excerptBlock = chapter.originalHtml.isEmpty && i < 12;
@@ -143,6 +144,9 @@ List<ExtractedBlock> _transferBlocks(InspectedChapter chapter) {
         sourceText: excerptBlock ? block.sourceText : '',
       ),
     );
+    // Twelve translations necessarily span at least the first twelve source
+    // blocks, so the source excerpt is complete when this cap is reached.
+    if (block.translatedHtml != null && ++translatedCount == 12) break;
   }
   return blocks;
 }
@@ -178,7 +182,7 @@ String _slimSourceBody(InspectedChapter chapter) {
         .body;
   }
   return EpubHtmlExtractor.limitPreviewText(
-    chapter.originalHtml.isEmpty
+    chapter.originalHtml.isEmpty && chapter.body.isEmpty
         ? chapter.blocks.take(12).map((b) => b.sourceText).join('\n\n').trim()
         : chapter.body,
   );
@@ -204,6 +208,9 @@ List<ExtractedBlock> _slimTranslations(InspectedChapter chapter) {
             : _excerptMarkup(text),
       ),
     );
+    // Defense in depth: _transferBlocks already caps translated blocks at
+    // 12 before the isolate copy; keep the original output-based bound here
+    // so empty translations never consume a preview slot.
     if (blocks.length == 12) break;
   }
   return blocks;

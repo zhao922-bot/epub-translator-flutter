@@ -789,6 +789,40 @@ class AppStrings {
       ? '所选文件超过 256 MiB 上限，无法导入。请选择较小的文件。'
       : 'The selected file exceeds the 256 MiB limit and cannot be imported. Please choose a smaller file.';
 
+  String get logPickTimeout => isChinese
+      ? '选择或导入文件超时，请重试。'
+      : 'File selection or import timed out. Please retry.';
+  String get logNoPicker => isChinese
+      ? '设备缺少文件选择器应用，请安装或启用文件管理器后重试。'
+      : 'This device lacks a file picker app. Install or enable a file manager and retry.';
+  String get logPickInProgress => isChinese
+      ? '正在选择或导入文件，请等待完成后重试。'
+      : 'File selection or import is in progress. Wait for it to finish before retrying.';
+  String get logPickRequestsExhausted => isChinese
+      ? '文件选择请求次数已达上限，请重启应用后重试。'
+      : 'The file picker request limit has been reached. Restart the app and retry.';
+  String get logInvalidFileType => isChinese
+      ? '文件类型不受支持，请选择 EPUB 文件。'
+      : 'Unsupported file type. Please select an EPUB file.';
+  String get logPickFailed => isChinese
+      ? '无法选择或导入文件，请重新选择后重试。'
+      : 'Could not select or import the file. Select it again and retry.';
+  String get logSaveInProgress => isChinese
+      ? '正在保存文件，请等待完成后重试。'
+      : 'A file is being saved. Wait for it to finish before retrying.';
+  String get logSaveFailed => isChinese
+      ? '保存文件失败，请检查存储空间后重试。'
+      : 'Could not save the file. Check available storage and retry.';
+  String get logSavePermissionDenied => isChinese
+      ? '保存所需的存储权限被拒绝，请在系统应用设置中授予权限后重试。'
+      : 'Storage permission to save was denied. Grant permission in system app settings and retry.';
+  String get logSavePermissionPermanentlyDenied => isChinese
+      ? '保存所需的存储权限已被永久拒绝，请前往系统应用设置开启权限后重试。'
+      : 'Storage permission to save was permanently denied. Enable permission in system app settings and retry.';
+  String get logShareFailed => isChinese
+      ? '无法打开文件分享，请确认已安装可接收 EPUB 的应用后重试。'
+      : 'Could not open file sharing. Check that an app accepting EPUB files is installed and retry.';
+
   /// The Windows file dialog itself cannot handle the over-long path: the
   /// PowerShell host is not covered by the app's longPathAware manifest
   /// entry, so this fails even when the system long-path policy is on.

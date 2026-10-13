@@ -586,6 +586,19 @@ class EpubInspector {
     return parentNs == null || parentNs == _opfNamespaceUri;
   }
 
+  /// Only direct OPF (or legacy namespace-less) spine children are entries.
+  static bool _isOpfSpineChild(XmlElement element, String localName) {
+    if (element.name.local != localName) return false;
+    final String? ns = element.name.namespaceUri;
+    if (ns != null && ns != _opfNamespaceUri) return false;
+    final XmlNode? parent = element.parent;
+    if (parent is! XmlElement || parent.name.local != 'spine') {
+      return false;
+    }
+    final String? parentNs = parent.name.namespaceUri;
+    return parentNs == null || parentNs == _opfNamespaceUri;
+  }
+
   static ({List<String> chapterPaths, List<String> unresolvedIdRefs})
   _chapterPathsFromOpfDocument(XmlDocument opfDocument, String opfPath) {
     final String opfDirectory = path.posix.dirname(opfPath);
@@ -612,7 +625,7 @@ class EpubInspector {
     final List<String> unresolvedIdRefs = <String>[];
     for (final XmlElement itemRef
         in opfDocument.descendants.whereType<XmlElement>()) {
-      if (itemRef.name.local != 'itemref') {
+      if (!_isOpfSpineChild(itemRef, 'itemref')) {
         continue;
       }
       final String? idRef = itemRef.getAttribute('idref');

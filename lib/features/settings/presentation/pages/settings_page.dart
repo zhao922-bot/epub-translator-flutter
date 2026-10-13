@@ -37,6 +37,21 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final saveError = ref.read(settingsSaveErrorProvider);
+      final conflict = ref.read(settingsWriteConflictProvider);
+      if (saveError != null || conflict != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              saveError?.message ??
+                  'Settings failed to load or save earlier; review before editing.',
+            ),
+          ),
+        );
+      }
+    });
   }
 
   @override
@@ -57,6 +72,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       unawaited(ref.read(settingsProvider.notifier).flushSliderChanges());
+      unawaited(_commitConnectionFields());
     }
   }
 
@@ -104,18 +120,32 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
 
   @override
   Widget build(BuildContext context) {
-    final config = ref.watch(settingsProvider);
+    final controller = ref.read(settingsProvider.notifier);
+    // The page owns non-slider fields; each slider subscribes independently.
+    ref.watch(settingsProvider.select((c) => (
+      c.apiBaseUrl, c.apiKey, c.model, c.apiProviderSelection,
+      c.deepseekApiKey, c.customApiBaseUrl, c.customApiKey, c.customModel,
+      c.uiLanguage, c.themeMode, c.targetLanguage, c.bilingual,
+      c.outputSuffix, c.residualQualityCheck, c.styleProfileEnabled,
+      c.lockedGlossary, c.httpProxy,
+      controller.providerSelectionRevision, controller.credentialDiscardRevision,
+      controller.secretReadFailed(SettingsSecretSlot.deepSeek),
+      controller.secretReadFailed(SettingsSecretSlot.custom),
+      controller.secretReadFailed(SettingsSecretSlot.proxy),
+    )));
+    final config = ref.read(settingsProvider);
     final bool isRunActive = ref.watch(
       translationDashboardProvider.select(
         (TranslationDashboardState state) => state.isRunActive,
       ),
     );
-    final controller = ref.read(settingsProvider.notifier);
+    final replayInProgress = ref.watch(settingsReplayInProgressProvider);
     final settingsLoaded =
         ref.watch(settingsLoadedProvider).hasValue &&
         controller.canTestConnection;
     final connectionTestState = ref.watch(connectionTestProvider);
-    final strings = ref.watch(appStringsProvider);
+    ref.watch(appStringsProvider.select((s) => s.isChinese));
+    final strings = ref.read(appStringsProvider);
     final bool secretKeyRotated =
         ref.watch(secretKeyRotatedNoticeProvider) != null;
     final bool writeConflict =
@@ -165,13 +195,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   : 'Another instance changed the settings; this page may show stale values and saves will fail. Reload and try again.',
               actionLabel: strings.isChinese ? '重新加载' : 'Reload',
               onAction: () async {
+                final eventId = ref.read(settingsWriteConflictProvider)?.id;
                 final bool ok = await ref
                     .read(settingsProvider.notifier)
                     .reloadSettings();
                 // P2-#38: keep the conflict notice when reload failed so
                 // the user doesn't lose the recovery entry. P2-#39: the
                 // page may be disposed while the reload is in flight.
-                if (ok && mounted) {
+                if (ok && mounted &&
+                    ref.read(settingsWriteConflictProvider)?.id == eventId) {
                   ref.read(settingsWriteConflictProvider.notifier).state =
                       null;
                 }
@@ -185,14 +217,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   ? '有 ${controller.blockedReplayCount} 个凭据修改因服务地址变更被暂缓，等待确认。确认为当前地址后将继续保存，放弃则丢弃这些修改。'
                   : '${controller.blockedReplayCount} credential change(s) are held back because the service address changed. Confirm to save them against the current address, or discard them.',
               actionLabel: strings.isChinese ? '确认应用' : 'Apply',
-              onAction: () async {
+              onAction: replayInProgress ? null : () async {
+                if (controller.isReplayingConflictedEdits) return;
+                final eventId = ref.read(settingsReplayBlockedProvider)?.id;
                 await controller.confirmBlockedConflictReplays();
-                if (mounted) {
+                if (mounted &&
+                    ref.read(settingsReplayBlockedProvider)?.id == eventId) {
                   ref.read(settingsReplayBlockedProvider.notifier).state =
                       null;
                 }
               },
               secondaryActionLabel: strings.isChinese ? '放弃' : 'Discard',
+              secondaryActionDisabled: replayInProgress,
               onSecondaryAction: () async {
                 controller.discardBlockedConflictReplays();
                 if (mounted) {
@@ -378,12 +414,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                TuningPresetSelector(
-                  config: config,
+                Consumer(builder: (context, ref, child) {
+                  ref.watch(settingsProvider.select((c) => (
+                    c.chunkSize, c.maxConcurrent, c.timeoutSeconds,
+                    c.maxRetries, c.retryDelaySeconds,
+                  )));
+                  return TuningPresetSelector(
+                  config: ref.read(settingsProvider),
                   controller: controller,
                   strings: strings,
                   enabled: !isRunActive,
-                ),
+                );
+                }),
                 const SizedBox(height: 8),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -409,31 +451,29 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   tilePadding: EdgeInsets.zero,
                   title: Text(strings.advancedTuning),
                   children: <Widget>[
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(strings.chunkSizeLabel(config.chunkSize)),
-                    ),
-                    Slider(
+                    _SettingsSlider(
+                      select: (c) => c.chunkSize.toDouble(),
+                      label: (v) => strings.chunkSizeLabel(v.round()),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '分块大小 ${v.round()} 字符'
+                          : 'Chunk size ${v.round()} characters',
                       min: 1000,
                       max: 12000,
                       divisions: 11,
-                      value: config.chunkSize.toDouble(),
                       onChanged: isRunActive ? null : controller.setChunkSize,
                       onChangeEnd: isRunActive
                           ? null
                           : (_) => controller.flushSliderChanges(),
                     ),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        strings.maxConcurrentLabel(config.maxConcurrent),
-                      ),
-                    ),
-                    Slider(
+                    _SettingsSlider(
+                      select: (c) => c.maxConcurrent.toDouble(),
+                      label: (v) => strings.maxConcurrentLabel(v.round()),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '并发数 ${v.round()}'
+                          : 'Concurrency ${v.round()}',
                       min: 1,
                       max: 8,
                       divisions: 7,
-                      value: config.maxConcurrent.toDouble(),
                       onChangeEnd: isRunActive
                           ? null
                           : (_) => controller.flushSliderChanges(),
@@ -441,15 +481,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                           ? null
                           : controller.setMaxConcurrent,
                     ),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(strings.timeoutLabel(config.timeoutSeconds)),
-                    ),
-                    Slider(
+                    _SettingsSlider(
+                      select: (c) => c.timeoutSeconds.toDouble(),
+                      label: (v) => strings.timeoutLabel(v.round()),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '超时 ${v.round()} 秒'
+                          : 'Timeout ${v.round()} seconds',
                       min: 30,
                       max: 300,
                       divisions: 9,
-                      value: config.timeoutSeconds.toDouble(),
                       onChangeEnd: isRunActive
                           ? null
                           : (_) => controller.flushSliderChanges(),
@@ -457,31 +497,29 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                           ? null
                           : controller.setTimeoutSeconds,
                     ),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(strings.maxRetriesLabel(config.maxRetries)),
-                    ),
-                    Slider(
+                    _SettingsSlider(
+                      select: (c) => c.maxRetries.toDouble(),
+                      label: (v) => strings.maxRetriesLabel(v.round()),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '最多重试 ${v.round()} 次'
+                          : 'Maximum retries ${v.round()}',
                       min: 1,
                       max: 6,
                       divisions: 5,
-                      value: config.maxRetries.toDouble(),
                       onChangeEnd: isRunActive
                           ? null
                           : (_) => controller.flushSliderChanges(),
                       onChanged: isRunActive ? null : controller.setMaxRetries,
                     ),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        strings.retryDelayLabel(config.retryDelaySeconds),
-                      ),
-                    ),
-                    Slider(
+                    _SettingsSlider(
+                      select: (c) => c.retryDelaySeconds.toDouble(),
+                      label: (v) => strings.retryDelayLabel(v.round()),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '重试间隔 ${v.round()} 秒'
+                          : 'Retry delay ${v.round()} seconds',
                       min: 1,
                       max: 15,
                       divisions: 14,
-                      value: config.retryDelaySeconds.toDouble(),
                       onChangeEnd: isRunActive
                           ? null
                           : (_) => controller.flushSliderChanges(),
@@ -592,14 +630,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   },
                 ),
                 const SizedBox(height: 12),
-                Text(
-                  '${strings.textScaleLabel}: ${config.textScale.toStringAsFixed(2)}x',
-                ),
-                Slider(
+                _SettingsSlider(
+                  select: (c) => c.textScale.clamp(0.9, 1.3),
+                  label: (v) => '${strings.textScaleLabel}: ${v.toStringAsFixed(2)}x',
                   min: 0.9,
                   max: 1.3,
                   divisions: 8,
-                  value: config.textScale.clamp(0.9, 1.3),
                   onChanged: controller.setTextScale,
                   onChangeEnd: (_) => controller.flushSliderChanges(),
                 ),
@@ -610,6 +646,45 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
         ],
       ),
     );
+  }
+}
+
+class _SettingsSlider extends ConsumerWidget {
+  const _SettingsSlider({
+    required this.select, required this.label, required this.min,
+    required this.max, required this.divisions, required this.onChanged,
+    required this.onChangeEnd,
+    this.semanticFormatterCallback,
+  });
+
+  final double Function(TranslationConfig) select;
+  final String Function(double) label;
+  final String Function(double)? semanticFormatterCallback;
+  final double min;
+  final double max;
+  final int divisions;
+  final ValueChanged<double>? onChanged;
+  final ValueChanged<double>? onChangeEnd;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final value = ref.watch(settingsProvider.select(select));
+    return Column(children: [
+      Align(alignment: Alignment.centerLeft, child: Text(label(value))),
+      MergeSemantics(
+        child: Semantics(
+          child: Slider(
+            min: min,
+            max: max,
+            divisions: divisions,
+            value: value,
+            semanticFormatterCallback: semanticFormatterCallback ?? label,
+            onChanged: onChanged,
+            onChangeEnd: onChangeEnd,
+          ),
+        ),
+      ),
+    ]);
   }
 }
 
@@ -674,6 +749,7 @@ class _SettingsWarningBanner extends StatelessWidget {
     this.onAction,
     this.secondaryActionLabel,
     this.onSecondaryAction,
+    this.secondaryActionDisabled = false,
   });
 
   final String text;
@@ -681,6 +757,7 @@ class _SettingsWarningBanner extends StatelessWidget {
   final Future<void> Function()? onAction;
   final String? secondaryActionLabel;
   final Future<void> Function()? onSecondaryAction;
+  final bool secondaryActionDisabled;
 
   @override
   Widget build(BuildContext context) {
@@ -712,7 +789,7 @@ class _SettingsWarningBanner extends StatelessWidget {
               if (secondaryActionLabel != null && onSecondaryAction != null) ...[
                 const SizedBox(width: 8),
                 TextButton(
-                  onPressed: () {
+                  onPressed: secondaryActionDisabled ? null : () {
                     // P2-#39: an unawaited banner action must not drop
                     // errors silently.
                     unawaited(
@@ -731,10 +808,10 @@ class _SettingsWarningBanner extends StatelessWidget {
                   child: Text(secondaryActionLabel),
                 ),
               ],
-              if (actionLabel != null && onAction != null) ...[
+              if (actionLabel != null) ...[
                 const SizedBox(width: 8),
                 TextButton(
-                  onPressed: () {
+                  onPressed: onAction == null ? null : () {
                     // P2-#39: an unawaited banner action must not drop
                     // errors silently.
                     unawaited(

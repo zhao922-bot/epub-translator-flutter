@@ -115,6 +115,11 @@ class JobHistoryStore {
       if (!await file.exists()) {
         return (jobs: const <TranslationJob>[], clearedAt: 0);
       }
+      try {
+        return await _HistoryStreamReader(file).read();
+      } on FormatException {
+        // Re-read only corrupt input for the existing fingerprint/backup path.
+      }
       // Windows Notepad writes UTF-8 with BOM; without stripping, a
       // hand-edited job-history.json parses as corrupt, the load returns
       // empty, and the next persist silently wipes the whole history.
@@ -139,6 +144,14 @@ class JobHistoryStore {
         final int preservedClearedAt = await _backupCorruptHistoryFile(
           expectedFingerprint: _fingerprint(bytes),
         );
+        // C-P2-21: load has no later write to persist the recovered tombstone.
+        // Merge under the history lock to preserve any concurrent new history.
+        if (preservedClearedAt > 0) {
+          await saveMerged(
+            merge: (jobs, _) => jobs,
+            clearedAtEpochMs: preservedClearedAt,
+          );
+        }
         AppLogger.error(
           'Failed to decode job-history.json as UTF-8; moved aside and '
           'starting fresh.',
@@ -175,6 +188,13 @@ class JobHistoryStore {
         final int preservedClearedAt = await _backupCorruptHistoryFile(
           expectedFingerprint: _fingerprint(bytes),
         );
+        // C-P2-21: persist the tombstone on the parse-failure load path too.
+        if (preservedClearedAt > 0) {
+          await saveMerged(
+            merge: (jobs, _) => jobs,
+            clearedAtEpochMs: preservedClearedAt,
+          );
+        }
         AppLogger.error(
           'Failed to parse job-history.json; moved aside and starting fresh.',
           tag: 'history',
@@ -414,6 +434,11 @@ class JobHistoryStore {
       final String raw = utf8.decode(bytes, allowMalformed: true);
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
+        if (!_isValidHistoryStructure(decoded)) {
+          throw const FormatException(
+            'job-history.json has an invalid structure',
+          );
+        }
         if (decoded is Map<String, dynamic> &&
             _readClearedAt(decoded) > clearedAtEpochMs) {
           throw HistoryWriteConflict(_readClearedAt(decoded));
@@ -610,5 +635,143 @@ class JobHistoryStore {
       await PlatformUtils.appDocumentsDirectory(),
     );
     return File(path.join(appDirectory.path, 'job-history.json'));
+  }
+}
+
+/// Bounds normal-load memory to one JSON value and twenty jobs. The tail must
+/// still be validated: it may contain corruption, a later tombstone, or a
+/// duplicate envelope field (JSON's last value wins).
+class _HistoryStreamReader {
+  _HistoryStreamReader(this.file);
+  final File file;
+  late StreamIterator<String> tokens;
+  String? current;
+
+  Future<void> advance() async {
+    current = await tokens.moveNext() ? tokens.current : null;
+  }
+
+  Never invalid() => throw const FormatException('Invalid history JSON');
+
+  Future<void> expectToken(String token) async {
+    if (current != token) invalid();
+    await advance();
+  }
+
+  Future<Object?> value() async {
+    final text = StringBuffer();
+    var depth = 0;
+    do {
+      final token = current;
+      if (token == null) invalid();
+      text.write(token);
+      // Separate primitives so malformed adjacent values cannot coalesce.
+      text.write(' ');
+      if (token == '[' || token == '{') depth++;
+      if (token == ']' || token == '}') depth--;
+      await advance();
+    } while (depth > 0);
+    return jsonDecode(text.toString());
+  }
+
+  Future<List<TranslationJob>> jobs() async {
+    await expectToken('[');
+    final result = <TranslationJob>[];
+    if (current != ']') {
+      while (true) {
+        final item = await value();
+        if (result.length < 20 && item is Map<String, dynamic>) {
+          try {
+            result.add(TranslationJob.fromJson(item));
+          } catch (_) {
+            // Match _parseJobs: skip invalid entries, not valid JSON syntax.
+          }
+        }
+        if (current != ',') break;
+        await advance();
+      }
+    }
+    await expectToken(']');
+    return result.toList(growable: false);
+  }
+
+  Future<({List<TranslationJob> jobs, int clearedAt})> read() async {
+    tokens = StreamIterator(_tokens(file.openRead().transform(utf8.decoder)));
+    try {
+      await advance();
+      var clearedAt = 0;
+      List<TranslationJob>? result;
+      if (current == '[') {
+        result = await jobs();
+      } else {
+        await expectToken('{');
+        if (current != '}') {
+          while (true) {
+            final key = await value();
+            if (key is! String) invalid();
+            await expectToken(':');
+            if (key == 'jobs' && current == '[') {
+              result = await jobs();
+            } else {
+              final item = await value();
+              if (key == 'jobs') result = null;
+              if (key == 'clearedAt') clearedAt = item is int ? item : 0;
+            }
+            if (current != ',') break;
+            await advance();
+          }
+        }
+        await expectToken('}');
+      }
+      if (current != null || result == null) invalid();
+      return (jobs: result, clearedAt: clearedAt);
+    } finally {
+      await tokens.cancel();
+    }
+  }
+
+  static Stream<String> _tokens(Stream<String> chunks) async* {
+    var buffer = StringBuffer();
+    var quoted = false;
+    var escaped = false;
+    var first = true;
+    const punctuation = '{}[]:,';
+    await for (final chunk in chunks) {
+      for (var i = 0; i < chunk.length; i++) {
+        final c = chunk[i];
+        if (first) {
+          first = false;
+          if (c == '\uFEFF') continue;
+        }
+        if (quoted) {
+          buffer.write(c);
+          if (escaped) {
+            escaped = false;
+          } else if (c == r'\') {
+            escaped = true;
+          } else if (c == '"') {
+            quoted = false;
+            yield buffer.toString();
+            buffer = StringBuffer();
+          }
+        } else if (c == '"' || punctuation.contains(c) ||
+            c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+          if (buffer.isNotEmpty) {
+            yield buffer.toString();
+            buffer = StringBuffer();
+          }
+          if (c == '"') {
+            quoted = true;
+            buffer.write(c);
+          } else if (punctuation.contains(c)) {
+            yield c;
+          }
+        } else {
+          buffer.write(c);
+        }
+      }
+    }
+    if (quoted) throw const FormatException('Unterminated JSON string');
+    if (buffer.isNotEmpty) yield buffer.toString();
   }
 }

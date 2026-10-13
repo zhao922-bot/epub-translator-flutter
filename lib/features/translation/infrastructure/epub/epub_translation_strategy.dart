@@ -266,17 +266,8 @@ class _EpubTranslationStrategy {
             response.data,
             batch.blocks.map((b) => b.id).toSet(),
           );
-          final Object? blocksJson = jsonPayload['blocks'];
-          if (blocksJson is! List) {
-            throw const FormatException(
-              'Translated batch blocks is not a JSON array.',
-            );
-          }
-          if (blocksJson.length != batch.blocks.length) {
-            throw const FormatException(
-              'Translated batch length does not match request length.',
-            );
-          }
+          final List<dynamic> blocksJson =
+              jsonPayload['blocks'] as List<dynamic>;
 
           final Map<String, String> translatedById = <String, String>{};
           final Set<String> requestedIds = batch.blocks
@@ -285,22 +276,13 @@ class _EpubTranslationStrategy {
           if (requestedIds.length != batch.blocks.length) {
             throw const FormatException('Requested block ids must be unique.');
           }
-          for (final dynamic item in blocksJson) {
-            if (item is! Map<String, dynamic>) {
-              throw const FormatException(
-                'Translated batch item is not a JSON object.',
-              );
-            }
-            final Object? id = item['id'];
+          for (final Map<String, dynamic> item
+              in blocksJson.cast<Map<String, dynamic>>()) {
+            final String id = item['id'] as String;
             final Object? html = item['html'];
-            if (id is! String || id.isEmpty) {
+            if (id.isEmpty) {
               throw const FormatException(
                 'Translated batch item is missing id.',
-              );
-            }
-            if (!requestedIds.contains(id) || translatedById.containsKey(id)) {
-              throw const FormatException(
-                'Translated batch contains an unknown or duplicate id.',
               );
             }
             // An empty or missing html is a per-block failure, not a batch
@@ -836,11 +818,13 @@ class _EpubTranslationStrategy {
         // could fix stay fatal. Matches the main block path (:344) and the
         // protected-slot path (:1248).
         //
-        // A lone 413 keeps its direct fast path below: a single reference
+        // A lone oversized payload takes the direct fast path: one reference
         // cannot shrink further, so re-sending it would only burn a doomed
         // request.
         final bool loneOversizedPayload =
-            error.response?.statusCode == 413 && htmlReferences.length == 1;
+            htmlReferences.length == 1 &&
+            (error.response?.statusCode == 413 ||
+                TranslationApiClient.isContextOverflowError(error));
         if (!loneOversizedPayload &&
             TranslationApiClient.shouldFallbackBatchDioException(error)) {
           // Send and receive timeouts degrade alike: a receive timeout on a
@@ -893,7 +877,8 @@ class _EpubTranslationStrategy {
           // configuration errors: fail fast with the precise localized
           // diagnostic instead of burning per-reference fallback requests
           // that would all fail the same way.
-          if (TranslationApiClient.isDeterministicHttpError(error)) {
+          if (!loneOversizedPayload &&
+              TranslationApiClient.isDeterministicHttpError(error)) {
             throw StateError(
               TranslationApiClient.deterministicHttpErrorMessage(error, config),
             );
@@ -956,11 +941,10 @@ class _EpubTranslationStrategy {
             ),
           );
         } else {
-          // Single reference: the batch already exhausted its retries inside
-          // runRetried before this FormatException escaped, so re-sending the
-          // identical payload would just burn another full retry cycle for
-          // the same failure. Degrade directly to the source HTML instead
-          // of re-billing the request (A-1: was 6 paid requests).
+          // Single reference: retryable format failures exhausted runRetried;
+          // deterministic TranslationParseException failures skipped retries.
+          // Neither path benefits from another identical request cycle, so
+          // degrade directly to the source HTML.
           final FootnoteBlockReference reference = htmlReferences.single;
           owner._markDegradedBlock(
             chapterPath: reference.chapter.path,
@@ -1062,36 +1046,16 @@ class _EpubTranslationStrategy {
           response.data,
           requestedIds,
         );
-        final Object? rawBlocks = jsonPayload['blocks'];
-        if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != references.length) {
-          throw const FormatException(
-            'Translated footnote batch length does not match request length.',
-          );
-        }
+        final List<dynamic> rawBlocks = jsonPayload['blocks'] as List<dynamic>;
 
         final Map<String, String> rawTranslatedById = <String, String>{};
-        for (final Object? item in rawBlocks) {
-          if (item is! Map<String, dynamic>) {
-            throw const FormatException(
-              'Translated footnote batch item is not a JSON object.',
-            );
-          }
-          final Object? rawId = item['id'];
+        for (final Map<String, dynamic> item
+            in rawBlocks.cast<Map<String, dynamic>>()) {
+          final String rawId = item['id'] as String;
           final Object? rawHtml = item['html'];
-          if (rawId is! String || rawId.isEmpty) {
+          if (rawId.isEmpty) {
             throw const FormatException(
               'Translated footnote batch item is missing id.',
-            );
-          }
-          if (!requestedIds.contains(rawId)) {
-            throw FormatException(
-              'Translated footnote batch contains unknown id $rawId.',
-            );
-          }
-          if (rawTranslatedById.containsKey(rawId)) {
-            throw FormatException(
-              'Translated footnote batch contains duplicate id $rawId.',
             );
           }
           // An empty or missing html is a per-reference failure: leave it
@@ -1667,6 +1631,19 @@ class _EpubTranslationStrategy {
     final List<String> normalizedSlotTexts = request.template.slotTexts
         .map((String s) => s.trim().replaceAll(RegExp(r'\s+'), ' '))
         .toList(growable: false);
+    // Cache spans in order before concurrent requests/retries start. A missing
+    // span keeps later slots on the historical leading-window fallback.
+    int fromIndex = 0;
+    final List<int> slotStarts = <int>[];
+    for (final String needle in normalizedSlotTexts) {
+      if (needle.isEmpty || fromIndex < 0) {
+        slotStarts.add(-1);
+        continue;
+      }
+      final int found = normalizedBlockText.indexOf(needle, fromIndex);
+      slotStarts.add(found);
+      fromIndex = found < 0 ? -1 : found + needle.length;
+    }
     final List<String>
     translatedSlots = await const TranslationWorkQueue().map<String, String>(
       request.template.slotTexts,
@@ -1685,7 +1662,7 @@ class _EpubTranslationStrategy {
         return owner._apiClient.runRetried<String>(
           config: config,
           retryDelayOverride: retryDelayOverride,
-          shouldRetry: TranslationApiClient.shouldRetryBatchError,
+          shouldRetry: _shouldRetryIndividualSlotError,
           cancelToken: cancelToken,
           operation: () => _translateProtectedSlotTextOnce(
             dio: dio,
@@ -1695,6 +1672,7 @@ class _EpubTranslationStrategy {
             slotIndex: index,
             normalizedBlockText: normalizedBlockText,
             normalizedSlotTexts: normalizedSlotTexts,
+            locatedSlotStart: slotStarts[index],
             context: context,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
@@ -1727,6 +1705,14 @@ class _EpubTranslationStrategy {
   /// located in the block, it falls back to the leading window.
   static const int _slotContextLimit = 600;
 
+  static bool _shouldRetryIndividualSlotError(Object error) {
+    return error is! TranslationCancelledException &&
+        !EpubChapterTranslator._isCancelError(error) &&
+        error is! TranslationParseException &&
+        !TranslationApiClient.isDeterministicHttpError(error) &&
+        !(error is DioException && error.response?.statusCode == 413);
+  }
+
   static String _boundedSlotNeighbor(String text) =>
       text.length <= _slotContextLimit
       ? text
@@ -1739,6 +1725,7 @@ class _EpubTranslationStrategy {
     List<String>? slotTexts,
     List<String>? normalizedSlotTexts,
     String? normalizedBlockText,
+    int? locatedSlotStart,
   }) {
     const int limit = _slotContextLimit;
     // 性能-#37: the normalized block text is identical for every slot of
@@ -1758,13 +1745,15 @@ class _EpubTranslationStrategy {
         // (P2-#21's old approach) confused a needle that also appears
         // inside another slot's text ("world" inside "Hello world") with
         // the slot's own occurrence and centered the window wrongly.
-        final int found = _indexOfSlotSpan(
-          text,
-          needle: needle,
-          slotIndex: slotIndex,
-          slotTexts: slotTexts,
-          normalizedSlotTexts: normalizedSlotTexts,
-        );
+        final int found =
+            locatedSlotStart ??
+            _indexOfSlotSpan(
+              text,
+              needle: needle,
+              slotIndex: slotIndex,
+              slotTexts: slotTexts,
+              normalizedSlotTexts: normalizedSlotTexts,
+            );
         if (found >= 0) {
           center = found + needle.length ~/ 2;
           located = true;
@@ -1847,6 +1836,7 @@ class _EpubTranslationStrategy {
     String? retryReason,
     String? normalizedBlockText,
     List<String>? normalizedSlotTexts,
+    int? locatedSlotStart,
   }) async {
     final String trimmedSource = sourceText.trim();
     if (cancelToken?.isCancelled ?? false) {
@@ -1885,6 +1875,7 @@ class _EpubTranslationStrategy {
         normalizedBlockText: normalizedBlockText,
         // 性能-#50: cached normalized slot texts (same).
         normalizedSlotTexts: normalizedSlotTexts,
+        locatedSlotStart: locatedSlotStart,
       ),
       'currentSlotId': request.slotIds[slotIndex],
       'previousText': slotIndex > 0
@@ -1970,7 +1961,7 @@ class _EpubTranslationStrategy {
           sourceText: sourceText,
           translatedText: trimmed,
         ) ||
-        _hasMarkdownWrapper(trimmed) ||
+        _hasMarkdownWrapper(trimmed, sourceText: sourceText) ||
         (checkHtmlTags && _slotHtmlCommentPattern.hasMatch(trimmed)) ||
         // See [_slotWrapperTagPattern]: `<` must abut a letter/`/`/`!`/`?`
         // or a comparison like "a < b" is misread as markup.
@@ -1982,7 +1973,7 @@ class _EpubTranslationStrategy {
     }
   }
 
-  static bool _hasMarkdownWrapper(String value) {
+  static bool _hasMarkdownWrapper(String value, {String sourceText = ''}) {
     if (RegExp(r'^`{1,2}[\s\S]+`{1,2}$').hasMatch(value) ||
         RegExp(r'^~~[\s\S]+~~$').hasMatch(value) ||
         RegExp(r'^\*\*[\s\S]+\*\*$').hasMatch(value) ||
@@ -1992,14 +1983,26 @@ class _EpubTranslationStrategy {
         RegExp(r'!?\[[^\]\r\n]+\]\([^\)\r\n]+\)').hasMatch(value)) {
       return true;
     }
-    return value
+    final numbered = RegExp(r'^\s*(\d+[.)])\s+');
+    final sourceMarkers = sourceText
+        .trim()
         .split(RegExp(r'\r?\n'))
-        .any(
-          (String line) =>
-              RegExp(r'^\s*(?:#{1,6}|>|[-+*]|\d+[.)])\s+').hasMatch(line) ||
-              RegExp(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$').hasMatch(line) ||
-              RegExp(r'^\s*\|.*\|\s*$').hasMatch(line),
-        );
+        .map((line) => numbered.firstMatch(line)?.group(1))
+        .toList();
+    final lines = value.split(RegExp(r'\r?\n'));
+    for (int index = 0; index < lines.length; index++) {
+      final line = lines[index];
+      final marker = numbered.firstMatch(line)?.group(1);
+      if ((marker != null &&
+              (index >= sourceMarkers.length ||
+                  sourceMarkers[index] != marker)) ||
+          RegExp(r'^\s*(?:#{1,6}|>|[-+*])\s+').hasMatch(line) ||
+          RegExp(r'^\s*(?:-{3,}|\*{3,}|_{3,})\s*$').hasMatch(line) ||
+          RegExp(r'^\s*\|.*\|\s*$').hasMatch(line)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static bool _hasTranslationExplanationPrefix(String value) {

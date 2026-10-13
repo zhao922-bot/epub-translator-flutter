@@ -1,6 +1,7 @@
 package com.yang.epubtranslator
 
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 import java.io.File
 
 internal const val MAX_IMPORT_BYTES = 256L * 1024 * 1024
@@ -41,6 +42,21 @@ internal class ProtectedImportPaths {
 /** A callback belongs to one attempt, even if completion races a newer pick. */
 internal class ImportWatchdog {
     var callback: Runnable? = null
+    /** A streamless running task may never return from provider IPC. */
+    fun onExecutorReplaced(
+        pickerOpen: Boolean,
+        runningAttemptId: Int,
+        attemptId: Int,
+        replyTimeout: () -> Unit,
+    ) {
+        if (!pickerOpen && runningAttemptId == attemptId) replyTimeout()
+    }
+
+    /** Shared by timeout and completion, including a late provider return. */
+    fun replyOnce(done: AtomicBoolean, reply: () -> Unit) {
+        if (done.compareAndSet(false, true)) reply()
+    }
+
     fun cancel(remove: (Runnable) -> Unit) {
         callback?.let(remove)
         callback = null

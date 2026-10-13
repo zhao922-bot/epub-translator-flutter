@@ -21,5 +21,16 @@ internal object SecretExecutor : Executor {
      * the same alias throws. */
     internal val keyStoreLock = Any()
 
-    override fun execute(command: Runnable) = executor.execute(command)
+    // Match Dart's androidSecretTimeout: expired queued work must not run.
+    private const val taskExpiryMillis = 5 * 60 * 1000L
+
+    override fun execute(command: Runnable) {
+        val submitTime = System.currentTimeMillis()
+        executor.execute task@{
+            if (System.currentTimeMillis() - submitTime > taskExpiryMillis) {
+                return@task
+            }
+            command.run()
+        }
+    }
 }

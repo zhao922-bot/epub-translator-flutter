@@ -78,6 +78,29 @@ enum ProxySettingError {
 class TranslationApiClient {
   const TranslationApiClient();
 
+  static final RegExp _whitespace = RegExp(r'\s');
+  static final RegExp _leadingReasoningBlocks = RegExp(
+    r'^(?:\s*<think(?:\s[^>]*)?>[\s\S]*?</think>)+',
+    caseSensitive: false,
+  );
+  static final RegExp _trailingReasoningBlocks = RegExp(
+    r'(?:<think(?:\s[^>]*)?>(?:(?!</think>)[\s\S])*</think>\s*)+$',
+    caseSensitive: false,
+  );
+  static final RegExp _jsonFence = RegExp(r'```(?:json)?\s*([\s\S]*?)\s*```');
+  static final RegExp _unsupportedParameter = RegExp(
+    r'unsupported[\s_]+parameter',
+  );
+  static final RegExp _contextOverflow = RegExp(
+    r'maximum.{0,24}context|context.{0,40}(length|window|limit|budget|'
+    r'size|too (long|large)|exceed|overflow|exhaust)|'
+    r'too many tokens|token.{0,24}limit|exceed.{0,24}tokens?|'
+    r'max_tokens.{0,40}(exceed|limit|too (long|large)|maximum)|'
+    r'(exceed|limit|too (long|large)|maximum).{0,40}max_tokens|'
+    r'input.{0,20}too (long|large)|prompt.{0,20}too (long|large)|'
+    r'message.{0,20}too (long|large)',
+  );
+
   /// Carries cancellation through the repository's unchanged probe API.
   static final Object probeCancelTokenKey = Object();
 
@@ -626,24 +649,22 @@ class TranslationApiClient {
   }
 
   /// Removes `<think>...</think>` reasoning blocks that reasoning models
-  /// (for example DeepSeek-R1 variants) may prepend to the visible content.
+  /// (for example DeepSeek-R1 variants) may prepend or append to the content.
   ///
   /// These blocks are model-internal reasoning, not translation output; they
   /// would otherwise break strict JSON parsing in batch mode and be mistaken
   /// for untranslated source text in single-block mode.
   String _stripReasoningBlocks(String content) {
-    final String stripped = content.replaceAllMapped(
-      RegExp(r'<think(?:\s[^>]*)?>[\s\S]*?</think>', caseSensitive: false),
-      (Match match) => '',
-    );
+    // Interior blocks can be literal translation text, including JSON values.
+    final String stripped = content
+        .replaceFirst(_leadingReasoningBlocks, '')
+        .replaceFirst(_trailingReasoningBlocks, '');
     return stripped.trim();
   }
 
   static String _stripJsonFence(String content) {
     final String normalized = content.trim();
-    final Match? fenced = RegExp(
-      r'```(?:json)?\s*([\s\S]*?)\s*```',
-    ).firstMatch(normalized);
+    final Match? fenced = _jsonFence.firstMatch(normalized);
     return fenced?.group(1)?.trim() ?? normalized;
   }
 
@@ -816,7 +837,7 @@ class TranslationApiClient {
   String? _nextNonWhitespaceCharacter(String source, int start) {
     for (int index = start; index < source.length; index += 1) {
       final String character = source[index];
-      if (!RegExp(r'\s').hasMatch(character)) {
+      if (!_whitespace.hasMatch(character)) {
         return character;
       }
     }
@@ -925,13 +946,10 @@ class TranslationApiClient {
       return false;
     }
     final String body = (error.response?.data?.toString() ?? '').toLowerCase();
-    return RegExp(
-      r'maximum.{0,24}context|context.{0,40}(length|window|limit|budget|'
-      r'size|too (long|large)|exceed|overflow|exhaust)|'
-      r'too many tokens|token.{0,24}limit|exceed.{0,24}tokens?|'
-      r'max_tokens|input.{0,20}too (long|large)|prompt.{0,20}too (long|large)|'
-      r'message.{0,20}too (long|large)',
-    ).hasMatch(body);
+    if (_unsupportedParameter.hasMatch(body)) {
+      return false;
+    }
+    return _contextOverflow.hasMatch(body);
   }
 
   /// HTTP status codes that are deterministic configuration errors: a

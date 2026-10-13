@@ -314,24 +314,51 @@ class ShareStagingTest {
         )
         assertEquals(setOf("content://u/old|/s/old.epub|1"), afterFailedRevoke)
         val revoked = mutableListOf<String>()
-        val afterRetry = retryOrphanedGrantRevokes(
+        val (afterRetry, failedPaths) = retryOrphanedGrantRevokes(
             grants = afterFailedRevoke,
             livePaths = emptySet(),
             revokeUri = { revoked.add(it) },
         )
         assertEquals(listOf("content://u/old"), revoked)
         assertTrue(afterRetry.isEmpty())
+        assertTrue(failedPaths.isEmpty())
     }
 
     @Test fun orphanRetryKeepsEntryWhenRevokeFailsAgain() {
         // P2-#17: an orphan whose revoke keeps failing stays in the ledger
         // for the sweep after that.
-        val afterRetry = retryOrphanedGrantRevokes(
+        val (afterRetry, failedPaths) = retryOrphanedGrantRevokes(
             grants = setOf("content://u/old|/s/old.epub|1"),
             livePaths = emptySet(),
             revokeUri = { throw RuntimeException("still failing") },
         )
         assertEquals(setOf("content://u/old|/s/old.epub|1"), afterRetry)
+        assertEquals(setOf("/s/old.epub"), failedPaths)
+    }
+
+    @Test fun staleDropPreservesFailedOrphanRevokeButDropsSuccessfulRevoke() {
+        val grants = setOf(
+            "content://u/failed|/s/failed.epub|1",
+            "content://u/success|/s/success.epub|2",
+            "content://u/live|/s/live.epub|3",
+        )
+        val livePaths = setOf("/s/live.epub")
+        val attempted = mutableListOf<String>()
+        val (remaining, failedPaths) = retryOrphanedGrantRevokes(grants, livePaths) { uri ->
+            attempted.add(uri)
+            if (uri == "content://u/failed") throw RuntimeException("retry later")
+        }
+        assertEquals(listOf("content://u/failed", "content://u/success"), attempted)
+        assertEquals(setOf("/s/failed.epub"), failedPaths)
+        val persisted = dropStaleShareGrants(remaining, livePaths + failedPaths)
+        assertEquals(grants - "content://u/success|/s/success.epub|2", persisted)
+
+        val (afterRetry, stillFailed) = retryOrphanedGrantRevokes(persisted, livePaths) {}
+        assertTrue(stillFailed.isEmpty())
+        assertEquals(
+            setOf("content://u/live|/s/live.epub|3"),
+            dropStaleShareGrants(afterRetry, livePaths + stillFailed),
+        )
     }
 
     @Test fun cleanupDeleteThrowIsTreatedAsFailureAndContinues() {

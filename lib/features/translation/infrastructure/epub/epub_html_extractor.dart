@@ -159,11 +159,30 @@ class EpubHtmlExtractor {
     bool detectAuthorSignatures = false,
   }) {
     final List<ExtractedBlock> blocks = <ExtractedBlock>[];
+    final elements = extractTranslatableTextElements(document);
+    final sourceTexts = <dom.Element, String>{};
+    final candidatesByParent = <dom.Element, Set<dom.Element>>{};
+    for (final element in elements) {
+      final text = elementText(element);
+      sourceTexts[element] = text;
+      final parent = element.parent;
+      if (detectAuthorSignatures &&
+          tagLocalName(element) == 'p' &&
+          element.children.isEmpty &&
+          _hasSignatureClass(element) &&
+          _looksLikePersonName(text) &&
+          parent != null) {
+        (candidatesByParent[parent] ??= <dom.Element>{}).add(element);
+      }
+    }
+    final authorSignatures = <dom.Element>{};
+    for (final entry in candidatesByParent.entries) {
+      final signature = _authorSignatureForParent(entry.key, entry.value);
+      if (signature != null) authorSignatures.add(signature);
+    }
     int index = 0;
-    for (final dom.Element element in extractTranslatableTextElements(
-      document,
-    )) {
-      final String sourceText = elementText(element);
+    for (final dom.Element element in elements) {
+      final String sourceText = sourceTexts[element]!;
       index += 1;
       final String tag = tagLocalName(element);
       final String tagToken = tag.isEmpty ? 'node' : tag;
@@ -173,28 +192,21 @@ class EpubHtmlExtractor {
           tagName: tagToken,
           sourceHtml: EpubSemantics.sourceHtmlWithBindings(element),
           sourceText: sourceText,
-          isAuthorSignature:
-              detectAuthorSignatures && _isAuthorSignatureElement(element),
+          isAuthorSignature: authorSignatures.contains(element),
         ),
       );
     }
     return blocks;
   }
 
-  bool _isAuthorSignatureElement(dom.Element element) {
-    if (tagLocalName(element) != 'p' ||
-        element.children.isNotEmpty ||
-        !_hasSignatureClass(element) ||
-        !_looksLikePersonName(elementText(element))) {
-      return false;
+  dom.Element? _authorSignatureForParent(
+    dom.Element parent,
+    Set<dom.Element> candidates,
+  ) {
+    if (!_isSemanticPrefaceContainer(parent)) {
+      return null;
     }
-    final dom.Element? parent = element.parent;
-    if (parent == null || !_isSemanticPrefaceContainer(parent)) {
-      return false;
-    }
-    // P-#48: compute each sibling's text once. The old shape re-ran
-    // elementText (a subtree walk) for every sibling on every candidate,
-    // which is O(N^2) over the container's children.
+    // B-PERF-8: one sibling-text pass per parent, not per candidate.
     final List<(dom.Element, String)> visibleSiblings =
         <(dom.Element, String)>[];
     for (final dom.Element sibling in parent.children) {
@@ -203,11 +215,12 @@ class EpubHtmlExtractor {
         visibleSiblings.add((sibling, text));
       }
     }
-    final int candidateIndex = visibleSiblings.indexWhere(
-      (sibling) => identical(sibling.$1, element),
-    );
-    if (candidateIndex <= 0) {
-      return false;
+    // A valid run must contain exactly the final three visible siblings,
+    // preceded by substantive prose. No earlier candidate can qualify.
+    final int candidateIndex = visibleSiblings.length - 3;
+    if (candidateIndex <= 0 ||
+        !candidates.contains(visibleSiblings[candidateIndex].$1)) {
+      return null;
     }
 
     final List<(dom.Element, String)> signatureRun = visibleSiblings
@@ -228,12 +241,14 @@ class EpubHtmlExtractor {
         sharedSignatureClasses.isEmpty ||
         !_looksLikeSignatureDate(signatureRun[1].$2) ||
         !_looksLikeSignatureLocation(signatureRun[2].$2)) {
-      return false;
+      return null;
     }
 
     final (dom.Element, String) previous = visibleSiblings[candidateIndex - 1];
     return !_hasSignatureClass(previous.$1) &&
-        _looksLikeSubstantiveProse(previous.$2);
+            _looksLikeSubstantiveProse(previous.$2)
+        ? signatureRun.first.$1
+        : null;
   }
 
   bool _hasSignatureClass(dom.Element element) {

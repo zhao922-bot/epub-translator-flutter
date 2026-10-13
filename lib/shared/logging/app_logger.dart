@@ -1,3 +1,4 @@
+import 'package:epub_translator_flutter/shared/security/sensitive_text.dart';
 import 'package:logger/logger.dart';
 
 /// App-wide structured logger (levels + simple context tags).
@@ -40,9 +41,12 @@ class AppLogger {
   /// Parser errors can carry the entire input, including old plaintext keys.
   static Object? safeError(Object? error) => error is FormatException
       ? 'FormatException (offset: ${error.offset ?? 'unknown'})'
+      : error is String
+      ? SensitiveText.redact(error)
       : error;
 
   static String _format(String? tag, String message) {
+    message = SensitiveText.redact(message);
     if (tag == null || tag.isEmpty) {
       return message;
     }

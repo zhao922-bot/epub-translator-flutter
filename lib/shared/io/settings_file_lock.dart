@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:path/path.dart' as path;
+
 // The OS file lock below serializes *processes* (advisory flock on
 // POSIX, mandatory LockFileEx on Windows). On POSIX it does NOT serialize
 // Dart isolates in the same process: flock locks are associated with the
@@ -32,7 +34,7 @@ Future<T> withSettingsFileLock<T>(
   File file,
   Future<T> Function() action,
 ) async {
-  final key = File(file.path).absolute.path;
+  final key = path.normalize(file.absolute.path);
   final previous = _settingsWriters[key] ?? Future<void>.value();
   final done = Completer<void>();
   _settingsWriters[key] = done.future;

@@ -4,9 +4,61 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_quality.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:html/dom.dart' as dom;
+import 'package:html/parser.dart' as html_parser;
+
+class _TextScanCountingExtractor extends EpubHtmlExtractor {
+  final scans = <dom.Element, int>{};
+
+  @override
+  String elementText(dom.Element element) {
+    scans.update(element, (count) => count + 1, ifAbsent: () => 1);
+    return super.elementText(element);
+  }
+}
 
 void main() {
   const EpubHtmlExtractor extractor = EpubHtmlExtractor();
+
+  test('signature sibling scans are once per parent regardless of candidates', () {
+    // Keep the sibling count fixed while increasing eligible name rows.
+    for (final candidateCount in [1, 32, 128]) {
+      final document = html_parser.parse('''
+<html><body>
+${List.generate(2, (parent) => '''
+<section role="doc-preface">
+${List.generate(128, (i) => i < candidateCount - 1 ? '<p class="sig">John Smith</p>' : '<p>Ordinary earlier text.</p>').join()}
+<p>The preface closes with enough ordinary prose to establish the boundary.</p>
+<p class="sig">Peter Thiel</p>
+<p class="sig">January 6, 2020</p>
+<p class="sig">Los Angeles</p>
+<div></div>
+</section>''').join()}
+</body></html>''');
+      final counting = _TextScanCountingExtractor();
+      counting.extractBlocks(document, chapterPath: 'preface.xhtml');
+      final baseline = Map<dom.Element, int>.of(counting.scans);
+      counting.scans.clear();
+      final blocks = counting.extractBlocks(
+        document,
+        chapterPath: 'preface.xhtml',
+        detectAuthorSignatures: true,
+      );
+      expect(
+        blocks.where((block) => block.isAuthorSignature).map((b) => b.sourceText),
+        ['Peter Thiel', 'Peter Thiel'],
+      );
+      for (final parent in document.querySelectorAll('section')) {
+        for (final sibling in parent.children) {
+          expect(
+            (counting.scans[sibling] ?? 0) - (baseline[sibling] ?? 0),
+            1,
+            reason: '$candidateCount candidates: ${sibling.outerHtml}',
+          );
+        }
+      }
+    }
+  });
 
   test('image-only cover is ancillary and not recommended', () {
     final InspectedChapter chapter = extractor.inspectChapterBytes(

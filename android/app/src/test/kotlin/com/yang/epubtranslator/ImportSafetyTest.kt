@@ -95,6 +95,43 @@ class ImportSafetyTest {
         assertSame(newCallback, newer.callback)
     }
 
+    @Test fun executorReplacementRepliesWhileProviderBlockedAndLateCompletionCannotReplyAgain() {
+        val watchdog = ImportWatchdog()
+        val done = AtomicBoolean(false)
+        val blocked = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val replies = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val worker = Thread {
+            blocked.countDown()
+            release.await()
+            watchdog.replyOnce(done) { replies.add("late completion") }
+        }
+        worker.start()
+        try {
+            assertTrue(blocked.await(2, TimeUnit.SECONDS))
+            watchdog.onExecutorReplaced(false, 7, 7) {
+                watchdog.replyOnce(done) { replies.add("PICK_TIMEOUT") }
+            }
+            assertTrue(worker.isAlive)
+            assertTrue(done.get())
+            assertEquals(listOf("PICK_TIMEOUT"), replies)
+        } finally {
+            release.countDown()
+            worker.join(2000)
+        }
+        assertFalse(worker.isAlive)
+        assertEquals(listOf("PICK_TIMEOUT"), replies)
+    }
+
+    @Test fun executorReplacementExcludesPickerOpenAndNeverStartedAttempts() {
+        val watchdog = ImportWatchdog()
+        for ((pickerOpen, runningId) in listOf(true to 7, true to -1, false to -1, false to 6)) {
+            watchdog.onExecutorReplaced(pickerOpen, runningId, 7) {
+                fail("Replacement must not claim the running-copy reply for $pickerOpen/$runningId")
+            }
+        }
+    }
+
     @Test fun teardownInvalidatesEveryBlockedProviderStage() {
         for (stage in listOf("queryDisplayName", "getType", "probeOpen", "probeRead", "querySize", "openInputStream", "read")) {
             val lifecycle = ImportLifecycle()

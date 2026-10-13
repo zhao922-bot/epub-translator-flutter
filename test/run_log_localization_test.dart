@@ -1,7 +1,15 @@
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_run_estimate.dart';
+import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
+import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/services.dart';
+
+class _UnusedRepository implements TranslationRepository {
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 TranslationRunEstimate _estimateWith(Duration? remaining) =>
     TranslationRunEstimate(
@@ -14,6 +22,58 @@ TranslationRunEstimate _estimateWith(Duration? remaining) =>
     );
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  for (final language in [UiLanguage.chinese, UiLanguage.english]) {
+    final strings = AppStrings(language);
+    final pickMessages = <String, String>{
+      'PICK_TIMEOUT': strings.logPickTimeout,
+      'PICK_NO_PICKER': strings.logNoPicker,
+      'PICK_IN_PROGRESS': strings.logPickInProgress,
+      'PICK_REQUESTS_EXHAUSTED': strings.logPickRequestsExhausted,
+      'INVALID_FILE_TYPE': strings.logInvalidFileType,
+      'PICK_FAILED': strings.logPickFailed,
+    };
+    final saveMessages = <String, String>{
+      'SAVE_IN_PROGRESS': strings.logSaveInProgress,
+      'SAVE_FAILED': strings.logSaveFailed,
+      'SAVE_PERMISSION_DENIED': strings.logSavePermissionDenied,
+      'SAVE_PERMISSION_PERMANENTLY_DENIED':
+          strings.logSavePermissionPermanentlyDenied,
+    };
+    for (final entry in {
+      ...pickMessages,
+      ...saveMessages,
+      'SHARE_FAILED': strings.logShareFailed,
+    }.entries) {
+      test('${language.name} localizes ${entry.key}', () {
+        final controller =
+            TranslationDashboardController(repository: _UnusedRepository())
+              ..syncSettings(
+                TranslationConfig.defaults().copyWith(uiLanguage: language),
+              );
+        addTearDown(controller.dispose);
+        final error = PlatformException(
+          code: entry.key,
+          message: 'Raw native English error',
+        );
+        final String actual;
+        if (pickMessages.containsKey(entry.key)) {
+          actual = controller.debugPickErrorLogLine(error);
+        } else if (saveMessages.containsKey(entry.key)) {
+          actual = controller.debugSaveErrorLogLine(error);
+        } else {
+          actual = controller.debugShareErrorLogLine(error);
+          expect(controller.debugOpenJobOutputErrorLogLine(error), entry.value);
+        }
+        expect(actual, entry.value);
+        expect(actual, isNot(contains('Raw native English error')));
+        expect(
+          RegExp(r'[\u4e00-\u9fff]').hasMatch(actual),
+          language == UiLanguage.chinese,
+        );
+      });
+    }
+  }
   group('remainingLabel', () {
     test('english labels', () {
       const strings = AppStrings(UiLanguage.english);

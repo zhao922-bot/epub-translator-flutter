@@ -389,8 +389,12 @@ void main() {
         clearedAt,
         reason: 'the corrupt backup must preserve the clear tombstone',
       );
-      // The corrupt file was moved aside.
-      expect(await file.exists(), isFalse);
+      // C-P2-21: the corrupt file was moved aside AND the tombstone was
+      // persisted, so a concurrent instance cannot resurrect cleared history.
+      expect(await file.exists(), isTrue);
+      final reloaded = await store.loadWithTombstone();
+      expect(reloaded.clearedAt, clearedAt);
+      expect(reloaded.jobs, isEmpty);
     });
 
     test('saveMerged applies the preserved tombstone', () async {

@@ -34,6 +34,96 @@ InspectedChapter legacy({
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('B-P2-6 recovery preserves retained source after release', () {
+    final chapter = legacy().copyWith(
+      originalHtml: '',
+      body: 'Retained source excerpt',
+      blocks: [
+        legacy().blocks.single.copyWith(sourceHtml: '', sourceText: ''),
+      ],
+    );
+
+    expect(needsPreviewRecovery(chapter), isTrue);
+    for (final preview in [
+      recoverBatchForTest([chapter]).single,
+      previewChapterFromInspected(chapter),
+    ]) {
+      expect(preview.body, 'Retained source excerpt');
+      expect(preview.translatedBody, '译文');
+      expect(preview.blockCount, 1);
+      expect(preview.translatedBlockCount, 1);
+    }
+  });
+
+  test(
+    'B-PERF-9 caps transfer at 12 translations and preserves source excerpt',
+    () async {
+      for (final noHtml in [false, true]) {
+        for (final emptyFirst in [false, true]) {
+          final sourceBlocks = List.generate(
+            12,
+            (i) => ExtractedBlock(
+              id: 'source-$i',
+              tagName: 'p',
+              sourceHtml: '<p>Source $i</p>',
+              sourceText: 'Source $i',
+            ),
+          );
+          final chapter = legacy().copyWith(
+            originalHtml: noHtml ? '' : legacy().originalHtml,
+            body: '',
+            blocks: [
+              ...sourceBlocks,
+              ...List.generate(
+                30,
+                (i) => legacy().blocks.single.copyWith(
+                  translatedHtml: emptyFirst && i == 0
+                      ? '<p></p>'
+                      : '<p>Translation $i</p>',
+                ),
+              ),
+            ],
+          );
+          final expectedSource = noHtml
+              ? sourceBlocks.map((b) => b.sourceText).join('\n\n')
+              : 'Original';
+          final expectedTranslation = List.generate(
+            12,
+            (i) => 'Translation $i',
+          ).skip(emptyFirst ? 1 : 0).join('\n\n');
+          final cache = PreviewRecoveryCache(
+            runner: (received) async {
+              final payload = received.single;
+              expect(
+                payload.blocks.where((b) => b.translatedHtml != null),
+                hasLength(12),
+              );
+              expect(payload.blocks, hasLength(noHtml ? 24 : 12));
+              if (noHtml) {
+                expect(
+                  payload.blocks.take(12).map((b) => b.sourceText),
+                  sourceBlocks.map((b) => b.sourceText),
+                );
+              }
+              return recoverBatchForTest(received);
+            },
+          );
+          await cache.prepare([chapter]);
+          for (final preview in [
+            cache.lookup(chapter)!,
+            recoverBatchForTest([chapter]).single,
+            previewChapterFromInspected(chapter),
+          ]) {
+            expect(preview.body, expectedSource);
+            expect(preview.translatedBody, expectedTranslation);
+            expect(preview.blockCount, 42);
+            expect(preview.translatedBlockCount, 30);
+          }
+        }
+      }
+    },
+  );
+
   test(
     'perf-#35 runner receives untouched chapters; isolate slims with identical excerpts',
     () async {
@@ -182,6 +272,7 @@ void main() {
       expect(previewChapterFromInspected(chapter).body, 'Original');
       final noHtml = chapter.copyWith(
         originalHtml: '',
+        body: '',
         blocks: [chapter.blocks.single.copyWith(sourceText: 'Fallback')],
       );
       await cache.prepare([noHtml]);

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
@@ -148,23 +149,33 @@ class EpubChapterTranslator {
     CancelToken? cancelToken,
   }) {
     if (!data.containsKey('max_tokens')) _TranslationRequestBudget.apply(data);
-    return _run.requests.run(() {
+    return _run.requests.run(() async {
       _run.throwIfCancelled();
       if (cancelToken?.isCancelled ?? false) {
         throw const TranslationCancelledException();
       }
-      return _apiClient.postChatCompletions(
-        dio: dio,
-        data: data,
-        cancelToken: cancelToken ?? _run.cancelToken,
-      );
+      final onMemoryAttempt =
+          Zone.current[_memoryAttemptKey] as void Function(Duration)?;
+      final stopwatch = onMemoryAttempt == null ? null : (Stopwatch()..start());
+      try {
+        return await _apiClient.postChatCompletions(
+          dio: dio,
+          data: data,
+          cancelToken: cancelToken ?? _run.cancelToken,
+        );
+      } finally {
+        if (stopwatch != null) {
+          stopwatch.stop();
+          onMemoryAttempt!(stopwatch.elapsed);
+        }
+      }
     });
   }
 
-  static const String _cacheSchemaVersion = 'v15-second-person-and-idiom';
+  static final Object _memoryAttemptKey = Object();
+  static const String _cacheSchemaVersion = 'v17-structure-repair';
 
-  // Additive schema extension: both identities include v16, leaving the prior
-  // schema declaration and third-batch prompt/test hooks intact.
+  // Memory checkpoints keep their independent quality schema.
   static const String qualityCacheSchemaVersion = 'v16-quality-memory-lru';
 
   static int htmlBudgetTokensForTest(String html) =>
@@ -800,12 +811,14 @@ class EpubChapterTranslator {
     required TranslationConfig config,
     required Map<String, Object?> currentMemory,
     required InspectedChapter chapter,
+    Set<String> degradedBlockIds = const <String>{},
   }) async {
     return (await _memory.updateBookMemoryAfterChapter(
       dio: dio,
       config: config,
       currentMemory: _BookMemory.fromJson(currentMemory, trustedLocks: true),
       chapter: chapter,
+      degradedBlockIds: degradedBlockIds,
     )).toJson();
   }
 
@@ -1027,12 +1040,21 @@ class EpubChapterTranslator {
       int footnoteBatchCount = 0;
       int footnoteRequestCount = 0;
 
+      Future<_BookMemory> trackMemoryRequests(
+        Future<_BookMemory> Function() operation,
+      ) => runZoned(
+        operation,
+        zoneValues: {
+          _memoryAttemptKey: (Duration elapsed) {
+            memoryRequestCount += 1;
+            totalMemoryElapsed += elapsed;
+          },
+        },
+      );
+
       final TranslationStyleProfile? confirmedProfile =
           config.styleProfileEnabled ? confirmedStyleProfile : null;
-      final TranslationStyleProfile? userStyleProfile =
-          confirmedProfile == null || confirmedProfile.isEmpty
-          ? null
-          : confirmedProfile;
+      final TranslationStyleProfile? userStyleProfile = confirmedProfile;
       final String inputFingerprint = await _inputFingerprint(
         inputPath,
         expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
@@ -1375,16 +1397,15 @@ class EpubChapterTranslator {
         initialBookMemoryAttempted = true;
         throwIfCancelled();
         try {
-          final bool hasInitialMemorySources =
-              _EpubBookMemory._initialMemorySourceChapters(chapters).isNotEmpty;
           final Stopwatch memoryStopwatch = Stopwatch()..start();
-          final _BookMemory initialMemory = await _memory
-              .generateInitialBookMemory(
-                dio: dio,
-                config: config,
-                chapters: chapters,
-                cancelToken: cancelToken,
-              );
+          final _BookMemory initialMemory = await trackMemoryRequests(
+            () => _memory.generateInitialBookMemory(
+              dio: dio,
+              config: config,
+              chapters: chapters,
+              cancelToken: cancelToken,
+            ),
+          );
           bookMemory = userStyleProfile == null
               ? initialMemory
               : initialMemory.copyWith(
@@ -1393,10 +1414,6 @@ class EpubChapterTranslator {
                 );
           memoryStopwatch.stop();
           await persistBookMemory();
-          if (hasInitialMemorySources) {
-            totalMemoryElapsed += memoryStopwatch.elapsed;
-            memoryRequestCount += 1;
-          }
           if (initialMemory.isEmpty &&
               (userStyleProfile == null || userStyleProfile.isEmpty)) {
             emit(
@@ -1434,7 +1451,7 @@ class EpubChapterTranslator {
             }
           }
         } catch (error) {
-          if (userStyleProfile != null && !userStyleProfile.isEmpty) {
+          if (userStyleProfile != null) {
             bookMemory = _BookMemory.empty.copyWith(
               styleProfile: userStyleProfile,
               styleProfileConfirmed: true,
@@ -1548,14 +1565,32 @@ class EpubChapterTranslator {
           await ensureInitialBookMemory();
           throwIfCancelled();
         }
-        final List<FootnoteTranslationBatch> batches = _footnoteBatchPlanner
-            .plan(
+        final List<FootnoteTranslationBatch> batches = [];
+        final snapshotGroup = <int, List<ExtractedBlock>>{};
+        Map<String, Object?>? groupMemory;
+        String? groupIdentity;
+        void flushSnapshotGroup() {
+          if (snapshotGroup.isEmpty) return;
+          batches.addAll(
+            _footnoteBatchPlanner.plan(
               chapters: selectedChapters,
-              pendingBlocksByChapter: pendingBlocksByChapter,
+              pendingBlocksByChapter: snapshotGroup,
               footnoteClassificationByChapter: footnoteClassificationByChapter,
               chunkSize: config.chunkSize,
-              bookMemory: bookMemory?.toJson(),
-            );
+              bookMemory: groupMemory,
+            ),
+          );
+          snapshotGroup.clear();
+        }
+        for (final index in pendingBlocksByChapter.keys.toList()..sort()) {
+          final snapshot = bookMemorySnapshotFor(selectedChapters[index]);
+          final identity = jsonEncode(snapshot);
+          if (identity != groupIdentity) flushSnapshotGroup();
+          groupIdentity = identity;
+          groupMemory = snapshot;
+          snapshotGroup[index] = pendingBlocksByChapter[index]!;
+        }
+        flushSnapshotGroup();
         emit(
           currentJob.copyWith(
             currentChapter: selectedChapters[startChapterIndex].title,
@@ -2111,12 +2146,18 @@ class EpubChapterTranslator {
             if (!memoryChapters.contains(chapter.path)) {
             try {
               final Stopwatch memoryStopwatch = Stopwatch()..start();
-              bookMemory = await _memory.updateBookMemoryAfterChapter(
-                dio: dio,
-                config: config,
-                currentMemory: bookMemory ?? _BookMemory.empty,
-                chapter: updatedByPath[chapter.path]!,
-                cancelToken: cancelToken,
+              bookMemory = await trackMemoryRequests(
+                () => _memory.updateBookMemoryAfterChapter(
+                  dio: dio,
+                  config: config,
+                  currentMemory: _BookMemory.fromJson(
+                    bookMemorySnapshotFor(chapter) ?? <String, Object?>{},
+                    trustedLocks: true,
+                  ),
+                  chapter: updatedByPath[chapter.path]!,
+                  degradedBlockIds: _degradedBlocks,
+                  cancelToken: cancelToken,
+                ),
               );
               memoryStopwatch.stop();
               memoryChapters.add(chapter.path);
@@ -2132,8 +2173,6 @@ class EpubChapterTranslator {
                 record: () => recordMemoryTimeline(chapter.path, bookMemory!),
                 persist: persistBookMemory,
               );
-              totalMemoryElapsed += memoryStopwatch.elapsed;
-              memoryRequestCount += 1;
               emit(
                 chapterDoneJob,
                 s.runLogBookMemoryUpdated(
@@ -2811,6 +2850,8 @@ class EpubChapterTranslator {
         _protectedSlotCountsByTag(rebuilt, sourceSlots);
     final Map<dom.Text, bool> effectiveProtectedByNode =
         Map<dom.Text, bool>.identity();
+    final Map<dom.Element, bool> effectiveProtectedByElement =
+        Map<dom.Element, bool>.identity();
     final Map<dom.Text, int> writableIndexByNode =
         Map<dom.Text, int>.identity();
     final List<String> writableTranslatedTexts = <String>[];
@@ -2827,8 +2868,18 @@ class EpubChapterTranslator {
       final String tag = _nearestProtectingTag(translatedDom, slot.node) ?? '';
       final int ordinal = seenProtectedByTag[tag] ?? 0;
       seenProtectedByTag[tag] = ordinal + 1;
-      final bool effective = ordinal < (sourceProtectedCounts[tag] ?? 0);
+      final bool effective =
+          tag == 'script' || tag == 'style' ||
+          ordinal < (sourceProtectedCounts[tag] ?? 0);
       effectiveProtectedByNode[slot.node] = effective;
+      dom.Node? ancestor = slot.node.parentNode;
+      while (ancestor is dom.Element) {
+        if (translatedDom.isProtected(ancestor)) {
+          effectiveProtectedByElement[ancestor] = effective;
+          break;
+        }
+        ancestor = ancestor.parentNode;
+      }
       if (slot.text.isEmpty) {
         continue;
       }
@@ -2837,6 +2888,18 @@ class EpubChapterTranslator {
       } else {
         writableIndexByNode[slot.node] = writableTranslatedTexts.length;
         writableTranslatedTexts.add(slot.text);
+      }
+    }
+    // Whitespace-only protected-kind wrappers have no slots. Resolve them
+    // using the same source-counterpart fallback before collecting gaps.
+    for (final element in translatedDom.fragment.querySelectorAll('*')) {
+      if (translatedDom.isProtected(element)) {
+        effectiveProtectedByElement.putIfAbsent(
+          element,
+          () => element.localName == 'script' ||
+              element.localName == 'style' ||
+              (sourceProtectedCounts[element.localName] ?? 0) > 0,
+        );
       }
     }
     // Positional mapping must pair unprotected slots with unprotected
@@ -2870,6 +2933,7 @@ class EpubChapterTranslator {
         writableIndexByNode,
         rebuilt,
         writableSourceIndexByNode,
+        effectiveProtectedByElement,
       );
       for (int index = 0; index < writableSourceSlots.length; index += 1) {
         writableSourceSlots[index].text = finalTexts[index];
@@ -2887,6 +2951,7 @@ class EpubChapterTranslator {
     final String translatedPlainText = _unprotectedResponseText(
       translatedDom,
       effectiveProtectedByNode,
+      effectiveProtectedByElement,
     );
     bool wroteMainText = false;
     final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
@@ -3575,8 +3640,9 @@ class EpubChapterTranslator {
   static void _collectStandaloneWhitespaceGaps(
     _ResponseHtml document,
     Map<dom.Text, int> writableIndexByNode,
-    void Function(int precedingSlot, String data) onGap,
-  ) {
+    void Function(int precedingSlot, String data) onGap, [
+    Map<dom.Element, bool>? effectiveProtection,
+  ]) {
     int lastWritable = -1;
     void visit(dom.Node node, bool protected) {
       if (node is dom.Text) {
@@ -3595,7 +3661,10 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      final bool childProtected = protected || document.isProtected(node);
+      if (node.localName == 'script' || node.localName == 'style') return;
+      final bool childProtected =
+          protected ||
+          (effectiveProtection?[node] ?? document.isProtected(node));
       for (final dom.Node child in node.nodes) {
         visit(child, childProtected);
       }
@@ -3626,6 +3695,7 @@ class EpubChapterTranslator {
     Map<dom.Text, int> writableIndexByNode,
     _ResponseHtml sourceDom,
     Map<dom.Text, int> writableSourceIndexByNode,
+    Map<dom.Element, bool> effectiveProtection,
   ) {
     final List<({int precedingSlot, String data})> gaps =
         <({int precedingSlot, String data})>[];
@@ -3634,6 +3704,7 @@ class EpubChapterTranslator {
       writableIndexByNode,
       (int precedingSlot, String data) =>
           gaps.add((precedingSlot: precedingSlot, data: data)),
+      effectiveProtection,
     );
     if (gaps.isEmpty) {
       return writableTexts;
@@ -3675,16 +3746,12 @@ class EpubChapterTranslator {
   static String _unprotectedResponseText(
     _ResponseHtml translatedDom,
     Map<dom.Text, bool> effectiveProtectedByNode,
+    Map<dom.Element, bool> effectiveProtection,
   ) {
     final StringBuffer buffer = StringBuffer();
     void visit(dom.Node node, bool protected) {
       if (node is dom.Text) {
-        if (!protected) {
-          buffer.write(node.data);
-          return;
-        }
-        if (node.data.trim().isNotEmpty &&
-            effectiveProtectedByNode[node] == false) {
+        if (!(effectiveProtectedByNode[node] ?? protected)) {
           buffer.write(node.data);
         }
         return;
@@ -3692,7 +3759,10 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      final bool childProtected = protected || translatedDom.isProtected(node);
+      if (node.localName == 'script' || node.localName == 'style') return;
+      final bool childProtected =
+          protected ||
+          (effectiveProtection[node] ?? translatedDom.isProtected(node));
       for (final dom.Node child in node.nodes) {
         visit(child, childProtected);
       }
@@ -4092,6 +4162,7 @@ class EpubChapterTranslator {
           targetLanguage: config.targetLanguage,
           allowRetainedAuthorSignature: block.isAuthorSignature,
           allowBibliographicRetention: isBibliographicEntry,
+          lockedGlossary: config.lockedGlossary,
         );
     _responseCount(translatedDom.instrumentation, 'qualityDomChecks');
     if (finding == null) {
@@ -4492,7 +4563,7 @@ class EpubChapterTranslator {
   static String _styleProfileCacheValue(
     TranslationStyleProfile? confirmedStyleProfile,
   ) {
-    if (confirmedStyleProfile == null || confirmedStyleProfile.isEmpty) {
+    if (confirmedStyleProfile == null) {
       return 'none';
     }
     return jsonEncode(confirmedStyleProfile.toJson());

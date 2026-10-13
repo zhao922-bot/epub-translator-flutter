@@ -181,7 +181,8 @@ internal fun planShareStagingCleanup(
  * Retries revoking URI grants whose staging files are already gone
  * (P2-#17): a previous sweep may have deleted the file while its revoke
  * failed, or the process may have died between the delete and the revoke.
- * Returns the updated ledger: an entry is dropped only when its revoke
+ * Returns the updated ledger and failed paths, which must survive stale
+ * ledger filtering. An entry is dropped only when its revoke
  * succeeds; a failed revoke keeps its entry so a later sweep retries it
  * instead of leaking the persisted grant forever.
  *
@@ -192,19 +193,21 @@ internal fun retryOrphanedGrantRevokes(
     grants: Set<String>,
     livePaths: Set<String>,
     revokeUri: (String) -> Unit,
-): Set<String> {
+): Pair<Set<String>, Set<String>> {
     var remaining = grants
+    val failedPaths = mutableSetOf<String>()
     for ((path, grant) in loadShareGrants(grants)) {
         if (path in livePaths) continue
         try {
             revokeUri(grant.uri)
         } catch (_: Exception) {
             // Keep the entry: the next sweep retries the revoke.
+            failedPaths.add(path)
             continue
         }
         remaining = dropShareGrant(remaining, path)
     }
-    return remaining
+    return remaining to failedPaths
 }
 
 /**

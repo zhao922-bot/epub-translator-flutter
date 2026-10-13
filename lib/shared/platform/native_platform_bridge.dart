@@ -554,7 +554,22 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
     return clean.isEmpty ? null : clean;
   }
 
-  static Future<void> _writeMacosSecret(String name, String value) async {
+  // security -i has a 4096-byte line buffer; reserve room for the newline
+  // and terminator so a long command cannot partially overwrite a secret.
+  static const int _macosSecretCommandMaxBytes = 4000;
+
+  @visibleForTesting
+  static Future<void> writeMacosSecretForTest(
+    String name,
+    String value, {
+    required Future<void> Function(String command) storeCommand,
+  }) => _writeMacosSecret(name, value, storeCommand: storeCommand);
+
+  static Future<void> _writeMacosSecret(
+    String name,
+    String value, {
+    Future<void> Function(String command)? storeCommand,
+  }) async {
     rejectMultilineMacosSecret(value);
     // The old bare `-w` flag made `security` read the password via
     // readpassphrase(3), which prefers /dev/tty over the pipe when a
@@ -568,6 +583,15 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       name,
       value,
     );
+    if (utf8.encode(command).length > _macosSecretCommandMaxBytes) {
+      throw StateError(
+        'Secret too long for macOS keychain write; refusing to overwrite.',
+      );
+    }
+    if (storeCommand != null) {
+      await storeCommand(command);
+      return;
+    }
     await _runDesktopSecretHelper(
       'security',
       macosSecretStoreArgs(),
@@ -820,16 +844,30 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   /// and a broken registry read must not respawn it on every selection.
   static bool? _windowsLongPathsEnabledCache;
   static bool _windowsLongPathsQueried = false;
+  static Future<bool?>? _windowsLongPathsInFlight;
 
-  static Future<bool?> _windowsLongPathsEnabled() async {
+  @visibleForTesting
+  static void resetWindowsLongPathsCacheForTest() {
+    assert(_windowsLongPathsInFlight == null);
+    _windowsLongPathsQueried = false;
+    _windowsLongPathsEnabledCache = null;
+  }
+
+  static Future<bool?> _windowsLongPathsEnabled() {
     if (_windowsLongPathsQueried) {
-      return _windowsLongPathsEnabledCache;
+      return Future.value(_windowsLongPathsEnabledCache);
     }
+    return _windowsLongPathsInFlight ??= _queryWindowsLongPathsEnabled()
+        .whenComplete(() => _windowsLongPathsInFlight = null);
+  }
+
+  static Future<bool?> _queryWindowsLongPathsEnabled() async {
     try {
       // Process.start (not Process.run) so a 30s timeout kills the child:
       // Process.run's timeout only stops *waiting* and leaves the
       // PowerShell behind.
-      final Process process = await Process.start('powershell', <String>[
+      final starter = debugWindowsProcessStarter ?? Process.start;
+      final Process process = await starter('powershell', <String>[
         '-NoProfile',
         '-ExecutionPolicy',
         'Bypass',
