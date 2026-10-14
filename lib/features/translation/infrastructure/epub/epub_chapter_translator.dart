@@ -176,7 +176,7 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion = 'v17-quality-script-residual';
+  static const String qualityCacheSchemaVersion = 'v18-prefixed-text-protection';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
@@ -2700,7 +2700,9 @@ class EpubChapterTranslator {
     void preserve(dom.Element original, dom.Element reply, dom.Element output) {
       if (original.localName != reply.localName ||
           original.localName != output.localName ||
-          EpubHtmlExtractor.nonTextAncestors.contains(original.localName)) {
+          EpubHtmlExtractor.nonTextAncestors.contains(
+            EpubHtmlExtractor.tagLocalName(original),
+          )) {
         return;
       }
       // Only carry language metadata on an unambiguously aligned subtree.
@@ -2896,9 +2898,12 @@ class EpubChapterTranslator {
       if (translatedDom.isProtected(element)) {
         effectiveProtectedByElement.putIfAbsent(
           element,
-          () => element.localName == 'script' ||
-              element.localName == 'style' ||
-              (sourceProtectedCounts[element.localName] ?? 0) > 0,
+          () {
+            final String tag = EpubHtmlExtractor.tagLocalName(element);
+            return tag == 'script' ||
+                tag == 'style' ||
+                (sourceProtectedCounts[tag] ?? 0) > 0;
+          },
         );
       }
     }
@@ -3211,7 +3216,9 @@ class EpubChapterTranslator {
       return;
     }
 
-    if (!EpubHtmlExtractor.nonTextAncestors.contains(source.localName) &&
+    if (!EpubHtmlExtractor.nonTextAncestors.contains(
+          EpubHtmlExtractor.tagLocalName(source),
+        ) &&
         sourceDom.isProtected(source) &&
         _isProtectedMarkerText(sourceDom.textOf(source))) {
       _normalizeProtectedAnchor(
@@ -3340,7 +3347,7 @@ class EpubChapterTranslator {
       'embed',
       'img',
     };
-    if (unsafeTags.contains(node.localName)) {
+    if (unsafeTags.contains(EpubHtmlExtractor.tagLocalName(node))) {
       return '';
     }
     return node.nodes.map(_safeOverflowText).join();
@@ -3624,7 +3631,7 @@ class EpubChapterTranslator {
     dom.Node? ancestor = slotNode.parentNode;
     while (ancestor is dom.Element) {
       if (document.isProtected(ancestor)) {
-        return ancestor.localName;
+        return EpubHtmlExtractor.tagLocalName(ancestor);
       }
       ancestor = ancestor.parentNode;
     }
@@ -3661,7 +3668,8 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      if (node.localName == 'script' || node.localName == 'style') return;
+      final String tag = EpubHtmlExtractor.tagLocalName(node);
+      if (tag == 'script' || tag == 'style') return;
       final bool childProtected =
           protected ||
           (effectiveProtection?[node] ?? document.isProtected(node));
@@ -3759,7 +3767,8 @@ class EpubChapterTranslator {
       if (node is! dom.Element) {
         return;
       }
-      if (node.localName == 'script' || node.localName == 'style') return;
+      final String tag = EpubHtmlExtractor.tagLocalName(node);
+      if (tag == 'script' || tag == 'style') return;
       final bool childProtected =
           protected ||
           (effectiveProtection[node] ?? translatedDom.isProtected(node));
@@ -3774,7 +3783,7 @@ class EpubChapterTranslator {
   }
 
   static bool _isProtectedTextElement(dom.Element element, {String? text}) {
-    final String tag = element.localName ?? '';
+    final String tag = EpubHtmlExtractor.tagLocalName(element);
     if (EpubHtmlExtractor.nonTextAncestors.contains(tag)) return true;
     final Set<String> roles = _roleTokens(element);
     final Set<String> epubTypes = _epubTypes(element);
@@ -4637,7 +4646,8 @@ class EpubChapterTranslator {
   static bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
     dom.Node? current = element;
     while (current is dom.Element) {
-      if (current.localName == 'a' && _containsFootnoteMarkerClass(current)) {
+      if (EpubHtmlExtractor.tagLocalName(current) == 'a' &&
+          _containsFootnoteMarkerClass(current)) {
         return true;
       }
       current = current.parentNode;

@@ -1,4 +1,5 @@
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_quality.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -136,6 +137,98 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  group('foreign-script source residual windows', () {
+    bool check(String source, String translated) =>
+        TranslationQuality.hasSuspiciousSourceResidual(
+          sourceText: source,
+          translatedText: translated,
+          targetLanguage: 'Chinese',
+        );
+
+    test('keeps the inclusive 32 UTF-16 unit limit', () {
+      final atLimit = 'あ${'中' * 24}いうえおかきく';
+      final overLimit = 'あ${'中' * 25}いうえおかきく';
+      expect(atLimit.length, 32);
+      expect(overLimit.length, 33);
+      expect(check(atLimit, atLimit), isTrue);
+      expect(check(overLimit, overLimit), isFalse);
+    });
+
+    test('counts supplementary separators in UTF-16 units', () {
+      final atLimit = 'あ${'𠀀' * 12}いうえおかきく';
+      final overLimit = 'あ${'𠀀' * 12}中いうえおかきく';
+      expect(atLimit.length, 32);
+      expect(overLimit.length, 33);
+      expect(check('😀$atLimit😀', '𠀁$atLimit𠀁'), isTrue);
+      expect(check(overLimit, overLimit), isFalse);
+      expect(check(atLimit, atLimit.replaceFirst('𠀀', '𠀁')), isFalse);
+    });
+
+    test('preserves exact surrogate code units inside a window', () {
+      for (final separator in ['😀', '\uD800', '\uDC00']) {
+        final window = 'あ$separatorいうえおかきく';
+        expect(check(window, window), isTrue);
+        expect(check('あいうえおかきく', window), isFalse);
+      }
+    });
+
+    test('matches only a whole verbatim window including punctuation', () {
+      const window = 'あ・い、う。え！お？か：き；く';
+      expect(check('前文$window後文', window), isTrue);
+      expect(check(window.replaceFirst('・', '、'), window), isFalse);
+      expect(check('あいうえおかきく', window), isFalse);
+      expect(check(window, 'あ・い、う。え！お？か：き'), isFalse);
+    });
+
+    test('keeps existing whitespace normalization for spaced Hangul', () {
+      expect(check('가\t나\n다  라 마 바 사 아', '가 나 다 라 마 바 사 아'), isTrue);
+      expect(check('가나다라마바사아', '가 나 다 라 마 바 사 아'), isFalse);
+    });
+
+    test('finds later overlapping windows after earlier misses', () {
+      expect(check('いうえおかきくけ', 'あいうえおかきくけ'), isTrue);
+      expect(check('あああああああい', 'ああああああああい'), isTrue);
+    });
+
+    test('finds a shorter script window inside another window prefix', () {
+      expect(check('あ가나다라마바사아', 'あ가나다라마바사아이いうえおかきく'), isTrue);
+    });
+
+    final performanceSamples = <String, String>{
+      'repeated': 'かかかかかかかき' * 1600,
+      // Each Han separator differs, so deduplication alone cannot make
+      // per-window searches linear in the source length.
+      'distinct': String.fromCharCodes([
+        for (var index = 0; index < 6400; index++) ...[0x304B, 0x3400 + index],
+      ]),
+    };
+    for (final sample in performanceSamples.entries) {
+      test('checks 12800-unit ${sample.key} windows within 200 ms', () {
+        final source = 'か' * 12800;
+        final translated = sample.value;
+        expect(translated.length, 12800);
+        expect(check(source, translated), isFalse); // Warm up the VM.
+        final timings = <Duration>[];
+        for (var round = 0; round < 3; round++) {
+          final stopwatch = Stopwatch()..start();
+          final residual = check(source, translated);
+          stopwatch.stop();
+          timings.add(stopwatch.elapsed);
+          expect(residual, isFalse);
+        }
+        timings.sort();
+        final median = timings[1];
+        debugPrint(
+          '12800-unit ${sample.key} windows: '
+          '${(median.inMicroseconds / 1000).toStringAsFixed(2)} ms median.',
+        );
+        // A median and a generous bound tolerate occasional CI scheduling
+        // noise while catching the former ~1.35 second source rescans.
+        expect(median, lessThan(const Duration(milliseconds: 200)));
+      });
+    }
   });
 
   group('HTML-aware residual checks', () {

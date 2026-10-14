@@ -276,7 +276,7 @@ void main() {
       await EpubIsolateWorker.enforceRecoveryBudgetForTest(
         finalFile,
         deleteForTest: (file) async {
-          if (file.path == tmp.path) {
+          if (EpubIsolateWorker.sameFilesystemPath(file.path, tmp.path)) {
             throw const FileSystemException('simulated stuck delete');
           }
           await file.delete();

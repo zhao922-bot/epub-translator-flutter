@@ -312,7 +312,7 @@ body.epub-translator-cjk [data-translation="true"] {
                   'caption',
                   'summary',
                   'figcaption',
-                }.contains(target.localName)
+                }.contains(EpubHtmlExtractor.tagLocalName(target))
                 ? _bilingualStructuralItem(target, translationPart)
                 : '${target.outerHtml}\n$translationPart')
           : translationPart;
@@ -368,7 +368,7 @@ body.epub-translator-cjk [data-translation="true"] {
       chapterRoot?.attributes['xml:lang'] = languageTag;
     }
     if (containsCjkTranslation) {
-      _applyCjkReadingCompatibility(document);
+      _applyCjkReadingCompatibility(document, prefixedRoot: prefixedRoot);
     }
     return _serializeChapter(
       document,
@@ -425,14 +425,16 @@ body.epub-translator-cjk [data-translation="true"] {
   /// Translations are content inside the original structural element.
   String _bilingualStructuralItem(dom.Element source, String translationHtml) {
     final dom.Element item = source.clone(true);
+    final String sourceTag = EpubHtmlExtractor.tagLocalName(source);
     final dom.DocumentFragment fragment = html_parser.parseFragment(
       translationHtml,
       container: _replacementContainerFor(source),
     );
     for (final dom.Node node in fragment.nodes.toList()) {
-      if (node is dom.Element && node.localName == source.localName) {
+      if (node is dom.Element &&
+          EpubHtmlExtractor.tagLocalName(node) == sourceTag) {
         final dom.Element translation = dom.Element.tag(
-          source.localName == 'summary' ? 'span' : 'div',
+          _qualifiedTagName(source, sourceTag == 'summary' ? 'span' : 'div'),
         );
         translation.attributes.addAll(node.attributes);
         translation.attributes.remove('value');
@@ -953,24 +955,50 @@ body.epub-translator-cjk [data-translation="true"] {
     }
   }
 
-  void _applyCjkReadingCompatibility(dom.Document document) {
-    final dom.Element? body = document.body;
+  void _applyCjkReadingCompatibility(
+    dom.Document document, {
+    dom.Element? prefixedRoot,
+  }) {
+    dom.Element? chapterElement(String tag, dom.Element? fallback) =>
+        prefixedRoot == null
+        ? fallback
+        : prefixedRoot
+              .querySelectorAll('*')
+              .where(
+                (element) => EpubHtmlExtractor.tagLocalName(element) == tag,
+              )
+              .firstOrNull;
+    final dom.Element? body = chapterElement('body', document.body);
     if (body == null) {
       return;
     }
     body.classes.add('epub-translator-cjk');
-    for (final dom.Element anchor in body.querySelectorAll('a:not([href])')) {
+    for (final dom.Element anchor
+        in body
+            .querySelectorAll('*')
+            .where(
+              (element) =>
+                  EpubHtmlExtractor.tagLocalName(element) == 'a' &&
+                  !element.attributes.containsKey('href'),
+            )) {
       anchor.classes.add('epub-translator-anchor-marker');
     }
 
-    final dom.Element? head = document.head;
+    final dom.Element? head = chapterElement('head', document.head);
     if (head == null) {
       return;
     }
     final dom.Element style =
-        head.querySelector('style[title="$_cjkCompatibilityStyleTitle"]') ??
+        head
+            .querySelectorAll('[title]')
+            .where(
+              (element) =>
+                  EpubHtmlExtractor.tagLocalName(element) == 'style' &&
+                  element.attributes['title'] == _cjkCompatibilityStyleTitle,
+            )
+            .firstOrNull ??
         head.querySelector('#epub-translator-cjk-compat') ??
-        dom.Element.tag('style');
+        dom.Element.tag(_qualifiedTagName(prefixedRoot ?? head, 'style'));
     style.attributes.remove('id');
     style.attributes['type'] = 'text/css';
     style.attributes['title'] = _cjkCompatibilityStyleTitle;
@@ -978,6 +1006,12 @@ body.epub-translator-cjk [data-translation="true"] {
     if (style.parentNode == null) {
       head.append(style);
     }
+  }
+
+  String _qualifiedTagName(dom.Element source, String tag) {
+    final String name = source.localName ?? '';
+    final int colon = name.indexOf(':');
+    return colon < 0 ? tag : '${name.substring(0, colon)}:$tag';
   }
 
   bool _containsCjk(String value) {

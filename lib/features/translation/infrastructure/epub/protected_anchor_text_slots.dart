@@ -44,7 +44,9 @@ class ProtectedAnchorTextSlots {
       sourceRoot,
       <dom.Element>[
         sourceRoot,
-        ...sourceRoot.querySelectorAll('a'),
+        ...sourceRoot
+            .querySelectorAll('*')
+            .where((element) => EpubHtmlExtractor.tagLocalName(element) == 'a'),
       ].any(_isProtectedAnchor),
       slots.map((dom.Text slot) => slot.data).toList(growable: false),
     );
@@ -62,7 +64,9 @@ class ProtectedAnchorTextSlots {
       }
       if (<dom.Element>[
         node,
-        ...node.querySelectorAll('a'),
+        ...node
+            .querySelectorAll('*')
+            .where((element) => EpubHtmlExtractor.tagLocalName(element) == 'a'),
       ].any(_isProtectedAnchor)) {
         return true;
       }
@@ -125,7 +129,9 @@ class ProtectedAnchorTextSlots {
 
       final bool childProtected =
           protected ||
-          EpubHtmlExtractor.nonTextAncestors.contains(node.localName) ||
+          EpubHtmlExtractor.nonTextAncestors.contains(
+            EpubHtmlExtractor.tagLocalName(node),
+          ) ||
           _isRawTextElement(node) ||
           _isProtectedSemanticMarker(node) ||
           _isProtectedAnchor(node);
@@ -139,7 +145,8 @@ class ProtectedAnchorTextSlots {
   }
 
   static bool _isProtectedAnchor(dom.Element element) {
-    if (element.localName != 'a' || !_isShortMarker(element.text)) {
+    if (EpubHtmlExtractor.tagLocalName(element) != 'a' ||
+        !_isShortMarker(element.text)) {
       return false;
     }
 
@@ -188,7 +195,7 @@ class ProtectedAnchorTextSlots {
       'script',
       'style',
       'xmp',
-    }.contains(element.localName);
+    }.contains(EpubHtmlExtractor.tagLocalName(element));
   }
 
   static Set<String> _tokens(String? value) {

@@ -88,6 +88,109 @@ class _WorkTitleBlockContext {
   final Map<Node, (int, int)> spans = Map.identity();
 }
 
+class _SourceResidualWindowNode {
+  // Most trie nodes have one outgoing edge. Store it inline rather than
+  // allocating a Map for every code unit of every distinct window.
+  int unit = -1;
+  int next = 0;
+  Map<int, int>? branches;
+  int failure = 0;
+  bool isMatch = false;
+
+  int? transition(int codeUnit) =>
+      codeUnit == unit ? next : branches?[codeUnit];
+
+  void addTransition(int codeUnit, int state) {
+    if (unit < 0) {
+      unit = codeUnit;
+      next = state;
+    } else {
+      (branches ??= <int, int>{})[codeUnit] = state;
+    }
+  }
+}
+
+/// Aho-Corasick matcher for residual windows of at most 32 UTF-16 units.
+/// Preparation is linear in the total bounded window length; scanning the
+/// source once avoids a full source search for every translated window.
+/// Code units preserve String.contains semantics, including surrogate pairs
+/// and unpaired surrogates between the unicode RegExp letter boundaries.
+class _SourceResidualWindowMatcher {
+  _SourceResidualWindowMatcher(Iterable<String> windows) {
+    for (final window in windows) {
+      var state = 0;
+      for (var index = 0; index < window.length; index++) {
+        final unit = window.codeUnitAt(index);
+        final next = _nodes[state].transition(unit);
+        if (next == null) {
+          final nextState = _nodes.length;
+          _nodes[state].addTransition(unit, nextState);
+          _nodes.add(_SourceResidualWindowNode());
+          state = nextState;
+        } else {
+          state = next;
+        }
+      }
+      _nodes[state].isMatch = true;
+    }
+
+    // Breadth-first order makes every shorter failure state available before
+    // its children, including matches that are suffixes of another window.
+    final root = _nodes[0];
+    final queue = <int>[
+      if (root.unit >= 0) root.next,
+      ...?root.branches?.values,
+    ];
+    for (var index = 0; index < queue.length; index++) {
+      final node = _nodes[queue[index]];
+      if (node.unit >= 0) {
+        _enqueueChild(node, node.unit, node.next, queue);
+      }
+      final branches = node.branches;
+      if (branches != null) {
+        for (final edge in branches.entries) {
+          _enqueueChild(node, edge.key, edge.value, queue);
+        }
+      }
+    }
+  }
+
+  final List<_SourceResidualWindowNode> _nodes = [_SourceResidualWindowNode()];
+
+  void _enqueueChild(
+    _SourceResidualWindowNode parent,
+    int unit,
+    int state,
+    List<int> queue,
+  ) {
+    var fallback = parent.failure;
+    var next = _nodes[fallback].transition(unit);
+    while (fallback != 0 && next == null) {
+      fallback = _nodes[fallback].failure;
+      next = _nodes[fallback].transition(unit);
+    }
+    final child = _nodes[state];
+    child.failure = next ?? 0;
+    child.isMatch = child.isMatch || _nodes[child.failure].isMatch;
+    queue.add(state);
+  }
+
+  bool hasMatch(String source) {
+    var state = 0;
+    for (var index = 0; index < source.length; index++) {
+      final unit = source.codeUnitAt(index);
+      var next = _nodes[state].transition(unit);
+      while (state != 0 && next == null) {
+        state = _nodes[state].failure;
+        next = _nodes[state].transition(unit);
+      }
+      state = next ?? 0;
+      if (_nodes[state].isMatch) return true;
+    }
+    return false;
+  }
+}
+
 /// Residual / quality checks for translated blocks (multi-language targets).
 class TranslationQuality {
   const TranslationQuality._();
@@ -183,10 +286,12 @@ class TranslationQuality {
     source = _normalizeText(_stripNonLinguisticTokens(source));
     translated = _normalizeText(_stripNonLinguisticTokens(translated));
     final foreignScriptLetters = <RegExp>[
-      if (!_isJapaneseTargetLanguage(target)) RegExp(kanaLetters, unicode: true),
+      if (!_isJapaneseTargetLanguage(target))
+        RegExp(kanaLetters, unicode: true),
       if (!_isKoreanTargetLanguage(target))
         RegExp(r'[\uAC00-\uD7A3]', unicode: true),
     ];
+    final windows = <String>{};
     for (final letters in foreignScriptLetters) {
       final matches = letters.allMatches(translated).toList();
       for (int index = 7; index < matches.length; index++) {
@@ -195,11 +300,14 @@ class TranslationQuality {
         // Eight letters in at most 32 UTF-16 units give >=25% local evidence.
         // Han, spaces and punctuation may separate them, but the entire
         // window must still occur verbatim in the source.
-        if (end - start <= 32 &&
-            source.contains(translated.substring(start, end))) {
-          return true;
+        if (end - start <= 32) {
+          windows.add(translated.substring(start, end));
         }
       }
+    }
+    if (windows.isNotEmpty &&
+        _SourceResidualWindowMatcher(windows).hasMatch(source)) {
+      return true;
     }
     return patterns.any(
       (pattern) => pattern

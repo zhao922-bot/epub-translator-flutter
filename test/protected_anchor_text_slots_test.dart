@@ -4,6 +4,63 @@ import 'package:html/parser.dart' as html_parser;
 
 void main() {
   group('ProtectedAnchorTextSlots', () {
+    test('preserves prefixed footnote markers and code outside text slots', () {
+      const source =
+          '<x:p xmlns:x="http://www.w3.org/1999/xhtml">Read'
+          '<x:a href="#note">1</x:a><x:code>KEEP</x:code> now.</x:p>';
+      final template = ProtectedAnchorTextSlots.parse(source);
+
+      expect(template.slotTexts, ['Read', ' now.']);
+      expect(template.hasProtectedAnchors, isTrue);
+      expect(ProtectedAnchorTextSlots.containsProtectedAnchors(source), isTrue);
+      expect(
+        ProtectedAnchorTextSlots.containsProtectedAnchors(
+          '$source<p>Other</p>',
+        ),
+        isTrue,
+      );
+      expect(
+        template.render(['阅读', '现在。']),
+        '<x:p xmlns:x="http://www.w3.org/1999/xhtml">阅读'
+        '<x:a href="#note">1</x:a><x:code>KEEP</x:code> 现在。</x:p>',
+      );
+    });
+
+    test('preserves prefixed inline code and its descendants', () {
+      const source =
+          '<x:p xmlns:x="http://www.w3.org/1999/xhtml">Run '
+          '<x:code>call(<x:span>KEEP</x:span>)</x:code> now.</x:p>';
+      final template = ProtectedAnchorTextSlots.parse(source);
+
+      expect(template.slotTexts, ['Run ', ' now.']);
+      expect(template.hasProtectedAnchors, isFalse);
+      expect(
+        ProtectedAnchorTextSlots.containsProtectedAnchors(source),
+        isFalse,
+      );
+      expect(
+        template.render(['执行', '现在。']),
+        '<x:p xmlns:x="http://www.w3.org/1999/xhtml">执行 '
+        '<x:code>call(<x:span>KEEP</x:span>)</x:code> 现在。</x:p>',
+      );
+    });
+
+    for (final tag in ['script', 'style', 'iframe']) {
+      test('preserves prefixed $tag content outside text slots', () {
+        final source =
+            '<x:p xmlns:x="http://www.w3.org/1999/xhtml">Before'
+            '<x:$tag>KEEP</x:$tag>After</x:p>';
+        final template = ProtectedAnchorTextSlots.parse(source);
+
+        expect(template.slotTexts, ['Before', 'After']);
+        expect(
+          template.render(['前', '后']),
+          '<x:p xmlns:x="http://www.w3.org/1999/xhtml">前'
+          '<x:$tag>KEEP</x:$tag>后</x:p>',
+        );
+      });
+    }
+
     test('excludes supported short protected markers from stable slots', () {
       final ProtectedAnchorTextSlots template = ProtectedAnchorTextSlots.parse(
         '<p>Before '

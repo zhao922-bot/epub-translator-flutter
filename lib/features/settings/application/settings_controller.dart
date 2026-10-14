@@ -824,6 +824,19 @@ class SettingsController extends StateNotifier<TranslationConfig> {
             route.customApiBaseUrl != state.customApiBaseUrl);
   }
 
+  // Saved credentials retain their slot's route even when another provider is active.
+  bool _isSecretRouteChangedForSlot(
+    TranslationConfig config,
+    SettingsSecretSlot slot,
+  ) => switch (slot) {
+    SettingsSecretSlot.legacy =>
+      config.apiProviderSelection != state.apiProviderSelection ||
+          config.apiBaseUrl != state.apiBaseUrl,
+    SettingsSecretSlot.custom =>
+      config.customApiBaseUrl != state.customApiBaseUrl,
+    SettingsSecretSlot.deepSeek || SettingsSecretSlot.proxy => false,
+  };
+
   Future<void> _replayConflictedEdits() async {
     if (_replayingConflictedEdits || !mounted) return;
     _replayingConflictedEdits = true;
@@ -987,7 +1000,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     // C-P1-4: failed commits remain dirty in the text field and may also
     // remain in optimistic state. Discard both, using the fresh load that
     // established the changed route, unless a newer save owns the slot in
-    // this load generation and on the current credential route.
+    // this load generation and on the slot's current credential route.
     final loaded = _lastLoadedConfig!;
     bool belongsToCurrentLoad(
       TranslationConfig config,
@@ -995,12 +1008,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       SettingsSecretSlot slot,
     ) =>
         stateGeneration == _stateGeneration &&
-        !_isCredentialRouteChanged((
-          providerSelection: config.apiProviderSelection,
-          apiBaseUrl: config.apiBaseUrl,
-          customApiBaseUrl: config.customApiBaseUrl,
-          secretSlots: {slot},
-        ));
+        !_isSecretRouteChangedForSlot(config, slot);
 
     String restoredSecret(SettingsSecretSlot slot, String loadedValue) {
       // Pending saves include edits queued behind another save. Preserve the

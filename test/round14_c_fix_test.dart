@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:logger/logger.dart';
+import 'package:path/path.dart' as path;
 
 /// Gate-based fixture, matching the round10/round13 replay tests. Loading
 /// deliberately clears the error before returning its snapshot (real store).
@@ -498,7 +499,7 @@ void main() {
       resume.complete();
       await scanning;
     }
-    final added = File('${root.path}/blocks/bb/bb-new.html');
+    final added = File(path.join(root.path, 'blocks', 'bb', 'bb-new.html'));
     final stat = await added.stat();
     expect(cache.estimatedCacheBytesForTest, stat.size);
     expect(cache.mtimeBaselineForTest(added.path), stat.modified);
