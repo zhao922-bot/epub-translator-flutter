@@ -83,8 +83,8 @@ class TranslationApiClient {
     r'^(?:\s*<think(?:\s[^>]*)?>[\s\S]*?</think>)+',
     caseSensitive: false,
   );
-  static final RegExp _trailingReasoningBlocks = RegExp(
-    r'(?:<think(?:\s[^>]*)?>(?:(?!</think>)[\s\S])*</think>\s*)+$',
+  static final RegExp _thinkOpeningPrefix = RegExp(
+    r'<think(?=[\s>])',
     caseSensitive: false,
   );
   static final RegExp _jsonFence = RegExp(r'```(?:json)?\s*([\s\S]*?)\s*```');
@@ -648,9 +648,7 @@ class TranslationApiClient {
     return visibleContent;
   }
 
-  /// P2-05: [_trailingReasoningBlocks] can only match when a complete closing
-  /// tag ends the content (ignoring trailing whitespace). Skip its unanchored
-  /// scan otherwise to avoid quadratic work on many unclosed `<think>` tags.
+  /// A trailing reasoning block needs a complete closing tag at the end.
   static bool _endsWithThinkClose(String content) {
     int end = content.length;
     // Match the non-Unicode regexp's trailing \s*: tab, LF, VT, FF, CR, space.
@@ -671,6 +669,91 @@ class TranslationApiClient {
     return content.substring(end - close.length, end).toLowerCase() == close;
   }
 
+  /// Protect a JSON envelope's literal tags before scanning its suffix.
+  /// Each JSON string is traversed once, including its escape sequences.
+  int _jsonEnvelopeEnd(String content) {
+    int start = 0;
+    while (start < content.length && _whitespace.hasMatch(content[start])) {
+      start++;
+    }
+    if (content.startsWith('```', start)) {
+      start += 3;
+      if (content.startsWith('json', start)) start += 4;
+      while (start < content.length && _whitespace.hasMatch(content[start])) {
+        start++;
+      }
+    }
+    if (start >= content.length ||
+        (content[start] != '{' && content[start] != '[')) {
+      return 0;
+    }
+    int depth = 0;
+    for (int cursor = start; cursor < content.length; cursor++) {
+      final String character = content[cursor];
+      if (character == '"') {
+        try {
+          cursor = _jsonStringEnd(content, cursor);
+        } on FormatException {
+          return 0;
+        }
+      } else if (character == '{' || character == '[') {
+        depth++;
+      } else if (character == '}' || character == ']') {
+        if (--depth == 0) return cursor + 1;
+      }
+    }
+    return 0;
+  }
+
+  /// Scan backwards over complete, consecutive suffix blocks. A preceding
+  /// closing tag bounds each scan; no prefix is repeatedly searched.
+  int _trailingReasoningStart(String content) {
+    final int lowerBound = _jsonEnvelopeEnd(content);
+    int strippedEnd = content.length;
+    int end = strippedEnd;
+    const String close = '</think>';
+    while (end > lowerBound) {
+      while (end > lowerBound && _whitespace.hasMatch(content[end - 1])) {
+        end--;
+      }
+      final int closingStart = end - close.length;
+      if (closingStart < lowerBound ||
+          content.substring(closingStart, end).toLowerCase() != close) {
+        break;
+      }
+      int opening = -1;
+      int tagEnd = -1;
+      bool sawClosingTag = false;
+      for (int cursor = closingStart - 1; cursor >= lowerBound; cursor--) {
+        if (content[cursor] == '>') {
+          if (sawClosingTag) break;
+          tagEnd = cursor;
+        }
+        if (content[cursor] != '<') continue;
+        if (cursor + close.length <= closingStart &&
+            content.substring(cursor, cursor + close.length).toLowerCase() ==
+                close) {
+          // An opening tag's attributes may contain this literal close.
+          // Search only to the preceding '>', never across another block.
+          sawClosingTag = true;
+          continue;
+        }
+        final Match? prefix = _thinkOpeningPrefix.matchAsPrefix(
+          content,
+          cursor,
+        );
+        if (prefix != null && tagEnd >= prefix.end) {
+          // Keep the earliest opening before the next closing tag, matching
+          // the previous stripping semantics for nested opening tags.
+          opening = cursor;
+        }
+      }
+      if (opening < 0) break;
+      strippedEnd = end = opening;
+    }
+    return strippedEnd;
+  }
+
   /// Removes `<think>...</think>` reasoning blocks that reasoning models
   /// (for example DeepSeek-R1 variants) may prepend or append to the content.
   ///
@@ -680,10 +763,8 @@ class TranslationApiClient {
   String _stripReasoningBlocks(String content) {
     // Interior blocks can be literal translation text, including JSON values.
     String stripped = content.replaceFirst(_leadingReasoningBlocks, '');
-    // P2-05: when the closing-tag precheck fails, the trailing regexp cannot
-    // match; skip it while retaining the original regexp for matching input.
     if (_endsWithThinkClose(stripped)) {
-      stripped = stripped.replaceFirst(_trailingReasoningBlocks, '');
+      stripped = stripped.substring(0, _trailingReasoningStart(stripped));
     }
     return stripped.trim();
   }

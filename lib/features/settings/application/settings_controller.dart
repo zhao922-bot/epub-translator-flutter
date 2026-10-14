@@ -282,8 +282,25 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   Future<bool>? _sliderFlushInProgress;
   int _noticeRevision = 0;
   int _commitGeneration = 0;
-  final Map<SettingsSecretSlot, ({String value, int generation})>
+  final Map<
+    SettingsSecretSlot,
+    ({
+      String value,
+      int generation,
+      int stateGeneration,
+      TranslationConfig config,
+    })
+  >
   _lastCommittedSecrets = {};
+  final _inFlightSecretSaves =
+      <
+        ({
+          TranslationConfig config,
+          Set<SettingsSecretSlot> slots,
+          int generation,
+          int stateGeneration,
+        })
+      >[];
 
   /// In-flight [reloadSettings] future, if any (P2-#36). Concurrent reloads
   /// join it instead of starting a second load.
@@ -355,8 +372,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
     _loaded = true;
     _lastLoadedConfig = loaded;
-    state = loaded;
     _stateGeneration++;
+    // The loaded values are the new baseline, including when only keys changed.
+    // Update it before state listeners can discard queued credential edits.
+    _lastCommittedSecrets.clear();
+    state = loaded;
     if (_store.didCorruptReset) {
       onCorruptReset?.call(_store.lastCorruptBackupPath);
     }
@@ -641,6 +661,15 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   }) async {
     final noticeRevision = _noticeRevision;
     final olderEdits = _conflictedEdits.toList();
+    final stateGeneration = _stateGeneration;
+    final inFlight = (
+      config: next,
+      slots: Set<SettingsSecretSlot>.of(slots),
+      // A successful pending save will commit after edits from this generation.
+      generation: _commitGeneration + 1,
+      stateGeneration: stateGeneration,
+    );
+    if (slots.isNotEmpty) _inFlightSecretSaves.add(inFlight);
     try {
       await _persist(next, explicitSecretMutations: slots);
       // Successful saves must retain blocked or newly conflicted replays.
@@ -649,13 +678,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       _commitGeneration++;
       for (final slot in persisted) {
         _lastCommittedSecrets[slot] = (
-          value: switch (slot) {
-            SettingsSecretSlot.legacy => next.apiKey,
-            SettingsSecretSlot.deepSeek => next.deepseekApiKey,
-            SettingsSecretSlot.custom => next.customApiKey,
-            SettingsSecretSlot.proxy => next.httpProxy,
-          },
+          value: _secretValue(next, slot),
           generation: _commitGeneration,
+          // Capture at save issuance: recovery may load again before it returns.
+          stateGeneration: stateGeneration,
+          config: next,
         );
       }
       // C-07: only the slots this save explicitly targeted may clear their
@@ -704,8 +731,20 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       // letting the future go unhandled at the call site.
       if (mounted) onSaveError?.call(error);
       return false;
+    } finally {
+      _inFlightSecretSaves.remove(inFlight);
     }
   }
+
+  static String _secretValue(
+    TranslationConfig config,
+    SettingsSecretSlot slot,
+  ) => switch (slot) {
+    SettingsSecretSlot.legacy => config.apiKey,
+    SettingsSecretSlot.deepSeek => config.deepseekApiKey,
+    SettingsSecretSlot.custom => config.customApiKey,
+    SettingsSecretSlot.proxy => config.httpProxy,
+  };
 
   /// Re-reads settings from disk. Used after a cross-instance write
   /// conflict: the other instance's values become visible and the stale
@@ -947,11 +986,44 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     _conflictedEdits.removeWhere(blocked.contains);
     // C-P1-4: failed commits remain dirty in the text field and may also
     // remain in optimistic state. Discard both, using the fresh load that
-    // established the changed route, unless a newer commit saved the slot.
+    // established the changed route, unless a newer save owns the slot in
+    // this load generation and on the current credential route.
     final loaded = _lastLoadedConfig!;
+    bool belongsToCurrentLoad(
+      TranslationConfig config,
+      int stateGeneration,
+      SettingsSecretSlot slot,
+    ) =>
+        stateGeneration == _stateGeneration &&
+        !_isCredentialRouteChanged((
+          providerSelection: config.apiProviderSelection,
+          apiBaseUrl: config.apiBaseUrl,
+          customApiBaseUrl: config.customApiBaseUrl,
+          secretSlots: {slot},
+        ));
+
     String restoredSecret(SettingsSecretSlot slot, String loadedValue) {
+      // Pending saves include edits queued behind another save. Preserve the
+      // latest one so a successful completion agrees with the optimistic state.
+      for (final pending in _inFlightSecretSaves.reversed) {
+        if (pending.slots.contains(slot) &&
+            pending.generation > touchGenerations[slot]! &&
+            belongsToCurrentLoad(
+              pending.config,
+              pending.stateGeneration,
+              slot,
+            )) {
+          return _secretValue(pending.config, slot);
+        }
+      }
       final committed = _lastCommittedSecrets[slot];
-      return committed != null && committed.generation > touchGenerations[slot]!
+      return committed != null &&
+              committed.generation > touchGenerations[slot]! &&
+              belongsToCurrentLoad(
+                committed.config,
+                committed.stateGeneration,
+                slot,
+              )
           ? committed.value
           : loadedValue;
     }

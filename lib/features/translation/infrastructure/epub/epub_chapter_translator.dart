@@ -175,8 +175,8 @@ class EpubChapterTranslator {
   static final Object _memoryAttemptKey = Object();
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
-  // Memory checkpoints keep their independent quality schema.
-  static const String qualityCacheSchemaVersion = 'v16-quality-memory-lru';
+  // Quality rules version input/job/block identities as well as checkpoints.
+  static const String qualityCacheSchemaVersion = 'v17-quality-script-residual';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);

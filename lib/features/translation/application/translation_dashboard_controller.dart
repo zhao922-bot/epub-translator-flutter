@@ -632,6 +632,11 @@ class TranslationDashboardController
     // P2-02: invalidate the finishing run and stop its service here, since
     // its stale finally will no longer stop the foreground service.
     ++_translationRunGeneration;
+    // Release the old context before publishing the new input; a stale
+    // result must not later clear history or timing owned by a newer run.
+    _clearActiveTranslationHistory();
+    _translationStopwatch?.stop();
+    _translationStopwatch = null;
     _stopTranslationForegroundService();
     // A new input abandons any in-flight style generation and its profile:
     // drop the edit markers too, or the next merge would overlay fields from
@@ -703,6 +708,9 @@ class TranslationDashboardController
     // pick can bump the input revision while a run is still active. Stop
     // its service here because the stale finally will skip cleanup.
     ++_translationRunGeneration;
+    _clearActiveTranslationHistory();
+    _translationStopwatch?.stop();
+    _translationStopwatch = null;
     _stopTranslationForegroundService();
     final String outputDirectory = state.outputDirectory.isEmpty
         ? inferredOutput
@@ -1183,6 +1191,9 @@ class TranslationDashboardController
     // P2-02: a new inspection (including same-book reinspection or retry)
     // invalidates the finishing run and takes over its service cleanup.
     ++_translationRunGeneration;
+    _clearActiveTranslationHistory();
+    _translationStopwatch?.stop();
+    _translationStopwatch = null;
     _stopTranslationForegroundService();
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
@@ -1618,6 +1629,9 @@ class TranslationDashboardController
           // re-key the cache to the new list, keeping the frozen part.
           if (identical(chapters, _estimateStaticChaptersKey)) {
             _estimateStaticChaptersKey = next;
+            if (chapter.includeInTranslation) {
+              _estimateHasReleasedSources = true;
+            }
           }
         },
       );
@@ -2797,6 +2811,9 @@ class TranslationDashboardController
 
   void _clearActiveTranslationHistory() {
     _activeTranslationHistoryJobId = null;
+    _activeTranslationRunStartedAt = 0;
+    _activeTranslationRecordRevision = 0;
+    _activeTranslationOutputDirectory = '';
     _activeTranslationChapterPaths = null;
     _lastProgressHistoryPersistAt = null;
   }
@@ -2842,6 +2859,9 @@ class TranslationDashboardController
   List<InspectedChapter>? _estimateStaticChaptersKey;
   int _estimateStaticChunkSizeKey = -1;
   TranslationRunEstimate? _estimateStaticCache;
+  // The memoized totals still describe full sources after selected chapters
+  // release their text; even a partial release prevents a fresh replan.
+  bool _estimateHasReleasedSources = false;
 
   // P2-#8: the chunk size and batch count the frozen estimate was planned
   // from (full sources). Scaling released-source estimates compounds ceil()
@@ -2888,11 +2908,13 @@ class TranslationDashboardController
           ? selectedChapters
           : (_estimateStaticChaptersKey ?? sourceChapters);
       final bool sourcesReleased =
-          releaseCheckChapters.isNotEmpty &&
-          !releaseCheckChapters.any(
-            (chapter) =>
-                chapter.blocks.any((block) => block.sourceText.isNotEmpty),
-          );
+          (identical(sourceChapters, _estimateStaticChaptersKey) &&
+              _estimateHasReleasedSources) ||
+          (releaseCheckChapters.isNotEmpty &&
+              !releaseCheckChapters.any(
+                (chapter) =>
+                    chapter.blocks.any((block) => block.sourceText.isNotEmpty),
+              ));
       if (sourcesReleased && staticPart != null) {
         if (identical(sourceChapters, _estimateStaticChaptersKey)) {
           // P2-#20: always scale the batch count from the anchor's original
@@ -2930,6 +2952,7 @@ class TranslationDashboardController
           sourceChapters,
           chunkSize: chunkSize,
         );
+        _estimateHasReleasedSources = false;
         // P2-#8 anchor: the batch count actually planned from full sources
         // at this chunk size.
         _estimateAnchorChunkSize = chunkSize;

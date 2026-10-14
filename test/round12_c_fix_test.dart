@@ -397,7 +397,8 @@ void main() {
       expect(reloaded.jobs, isEmpty);
     });
 
-    test('saveMerged applies the preserved tombstone', () async {
+    test('saveMerged with corrupt file honors the newer preserved tombstone',
+        () async {
       final temp = await Directory.systemTemp.createTemp('c12_p233b_');
       addTearDown(() => temp.delete(recursive: true));
       final file = File(p.join(temp.path, 'job-history.json'));
@@ -406,19 +407,41 @@ void main() {
       await store.save([_job('a')], clearedAtEpochMs: 0);
       final clearedAt = DateTime.now().millisecondsSinceEpoch;
       await store.save([], clearedAtEpochMs: clearedAt);
-      await file.writeAsString('{"version": 2, "clearedAt": $clearedAt, "jo');
+      final truncated = '{"version": 2, "clearedAt": $clearedAt, "jo';
+      await file.writeAsString(truncated);
 
       // Another instance with a stale (pre-clear) view tries to merge.
+      // 旧断言错误地认可了旧记录复活。恢复出的墓碑新于调用者时，
+      // 不调用 merge，返回 written:false，并持久化携带新墓碑的空历史。
+      var mergeCalled = false;
       final result = await store.saveMerged(
-        merge: (fileJobs, fileClearedAt) => [_job('stale')],
+        merge: (fileJobs, fileClearedAt) {
+          mergeCalled = true;
+          return [_job('stale')];
+        },
         clearedAtEpochMs: 0,
       );
-      expect(result.written, isTrue);
-      // The tombstone was preserved and applied: the merge cannot move it
-      // backwards.
+      expect(result.written, isFalse);
+      expect(result.fileClearedAt, clearedAt);
+      expect(mergeCalled, isFalse);
+      expect(await file.exists(), isTrue);
+      final backups = await temp
+          .list()
+          .where(
+            (e) =>
+                e is File &&
+                p.basename(e.path).startsWith('job-history.json.bad-'),
+          )
+          .cast<File>()
+          .toList();
+      expect(backups, hasLength(1));
+      expect(await backups.single.readAsString(), truncated);
       final reloaded = await store.loadWithTombstone();
       expect(reloaded.clearedAt, clearedAt);
-      expect(reloaded.jobs.map((j) => j.id), contains('stale'));
+      expect(reloaded.jobs, isEmpty);
+      final loadedAgain = await store.loadWithTombstone();
+      expect(loadedAgain.clearedAt, clearedAt);
+      expect(loadedAgain.jobs, isEmpty);
     });
   });
 

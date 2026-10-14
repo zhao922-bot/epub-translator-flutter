@@ -156,20 +156,19 @@ class TranslationQuality {
   ) {
     final target = targetLanguage.trim().toLowerCase();
     if (target.isEmpty) return false;
+    // Only Lo/Lm letters in the kana blocks count, not punctuation, symbols,
+    // combining marks or unassigned code points.
+    const kanaLetters =
+        r'[\u3041-\u3096\u309D-\u309F\u30A1-\u30FA\u30FC-\u30FF]';
     // Require a substantial verbatim source run in a script foreign to the
     // target. Shared Han characters across CJK languages are not evidence.
     final patterns = <RegExp>[
       if (!_isCjkTargetLanguage(target))
         RegExp(
-          r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]{8,}',
+          '(?:$kanaLetters|'
+          r'[\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]){8,}',
           unicode: true,
-        )
-      else ...[
-        if (!_isJapaneseTargetLanguage(target))
-          RegExp(r'[\u3040-\u30FF]{8,}', unicode: true),
-        if (!_isKoreanTargetLanguage(target))
-          RegExp(r'[\uAC00-\uD7AF]{8,}', unicode: true),
-      ],
+        ),
       if (!RegExp(r'^ru(?:[-_]|$)').hasMatch(target) &&
           !_matchesLanguageName(target, 'russian') &&
           !target.contains('русский') &&
@@ -183,6 +182,25 @@ class TranslationQuality {
     ];
     source = _normalizeText(_stripNonLinguisticTokens(source));
     translated = _normalizeText(_stripNonLinguisticTokens(translated));
+    final foreignScriptLetters = <RegExp>[
+      if (!_isJapaneseTargetLanguage(target)) RegExp(kanaLetters, unicode: true),
+      if (!_isKoreanTargetLanguage(target))
+        RegExp(r'[\uAC00-\uD7A3]', unicode: true),
+    ];
+    for (final letters in foreignScriptLetters) {
+      final matches = letters.allMatches(translated).toList();
+      for (int index = 7; index < matches.length; index++) {
+        final start = matches[index - 7].start;
+        final end = matches[index].end;
+        // Eight letters in at most 32 UTF-16 units give >=25% local evidence.
+        // Han, spaces and punctuation may separate them, but the entire
+        // window must still occur verbatim in the source.
+        if (end - start <= 32 &&
+            source.contains(translated.substring(start, end))) {
+          return true;
+        }
+      }
+    }
     return patterns.any(
       (pattern) => pattern
           .allMatches(translated)
@@ -660,13 +678,18 @@ class TranslationQuality {
     }
     // Strip trailing sentence-final punctuation then split into words.
     body = body.replaceFirst(RegExp(r'[.!?]+\s*$'), '');
-    final List<String> words = RegExp(
-      r"[A-Za-z][A-Za-z'’\-]*|\d+",
-    ).allMatches(body).map((RegExpMatch match) => match.group(0)!).toList();
+    final wordPattern = RegExp(r"[A-Za-z][A-Za-z'’\-]*|\d+");
+    // Numbers and citation cues cannot exempt letters the tokenizer did not
+    // consume. Check before every affirmative metadata branch.
+    if (RegExp(r'\p{L}', unicode: true).hasMatch(body.replaceAll(wordPattern, ''))) {
+      return false;
+    }
+    final List<String> words = wordPattern
+        .allMatches(body)
+        .map((RegExpMatch match) => match.group(0)!)
+        .toList();
     if (words.isEmpty) {
-      // Only bare numbers/punctuation lack translatable content. The ASCII
-      // tokenizer finding no words does not exempt non-Latin prose.
-      return !RegExp(r'\p{L}', unicode: true).hasMatch(body);
+      return true;
     }
     const Set<String> citationTokens = <String>{
       'a',

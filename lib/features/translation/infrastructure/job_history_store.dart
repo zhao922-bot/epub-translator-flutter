@@ -486,12 +486,14 @@ class JobHistoryStore {
   /// section, so it must be synchronous and fast — snapshot everything it
   /// needs beforehand.
   ///
-  /// Returns `written: false` (and does not write) when the file carries a
+  /// Returns `written: false` (without merging) when the file carries a
   /// *newer* clear tombstone than [clearedAtEpochMs]: another instance
   /// cleared after this instance's last read, and writing would resurrect
   /// the cleared entries. The caller should then adopt [fileClearedAt] and
   /// drop its stale in-memory entries (same semantics as the old
   /// [HistoryWriteConflict], without the exception).
+  /// Corrupt history moved to backup is replaced with an empty history that
+  /// preserves the newer tombstone before returning.
   ///
   /// The written tombstone is `max(clearedAtEpochMs, fileClearedAt)` so a
   /// merge can never move the tombstone backwards.
@@ -554,8 +556,7 @@ class JobHistoryStore {
           } on FormatException {
             // Only parse failures can start fresh, after preserving evidence.
             // IO failures must propagate: an unreadable file is not empty.
-            // P2-#33: the corrupt file's tombstone is preserved and applied
-            // to the merge below, so cleared entries cannot be resurrected.
+            // Preserve the corrupt file's tombstone before considering merge.
             fileClearedAt = await _backupCorruptHistoryFile(
               expectedFingerprint: fingerprint,
               // This method already holds the cross-process history lock
@@ -563,6 +564,19 @@ class JobHistoryStore {
               lockHeld: true,
             );
             if (await file.exists()) rethrow;
+            if (fileClearedAt > clearedAtEpochMs) {
+              // The backup removed the active file. Restore a valid empty
+              // history under this lock so other instances see the clear.
+              await writeFileAtomically(
+                file,
+                const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+                  'version': 2,
+                  'clearedAt': fileClearedAt,
+                  'jobs': const <Object?>[],
+                }),
+              );
+              return (written: false, fileClearedAt: fileClearedAt);
+            }
           }
         }
         final List<TranslationJob> toSave = merge(fileJobs, fileClearedAt);

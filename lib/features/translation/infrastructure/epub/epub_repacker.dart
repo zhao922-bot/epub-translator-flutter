@@ -26,6 +26,12 @@ class EpubRepacker {
 
   final EpubHtmlExtractor _extractor;
 
+  static const String _xhtmlNamespace = 'http://www.w3.org/1999/xhtml';
+  static final RegExp _possibleHeading = RegExp(
+    r'<h[1-6]',
+    caseSensitive: false,
+  );
+
   /// Chapter-scoped key for a degraded block. Block ids restart per chapter
   /// (`p-1` exists in nearly every chapter), so a bare block id would collide
   /// across chapters and mis-mark innocent blocks as untranslated.
@@ -238,6 +244,8 @@ body.epub-translator-cjk [data-translation="true"] {
     final dom.Document document = html_parser.parse(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(chapter.originalHtml),
     );
+    final prefixedRoot = _prefixedXhtmlRoot(document, chapter.originalHtml);
+    final chapterRoot = prefixedRoot ?? document.documentElement;
     final List<dom.Element> targets = _extractor
         .extractTranslatableTextElements(document);
     final int count = min(targets.length, chapter.blocks.length);
@@ -338,10 +346,17 @@ body.epub-translator-cjk [data-translation="true"] {
     if (hasTranslation && !bilingual && languageTag != null) {
       // Keep the original inherited language for unselected / degraded text.
       // Each translated block carries its own target-language override.
-      final body = document.body;
+      final body = prefixedRoot == null
+          ? document.body
+          : prefixedRoot.children
+                .where(
+                  (element) =>
+                      EpubHtmlExtractor.tagLocalName(element) == 'body',
+                )
+                .firstOrNull;
       final originalLanguage =
-          document.documentElement?.attributes['xml:lang'] ??
-          document.documentElement?.attributes['lang'];
+          chapterRoot?.attributes['xml:lang'] ??
+          chapterRoot?.attributes['lang'];
       if (body != null &&
           originalLanguage != null &&
           !body.attributes.containsKey('lang') &&
@@ -349,13 +364,61 @@ body.epub-translator-cjk [data-translation="true"] {
         body.attributes['lang'] = originalLanguage;
         body.attributes['xml:lang'] = originalLanguage;
       }
-      document.documentElement?.attributes['lang'] = languageTag;
-      document.documentElement?.attributes['xml:lang'] = languageTag;
+      chapterRoot?.attributes['lang'] = languageTag;
+      chapterRoot?.attributes['xml:lang'] = languageTag;
     }
     if (containsCjkTranslation) {
       _applyCjkReadingCompatibility(document);
     }
-    return XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
+    return _serializeChapter(
+      document,
+      chapterPath: chapter.path,
+      prefixedRoot: prefixedRoot,
+    );
+  }
+
+  /// HTML parsing nests a qualified XHTML root inside a synthesized html/body.
+  /// Only a valid XML source with the XHTML namespace opts into root recovery.
+  dom.Element? _prefixedXhtmlRoot(dom.Document document, String originalHtml) {
+    if (!originalHtml.contains(':html')) return null;
+    final xml.XmlElement sourceRoot;
+    try {
+      sourceRoot = xml.XmlDocument.parse(originalHtml).rootElement;
+    } on xml.XmlParserException {
+      return null;
+    }
+    if (sourceRoot.name.local != 'html' ||
+        sourceRoot.name.prefix == null ||
+        sourceRoot.namespaceUri != _xhtmlNamespace) {
+      return null;
+    }
+    final root = document
+        .querySelectorAll('*')
+        .where(
+          (element) =>
+              element.localName == sourceRoot.name.qualified.toLowerCase(),
+        )
+        .firstOrNull;
+    if (root == null) {
+      throw const FormatException('Generated EPUB markup lost its XHTML root.');
+    }
+    return root;
+  }
+
+  String _serializeChapter(
+    dom.Document document, {
+    required String chapterPath,
+    dom.Element? prefixedRoot,
+  }) {
+    final output = XhtmlHtmlCompatibility.normalizeForXhtmlOutput(
+      prefixedRoot?.outerHtml ?? document.outerHtml,
+    );
+    if (prefixedRoot != null) {
+      _validateXmlReplacements({
+        chapterPath: output,
+      }, requireXhtmlNamespace: true);
+    }
+    return output;
   }
 
   /// Preserve list numbering and the table grid (including row/col spans).
@@ -1104,8 +1167,11 @@ body.epub-translator-cjk [data-translation="true"] {
             changed;
       }
       if (changed) {
-        renderedByPath[chapter.path] =
-            XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml);
+        renderedByPath[chapter.path] = _serializeChapter(
+          document,
+          chapterPath: chapter.path,
+          prefixedRoot: _prefixedXhtmlRoot(document, chapter.originalHtml),
+        );
       }
     }
   }
@@ -1154,10 +1220,13 @@ body.epub-translator-cjk [data-translation="true"] {
       }
       for (final block in chapter.blocks) {
         if (block.translatedHtml?.trim().isNotEmpty != true) continue;
+        final sourceHtml =
+            sourcesById[block.id]?.sourceHtml ?? block.sourceHtml;
+        // The probe allows false positives; only definite non-heading blocks
+        // skip the two fragment parses. Pairing and label order stay unchanged.
+        if (!_possibleHeading.hasMatch(sourceHtml)) continue;
         final source = html_parser.parseFragment(
-          XhtmlHtmlCompatibility.normalizeForHtmlParser(
-            sourcesById[block.id]?.sourceHtml ?? block.sourceHtml,
-          ),
+          XhtmlHtmlCompatibility.normalizeForHtmlParser(sourceHtml),
         );
         final translated = html_parser.parseFragment(block.translatedHtml!);
         final headings = source.querySelectorAll('h1,h2,h3,h4,h5,h6');
@@ -1287,11 +1356,22 @@ body.epub-translator-cjk [data-translation="true"] {
     return '${headings.first}: ${headings[1]}';
   }
 
-  void _validateXmlReplacements(Map<String, String> replacements) {
+  void _validateXmlReplacements(
+    Map<String, String> replacements, {
+    bool requireXhtmlNamespace = false,
+  }) {
     for (final MapEntry<String, String> replacement in replacements.entries) {
       // Every replacement here is an XHTML chapter, regardless of its suffix.
       try {
-        xml.XmlDocument.parse(replacement.value);
+        final document = xml.XmlDocument.parse(replacement.value);
+        if (requireXhtmlNamespace &&
+            (document.rootElement.name.local != 'html' ||
+                document.rootElement.namespaceUri != _xhtmlNamespace)) {
+          throw FormatException(
+            'Generated EPUB markup lost its XHTML root or namespace at '
+            '${replacement.key}.',
+          );
+        }
       } on xml.XmlParserException catch (error) {
         throw FormatException(
           'Generated EPUB markup is invalid at ${replacement.key}: $error',
