@@ -20,6 +20,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:html/parser.dart' as html_parser;
+import 'package:html/dom.dart' as dom;
 
 // Regression tests for the B-area round-12 fixes (platform/export/UI).
 //
@@ -977,22 +978,24 @@ void _r12ExtractorTests() {
 
   test('P2-#23 pathological nesting degrades instead of overflowing', () {
     const depth = 50000;
-    final buffer = StringBuffer();
-    for (int i = 0; i < depth; i++) {
-      buffer.write('<div>');
+    // Isolate the DOM guard from the parser's quadratic handling of extreme
+    // nesting. The inspection entry-point has a separate pre-parser rejection.
+    final document = html_parser.parse('<html><body></body></html>');
+    final div = dom.Element.tag('div');
+    document.body!.append(div);
+    var parent = div;
+    for (int i = 1; i < depth; i++) {
+      final child = dom.Element.tag('div');
+      parent.append(child);
+      parent = child;
     }
-    buffer.write('deep');
-    for (int i = 0; i < depth; i++) {
-      buffer.write('</div>');
-    }
-    final document = html_parser.parse(buffer.toString());
+    parent.append(dom.Text('deep'));
     // Extraction and text computation must return (degraded past the cap),
     // not throw a StackOverflowError.
     expect(
       () => extractor.extractTranslatableElements(document),
       returnsNormally,
     );
-    final div = document.querySelector('div')!;
     expect(() => extractor.elementText(div), returnsNormally);
   });
 

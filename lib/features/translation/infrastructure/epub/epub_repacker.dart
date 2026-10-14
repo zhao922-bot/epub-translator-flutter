@@ -13,6 +13,7 @@ import '../../domain/repositories/translation_repository.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
+import 'epub_dom.dart';
 import 'epub_navigation.dart';
 import 'epub_source_guard.dart';
 import 'proper_name_normalizer.dart';
@@ -28,7 +29,7 @@ class EpubRepacker {
 
   static const String _xhtmlNamespace = 'http://www.w3.org/1999/xhtml';
   static final RegExp _possibleHeading = RegExp(
-    r'<h[1-6]',
+    r'<(?:[A-Za-z][\w.-]*:)?h[1-6](?=[\s/>])',
     caseSensitive: false,
   );
 
@@ -198,6 +199,7 @@ body.epub-translator-cjk [data-translation="true"] {
     final ProperNameBookState properNameState =
         ProperNameNormalizer.bookState();
     final Map<String, String> translatedHtmlByPath = <String, String>{};
+    final navigationLabelsByPath = <String, String>{};
     int completedChapters = 0;
     reportProgress(0, chapters.length);
     for (final InspectedChapter chapter in chapters) {
@@ -212,10 +214,10 @@ body.epub-translator-cjk [data-translation="true"] {
         lockedGlossary: config.lockedGlossary,
         properNameState: properNameState,
         degradedBlockIds: degradedBlockIds,
+        navigationLabels: navigationLabelsByPath,
       );
       reportProgress(++completedChapters, chapters.length);
     }
-    final navigationLabelsByPath = _navigationLabels(chapters);
     _synchronizeHtmlTocLabels(
       translatedHtmlByPath,
       chapters,
@@ -237,7 +239,9 @@ body.epub-translator-cjk [data-translation="true"] {
     String lockedGlossary = '',
     ProperNameBookState? properNameState,
     Set<String> degradedBlockIds = const <String>{},
+    Map<String, String>? navigationLabels,
   }) {
+    validateEpubMarkupDepth(chapter.originalHtml);
     final List<ProperNameMap> nameMappings = ProperNameNormalizer.parseGlossary(
       lockedGlossary,
     );
@@ -248,6 +252,12 @@ body.epub-translator-cjk [data-translation="true"] {
     final chapterRoot = prefixedRoot ?? document.documentElement;
     final List<dom.Element> targets = _extractor
         .extractTranslatableTextElements(document);
+    navigationLabels?.addAll(
+      _navigationLabels(
+        [chapter],
+        sourceElementsByChapter: {chapter.path: targets},
+      ),
+    );
     final int count = min(targets.length, chapter.blocks.length);
     final languageTag = _languageTagForTarget(targetLanguage);
     bool containsCjkTranslation = false;
@@ -261,6 +271,7 @@ body.epub-translator-cjk [data-translation="true"] {
       if (translatedHtml.isEmpty) {
         continue;
       }
+      validateEpubMarkupDepth(translatedHtml);
       hasTranslation = true;
       final isDegraded = degradedBlockIds.contains(
         degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
@@ -379,31 +390,8 @@ body.epub-translator-cjk [data-translation="true"] {
 
   /// HTML parsing nests a qualified XHTML root inside a synthesized html/body.
   /// Only a valid XML source with the XHTML namespace opts into root recovery.
-  dom.Element? _prefixedXhtmlRoot(dom.Document document, String originalHtml) {
-    if (!originalHtml.contains(':html')) return null;
-    final xml.XmlElement sourceRoot;
-    try {
-      sourceRoot = xml.XmlDocument.parse(originalHtml).rootElement;
-    } on xml.XmlParserException {
-      return null;
-    }
-    if (sourceRoot.name.local != 'html' ||
-        sourceRoot.name.prefix == null ||
-        sourceRoot.namespaceUri != _xhtmlNamespace) {
-      return null;
-    }
-    final root = document
-        .querySelectorAll('*')
-        .where(
-          (element) =>
-              element.localName == sourceRoot.name.qualified.toLowerCase(),
-        )
-        .firstOrNull;
-    if (root == null) {
-      throw const FormatException('Generated EPUB markup lost its XHTML root.');
-    }
-    return root;
-  }
+  dom.Element? _prefixedXhtmlRoot(dom.Document document, String originalHtml) =>
+      epubPrefixedXhtmlRoot(document, originalHtml);
 
   String _serializeChapter(
     dom.Document document, {
@@ -463,7 +451,7 @@ body.epub-translator-cjk [data-translation="true"] {
     // A bare-text API response also needs a local language boundary.
     for (final node in fragment.nodes.toList()) {
       if (node is dom.Text && node.data.trim().isNotEmpty) {
-        final wrapper = dom.Element.tag('span');
+        final wrapper = dom.Element.tag(epubQualifiedName(target, 'span'));
         final index = fragment.nodes.indexOf(node);
         node.remove();
         wrapper.nodes.add(node);
@@ -698,7 +686,9 @@ body.epub-translator-cjk [data-translation="true"] {
     for (final dom.Element element in fragment.querySelectorAll('[id]')) {
       element.attributes.remove('id');
     }
-    for (final anchor in fragment.querySelectorAll('a[name]')) {
+    for (final anchor in epubTags(fragment, const {
+      'a',
+    }).where((a) => a.attributes.containsKey('name'))) {
       anchor.attributes.remove('name');
     }
     for (final dom.Node node in fragment.nodes) {
@@ -817,7 +807,7 @@ body.epub-translator-cjk [data-translation="true"] {
     void collapseNode(dom.Node node, bool insideLiteralContent) {
       final bool inLiteralContent =
           insideLiteralContent ||
-          (node is dom.Element && _literalContentTags.contains(node.localName));
+          (node is dom.Element && _literalContentTags.contains(epubLocalName(node)));
       if (node is dom.Text) {
         if (!inLiteralContent) {
           final String collapsed = node.text.replaceAll(
@@ -843,7 +833,7 @@ body.epub-translator-cjk [data-translation="true"] {
   bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
     dom.Node? current = element;
     while (current is dom.Element) {
-      if (current.localName == 'a' && _containsFootnoteMarkerClass(current)) {
+      if (epubLocalName(current) == 'a' && _containsFootnoteMarkerClass(current)) {
         return true;
       }
       current = current.parentNode;
@@ -865,8 +855,8 @@ body.epub-translator-cjk [data-translation="true"] {
     // their classes/content rather than being mistaken for prose decoration.
     dom.Node? current = element;
     while (current is dom.Element) {
-      if (_literalContentTags.contains(current.localName) ||
-          EpubHtmlExtractor.nonTextAncestors.contains(current.localName)) {
+      if (_literalContentTags.contains(epubLocalName(current)) ||
+          EpubHtmlExtractor.nonTextAncestors.contains(epubLocalName(current))) {
         return true;
       }
       current = current.parentNode;
@@ -1173,11 +1163,13 @@ body.epub-translator-cjk [data-translation="true"] {
       );
       // EPUB 3 nav documents are handled from the manifest in the isolate.
       // Applying this legacy heuristic would also overwrite page-list labels.
-      if (document.querySelectorAll('nav').any(isEpubTocElement)) {
+      if (epubTags(document, const {'nav'}).any(isEpubTocElement)) {
         continue;
       }
       bool changed = false;
-      for (final dom.Element anchor in document.querySelectorAll('a[href]')) {
+      for (final dom.Element anchor in epubTags(document, const {
+        'a',
+      }).where((a) => a.attributes.containsKey('href'))) {
         if (bilingual &&
             chapter.includeInTranslation &&
             !isTranslatedNavigationAnchor(anchor)) {
@@ -1218,7 +1210,10 @@ body.epub-translator-cjk [data-translation="true"] {
   Map<String, String> debugNavigationLabels(List<InspectedChapter> chapters) =>
       _navigationLabels(chapters);
 
-  Map<String, String> _navigationLabels(List<InspectedChapter> chapters) {
+  Map<String, String> _navigationLabels(
+    List<InspectedChapter> chapters, {
+    Map<String, List<dom.Element>>? sourceElementsByChapter,
+  }) {
     final labels = <String, String>{};
     for (final chapter in chapters) {
       if (!chapter.includeInTranslation) continue;
@@ -1227,46 +1222,51 @@ body.epub-translator-cjk [data-translation="true"] {
       if (chapterLabel != null) labels[chapterPath] = chapterLabel;
       // Translation releases sourceHtml after caching. Recreate the same
       // extraction boundaries from the retained chapter document for export.
-      final originalDocument = html_parser.parse(
-        XhtmlHtmlCompatibility.normalizeForHtmlParser(chapter.originalHtml),
-      );
-      final originalBlocks = _extractor.extractBlocks(
-        originalDocument,
-        chapterPath: chapter.path,
-      );
-      final sourcesById = {for (final block in originalBlocks) block.id: block};
-      // The block fragments above lose document context: block splitting
-      // keeps only the heading element's own outerHtml, so ancestor ids
+      // Block fragments lose document context: keep actual source elements
+      // until heading labels are indexed, so ancestor ids
       // (`<section id="…"><h1>`) and preceding empty anchors
       // (`<a id="…"></a><h1>`) never appear in the fragment. Keep the
       // source elements from the same extraction (identical order and id
       // scheme) to resolve those against the full chapter document.
-      final sourceElements = _extractor.extractTranslatableTextElements(
-        originalDocument,
-      );
+      final sourceElements =
+          sourceElementsByChapter?[chapter.path] ??
+          _extractor.extractTranslatableTextElements(
+            html_parser.parse(
+              XhtmlHtmlCompatibility.normalizeForHtmlParser(
+                chapter.originalHtml,
+              ),
+            ),
+          );
       final elementsById = <String, dom.Element>{};
-      for (
-        var k = 0;
-        k < originalBlocks.length && k < sourceElements.length;
-        k++
-      ) {
-        elementsById[originalBlocks[k].id] = sourceElements[k];
+      for (var k = 0; k < sourceElements.length; k++) {
+        elementsById['${epubLocalName(sourceElements[k])}-${k + 1}'] =
+            sourceElements[k];
       }
       for (final block in chapter.blocks) {
         if (block.translatedHtml?.trim().isNotEmpty != true) continue;
-        final sourceHtml =
-            sourcesById[block.id]?.sourceHtml ?? block.sourceHtml;
-        // The probe allows false positives; only definite non-heading blocks
-        // skip the two fragment parses. Pairing and label order stay unchanged.
-        if (!_possibleHeading.hasMatch(sourceHtml)) continue;
-        final source = html_parser.parseFragment(
-          XhtmlHtmlCompatibility.normalizeForHtmlParser(sourceHtml),
-        );
+        final sourceElement = elementsById[block.id];
+        // Only legacy unmatched block ids need a source-fragment parse.
+        if (sourceElement == null &&
+            !_possibleHeading.hasMatch(block.sourceHtml)) {
+          continue;
+        }
+        final headings = sourceElement == null
+            ? epubElements(
+                html_parser.parseFragment(
+                  XhtmlHtmlCompatibility.normalizeForHtmlParser(
+                    block.sourceHtml,
+                  ),
+                ),
+              ).where(_isHeadingElement).toList()
+            : [
+                if (_isHeadingElement(sourceElement)) sourceElement,
+                ...epubElements(sourceElement).where(_isHeadingElement),
+              ];
+        if (headings.isEmpty) continue;
         final translated = html_parser.parseFragment(block.translatedHtml!);
-        final headings = source.querySelectorAll('h1,h2,h3,h4,h5,h6');
-        final translatedHeadings = translated.querySelectorAll(
-          'h1,h2,h3,h4,h5,h6',
-        );
+        final translatedHeadings = epubElements(
+          translated,
+        ).where(_isHeadingElement).toList();
         // Only pair structurally matching headings; preserve unknown labels.
         if (headings.length != translatedHeadings.length) continue;
         for (var i = 0; i < headings.length; i++) {
@@ -1277,7 +1277,11 @@ body.epub-translator-cjk [data-translation="true"] {
           final dom.Element heading = headings[i];
           for (final element in [
             heading,
-            ...heading.querySelectorAll('[id], a[name]'),
+            ...epubElements(heading).where(
+              (e) =>
+                  e.attributes.containsKey('id') ||
+                  (epubLocalName(e) == 'a' && e.attributes.containsKey('name')),
+            ),
           ]) {
             final id = element.attributes['id'] ?? element.attributes['name'];
             if (id != null && id.isNotEmpty) labels['$chapterPath#$id'] = label;
@@ -1295,8 +1299,8 @@ body.epub-translator-cjk [data-translation="true"] {
               _documentHeadingFor(elementsById[block.id], i) ?? heading;
           dom.Node? ancestor = contextHeading.parent;
           while (ancestor is dom.Element &&
-              ancestor.localName != 'body' &&
-              ancestor.localName != 'html') {
+              epubLocalName(ancestor) != 'body' &&
+              epubLocalName(ancestor) != 'html') {
             final String? ancestorId = ancestor.attributes['id'];
             if (ancestorId != null && ancestorId.isNotEmpty) {
               labels.putIfAbsent('$chapterPath#$ancestorId', () => label);
@@ -1321,7 +1325,7 @@ body.epub-translator-cjk [data-translation="true"] {
                 continue;
               }
               if (candidate is! dom.Element ||
-                  candidate.localName != 'a' ||
+                  epubLocalName(candidate) != 'a' ||
                   candidate.text.trim().isNotEmpty) {
                 break;
               }
@@ -1347,15 +1351,14 @@ body.epub-translator-cjk [data-translation="true"] {
     if (sourceElement == null) return null;
     final List<dom.Element> headings = <dom.Element>[
       if (_isHeadingElement(sourceElement)) sourceElement,
-      ...sourceElement.querySelectorAll('h1,h2,h3,h4,h5,h6'),
+      ...epubElements(sourceElement).where(_isHeadingElement),
     ];
     return index < headings.length ? headings[index] : null;
   }
 
   bool _isHeadingElement(dom.Element element) {
-    final String? tag = element.localName;
-    return tag != null &&
-        tag.length == 2 &&
+    final String tag = epubLocalName(element);
+    return tag.length == 2 &&
         tag.codeUnitAt(0) == 0x68 && // 'h'
         tag.codeUnitAt(1) >= 0x31 && // '1'
         tag.codeUnitAt(1) <= 0x36; // '6'

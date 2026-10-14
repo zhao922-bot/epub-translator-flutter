@@ -1,4 +1,5 @@
 import 'epub_html_extractor.dart';
+import 'epub_dom.dart';
 
 /// Deterministic post-processing layer that converts every configuration-
 /// locked proper name to the canonical display form across the whole book.
@@ -354,19 +355,28 @@ class ProperNameNormalizer {
     html = _maskNonProse(html);
     final StringBuffer out = StringBuffer();
     int cursor = 0;
-    final RegExp markup = RegExp(
-      r'</?[A-Za-z!?/][^>]*>\s*</[A-Za-z][^>]*>|</?[A-Za-z!?/][^>]*>',
-    );
-    for (final Match match in markup.allMatches(html)) {
+    final tokens = epubMarkupTokens.allMatches(html).toList();
+    for (var index = 0; index < tokens.length; index++) {
+      final match = tokens[index];
       out.write(html.substring(cursor, match.start));
-      final String tag = match.group(0)!;
       // An empty tag pair (open tag immediately followed by its close tag)
       // is transparent to the tolerant matcher; everything else is opaque.
-      final bool isEmptyPair = RegExp(
-        r'^</?[A-Za-z!?/][^>]*>\s*</[A-Za-z][^>]*>$',
-      ).hasMatch(tag);
-      out.write(isEmptyPair ? '\uE003' * tag.length : '\uE002' * tag.length);
-      cursor = match.end;
+      var end = match.end;
+      final next = index + 1 < tokens.length ? tokens[index + 1] : null;
+      final isEmptyPair =
+          match.group(2) != null &&
+          match.group(1) != '/' &&
+          !match.group(0)!.endsWith('/>') &&
+          next != null &&
+          next.group(1) == '/' &&
+          next.group(2) == match.group(2) &&
+          html.substring(end, next.start).trim().isEmpty;
+      if (isEmptyPair) {
+        end = next.end;
+        index++;
+      }
+      out.write((isEmptyPair ? '\uE003' : '\uE002') * (end - match.start));
+      cursor = end;
     }
     out.write(html.substring(cursor));
     return out.toString();
@@ -375,9 +385,7 @@ class ProperNameNormalizer {
   /// Keep source-owned subtrees opaque to every glossary rewrite, without
   /// serializing the DOM or changing offsets in the original HTML.
   static String _maskNonProse(String html) {
-    final tokens = RegExp(
-      r'''<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<(/?)([A-Za-z][\w:.-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>''',
-    );
+    final tokens = epubMarkupTokens;
     final out = StringBuffer();
     var cursor = 0;
     String? root;
@@ -389,7 +397,7 @@ class ProperNameNormalizer {
       final closing = token.group(1) == '/';
       final selfClosing = token.group(0)!.endsWith('/>');
       if (root == null) {
-        if (closing || !EpubHtmlExtractor.nonTextAncestors.contains(tag)) {
+        if (closing || !EpubHtmlExtractor.nonTextAncestors.contains(tag.split(':').last)) {
           continue;
         }
         out.write(html.substring(cursor, token.start));
@@ -399,13 +407,14 @@ class ProperNameNormalizer {
       } else if (tag == root) {
         if (closing) {
           depth--;
-        } else if (!selfClosing && root != 'script' && root != 'style') {
+        } else if (!selfClosing && root.split(':').last != 'script' &&
+            root.split(':').last != 'style') {
           depth++;
         }
       }
       if (depth == 0 ||
           (start == token.start &&
-              (selfClosing || const {'img', 'link', 'meta'}.contains(tag)))) {
+              (selfClosing || const {'img', 'link', 'meta'}.contains(tag.split(':').last)))) {
         out.write('\uE002' * (token.end - start));
         cursor = token.end;
         root = null;

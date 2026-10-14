@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -50,7 +51,7 @@ String _cacheKey({
   ].join('|'),
 );
 
-class _MemoryCache extends TranslationCacheStore {
+class _MemoryCache extends TranslationCacheStore with MemoryHistoryCache {
   final blocks = <String, String>{};
   final states = <String, JobResumeState>{};
   final reads = <String>[];

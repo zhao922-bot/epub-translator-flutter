@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -302,7 +303,7 @@ InspectedChapter translatedChapter(String source, List<String> translations) {
   );
 }
 
-class MemoryCache extends TranslationCacheStore {
+class MemoryCache extends TranslationCacheStore with MemoryHistoryCache {
   final values = <String, String>{};
   @override
   Future<String?> getBlockTranslation(String key) async => values[key];

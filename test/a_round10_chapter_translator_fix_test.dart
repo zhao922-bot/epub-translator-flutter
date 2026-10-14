@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -181,7 +182,7 @@ void main() {
   }
 }
 
-class _Cache extends TranslationCacheStore {
+class _Cache extends TranslationCacheStore with MemoryHistoryCache {
   final blocks = <String, String>{};
   final states = <String, JobResumeState>{};
   @override
@@ -196,7 +197,8 @@ class _Cache extends TranslationCacheStore {
   void rewriteMemory(void Function(Map<String, dynamic>) rewrite) {
     for (final entry in states.entries.toList()) {
       if (!entry.value.currentChapter.startsWith('{')) continue;
-      final memory = jsonDecode(entry.value.currentChapter) as Map<String, dynamic>;
+      var memory = jsonDecode(entry.value.currentChapter) as Map<String, dynamic>;
+      if (memory.containsKey('timelineFormat')) memory = expandMemoryState(memory);
       if (!memory.containsKey('memoryTimeline')) continue;
       rewrite(memory);
       states[entry.key] = JobResumeState.fromJson({

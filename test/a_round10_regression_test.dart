@@ -82,26 +82,26 @@ void main() {
             'jobKey',
             'chunkSize',
             'memory',
-            'completedChapterPaths',
-            'memoryTimeline',
+            'timelineFormat',
+            'timelineHead',
+            'timelineLength',
             'glossaryEvictionPolicy',
           ]);
           expect(
             decoded['schema'],
-            EpubChapterTranslator.qualityCacheSchemaVersion,
+            '${EpubChapterTranslator.qualityCacheSchemaVersion}:memory-history-v1',
           );
           expect(decoded['jobKey'], jobKey);
           expect(decoded['chunkSize'], chunkSize);
-          final saved = decoded['memoryTimeline'] as List;
+          final saved = await EpubChapterTranslator.loadBookMemoryTimelineForTest(
+            cacheStore: cache, jobKey: jobKey, chunkSize: chunkSize,
+          );
           expect(saved.map((e) => e['path']), timeline.map((e) => e.path));
           expect(
-            saved.map((e) => e['memory']['bookSummary']),
+            saved.map((e) => (e['memory'] as Map)['bookSummary']),
             timeline.map((e) => e.memory['bookSummary']),
           );
-          expect(
-            decoded['completedChapterPaths'],
-            timeline.map((e) => e.path).toList(),
-          );
+          expect(decoded['timelineLength'], timeline.length);
           // The cached raw JSON has exactly the same bytes as a full encode of
           // the same envelope, including escaped strings and field ordering.
           expect(state.currentChapter, jsonEncode(decoded));

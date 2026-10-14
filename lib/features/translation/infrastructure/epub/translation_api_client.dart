@@ -76,7 +76,10 @@ enum ProxySettingError {
 
 /// OpenAI-compatible chat client with retry / rate-limit handling.
 class TranslationApiClient {
-  const TranslationApiClient();
+  const TranslationApiClient({this.sharedRateLimitDelayOverride});
+
+  /// Allows offline transport fixtures to advance retries without real waits.
+  final Duration? sharedRateLimitDelayOverride;
 
   static final RegExp _whitespace = RegExp(r'\s');
   static final RegExp _leadingReasoningBlocks = RegExp(

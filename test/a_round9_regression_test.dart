@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -341,7 +342,7 @@ class _ContextAdapter implements HttpClientAdapter {
   }
 }
 
-class _CachedBody extends TranslationCacheStore {
+class _CachedBody extends TranslationCacheStore with MemoryHistoryCache {
   @override
   Future<String?> getBlockTranslation(String cacheKey) async => '<p>正文译文</p>';
   @override

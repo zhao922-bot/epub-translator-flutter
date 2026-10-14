@@ -4,6 +4,7 @@ import 'package:path/path.dart' as path;
 
 import '../../domain/models/inspected_chapter.dart';
 import 'epub_text_decoder.dart';
+import 'epub_dom.dart';
 import 'epub_semantics.dart';
 import 'xhtml_html_compatibility.dart';
 
@@ -77,11 +78,7 @@ class EpubHtmlExtractor {
   /// prefixed XHTML (`<x:html xmlns:x="...">`, legal in EPUBs) matches
   /// nothing.
   static String tagLocalName(dom.Element element) {
-    final String name = element.localName ?? '';
-    final int colon = name.indexOf(':');
-    return colon < 0
-        ? name.toLowerCase()
-        : name.substring(colon + 1).toLowerCase();
+    return epubLocalName(element);
   }
 
   /// First element under [root] whose stripped tag name is in [names],
@@ -91,7 +88,10 @@ class EpubHtmlExtractor {
     dom.Document document,
     Set<String> names,
   ) {
-    for (final dom.Element element in document.querySelectorAll('*')) {
+    for (final dom.Element element in epubElements(
+      document,
+      maxDepth: _kMaxDomDepth,
+    )) {
       if (names.contains(tagLocalName(element))) return element;
     }
     return null;
@@ -104,6 +104,7 @@ class EpubHtmlExtractor {
     // Non-UTF-8 chapters fail loud here (see epub_text_decoder.dart) instead
     // of degrading into U+FFFD confetti that would burn translation tokens.
     final String decoded = decodeEpubText(bytes: bytes, filePath: chapterPath);
+    validateEpubMarkupDepth(decoded);
     final dom.Document document = html_parser.parse(
       XhtmlHtmlCompatibility.normalizeForHtmlParser(decoded),
     );
@@ -158,6 +159,7 @@ class EpubHtmlExtractor {
     required String chapterPath,
     bool detectAuthorSignatures = false,
   }) {
+    validateEpubDomDepth(document);
     final List<ExtractedBlock> blocks = <ExtractedBlock>[];
     final elements = extractTranslatableTextElements(document);
     final sourceTexts = <dom.Element, String>{};
@@ -425,13 +427,23 @@ class EpubHtmlExtractor {
   List<dom.Element> extractTranslatableElements(dom.Document document) {
     // The body is located by stripped tag name so prefixed XHTML
     // (<x:body>) gets the same unclaimed-text normalization (P2-#22).
-    final dom.Element? body =
-        _firstByTagName(document, const {'body'}) ?? document.body;
+    final htmlBody = document.body;
+    final qualifiedRoot = htmlBody?.children
+        .where(
+          (element) =>
+              (element.localName ?? '').contains(':') &&
+              const {'html', 'body'}.contains(tagLocalName(element)),
+        )
+        .firstOrNull;
+    final dom.Element? body = qualifiedRoot == null
+        ? htmlBody ?? _firstByTagName(document, const {'body'})
+        : tagLocalName(qualifiedRoot) == 'body'
+        ? qualifiedRoot
+        : epubTags(qualifiedRoot, const {'body'}).firstOrNull ?? htmlBody;
     if (body != null) _wrapUnclaimedText(body);
     // A tag selector cannot match prefixed elements (x:p keeps the literal
     // tag name in package:html), so filter by stripped tag name instead.
-    return document
-        .querySelectorAll('*')
+    return epubElements(document, maxDepth: _kMaxDomDepth)
         .where(
           (dom.Element element) =>
               translatableTags.contains(tagLocalName(element)) &&
@@ -497,7 +509,7 @@ class EpubHtmlExtractor {
     final run = <dom.Node>[];
     void flush() {
       if (run.any((node) => hasUnclaimedText(node, depth))) {
-        final wrapper = dom.Element.tag('span');
+        final wrapper = dom.Element.tag(epubQualifiedName(container, 'span'));
         wrapper.nodes.addAll(run);
         replacement.add(wrapper);
       } else {

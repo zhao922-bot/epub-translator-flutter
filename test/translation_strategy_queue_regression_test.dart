@@ -10,7 +10,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:flutter_test/flutter_test.dart';
 
 class _Api extends TranslationApiClient {
-  _Api(this.reply);
+  _Api(this.reply) : super(sharedRateLimitDelayOverride: Duration.zero);
   final FutureOr<Object> Function(Map<String, dynamic> data) reply;
   final requests = <Map<String, dynamic>>[];
   int active = 0;

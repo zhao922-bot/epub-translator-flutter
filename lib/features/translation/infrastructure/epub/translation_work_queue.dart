@@ -11,8 +11,45 @@ class TranslationRequestBudget {
   final int limit;
   int _active = 0;
   final Queue<Completer<void>> _waiting = Queue<Completer<void>>();
+  final Stopwatch _clock = Stopwatch()..start();
+  Duration _cooldownUntil = Duration.zero;
+  Duration _pacedUntil = Duration.zero;
+  Duration _nextStart = Duration.zero;
 
-  Future<T> run<T>(Future<T> Function() request) async {
+  /// Shared server cooldown. Starts already in flight can finish; every new
+  /// request (including queued fallbacks) observes the latest deadline.
+  void deferFor(Duration delay) {
+    final deadline = _clock.elapsed + delay;
+    if (deadline > _cooldownUntil) _cooldownUntil = deadline;
+    _pacedUntil = _cooldownUntil + const Duration(seconds: 30);
+  }
+
+  Future<void> _waitForStart(void Function()? throwIfCancelled) async {
+    while (true) {
+      throwIfCancelled?.call();
+      final now = _clock.elapsed;
+      final deadline = _nextStart > _cooldownUntil
+          ? _nextStart
+          : _cooldownUntil;
+      if (now >= deadline) {
+        // Brief spacing after a limit avoids waking all workers together.
+        _nextStart = now < _pacedUntil
+            ? now + const Duration(milliseconds: 200)
+            : now;
+        return;
+      }
+      final remaining = deadline - now;
+      await Future<void>.delayed(
+        remaining > const Duration(milliseconds: 50)
+            ? const Duration(milliseconds: 50)
+            : remaining,
+      );
+    }
+  }
+
+  Future<T> run<T>(Future<T> Function() request, {
+    void Function()? throwIfCancelled,
+  }) async {
     if (_active < limit) {
       _active += 1;
     } else {
@@ -21,6 +58,11 @@ class TranslationRequestBudget {
       await ready.future;
     }
     try {
+      if (_clock.elapsed < _cooldownUntil || _clock.elapsed < _pacedUntil) {
+        await _waitForStart(throwIfCancelled);
+      } else {
+        throwIfCancelled?.call();
+      }
       return await request();
     } finally {
       if (_waiting.isEmpty) {

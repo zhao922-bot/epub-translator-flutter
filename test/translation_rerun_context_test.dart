@@ -1,8 +1,10 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/job_resume_state.dart';
@@ -22,7 +24,7 @@ import 'package:epub_translator_flutter/features/preview/application/preview_pro
 import 'package:epub_translator_flutter/features/preview/presentation/widgets/chapter_preview_content.dart';
 import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 
-class _Cache extends TranslationCacheStore {
+class _Cache extends TranslationCacheStore with MemoryHistoryCache {
   final values = <String, String>{};
   @override
   Future<String?> getBlockTranslation(String cacheKey) async =>
@@ -720,7 +722,10 @@ void main() {
         expect(api.singleSources.toSet(), hasLength(count));
         expect(api.peak, limit);
         expect(api.singlePeak, limit);
-        if (limit > 1) expect(api.overlappingParents, greaterThanOrEqualTo(2));
+        // Inter-parent overlap depends on scheduling/CPU load. The HTTP cap
+        // and simultaneous child requests are the invariant under test; the
+        // gate-based queue suite separately verifies parent/child deadlocks.
+        expect(api.activeParents, isEmpty);
         expect(api.active, 0);
         expect(result.job.completedBlocks, count);
         expect(result.job.degradedBlockCount, 0);
@@ -860,6 +865,23 @@ void main() {
       ]);
     },
   );
+
+  test('completed recoverable chapters release source and still support reruns', () async {
+    final identity = EpubSourceIdentity(
+      inputPath: input, sha256: sha256.convert(await File(input).readAsBytes()).toString(),
+    );
+    final cache = _Cache();
+    final api = _Api();
+    final first = await run(cache, api, [for (final c in chapters) c.copyWith(sourceIdentity: identity)]);
+    expect(first.chapters.every((c) => c.originalHtml.isEmpty), isTrue);
+    expect(first.chapters.every((c) => c.body.isNotEmpty && c.translatedBody!.isNotEmpty), isTrue);
+    final paidRequests = api.sourceRequests.length;
+    final second = await run(cache, api, first.chapters);
+    expect(second.job.cachedBlocks, 2);
+    expect(api.sourceRequests.length, paidRequests);
+    await run(cache, api, second.chapters, configuration: config.copyWith(targetLanguage: 'Korean'));
+    expect(api.sourceRequests.skip(paidRequests), ['<p>bank</p>', '<p>river</p>']);
+  });
 
   test(
     'expanding selection matches a clean full translation with different glossary',

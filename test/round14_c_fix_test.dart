@@ -110,12 +110,27 @@ class _SecretStore implements SettingsSecretStore {
   Future<void> deleteProxyAuthentication() => writeProxyAuthentication('');
 }
 
+class _ProbeProcess extends Fake implements Process {
+  @override
+  int get pid => 123;
+  @override
+  Stream<List<int>> get stdout => Stream.value(utf8.encode('1'));
+  @override
+  Stream<List<int>> get stderr => const Stream.empty();
+  @override
+  Future<int> get exitCode async => 0;
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) => true;
+}
+
 void main() {
   late _ReplayStore store;
   late SettingsController controller;
   late List<Object?> notices;
 
   setUp(() async {
+    NativePlatformBridge.debugWindowsProcessStarter = (_, _) async => _ProbeProcess();
+    addTearDown(() => NativePlatformBridge.debugWindowsProcessStarter = null);
     store = _ReplayStore();
     notices = [];
     controller = SettingsController(store, onSaveError: notices.add);
@@ -1012,7 +1027,7 @@ void main() {
         starts++;
         await gate.future;
         if (fail) throw StateError('launch failed');
-        return Process.start('sh', ['-c', 'printf 1']);
+        return _ProbeProcess();
       };
       final queries = List.generate(20,
           (_) => NativePlatformBridge.windowsLongPathsEnabled());

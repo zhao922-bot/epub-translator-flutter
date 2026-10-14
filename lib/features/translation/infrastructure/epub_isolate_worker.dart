@@ -15,6 +15,7 @@ import '../../../shared/logging/app_logger.dart';
 import '../../../shared/io/output_file_lock.dart';
 import 'epub/epub_text_decoder.dart';
 import 'epub/epub_navigation.dart';
+import 'epub/epub_dom.dart';
 import 'epub/epub_source_guard.dart';
 import '../domain/repositories/translation_repository.dart';
 import '../domain/models/inspected_chapter.dart';
@@ -1072,9 +1073,11 @@ class EpubIsolateWorker {
       XhtmlHtmlCompatibility.normalizeForHtmlParser(markup),
     );
     var changed = false;
-    for (final nav in document.querySelectorAll('nav')) {
+    for (final nav in epubTags(document, const {'nav'})) {
       if (!isEpubTocElement(nav)) continue;
-      for (final anchor in nav.querySelectorAll('a[href]')) {
+      for (final anchor in epubTags(nav, const {
+        'a',
+      }).where((a) => a.attributes.containsKey('href'))) {
         if (preserveSourceLabels && !isTranslatedNavigationAnchor(anchor)) {
           continue;
         }
@@ -1089,7 +1092,7 @@ class EpubIsolateWorker {
       }
     }
     return changed
-        ? XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml)
+        ? serializeEpubNavigation(document, markup)
         : markup;
   }
 

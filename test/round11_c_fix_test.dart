@@ -158,7 +158,7 @@ Future<void> main(List<String> args) async {
           helper.path,
           lockPath,
         ]);
-        addTearDown(() => holder.kill());
+        addTearDown(() async { holder.kill(); await holder.exitCode; });
         await holder.stdout
             .transform(const SystemEncoding().decoder)
             .firstWhere((line) => line.contains('LOCKED'));
@@ -172,7 +172,8 @@ Future<void> main(List<String> args) async {
         expect(await file.exists(), isFalse);
         // Writer C commits a newer history during the race window.
         await file.writeAsString(newer);
-        holder.stdin.close();
+        await holder.stdin.close();
+          await holder.exitCode;
         await loadFuture;
 
         // The newer history wins; it is not overwritten by the stale backup.
@@ -436,7 +437,7 @@ Future<void> main(List<String> args) async {
 }
 ''');
         final holder = await Process.start('dart', [helper.path, lockPath]);
-        addTearDown(() => holder.kill());
+        addTearDown(() async { holder.kill(); await holder.exitCode; });
         await holder.stdout
             .transform(const SystemEncoding().decoder)
             .firstWhere((line) => line.contains('LOCKED'));
@@ -453,7 +454,8 @@ Future<void> main(List<String> args) async {
           expect(stopwatch.elapsed, greaterThan(const Duration(seconds: 8)));
           expect(stopwatch.elapsed, lessThan(const Duration(seconds: 30)));
         } finally {
-          holder.stdin.close();
+          await holder.stdin.close();
+          await holder.exitCode;
         }
       },
       timeout: const Timeout(Duration(seconds: 60)),
@@ -775,7 +777,7 @@ Future<void> main(List<String> args) async {
         await file.setLastModified(old);
       }
       await store.saveJobState(jobState('live'));
-      // Throttled (same `now`): no prune scan.
+      // Throttled at the same time: no prune scan.
       expect(await jobFileCount(jobsDir), 25);
 
       // perf-#53: the throttle runs on a real Stopwatch, so fake time-travel

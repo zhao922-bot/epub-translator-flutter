@@ -37,6 +37,10 @@ void main() {
         ),
         createDirectory: (path) =>
             throw FileSystemException('Subdirectories denied', path),
+        // FileSystemEntity.type internally constructs a Directory too. That
+        // query is permitted; only actual subdirectory creation is denied.
+        fseGetType: (path, followLinks) async => path == temp.path
+            ? FileSystemEntityType.directory : FileSystemEntityType.notFound,
       );
       expect(temp.listSync(), isEmpty);
     },

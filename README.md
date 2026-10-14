@@ -9,14 +9,14 @@
 
 ## 下载安装
 
-当前版本：**1.6.0+16**。本次更新为四轮代码审查的 21 项修复：翻译可靠性（空原文重跑、字段类型降级、降级上下文、缓存范围）、密钥安全（迁移/删除/历史合并）、EPUB 导出（doctype、输出目录预检、文件名长度、重试目录）、缓存配额与 ZIP 预检，详见 [更新日志](CHANGELOG.md)。
+当前版本：**1.6.31+47**。本次修复七类内容保护、XHTML 命名空间、目录、双语锚点及深层 DOM 问题，并优化检查点、导出、缓存恢复、源文释放与共享限流。详见 [更新日志](CHANGELOG.md)。
 
-安装包与校验值见 [v1.6.0 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.0)。
+安装包与校验值见 [v1.6.31 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.31)。
 
 | 平台 | 下载 | 说明 |
 |------|------|------|
-| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.5.0/epub-translator-flutter-v1.5.0-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.5.0/epub-translator-flutter-v1.5.0-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.6.0 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.0/epub-translator-flutter-v1.6.0-android.apk) | 与 v1.5.0 同签名，已安装旧版的用户可直接覆盖升级，无需卸载 |
+| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.31/epub-translator-flutter-v1.6.31-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.31/epub-translator-flutter-v1.6.31-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [v1.6.31 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.31/epub-translator-v1.6.31-android.apk) | 本版使用新的发布签名，旧版不能直接覆盖升级；请先备份设置与数据，再卸载旧版并安装 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -57,7 +57,7 @@ flutter pub get
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 # 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
 # 可选 EXE 安装包：先安装 Inno Setup 6.3+ 并将 ISCC 加入 PATH
-ISCC /DAppVersion=1.5.0 tool\windows_installer.iss
+ISCC /DAppVersion=1.6.31 tool\windows_installer.iss
 flutter build apk --release       # 需配置 android/key.properties 签名
 ```
 
@@ -76,7 +76,7 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 ## 开发验证
 
-v1.5.0 本地验证：**1296 项测试通过、17 项依赖环境的测试跳过**，静态分析无问题。Android release APK 已构建（已验证与 v1.4.2 同签名，可直接覆盖升级）。另用 SiliconFlow DeepSeek-V4-Flash 对《黄色墙纸》《麦琪的礼物》做整书实测，翻译质量符合预期。
+v1.6.31 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：**2464 项测试通过、23 项环境相关用例跳过**，静态分析无问题。新增回归覆盖命名空间、内容保护、异常嵌套、检查点提交失败、缓存恢复和换语言重译。性能数据来自离线合成书对照；真实 API 吞吐及 Android 实机表现取决于服务商和设备。
 
 ```powershell
 $env:LIVE_TRANSLATION_E2E='0'

@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -19,7 +20,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html;
 
-class AuditCache extends TranslationCacheStore {
+class AuditCache extends TranslationCacheStore with MemoryHistoryCache {
   final values = <String, String>{};
   @override
   Future<String?> getBlockTranslation(String key) async => values[key];

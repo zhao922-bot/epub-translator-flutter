@@ -74,6 +74,7 @@ class EpubChapterTranslator {
   /// around ([ExtractedBlock.copyWith]), so identity checks would silently
   /// miss.)
   TranslationRunContext _run = TranslationRunContext(concurrency: 1);
+  TranslationConfig? _rateLimitConfig;
   Set<String> get _degradedBlocks => _run.degradedBlocks;
 
   /// Degraded blocks counted as completed API work in either pipeline.
@@ -163,13 +164,22 @@ class EpubChapterTranslator {
           data: data,
           cancelToken: cancelToken ?? _run.cancelToken,
         );
+      } catch (error) {
+        if (TranslationApiClient.isRateLimitError(error)) {
+          final config = _rateLimitConfig ?? TranslationConfig.defaults();
+          _run.requests.deferFor(
+            _apiClient.sharedRateLimitDelayOverride ??
+                TranslationApiClient.retryDelayForError(config, error, 1),
+          );
+        }
+        rethrow;
       } finally {
         if (stopwatch != null) {
           stopwatch.stop();
           onMemoryAttempt!(stopwatch.elapsed);
         }
       }
-    });
+    }, throwIfCancelled: _run.throwIfCancelled);
   }
 
   static final Object _memoryAttemptKey = Object();
@@ -850,6 +860,7 @@ class EpubChapterTranslator {
       isCancelled: isCancelled,
     );
     final EpubChapterTranslator invocation = _invocation(run);
+    invocation._rateLimitConfig = config;
     _run = run;
     run.watchCancellation();
     try {
@@ -895,6 +906,7 @@ class EpubChapterTranslator {
     late final Dio dio;
     bool dioReady = false;
     final sourceSpool = _ChapterSourceSpool();
+    final cacheSpool = CacheRestorationSpool();
     final invocationChapters = chapters;
     try {
       chapters = await ChapterSourceRestorer.restore(
@@ -1203,6 +1215,7 @@ class EpubChapterTranslator {
             configuredApiKey: config.apiKey,
           ).scan(
             chapters: selectedChapters,
+            persistChapter: cacheSpool.save,
             cacheKeyFor: (InspectedChapter chapter, ExtractedBlock block) =>
                 _blockCacheKey(
                   config,
@@ -1502,6 +1515,7 @@ class EpubChapterTranslator {
         ) {
           throwIfCancelled();
           final InspectedChapter chapter = selectedChapters[chapterIndex];
+          await cacheSpool.loadChapter(restoration, chapter.path);
           emit(
             currentJob.copyWith(
               currentChapter: chapter.title,
@@ -1874,6 +1888,7 @@ class EpubChapterTranslator {
           Duration chapterCacheWriteElapsed = Duration.zero;
           int chapterApiBlocks = 0;
           int chapterCacheWrites = 0;
+          await cacheSpool.loadChapter(restoration, chapter.path);
           emit(
             currentJob.copyWith(
               currentChapter: chapter.title,
@@ -2414,6 +2429,12 @@ class EpubChapterTranslator {
       // The EPUB file is committed from here on. Capture the terminal result
       // now so a late error or cancellation below still reports the finished
       // output instead of an aborted translation.
+      for (var index = 0; index < updatedChapters.length; index++) {
+        final chapter = updatedChapters[index];
+        if (chapter.sourceIdentity != null && chapter.includeInTranslation) {
+          updatedChapters[index] = chapter.copyWith(originalHtml: '');
+        }
+      }
       committedResult = TranslationRunResult(
         job: terminalJob,
         chapters: updatedChapters,
@@ -2495,6 +2516,7 @@ class EpubChapterTranslator {
       }
       rethrow;
     } finally {
+      await cacheSpool.dispose();
       await sourceSpool.dispose();
       if (dioReady) {
         dio.close(force: true);

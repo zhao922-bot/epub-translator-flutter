@@ -793,6 +793,55 @@ class TranslationCacheStore {
     await _pruneOldJobStates();
   }
 
+  /// Content-addressed history chunks are immutable. Publish the small head
+  /// only after its new chunk is durable, under the checkpoint/pruning gate.
+  Future<void> saveMemoryCheckpoint(
+    JobResumeState state, {
+    String? chunkHash,
+    String? chunk,
+  }) async {
+    final file = await _jobStateFile(state.jobKey);
+    await file.parent.create(recursive: true);
+    await _withFileGate(file, () async {
+      if (chunkHash != null && chunk != null) {
+        if (sha256.convert(utf8.encode(chunk)).toString() != chunkHash) {
+          throw const FormatException('Memory chunk checksum mismatch.');
+        }
+        final chunkFile = File(
+          path.join('${file.path}.history', '$chunkHash.json'),
+        );
+        await chunkFile.parent.create(recursive: true);
+        await writeFileAtomically(chunkFile, chunk);
+      }
+      await writeFileAtomically(file, jsonEncode(state.toJson()));
+      _savedJobStats[file.path] = await file.stat();
+    });
+    await _pruneOldJobStates();
+  }
+
+  Future<Map<String, dynamic>> readMemoryChunk(String key, String hash) async {
+    if (!RegExp(r'^[a-f0-9]{64}$').hasMatch(hash)) {
+      throw const FormatException('Invalid memory chunk identity.');
+    }
+    final head = await _jobStateFile(key);
+    final raw = await File(
+      path.join('${head.path}.history', '$hash.json'),
+    ).readAsString();
+    if (sha256.convert(utf8.encode(raw)).toString() != hash) {
+      throw const FormatException('Damaged memory history chunk.');
+    }
+    return jsonDecode(raw) as Map<String, dynamic>;
+  }
+
+  Future<void> _removeMemoryHistory(File head) async {
+    final directory = Directory('${head.path}.history');
+    try {
+      if (await directory.exists()) await directory.delete(recursive: true);
+    } catch (_) {
+      /* Best effort; preserve checkpoint maintenance semantics. */
+    }
+  }
+
   /// Maximum retained per-job checkpoints, aligned with the 20-entry job
   /// history cap: a checkpoint whose job has scrolled out of history can no
   /// longer be resumed through the UI, so keeping more would let `jobs/`
@@ -995,6 +1044,7 @@ class TranslationCacheStore {
               }
             }
             await entry.file.delete();
+            await _removeMemoryHistory(entry.file);
             return true;
           });
           if (deleted) {
@@ -1077,6 +1127,8 @@ class TranslationCacheStore {
           }
           return false;
         }
+        await _removeMemoryHistory(ordered[0].file);
+        await _removeMemoryHistory(ordered[1].file);
         return true;
       });
     });
@@ -1126,6 +1178,7 @@ class TranslationCacheStore {
         return;
       }
       await file.delete();
+      await _removeMemoryHistory(file);
       _savedJobStats.remove(file.path);
     });
   }

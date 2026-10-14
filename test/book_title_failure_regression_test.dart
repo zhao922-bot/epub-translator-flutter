@@ -1,3 +1,4 @@
+import 'helpers/memory_history_cache.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -15,7 +16,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/epub
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-class _CachedBody extends TranslationCacheStore {
+class _CachedBody extends TranslationCacheStore with MemoryHistoryCache {
   @override
   Future<String?> getBlockTranslation(String cacheKey) async => '<p>正文译文</p>';
   @override

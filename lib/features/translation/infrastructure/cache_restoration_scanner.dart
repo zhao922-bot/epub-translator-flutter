@@ -1,5 +1,10 @@
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
+
+import 'package:crypto/crypto.dart';
+import 'package:path/path.dart' as path;
+import '../../../shared/io/atomic_file_writer.dart';
 
 import '../../../shared/logging/app_logger.dart';
 import '../../../shared/security/sensitive_text.dart';
@@ -101,6 +106,8 @@ class CacheRestorationScanner {
     required CacheKeyResolver cacheKeyFor,
     required void Function() throwIfCancelled,
     CacheRestorationProgressCallback? onProgress,
+    Future<void> Function(String chapterPath, Map<String, String> translations)?
+    persistChapter,
   }) async {
     final int totalBlocks = chapters.fold<int>(
       0,
@@ -115,6 +122,22 @@ class CacheRestorationScanner {
     int formatFailures = 0;
     CacheReadDiagnostic? firstReadError;
     int lastPendingChapterIndex = -1;
+    String? activeChapter;
+    Future<void> flushChapter() async {
+      final translations = translationsByChapter[activeChapter];
+      if (persistChapter == null || translations == null) return;
+      try {
+        await persistChapter(activeChapter!, translations);
+        translationsByChapter.remove(activeChapter);
+      } on FileSystemException {
+        // Keep the verified hits in memory when temporary storage is full.
+        // Losing them would change progress counts or bill cached work again.
+        AppLogger.warn(
+          'Cache spool unavailable; retaining verified chapter hits.',
+          tag: 'cache-restoration',
+        );
+      }
+    }
 
     Iterable<
       ({int chapterIndex, InspectedChapter chapter, ExtractedBlock block})
@@ -173,6 +196,10 @@ class CacheRestorationScanner {
       final result = await entry.result;
       throwIfCancelled();
       final chapter = entry.chapter;
+      if (chapter.path != activeChapter) {
+        await flushChapter();
+        activeChapter = chapter.path;
+      }
       final block = entry.block;
       final translatedHtml = result.html;
       final error = result.error;
@@ -228,6 +255,7 @@ class CacheRestorationScanner {
       fillWindow();
     }
 
+    await flushChapter();
     return CacheRestorationResult(
       translationsByChapter: translationsByChapter,
       scannedBlocks: scannedBlocks,
@@ -238,5 +266,60 @@ class CacheRestorationScanner {
       formatFailures: formatFailures,
       firstReadError: firstReadError,
     );
+  }
+}
+
+/// A run-owned snapshot: later eviction of the shared cache cannot invalidate
+/// a hit counted during the initial scan. Only the current chapter is loaded.
+class CacheRestorationSpool {
+  Directory? _directory;
+  final Set<String> _chapters = {};
+
+  Future<File> _file(String chapter) async {
+    _directory ??= await Directory.systemTemp.createTemp(
+      'epub-cache-snapshot-',
+    );
+    return File(
+      path.join(
+        _directory!.path,
+        '${sha256.convert(utf8.encode(chapter))}.json',
+      ),
+    );
+  }
+
+  Future<void> save(String chapter, Map<String, String> translations) async {
+    await writeFileAtomically(await _file(chapter), jsonEncode(translations));
+    _chapters.add(chapter);
+  }
+
+  Future<void> loadChapter(
+    CacheRestorationResult result,
+    String chapter,
+  ) async {
+    if (!_chapters.contains(chapter)) return;
+    final file = await _file(chapter);
+    final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    result.translationsByChapter[chapter] = json.cast<String, String>();
+    _chapters.remove(chapter);
+    try {
+      await file.delete();
+    } on FileSystemException {
+      // The verified snapshot is already in memory; cleanup can be retried
+      // when the run-owned directory is disposed.
+    }
+  }
+
+  Future<void> dispose() async {
+    final directory = _directory;
+    if (directory != null) {
+      try {
+        await directory.delete(recursive: true);
+      } on FileSystemException {
+        AppLogger.warn(
+          'Cache snapshot cleanup deferred.',
+          tag: 'cache-restoration',
+        );
+      }
+    }
   }
 }

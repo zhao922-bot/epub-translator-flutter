@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart';
 import 'package:html/parser.dart' as html_parser;
 import 'epub/epub_html_extractor.dart';
+import 'epub/epub_dom.dart';
 
 enum TranslationResidualKind { longSourceText, cjkAdjacentLowercaseWord }
 
@@ -447,6 +448,8 @@ class TranslationQuality {
     bool allowBibliographicRetention = false,
     String lockedGlossary = '',
   }) {
+    validateEpubMarkupDepth(sourceHtml);
+    validateEpubMarkupDepth(translatedHtml);
     final Document sourceDocument = html_parser.parse(sourceHtml);
     final Document translatedDocument = html_parser.parse(translatedHtml);
     return _findSuspiciousDocumentResidual(
@@ -470,6 +473,7 @@ class TranslationQuality {
     String lockedGlossary = '',
   }) {
     Document qualityDocument(DocumentFragment fragment) {
+      validateEpubDomDepth(fragment);
       final document = Document();
       final html = Element.tag('html');
       final body = Element.tag('body');
@@ -504,9 +508,14 @@ class TranslationQuality {
     final sourceAuditedCores = _sourceAuditedForeignTermCores(sourceDocument);
     // Source-owned code/formula text is intentionally retained. Exempt only
     // identical subtrees, so newly introduced code wrappers cannot hide prose.
-    final selector = EpubHtmlExtractor.nonTextAncestors.join(',');
-    final sourceNonProse = sourceDocument.querySelectorAll(selector);
-    final translatedNonProse = translatedDocument.querySelectorAll(selector);
+    final sourceNonProse = epubTags(
+      sourceDocument,
+      EpubHtmlExtractor.nonTextAncestors,
+    ).toList();
+    final translatedNonProse = epubTags(
+      translatedDocument,
+      EpubHtmlExtractor.nonTextAncestors,
+    ).toList();
     if (sourceNonProse.length == translatedNonProse.length) {
       for (var index = sourceNonProse.length - 1; index >= 0; index--) {
         if (sourceNonProse[index].outerHtml ==

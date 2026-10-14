@@ -5,6 +5,7 @@ import 'package:html/parser.dart' as html_parser;
 import 'xhtml_html_compatibility.dart';
 import 'epub_semantics.dart';
 import 'epub_html_extractor.dart';
+import 'epub_dom.dart';
 
 bool isEpubTocElement(dom.Element element) {
   for (final attribute in element.attributes.entries) {
@@ -41,7 +42,7 @@ bool replaceNavigationAnchorLabel(
     if (node is! dom.Element) return;
     final types = EpubSemantics.typesOf(node);
     final roles = (node.attributes['role'] ?? '').split(RegExp(r'\s+'));
-    if (EpubHtmlExtractor.nonTextAncestors.contains(node.localName) ||
+    if (EpubHtmlExtractor.nonTextAncestors.contains(epubLocalName(node)) ||
         node.classes.contains('pagenum') ||
         types.any(const {'pagebreak', 'noteref', 'backlink'}.contains) ||
         roles.any(
@@ -67,7 +68,7 @@ bool replaceNavigationAnchorLabel(
       parent.attributes['xml:lang'] = languageTag;
     } else if (parent != null) {
       final index = parent.nodes.indexOf(labelNode);
-      final translatedLabel = dom.Element.tag('span')
+      final translatedLabel = dom.Element.tag(epubQualifiedName(anchor, 'span'))
         ..attributes['lang'] = languageTag
         ..attributes['xml:lang'] = languageTag;
       labelNode.remove();
@@ -91,13 +92,16 @@ String synchronizeEpub3Navigation({
   required String languageTag,
   bool preserveSourceLabels = false,
 }) {
+  validateEpubMarkupDepth(markup);
   final document = html_parser.parse(
     XhtmlHtmlCompatibility.normalizeForHtmlParser(markup),
   );
   var changed = false;
-  for (final nav in document.querySelectorAll('nav')) {
+  for (final nav in epubTags(document, const {'nav'})) {
     if (!isEpubTocElement(nav)) continue;
-    for (final anchor in nav.querySelectorAll('a[href]')) {
+    for (final anchor in epubTags(nav, const {
+      'a',
+    }).where((a) => a.attributes.containsKey('href'))) {
       if (preserveSourceLabels && !isTranslatedNavigationAnchor(anchor)) {
         continue;
       }
@@ -118,8 +122,14 @@ String synchronizeEpub3Navigation({
     }
   }
   return changed
-      ? XhtmlHtmlCompatibility.normalizeForXhtmlOutput(document.outerHtml)
-      : markup;
+      ? serializeEpubNavigation(document, markup) : markup;
+}
+
+String serializeEpubNavigation(dom.Document document, String originalMarkup) {
+  final root = epubPrefixedXhtmlRoot(document, originalMarkup);
+  return XhtmlHtmlCompatibility.normalizeForXhtmlOutput(
+    root?.outerHtml ?? document.outerHtml,
+  );
 }
 
 /// Translation markers live on block ancestors as well as anchors.

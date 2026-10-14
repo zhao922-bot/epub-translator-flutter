@@ -1024,31 +1024,48 @@ class _ChapterMemory {
 /// memory envelope lives in currentChapter on this internal-only checkpoint.
 class _BookMemoryCheckpoint {
   _BookMemoryCheckpoint(this.cacheStore, this.jobKey, this.chunkSize);
+  static const historySchema = '${EpubChapterTranslator.qualityCacheSchemaVersion}:memory-history-v1';
   final TranslationCacheStore cacheStore;
   final String jobKey;
   final int chunkSize;
 
-  /// Encoded array contents (without brackets) and their entry watermark.
-  /// Only new entries are JSON-encoded; assembling/writing the full checkpoint
-  /// still copies the prefix, but never traverses its memory objects again.
-  String _persistedTimelineJson = '';
+  /// The durable immutable-chain head and its entry/path watermarks. Advance
+  /// these only after the small checkpoint head has been atomically committed.
+  String? _timelineHead;
+  final Set<String> _persistedPaths = {};
   int _persistedTimelineLength = 0;
 
-  String get key => sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
+  String get key =>
+      sha256.convert(utf8.encode('$jobKey:book-memory')).toString();
 
-  Future<({ _BookMemory memory, Set<String> completedChapterPaths, List<({String path, _BookMemory memory})> timeline })?> load() async {
+  Future<
+    ({
+      _BookMemory memory,
+      Set<String> completedChapterPaths,
+      List<({String path, _BookMemory memory})> timeline,
+    })?
+  >
+  load() async {
     try {
       final state = await cacheStore.loadJobState(key);
       if (state == null) {
-        AppLogger.info('No compatible memory checkpoint for chunkSize=$chunkSize; older identities are not reused.', tag: 'book-memory');
+        AppLogger.info(
+          'No compatible memory checkpoint for chunkSize=$chunkSize; older identities are not reused.',
+          tag: 'book-memory',
+        );
         return null;
       }
       final decoded = jsonDecode(state.currentChapter);
       if (decoded is! Map<String, dynamic> ||
-          decoded['schema'] != EpubChapterTranslator.qualityCacheSchemaVersion ||
-          decoded['chunkSize'] != chunkSize || decoded['jobKey'] != jobKey ||
+          (decoded['schema'] != EpubChapterTranslator.qualityCacheSchemaVersion &&
+              decoded['schema'] != historySchema) ||
+          decoded['chunkSize'] != chunkSize ||
+          decoded['jobKey'] != jobKey ||
           decoded['memory'] is! Map<String, dynamic>) {
-        AppLogger.warn('Book memory checkpoint schema/chunkSize mismatch; discarding.', tag: 'book-memory');
+        AppLogger.warn(
+          'Book memory checkpoint schema/chunkSize mismatch; discarding.',
+          tag: 'book-memory',
+        );
         return null;
       }
       final memoryJson = decoded['memory'] as Map<String, dynamic>;
@@ -1057,29 +1074,95 @@ class _BookMemoryCheckpoint {
       // discarded, not silently normalized to empty values: the caller
       // rebuilds the memory via the API instead of translating blind.
       if (!_isIntactMemoryJson(memoryJson)) {
-        AppLogger.warn('Book memory checkpoint internals damaged; discarding.', tag: 'book-memory');
+        AppLogger.warn(
+          'Book memory checkpoint internals damaged; discarding.',
+          tag: 'book-memory',
+        );
         return null;
       }
-      final rawPaths = decoded['completedChapterPaths'];
+      var rawPaths = decoded['completedChapterPaths'];
       if (rawPaths != null && rawPaths is! List) {
-        AppLogger.warn('Book memory checkpoint chapter list damaged; discarding.', tag: 'book-memory');
+        AppLogger.warn(
+          'Book memory checkpoint chapter list damaged; discarding.',
+          tag: 'book-memory',
+        );
         return null;
       }
-      final timeline = _timelineFromJson(decoded['memoryTimeline']);
+      var rawTimeline = decoded['memoryTimeline'];
+      final head = decoded['timelineHead'];
+      if ((decoded['schema'] == historySchema && decoded['timelineFormat'] != 1) ||
+          (decoded['schema'] != historySchema && decoded.containsKey('timelineFormat'))) {
+        throw const FormatException('Memory schema and history format mismatch.');
+      }
+      if (decoded.containsKey('timelineFormat') &&
+          decoded['timelineFormat'] != 1) {
+        throw const FormatException('Unsupported memory history format.');
+      }
+      if (decoded['timelineFormat'] == 1 &&
+          head == null &&
+          decoded['timelineLength'] != 0) {
+        throw const FormatException('Missing memory history head.');
+      }
+      if (decoded['timelineFormat'] == 1 && head == null) {
+        rawTimeline = <dynamic>[];
+        rawPaths = <dynamic>[];
+      }
+      if (head != null) {
+        if (head is! String || decoded['timelineFormat'] != 1) {
+          throw const FormatException('Invalid memory history head.');
+        }
+        final chunks = <Map<String, dynamic>>[];
+        final seen = <String>{};
+        String? cursor = head;
+        while (cursor != null) {
+          if (!seen.add(cursor) || seen.length > 100000) {
+            throw const FormatException('Invalid memory history chain.');
+          }
+          final chunk = await cacheStore.readMemoryChunk(key, cursor);
+          if (chunk['entries'] is! List ||
+              chunk['paths'] is! List ||
+              (chunk['paths'] as List).any((path) => path is! String) ||
+              (chunk['previous'] != null && chunk['previous'] is! String)) {
+            throw const FormatException('Invalid memory history record.');
+          }
+          chunks.add(chunk);
+          cursor = chunk['previous'] as String?;
+        }
+        rawTimeline = [
+          for (final chunk in chunks.reversed) ...chunk['entries'] as List,
+        ];
+        rawPaths = [
+          for (final chunk in chunks.reversed) ...chunk['paths'] as List,
+        ];
+        if ((rawTimeline as List).length != decoded['timelineLength']) {
+          throw const FormatException('Incomplete memory history.');
+        }
+      }
+      final timeline = _timelineFromJson(rawTimeline);
+      if (head != null && timeline.length != (rawTimeline as List).length) {
+        throw const FormatException('Damaged memory history snapshot.');
+      }
       // Seed the incremental-persist watermark so the first save after a
       // resume does not re-serialize the restored prefix.
-      _persistedTimelineJson = timeline.map((entry) => jsonEncode(
-        {'path': entry.path, 'memory': entry.memory.toJson()},
-      )).join(',');
-      _persistedTimelineLength = timeline.length;
+      // Legacy envelopes migrate once, on the next successful save.
+      _persistedTimelineLength = head == null ? 0 : timeline.length;
+      _timelineHead = head as String?;
+      _persistedPaths.clear();
+      if (head != null) {
+        _persistedPaths.addAll((rawPaths as List).whereType<String>());
+      }
       return (
         memory: _BookMemory.fromJson(memoryJson, trustedLocks: true),
         completedChapterPaths: ((rawPaths as List<dynamic>?) ?? [])
-            .whereType<String>().toSet(),
+            .whereType<String>()
+            .toSet(),
         timeline: timeline,
       );
     } catch (error) {
-      AppLogger.warn('Book memory checkpoint unreadable (${error.runtimeType}); discarding.', tag: 'book-memory');
+      AppLogger.warn(
+        'Book memory checkpoint unreadable (${error.runtimeType}); discarding.',
+        tag: 'book-memory',
+      );
       return null;
     }
   }
@@ -1123,7 +1206,9 @@ class _BookMemoryCheckpoint {
   /// the snapshot is appended in book order. A retranslated earlier chapter
   /// later looks up the newest entry before its own position instead of
   /// receiving memory that already contains later chapters.
-  static List<({String path, _BookMemory memory})> _timelineFromJson(Object? raw) {
+  static List<({String path, _BookMemory memory})> _timelineFromJson(
+    Object? raw,
+  ) {
     if (raw is! List) return const [];
     final timeline = <({String path, _BookMemory memory})>[];
     for (final entry in raw) {
@@ -1135,59 +1220,81 @@ class _BookMemoryCheckpoint {
         continue;
       }
       if (!_isIntactMemoryJson(memory)) continue;
-      timeline.add((path: path, memory: _BookMemory.fromJson(memory, trustedLocks: true)));
+      timeline.add((
+        path: path,
+        memory: _BookMemory.fromJson(memory, trustedLocks: true),
+      ));
     }
     return timeline;
   }
 
-  Future<void> save(_BookMemory memory, {
+  Future<void> save(
+    _BookMemory memory, {
     Set<String> completedChapterPaths = const {},
     List<({String path, _BookMemory memory})> timeline = const [],
     String schema = EpubChapterTranslator.qualityCacheSchemaVersion,
-  }) {
-    // Incremental timeline persist: entries are append-only in book order
-    // (see recordMemoryTimeline), so only the suffix appended since the
-    // previous save is serialized. The on-disk envelope still carries the
-    // full merged timeline, so a resume sees every entry exactly once.
-    // This pairs with the record-before-persist order (A-2): the entry
-    // recorded for the just-finished chapter is included in this save.
-    if (timeline.length < _persistedTimelineLength) {
-      // The timeline was rebuilt (e.g. a fresh run reusing this
-      // checkpoint): the cached prefix no longer applies.
-      _persistedTimelineJson = '';
-      _persistedTimelineLength = 0;
+  }) async {
+    // A rebuilt history starts a new immutable chain. Old heads stay valid
+    // until the small checkpoint is atomically replaced.
+    final reset =
+        timeline.length < _persistedTimelineLength ||
+        !_persistedPaths.every(completedChapterPaths.contains);
+    final start = reset ? 0 : _persistedTimelineLength;
+    final previous = reset ? null : _timelineHead;
+    final paths = completedChapterPaths
+        .where((value) => reset || !_persistedPaths.contains(value))
+        .toList();
+    String? chunk;
+    String? hash;
+    if (timeline.length > start || paths.isNotEmpty) {
+      chunk = jsonEncode({
+        'previous': previous,
+        'entries': [
+          for (final entry in timeline.skip(start))
+            {'path': entry.path, 'memory': entry.memory.toJson()},
+        ],
+        'paths': paths,
+      });
+      hash = sha256.convert(utf8.encode(chunk)).toString();
     }
-    if (timeline.length > _persistedTimelineLength) {
-      final suffix = StringBuffer();
-      for (int i = _persistedTimelineLength; i < timeline.length; i++) {
-        if (i > 0) suffix.write(',');
-        final entry = timeline[i];
-        suffix.write(jsonEncode(
-          {'path': entry.path, 'memory': entry.memory.toJson()},
-        ));
-      }
-      _persistedTimelineJson += suffix.toString();
-    }
+    final head = hash ?? previous;
+    await cacheStore.saveMemoryCheckpoint(
+      JobResumeState(
+        jobKey: key,
+        inputFingerprint: jobKey,
+        inputPath: '',
+        outputPath: '',
+        status: 'book-memory',
+        completedFiles: completedChapterPaths.length,
+        totalFiles: 0,
+        completedBlocks: 0,
+        totalBlocks: 0,
+        cachedBlocks: 0,
+        resumedBlocks: 0,
+        currentChapter: jsonEncode({
+          // Old binaries must reject the new envelope rather than accepting
+          // its latest memory without the positional history it references.
+          'schema': schema == EpubChapterTranslator.qualityCacheSchemaVersion
+              ? historySchema : schema,
+          'jobKey': jobKey,
+          'chunkSize': chunkSize,
+          'memory': memory.toJson(),
+          'timelineFormat': 1,
+          'timelineHead': head,
+          'timelineLength': timeline.length,
+          'glossaryEvictionPolicy': _BookMemory.glossaryEvictionPolicy,
+        }),
+        updatedAtIso8601: DateTime.now().toIso8601String(),
+      ),
+      chunkHash: hash,
+      chunk: chunk,
+    );
+    // Failed writes must leave the watermark at the last committed state.
+    _timelineHead = head;
     _persistedTimelineLength = timeline.length;
-    // Encode the bounded envelope separately, then insert the already-encoded
-    // timeline before its last field. This retains the original JSON field
-    // order and escaping without re-encoding the growing timeline.
-    final envelope = jsonEncode({
-      'schema': schema, 'jobKey': jobKey, 'chunkSize': chunkSize,
-      'memory': memory.toJson(),
-      'completedChapterPaths': completedChapterPaths.toList(),
-    });
-    final currentChapter = '${envelope.substring(0, envelope.length - 1)},'
-        '"memoryTimeline":[$_persistedTimelineJson],'
-        '"glossaryEvictionPolicy":${jsonEncode(_BookMemory.glossaryEvictionPolicy)}}';
-    return cacheStore.saveJobState(JobResumeState(
-      jobKey: key, inputFingerprint: jobKey, inputPath: '', outputPath: '',
-      status: 'book-memory', completedFiles: completedChapterPaths.length,
-      totalFiles: 0, completedBlocks: 0, totalBlocks: 0, cachedBlocks: 0,
-      resumedBlocks: 0,
-      currentChapter: currentChapter,
-      updatedAtIso8601: DateTime.now().toIso8601String(),
-    ));
+    _persistedPaths
+      ..clear()
+      ..addAll(completedChapterPaths);
   }
 }
 
@@ -1269,7 +1376,9 @@ class _ChapterSourceSpool {
         if (cancelled()) throw const TranslationCancelledException();
         checkEpubSourceHash(snapshot.fingerprint, identity.sha256);
         final bytes = snapshot.files[chapterPath];
-        if (bytes == null) throw FormatException('Source chapter not found: $chapterPath');
+        if (bytes == null) {
+          throw FormatException('Source chapter not found: $chapterPath');
+        }
         // Lenient decode matches the extractor/decoder convention: a damaged
         // byte must not fail the whole restore.
         source = source.copyWith(originalHtml: utf8.decode(bytes, allowMalformed: true));
