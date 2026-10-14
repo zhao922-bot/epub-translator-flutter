@@ -1744,9 +1744,8 @@ class EpubIsolateWorker {
   /// Cap on the header-declared uncompressed total across all entries.
   static const int _kMaxEpubUncompressedBytes = 512 * 1024 * 1024;
 
-  /// The decoder eagerly inflates Unix symlink paths before our size checks.
-  /// At deflate's maximum expansion ratio (~1032:1), this bounds each such
-  /// allocation to roughly 64 MiB, well below the uncompressed cap.
+  /// Unix symlinks are rejected outright before the decoder eagerly inflates
+  /// their paths. Retain this value for limit-exception diagnostics.
   static const int _kMaxSymlinkCompressedBytes = 64 * 1024;
 
   /// Cap on total-uncompressed / compressed-bytes. Real books sit far below
@@ -1876,6 +1875,49 @@ class EpubIsolateWorker {
     return (archive: archive, duplicateNames: duplicates);
   }
 
+  /// Validates the EOCD comment length and requires archive 4.0.9's signature
+  /// scan to select the same record before any directory entries are decoded.
+  static int _findValidatedEocdEnd(List<int> bytes) {
+    Never invalid() => throw const FormatException('Invalid ZIP directory.');
+    int u16(int at) {
+      if (at < 0 || at + 2 > bytes.length) invalid();
+      return bytes[at] | (bytes[at + 1] << 8);
+    }
+
+    int u32(int at) => u16(at) | (u16(at + 2) << 16);
+
+    int end = bytes.length - 22;
+    final int searchStart = bytes.length - 22 - 65535;
+    while (end >= 0 && end >= searchStart) {
+      if (u32(end) == 0x06054b50 && end + 22 + u16(end + 20) == bytes.length) {
+        break;
+      }
+      end--;
+    }
+    if (end < 0 || end < searchStart) invalid();
+
+    // Mirror ZipDirectory._findSignature, including its chunk boundaries,
+    // reading the existing buffer directly without allocating chunk copies.
+    final length = bytes.length - 4;
+    const bufferSize = 1024;
+    final chunkSize = length < bufferSize ? length : bufferSize;
+    var startPos = length - chunkSize;
+    while (startPos >= 0) {
+      for (var chunkPos = chunkSize - 4; chunkPos >= 0; --chunkPos) {
+        if (u32(startPos + chunkPos) == 0x06054b50) {
+          if (startPos + chunkPos != end) invalid();
+          return end;
+        }
+      }
+      if (startPos > 0 && startPos < chunkSize) {
+        startPos = 0;
+      } else {
+        startPos -= chunkSize;
+      }
+    }
+    invalid();
+  }
+
   /// The decoder builds *all* central-directory headers before its first
   /// callback, even with decodeStream. Walk their lengths without allocating
   /// entry objects before handing the bytes to it. Count actual headers too:
@@ -1908,15 +1950,7 @@ class EpubIsolateWorker {
       }
     }
 
-    int end = bytes.length - 22;
-    final int searchStart = bytes.length - 22 - 65535;
-    while (end >= 0 && end >= searchStart) {
-      if (u32(end) == 0x06054b50 && end + 22 + u16(end + 20) == bytes.length) {
-        break;
-      }
-      end--;
-    }
-    if (end < 0 || end < searchStart) invalid();
+    final int end = _findValidatedEocdEnd(bytes);
     if (u16(end + 4) != 0 || u16(end + 6) != 0) invalid();
     int count = u16(end + 10);
     int size = u32(end + 12);
@@ -1956,8 +1990,8 @@ class EpubIsolateWorker {
     if (actualCount != count) invalid();
   }
 
-  /// Checks raw central-directory sizes before the decoder eagerly reads
-  /// Unix symlink payloads. Small legitimate symlinks remain supported.
+  /// Rejects all Unix symlinks in the raw central directory before the decoder
+  /// eagerly reads their payloads, regardless of compression method or size.
   @visibleForTesting
   static void checkSymlinkEntrySizesForTest(String inputPath, List<int> bytes) {
     Never invalid() => throw const FormatException('Invalid ZIP directory.');
@@ -1973,16 +2007,8 @@ class EpubIsolateWorker {
       return low;
     }
 
-    // Mirror the EOCD/ZIP64 locator handling in checkZipEntryCountForTest.
-    int end = bytes.length - 22;
-    final int searchStart = bytes.length - 22 - 65535;
-    while (end >= 0 && end >= searchStart) {
-      if (u32(end) == 0x06054b50 && end + 22 + u16(end + 20) == bytes.length) {
-        break;
-      }
-      end--;
-    }
-    if (end < 0 || end < searchStart) invalid();
+    // Mirror the ZIP64 locator handling in checkZipEntryCountForTest.
+    final int end = _findValidatedEocdEnd(bytes);
     if (u16(end + 4) != 0 || u16(end + 6) != 0) invalid();
     int size = u32(end + 12);
     int offset = u32(end + 16);
@@ -2013,16 +2039,12 @@ class EpubIsolateWorker {
       if ((versionMadeBy >> 8) == 3 &&
           ((externalFileAttributes >> 16) & 0xf000) == 0xa000) {
         final compressedSize = u32(offset + 20);
-        // Reject ZIP64 placeholders too; a path never needs ZIP64 sizes.
-        if (compressedSize == 0xffffffff ||
-            compressedSize > _kMaxSymlinkCompressedBytes) {
-          throw EpubDecompressionLimitException(
-            inputPath: inputPath,
-            compressedBytes: compressedSize,
-            uncompressedBytes: -1,
-            limitBytes: _kMaxSymlinkCompressedBytes,
-          );
-        }
+        throw EpubDecompressionLimitException(
+          inputPath: inputPath,
+          compressedBytes: compressedSize,
+          uncompressedBytes: -1,
+          limitBytes: _kMaxSymlinkCompressedBytes,
+        );
       }
       offset += length;
     }

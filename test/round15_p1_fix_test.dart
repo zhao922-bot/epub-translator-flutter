@@ -235,11 +235,19 @@ void _credentialRouteTests() {
             entry.value.apiProviderSelection,
           );
           expect(controller.state.apiBaseUrl, entry.value.apiBaseUrl);
-          expect(store.attempts.single.apiKey, 'K_X');
-          expect(store.explicitSecretMutations.single, <SettingsSecretSlot>{
-            SettingsSecretSlot.legacy,
-            SettingsSecretSlot.custom,
-          });
+          // P1-01 (round 11): when recovery changed the credential route, the
+          // edit is blocked WITHOUT attempting a save — the old behavior
+          // attempted once and relied on a second conflict to queue it.
+          expect(
+            store.attempts,
+            isEmpty,
+            reason: 'P1-01: route changed during recovery, no save attempted',
+          );
+          expect(
+            store.explicitSecretMutations,
+            isEmpty,
+            reason: 'P1-01: route changed during recovery, no save attempted',
+          );
           expect(
             controller.blockedReplayCount,
             1,
@@ -248,11 +256,15 @@ void _credentialRouteTests() {
 
           expect(await controller.reloadSettings(), isTrue);
           expect(controller.blockedReplayCount, 1);
-          expect(blockedNotices, 1);
+          // P1-01 (round 11): notice #1 fires when the edit is blocked at
+          // edit time; the reload's replay pass re-surfaces the still-blocked
+          // edit (notice #2). The queue itself is unchanged (count stays 1).
+          expect(blockedNotices, 2);
           expect(
             store.attempts,
-            hasLength(1),
-            reason: 'K_X must not replay onto Y without confirmation',
+            isEmpty,
+            reason:
+                'P1-01: K_X was blocked before any save attempt and stays queued for confirmation',
           );
           expect(controller.state.apiKey, 'K_Y');
           expect(store.persisted!.apiKey, 'K_Y');

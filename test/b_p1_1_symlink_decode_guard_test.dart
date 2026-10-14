@@ -84,16 +84,21 @@ void main() {
       });
     }
 
-    test('tiny legitimate symlink passes and decodes its target', () {
+    test('tiny legitimate symlink is rejected before decoding', () {
       const target = 'target/path.txt';
       final bytes = _zip(utf8.encode(target));
       expect(
         () => EpubIsolateWorker.checkSymlinkEntrySizesForTest('ok.epub', bytes),
-        returnsNormally,
-      );
-      expect(
-        ZipDecoder().decodeBytes(bytes).find('link')!.symbolicLink,
-        target,
+        throwsA(
+          isA<EpubDecompressionLimitException>()
+              .having(
+                (e) => e.compressedBytes,
+                'compressedBytes',
+                target.length,
+              )
+              .having((e) => e.uncompressedBytes, 'uncompressedBytes', -1)
+              .having((e) => e.limitBytes, 'limitBytes', 64 * 1024),
+        ),
       );
     });
 
@@ -118,14 +123,14 @@ void main() {
       );
     });
 
-    test('symlink compressed size exactly at the quota passes', () {
+    test('symlink compressed size exactly at the quota is rejected', () {
       final bytes = _zip(Uint8List(64 * 1024));
       expect(
         () => EpubIsolateWorker.checkSymlinkEntrySizesForTest(
           'boundary.epub',
           bytes,
         ),
-        returnsNormally,
+        throwsA(isA<EpubDecompressionLimitException>()),
       );
     });
 

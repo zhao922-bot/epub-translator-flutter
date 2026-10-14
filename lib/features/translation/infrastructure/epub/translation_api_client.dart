@@ -648,6 +648,29 @@ class TranslationApiClient {
     return visibleContent;
   }
 
+  /// P2-05: [_trailingReasoningBlocks] can only match when a complete closing
+  /// tag ends the content (ignoring trailing whitespace). Skip its unanchored
+  /// scan otherwise to avoid quadratic work on many unclosed `<think>` tags.
+  static bool _endsWithThinkClose(String content) {
+    int end = content.length;
+    // Match the non-Unicode regexp's trailing \s*: tab, LF, VT, FF, CR, space.
+    while (end > 0) {
+      final int unit = content.codeUnitAt(end - 1);
+      if (unit != 0x20 &&
+          unit != 0x09 &&
+          unit != 0x0A &&
+          unit != 0x0B &&
+          unit != 0x0C &&
+          unit != 0x0D) {
+        break;
+      }
+      end--;
+    }
+    const String close = '</think>';
+    if (end < close.length) return false;
+    return content.substring(end - close.length, end).toLowerCase() == close;
+  }
+
   /// Removes `<think>...</think>` reasoning blocks that reasoning models
   /// (for example DeepSeek-R1 variants) may prepend or append to the content.
   ///
@@ -656,9 +679,12 @@ class TranslationApiClient {
   /// for untranslated source text in single-block mode.
   String _stripReasoningBlocks(String content) {
     // Interior blocks can be literal translation text, including JSON values.
-    final String stripped = content
-        .replaceFirst(_leadingReasoningBlocks, '')
-        .replaceFirst(_trailingReasoningBlocks, '');
+    String stripped = content.replaceFirst(_leadingReasoningBlocks, '');
+    // P2-05: when the closing-tag precheck fails, the trailing regexp cannot
+    // match; skip it while retaining the original regexp for matching input.
+    if (_endsWithThinkClose(stripped)) {
+      stripped = stripped.replaceFirst(_trailingReasoningBlocks, '');
+    }
     return stripped.trim();
   }
 

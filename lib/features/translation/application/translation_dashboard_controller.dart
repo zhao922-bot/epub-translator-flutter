@@ -267,6 +267,9 @@ class TranslationDashboardController
   // still awaits saveJobState, and its late emits must not overwrite the
   // new run's state. Bumped on every run launch; onProgress ignores
   // callbacks captured under an older generation.
+  // P2-02: also bumped on accepted input changes (setInputPath /
+  // _acceptInputPath) and new inspections. Late progress, terminal results
+  // and failures must not replace the new input or inspection state.
   int _translationRunGeneration = 0;
   // Synchronous re-entrancy guards: checked and set before the first await so
   // a rapid double-tap cannot start two overlapping async flows.
@@ -626,6 +629,10 @@ class TranslationDashboardController
     // action boundary in startInspection.
     _sessionPathRevision += 1;
     _inputPathRevision += 1;
+    // P2-02: invalidate the finishing run and stop its service here, since
+    // its stale finally will no longer stop the foreground service.
+    ++_translationRunGeneration;
+    _stopTranslationForegroundService();
     // A new input abandons any in-flight style generation and its profile:
     // drop the edit markers too, or the next merge would overlay fields from
     // the discarded profile.
@@ -692,6 +699,11 @@ class TranslationDashboardController
     if (_logIfRunActive(dropped ? _s.logDropAfterRun : _s.logSelectAfterRun)) {
       return false;
     }
+    // P2-02: only accepted inputs invalidate the finishing run; a rejected
+    // pick can bump the input revision while a run is still active. Stop
+    // its service here because the stale finally will skip cleanup.
+    ++_translationRunGeneration;
+    _stopTranslationForegroundService();
     final String outputDirectory = state.outputDirectory.isEmpty
         ? inferredOutput
         : state.outputDirectory;
@@ -1168,6 +1180,10 @@ class TranslationDashboardController
     final String outputDirectory = state.outputDirectory.isEmpty
         ? inferredOutputDirectory
         : state.outputDirectory;
+    // P2-02: a new inspection (including same-book reinspection or retry)
+    // invalidates the finishing run and takes over its service cleanup.
+    ++_translationRunGeneration;
+    _stopTranslationForegroundService();
     _cancelRequested = false;
     _runApiKey = state.config.apiKey;
 
@@ -1335,6 +1351,13 @@ class TranslationDashboardController
     return job.copyWith(progress: verified);
   }
 
+  // P2-02: rejected picks can advance _inputPathRevision without changing
+  // the accepted input, so compare the path value rather than that revision.
+  bool _isStaleTranslationRun(int runGeneration, String runInputPath) {
+    return runGeneration != _translationRunGeneration ||
+        state.inputPath != runInputPath;
+  }
+
   /// Starts translation for the inspected selection.
   ///
   /// Returns true when the run actually started; false when a guard stopped
@@ -1380,6 +1403,7 @@ class TranslationDashboardController
     // P1-#3: capture the generation for this run's progress callbacks (the
     // callback below drops anything from an older generation).
     final int runGeneration = ++_translationRunGeneration;
+    final String runInputPath = state.inputPath;
     final TranslationJob? currentJob = state.job;
     final bool currentJobIsResumable =
         currentJob != null &&
@@ -1524,7 +1548,9 @@ class TranslationDashboardController
           // saves) can still be awaiting while this run is active. Its late
           // emits carry the old job and must not overwrite the new run's
           // state — only the current generation may apply progress.
-          if (runGeneration != _translationRunGeneration) {
+          // P2-02: accepted input changes and new inspections also make
+          // this run stale; verify the captured input path as well.
+          if (_isStaleTranslationRun(runGeneration, runInputPath)) {
             return;
           }
           final TranslationJob progressJob = _translationHistoryJob(
@@ -1599,7 +1625,9 @@ class TranslationDashboardController
       // B-P1-3: a newer run may have started while this run was suspended
       // (e.g. at checkpoint persistence). Its terminal state must not
       // overwrite the newer run — drop it untouched.
-      if (runGeneration != _translationRunGeneration) {
+      // P2-02: preserve an accepted new input or inspection too, checking
+      // both the operation generation and the captured input path.
+      if (_isStaleTranslationRun(runGeneration, runInputPath)) {
         return true;
       }
       // A returned terminal result means the repository already committed the
@@ -1671,7 +1699,9 @@ class TranslationDashboardController
       // B-P1-3: a newer run may have started while this run was suspended
       // (e.g. at checkpoint persistence). Its terminal state must not
       // overwrite the newer run — drop it untouched.
-      if (runGeneration != _translationRunGeneration) {
+      // P2-02: late failures must also preserve an accepted new input or
+      // inspection, using the same generation and input-path check.
+      if (_isStaleTranslationRun(runGeneration, runInputPath)) {
         return true;
       }
       if (_handleCancellation(error)) {
@@ -2571,7 +2601,7 @@ class TranslationDashboardController
     );
   }
 
-  /// C-M7: stops the foreground service; always called from a finally block
+  /// C-M7: stops the foreground service when a run exits or is invalidated,
   /// so completion, failure and cancellation all clean up.
   void _stopTranslationForegroundService() {
     if (!PlatformUtils.isAndroid || !_foregroundServiceActive) {

@@ -161,6 +161,7 @@ typedef _ConflictedEdit = ({
   // time by diffing. Used to drop stale earlier entries when a later entry
   // successfully persists newer values for the same fields.
   Set<String> changedFields,
+  int editGeneration,
   ({
     ApiProviderSelection providerSelection,
     String apiBaseUrl,
@@ -280,6 +281,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   bool _recoveryLoadPhase = false;
   Future<bool>? _sliderFlushInProgress;
   int _noticeRevision = 0;
+  int _commitGeneration = 0;
+  final Map<SettingsSecretSlot, ({String value, int generation})>
+  _lastCommittedSecrets = {};
 
   /// In-flight [reloadSettings] future, if any (P2-#36). Concurrent reloads
   /// join it instead of starting a second load.
@@ -454,6 +458,21 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
     if (hadLoadError) await _replayConflictedEdits();
     if (!mounted) return false;
+    // Recovery or a reload can change the service while this edit waits.
+    // Keep the original credential target until the user confirms it.
+    if (slots.isNotEmpty && _isCredentialRouteChanged(credentialRoute)) {
+      _conflictedEdits.add((
+        update: update,
+        explicitSecretMutations: explicitSecretMutations,
+        secretMutationsFor: secretMutationsFor,
+        changedFields: _changedFields(state, update(state)),
+        editGeneration: _commitGeneration,
+        credentialRoute: credentialRoute,
+      ));
+      _noticeRevision++;
+      onReplayBlocked?.call();
+      return false;
+    }
     final TranslationConfig prevState = state;
     final TranslationConfig next = update(prevState);
     if (!mounted) {
@@ -529,6 +548,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
                     // was made; recomputing against prevState now would be
                     // empty (the slider value is already in prevState).
                     changedFields: debouncedFields ?? const <String>{},
+                    editGeneration: _commitGeneration,
                     credentialRoute: (
                       providerSelection: state.apiProviderSelection,
                       apiBaseUrl: state.apiBaseUrl,
@@ -550,6 +570,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
                 prevState,
                 next,
               ).union(debouncedFields ?? const <String>{}),
+              editGeneration: _commitGeneration,
               credentialRoute: credentialRoute,
             ),
     );
@@ -575,35 +596,42 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   }
 
   Future<bool> _flushSliderChanges() async {
-    _sliderTimer?.cancel();
-    final completion = _sliderCompletion;
-    _sliderCompletion = null;
-    final debounced = _debouncedEdit;
-    _debouncedSetters.clear();
-    final debouncedFields = _debouncedChangedFields;
-    _debouncedChangedFields = null;
-    if (completion == null) return true;
-    final bool ok = await _saveUpdate(
-      state,
-      const {},
-      pendingEdit: debounced == null
-          ? null
-          : (
-              update: debounced,
-              explicitSecretMutations: const <SettingsSecretSlot>{},
-              secretMutationsFor: null,
-              // P2-#28: fields recorded when the slider edit was made.
-              changedFields: debouncedFields ?? const <String>{},
-              credentialRoute: (
-                providerSelection: state.apiProviderSelection,
-                apiBaseUrl: state.apiBaseUrl,
-                customApiBaseUrl: state.customApiBaseUrl,
-                secretSlots: const <SettingsSecretSlot>{},
-              ),
-            ),
-    );
-    completion.complete(ok);
-    return ok;
+    bool ok = true;
+    while (true) {
+      _sliderTimer?.cancel();
+      final completion = _sliderCompletion;
+      _sliderCompletion = null;
+      final debounced = _debouncedEdit;
+      _debouncedSetters.clear();
+      final debouncedFields = _debouncedChangedFields;
+      _debouncedChangedFields = null;
+      if (debounced == null) {
+        completion?.complete(true);
+        return ok;
+      }
+      final bool step = await _saveUpdate(
+        state,
+        const {},
+        pendingEdit: (
+          update: debounced,
+          explicitSecretMutations: const <SettingsSecretSlot>{},
+          secretMutationsFor: null,
+          // P2-#28: fields recorded when the slider edit was made.
+          changedFields: debouncedFields ?? const <String>{},
+          editGeneration: _commitGeneration,
+          credentialRoute: (
+            providerSelection: state.apiProviderSelection,
+            apiBaseUrl: state.apiBaseUrl,
+            customApiBaseUrl: state.customApiBaseUrl,
+            secretSlots: const <SettingsSecretSlot>{},
+          ),
+        ),
+      );
+      completion?.complete(step);
+      ok = ok && step;
+      // Slider edits arriving during the save belong to the same flush,
+      // but each completion reports the result of its own batch.
+    }
   }
 
   Future<bool> _saveUpdate(
@@ -618,6 +646,18 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       // Successful saves must retain blocked or newly conflicted replays.
       _unresolvedSecretFailures.removeAll(slots);
       final persisted = _store.lastPersistedSecretSlots;
+      _commitGeneration++;
+      for (final slot in persisted) {
+        _lastCommittedSecrets[slot] = (
+          value: switch (slot) {
+            SettingsSecretSlot.legacy => next.apiKey,
+            SettingsSecretSlot.deepSeek => next.deepseekApiKey,
+            SettingsSecretSlot.custom => next.customApiKey,
+            SettingsSecretSlot.proxy => next.httpProxy,
+          },
+          generation: _commitGeneration,
+        );
+      }
       _unresolvedSecretFailures.removeAll(persisted);
       if (pendingEdit != null) {
         final fields = pendingEdit.changedFields;
@@ -717,8 +757,18 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     }
   }
 
-  bool _isReplayBlockedByRouteChange(_ConflictedEdit edit) {
-    final route = edit.credentialRoute;
+  bool _isReplayBlockedByRouteChange(_ConflictedEdit edit) =>
+      _isCredentialRouteChanged(edit.credentialRoute);
+
+  bool _isCredentialRouteChanged(
+    ({
+      ApiProviderSelection providerSelection,
+      String apiBaseUrl,
+      String customApiBaseUrl,
+      Set<SettingsSecretSlot> secretSlots,
+    })
+    route,
+  ) {
     return route.secretSlots.any(
           (slot) => const {
             SettingsSecretSlot.legacy,
@@ -852,6 +902,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
         explicitSecretMutations: edit.explicitSecretMutations,
         secretMutationsFor: edit.secretMutationsFor,
         changedFields: edit.changedFields,
+        editGeneration: edit.editGeneration,
         credentialRoute: (
           providerSelection: state.apiProviderSelection,
           apiBaseUrl: state.apiBaseUrl,
@@ -880,22 +931,40 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final slots = <SettingsSecretSlot>{
       for (final edit in blocked) ...edit.credentialRoute.secretSlots,
     };
+    final touchGenerations = <SettingsSecretSlot, int>{};
+    for (final edit in blocked) {
+      for (final slot in edit.credentialRoute.secretSlots) {
+        final previous = touchGenerations[slot];
+        if (previous == null || edit.editGeneration > previous) {
+          touchGenerations[slot] = edit.editGeneration;
+        }
+      }
+    }
     _conflictedEdits.removeWhere(blocked.contains);
     // C-P1-4: failed commits remain dirty in the text field and may also
     // remain in optimistic state. Discard both, using the fresh load that
-    // established the changed route, before another full-state save.
+    // established the changed route, unless a newer commit saved the slot.
     final loaded = _lastLoadedConfig!;
+    String restoredSecret(SettingsSecretSlot slot, String loadedValue) {
+      final committed = _lastCommittedSecrets[slot];
+      return committed != null && committed.generation > touchGenerations[slot]!
+          ? committed.value
+          : loadedValue;
+    }
+
     credentialDiscardRevision++;
     state = state.copyWith(
-      apiKey: slots.contains(SettingsSecretSlot.legacy) ? loaded.apiKey : null,
+      apiKey: slots.contains(SettingsSecretSlot.legacy)
+          ? restoredSecret(SettingsSecretSlot.legacy, loaded.apiKey)
+          : null,
       deepseekApiKey: slots.contains(SettingsSecretSlot.deepSeek)
-          ? loaded.deepseekApiKey
+          ? restoredSecret(SettingsSecretSlot.deepSeek, loaded.deepseekApiKey)
           : null,
       customApiKey: slots.contains(SettingsSecretSlot.custom)
-          ? loaded.customApiKey
+          ? restoredSecret(SettingsSecretSlot.custom, loaded.customApiKey)
           : null,
       httpProxy: slots.contains(SettingsSecretSlot.proxy)
-          ? loaded.httpProxy
+          ? restoredSecret(SettingsSecretSlot.proxy, loaded.httpProxy)
           : null,
     );
   }

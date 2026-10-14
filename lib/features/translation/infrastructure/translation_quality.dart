@@ -97,8 +97,20 @@ class TranslationQuality {
     unicode: true,
   ).hasMatch(value);
 
+  static const int _lockedTermRulesCacheLimit = 8;
+  static final Map<String, List<RegExp>> _lockedTermRulesCache = {};
+
   static String _stripLockedTerms(String text, String glossary) {
     if (glossary.trim().isEmpty) return text;
+    for (final rule in _lockedTermRules(glossary)) {
+      text = text.replaceAll(rule, ' ');
+    }
+    return text;
+  }
+
+  static List<RegExp> _lockedTermRules(String glossary) {
+    final cached = _lockedTermRulesCache[glossary];
+    if (cached != null) return cached;
     final terms = <String>{};
     for (final line in glossary.split('\n')) {
       // The prompt accepts free text; only explicit, nonempty mappings grant
@@ -111,19 +123,31 @@ class TranslationQuality {
     }
     final ordered = terms.toList()
       ..sort((a, b) => b.length.compareTo(a.length));
-    for (final term in ordered) {
-      text = text.replaceAll(
+    final rules = List<RegExp>.unmodifiable([
+      for (final term in ordered)
         RegExp(
           '(?<![A-Za-z0-9_\u00C0-\u02AF\u0300-\u036F])'
           '${RegExp.escape(term)}'
           '(?![A-Za-z0-9_\u00C0-\u02AF\u0300-\u036F])',
           unicode: true,
         ),
-        ' ',
-      );
+    ]);
+    // Insertion-ordered, bounded cache: discard the oldest glossary when
+    // settings change rather than rebuilding these rules for every node.
+    if (_lockedTermRulesCache.length >= _lockedTermRulesCacheLimit) {
+      _lockedTermRulesCache.remove(_lockedTermRulesCache.keys.first);
     }
-    return text;
+    _lockedTermRulesCache[glossary] = rules;
+    return rules;
   }
+
+  @visibleForTesting
+  static String stripLockedTermsForTest(String text, String glossary) =>
+      _stripLockedTerms(text, glossary);
+
+  @visibleForTesting
+  static List<RegExp> lockedTermRulesForTest(String glossary) =>
+      _lockedTermRules(glossary);
 
   static bool _hasNonLatinSourceResidual(
     String source,
@@ -139,7 +163,13 @@ class TranslationQuality {
         RegExp(
           r'[\u3040-\u30FF\u3400-\u9FFF\uAC00-\uD7AF\u{20000}-\u{2FA1F}]{8,}',
           unicode: true,
-        ),
+        )
+      else ...[
+        if (!_isJapaneseTargetLanguage(target))
+          RegExp(r'[\u3040-\u30FF]{8,}', unicode: true),
+        if (!_isKoreanTargetLanguage(target))
+          RegExp(r'[\uAC00-\uD7AF]{8,}', unicode: true),
+      ],
       if (!RegExp(r'^ru(?:[-_]|$)').hasMatch(target) &&
           !_matchesLanguageName(target, 'russian') &&
           !target.contains('русский') &&
@@ -634,7 +664,9 @@ class TranslationQuality {
       r"[A-Za-z][A-Za-z'’\-]*|\d+",
     ).allMatches(body).map((RegExpMatch match) => match.group(0)!).toList();
     if (words.isEmpty) {
-      return true;
+      // Only bare numbers/punctuation lack translatable content. The ASCII
+      // tokenizer finding no words does not exempt non-Latin prose.
+      return !RegExp(r'\p{L}', unicode: true).hasMatch(body);
     }
     const Set<String> citationTokens = <String>{
       'a',
@@ -1159,20 +1191,31 @@ class TranslationQuality {
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
     final String lower = targetLanguage.trim().toLowerCase();
-    return RegExp(r'^(?:zh|ja|ko)(?:[-_]|$)').hasMatch(lower) ||
-        _matchesLanguageName(lower, 'chinese') ||
-        _matchesLanguageName(lower, 'japanese') ||
-        _matchesLanguageName(lower, 'korean') ||
-        lower.contains('中文') ||
-        lower.contains('汉语') ||
-        lower.contains('漢語') ||
-        lower.contains('日本語') ||
-        lower.contains('日语') ||
-        lower.contains('日語') ||
-        lower.contains('한국어') ||
-        lower.contains('韩语') ||
-        lower.contains('韓語');
+    return _isChineseTargetLanguage(lower) ||
+        _isJapaneseTargetLanguage(lower) ||
+        _isKoreanTargetLanguage(lower);
   }
+
+  static bool _isChineseTargetLanguage(String lower) =>
+      RegExp(r'^zh(?:[-_]|$)').hasMatch(lower) ||
+      _matchesLanguageName(lower, 'chinese') ||
+      lower.contains('中文') ||
+      lower.contains('汉语') ||
+      lower.contains('漢語');
+
+  static bool _isJapaneseTargetLanguage(String lower) =>
+      RegExp(r'^ja(?:[-_]|$)').hasMatch(lower) ||
+      _matchesLanguageName(lower, 'japanese') ||
+      lower.contains('日本語') ||
+      lower.contains('日语') ||
+      lower.contains('日語');
+
+  static bool _isKoreanTargetLanguage(String lower) =>
+      RegExp(r'^ko(?:[-_]|$)').hasMatch(lower) ||
+      _matchesLanguageName(lower, 'korean') ||
+      lower.contains('한국어') ||
+      lower.contains('韩语') ||
+      lower.contains('韓語');
 
   static int? _runeBefore(String text, int offset) {
     if (offset <= 0) {
