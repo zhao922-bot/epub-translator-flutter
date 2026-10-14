@@ -279,7 +279,11 @@ void main() {
     expect(notices.last, isA<SettingsWriteConflict>());
   });
 
-  test('C-P2-10 implicit secret persistence resolves failed secret slots',
+  // C-07 invariant: even when an unrelated save's implicit retry actually
+  // persists a previously failed key, the failure notice stays until the
+  // user's explicit retry. (This test previously pinned the v1.6.26
+  // regression where unrelated saves cleared the notice.)
+  test('C-P2-10 implicit secret persistence keeps the failure notice',
       () async {
     store.saveError = SettingsSecretSaveException({
       SettingsSecretSlot.legacy: StateError('secret unavailable'),
@@ -288,8 +292,10 @@ void main() {
     expect(await controller.setApiKey('retry-key'), isFalse);
     store.saveError = null;
     expect(await controller.setOutputSuffix('_implicit'), isTrue);
+    // The implicit retry did persist the key...
     expect(store.persisted.apiKey, 'retry-key');
-    expect(notices.last, isNull);
+    // ...but the notice is not cleared by the unrelated save.
+    expect(notices.last, isNotNull);
   });
 
   Future<ProviderContainer> showSettings(WidgetTester tester) async {

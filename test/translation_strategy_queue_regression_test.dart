@@ -292,11 +292,14 @@ void main() {
           await expectLater(future, throwsA(isA<DioException>()));
         }
         expect(slotCalls[_text], 1);
+        // Slot-level retries follow the individual-slot policy, not the
+        // batch-level shouldRetryBatchError: a timeout is retried once at
+        // slot level (per maxAttemptsForError) even though a batch timeout
+        // would take the shrink fallback instead of a batch retry.
+        // v1.6.26 made this deliberate; A-P2-4 pins {'Second': 2}.
         expect(
           slotCalls['Then he rested.'],
-          TranslationApiClient.shouldRetryBatchError(error)
-              ? TranslationApiClient.maxAttemptsForError(config, error)
-              : 1,
+          TranslationApiClient.maxAttemptsForError(config, error),
         );
         expect(slotCalls.keys.any((text) => text.contains('[RETRY]')), isFalse);
       },

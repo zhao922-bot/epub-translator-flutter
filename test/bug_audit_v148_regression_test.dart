@@ -19,6 +19,10 @@ class ReadFailureFile implements File {
   String get path => delegate.path;
   @override
   Directory get parent => delegate.parent;
+  // withSettingsFileLock keys on file.absolute.path; the stub must resolve
+  // it instead of falling into noSuchMethod (which rethrows).
+  @override
+  File get absolute => this;
   @override
   Future<bool> exists() => delegate.exists();
   @override

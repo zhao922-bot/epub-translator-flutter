@@ -2,6 +2,17 @@
 
 本项目遵循语义化版本号；`+` 后的数字为构建号。
 
+## [1.6.28] - 2026-10-14
+
+构建号：`1.6.28+44`。修复 GitHub CI（windows-latest）5 个失败测试，均为 v1.6.26 引入的回归或测试桩滞后。
+
+### 修复
+
+- 翻译：`SHARE_FAILED` 不再走通用本地化文案，回归到带原始错误信息的通用导出失败文案（v1.6.26 引入的回归；`SHARE_NO_SPACE` 仍走本地化）。
+- 设置：无关的成功保存不再清除未解决的密钥失败 notice——只有本次实际保存的 slot 才能清除其未解决失败（v1.6.26 引入的回归；notice 保留到用户显式重试）。
+- 翻译：修正 A3 测试的 slot 重试次数期望公式——slot 层重试遵循 individual-slot 策略（超时重试 1 次），而非 batch 层的 `shouldRetryBatchError`（v1.6.26 故意行为，A-P2-4 已 pin 住；代码未动）。
+- 测试：`ReadFailureFile` 测试桩补上 `absolute` getter（`withSettingsFileLock` 改调 `file.absolute.path` 后桩类滞后），`LockedSettingsFile`/`BackupFailureFile` 继承修复。
+
 ## [1.6.27] - 2026-10-14
 
 构建号：`1.6.27+43`。codex CLI `gpt-6.1-sol`（max 档位）第 11 轮审查 10 项确认全修（P1×4、P2×5、P3×1）；其中 2 项为近期修复引入的回归（v1.6.25、v1.6.26）。

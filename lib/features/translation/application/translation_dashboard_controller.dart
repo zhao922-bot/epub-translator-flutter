@@ -2361,9 +2361,6 @@ class TranslationDashboardController
   /// regress to surfacing the raw English native text.
   @visibleForTesting
   String debugShareErrorLogLine(Object error) {
-    if (error is PlatformException && error.code == 'SHARE_FAILED') {
-      return _s.logShareFailed;
-    }
     if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }
@@ -2375,9 +2372,6 @@ class TranslationDashboardController
   /// failures keep this call site's own message.
   @visibleForTesting
   String debugOpenJobOutputErrorLogLine(Object error) {
-    if (error is PlatformException && error.code == 'SHARE_FAILED') {
-      return _s.logShareFailed;
-    }
     if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
       return _s.logNotEnoughSpace;
     }

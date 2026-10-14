@@ -40,11 +40,7 @@ void main() {
       'SAVE_PERMISSION_PERMANENTLY_DENIED':
           strings.logSavePermissionPermanentlyDenied,
     };
-    for (final entry in {
-      ...pickMessages,
-      ...saveMessages,
-      'SHARE_FAILED': strings.logShareFailed,
-    }.entries) {
+    for (final entry in {...pickMessages, ...saveMessages}.entries) {
       test('${language.name} localizes ${entry.key}', () {
         final controller =
             TranslationDashboardController(repository: _UnusedRepository())
@@ -59,11 +55,8 @@ void main() {
         final String actual;
         if (pickMessages.containsKey(entry.key)) {
           actual = controller.debugPickErrorLogLine(error);
-        } else if (saveMessages.containsKey(entry.key)) {
-          actual = controller.debugSaveErrorLogLine(error);
         } else {
-          actual = controller.debugShareErrorLogLine(error);
-          expect(controller.debugOpenJobOutputErrorLogLine(error), entry.value);
+          actual = controller.debugSaveErrorLogLine(error);
         }
         expect(actual, entry.value);
         expect(actual, isNot(contains('Raw native English error')));

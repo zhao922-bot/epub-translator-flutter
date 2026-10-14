@@ -658,7 +658,11 @@ class SettingsController extends StateNotifier<TranslationConfig> {
           generation: _commitGeneration,
         );
       }
-      _unresolvedSecretFailures.removeAll(persisted);
+      // C-07: only the slots this save explicitly targeted may clear their
+      // unresolved failures (via removeAll(slots) above). Slots that merely
+      // landed through an implicit retry (e.g. a previously failed key
+      // re-persisted during an unrelated theme save) must NOT clear the
+      // notice: it stays until the user's explicit retry of that action.
       if (pendingEdit != null) {
         final fields = pendingEdit.changedFields;
         _conflictedEdits.removeWhere((edit) =>
