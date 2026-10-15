@@ -734,11 +734,11 @@ class AppStrings {
       ? '翻译已完成，但有 $count 个块保留了回退内容。'
       : 'Translation completed with $count blocks retaining fallback content.';
   String degradedBlocksWarning(int count) => isChinese
-      ? '$count 个块未能完成翻译，保留原文。当前 EPUB 仍可使用，也可重试。'
-      : '$count blocks could not be translated and retain the original text. You can use this EPUB or retry.';
+      ? '$count 个块未通过翻译检查，已保留原文或待复核译文。请查看日志了解原因，可重试。'
+      : '$count blocks did not pass translation checks. Original text or a translation needing review was retained. See the log for details or retry.';
   String get partialOutputWarning => isChinese
-      ? '部分内容未完成翻译，保留原文。当前 EPUB 仍可使用，也可重试。'
-      : 'Some content could not be translated and retains the original text. You can use this EPUB or retry.';
+      ? '部分内容未通过翻译检查，已保留原文或待复核译文。请查看日志了解原因，可重试。'
+      : 'Some content did not pass translation checks. Original text or a translation needing review was retained. See the log for details or retry.';
   String logCacheResume(int cached, int resumed) => isChinese
       ? '缓存/续传：$cached 缓存块 · $resumed 续传块。'
       : 'Cache/resume: $cached cached, $resumed resumed blocks.';

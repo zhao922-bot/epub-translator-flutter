@@ -11,6 +11,7 @@ import '../../../../shared/localization/app_strings.dart';
 
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
+import '../translation_response_guard.dart';
 import 'cancellation_listener.dart';
 
 /// Thrown when a translation, style, or memory reply cannot be parsed as JSON
@@ -1318,7 +1319,8 @@ class TranslationApiClient {
     // per-block fallback. Validation failures on a well-formed reply
     // (wrong ids, residual-quality gate, empty block) are often transient
     // and keep the normal batch retry policy.
-    if (error is TranslationParseException) {
+    if (error is TranslationParseException ||
+        error is NonTranslationReplyException) {
       return false;
     }
     return error is! DioException || !shouldFallbackBatchDioException(error);
@@ -1365,6 +1367,7 @@ class TranslationApiClient {
       return 1;
     }
     final int normalMaxAttempts = max(1, config.maxRetries);
+    if (error is NonTranslationReplyException) return min(normalMaxAttempts, 2);
     if (isRateLimitError(error)) {
       return max(normalMaxAttempts, 8);
     }

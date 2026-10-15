@@ -24,6 +24,7 @@ import '../../domain/models/translation_style_profile.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../translation_cache_store.dart';
 import '../translation_quality.dart';
+import '../translation_response_guard.dart';
 import '../cache_restoration_scanner.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_repacker.dart';
@@ -118,12 +119,14 @@ class EpubChapterTranslator {
     required String blockId,
     bool apiCounted = false,
     String? reason,
+    bool retainedPartialTranslation = false,
   }) {
     _run.markDegraded(
       chapterPath: chapterPath,
       blockId: blockId,
       apiCounted: apiCounted,
       reason: reason,
+      retainedPartialTranslation: retainedPartialTranslation,
     );
   }
 
@@ -1334,14 +1337,23 @@ class EpubChapterTranslator {
           ).scan(
             chapters: selectedChapters,
             persistChapter: cacheSpool.save,
-            acceptCached: config.semanticQualityCheck
-                ? (chapter, block, html) => _semanticReviewer.restore(
+            acceptCached: (chapter, block, html) async {
+              // Recheck this narrow guard on old cache entries without
+              // invalidating an otherwise reusable whole-book cache.
+              if (TranslationResponseGuard.isNonTranslationReply(
+                sourceText: block.sourceText,
+                translatedText: _ResponseHtml.parse(html).plainText,
+              )) {
+                return false;
+              }
+              return !config.semanticQualityCheck ||
+                  await _semanticReviewer.restore(
                     config,
                     chapter.path,
                     block,
                     html,
-                  )
-                : null,
+                  );
+            },
             cacheKeyFor: (InspectedChapter chapter, ExtractedBlock block) =>
                 _blockCacheKey(
                   config,
@@ -2468,13 +2480,23 @@ class EpubChapterTranslator {
         updatedChapters[index] = restored;
       }
       final int degradedBlockCount = _degradedBlocks.length;
+      final degradedDetails = [
+        for (final key in _degradedBlocks)
+          {
+            'block': key.replaceAll('\u0000', ':'),
+            'reason': _run.degradedReasons[key]!,
+            'fallback': _run.degradedFallbacks[key]!,
+          },
+      ];
       if (degradedBlockCount > 0) {
         // Scoped keys use \u0000 as the separator; render it readably.
         final String degradedBlockSample = _degradedBlocks
             .take(20)
             .map(
               (String key) =>
-                  '${key.replaceAll('\u0000', ':')}${_run.degradedReasons[key] == null ? '' : ' (${_run.degradedReasons[key]})'}',
+                  '${key.replaceAll('\u0000', ':')} '
+                  '(${_run.degradedReasons[key]}; '
+                  '${_run.degradedFallbacks[key] == 'partialTranslation' ? (s.isChinese ? '保留待复核译文' : 'partial translation retained; needs review') : (s.isChinese ? '保留原文' : 'source retained')})',
             )
             .join(',');
         emit(
@@ -2630,6 +2652,24 @@ class EpubChapterTranslator {
         s.runLogRepackPerformance(_formatDuration(repackStopwatch.elapsed)),
       );
       final usage = committedResult.apiUsage;
+      try {
+        final diagnostics = File('$outputFilePath.diagnostics.json');
+        // A successful retry can overwrite the same EPUB. Clear old warning
+        // records too, so its sidecar cannot describe the previous run.
+        if (degradedDetails.isNotEmpty || await diagnostics.exists()) {
+          await writeFileAtomically(
+            diagnostics,
+            const JsonEncoder.withIndent(
+              '  ',
+            ).convert({'version': 1, 'degradedBlocks': degradedDetails}),
+          );
+        }
+      } catch (error) {
+        AppLogger.warn(
+          'Translation diagnostics write failed (${error.runtimeType}).',
+          tag: 'translate',
+        );
+      }
       emit(
         terminalJob,
         s.isChinese
@@ -2671,6 +2711,7 @@ class EpubChapterTranslator {
               'degradedBlocks': _degradedBlocks
                   .map((id) => id.replaceAll('\u0000', ':'))
                   .toList(),
+              'degradedDetails': degradedDetails,
               'requests': _run.semanticRequests,
               'requestLimit': config.maxSemanticReviewRequests,
               'corrections': _run.semanticCorrections,
@@ -2909,7 +2950,7 @@ class EpubChapterTranslator {
     required String translatedHtml,
     Map<String, int>? instrumentation,
     bool rejectEmptyResponse = false,
-    void Function(String html)? onLocked,
+    void Function(String html, String text)? onLocked,
   }) {
     final replyDom = _cleanResponseDom(
       translatedHtml,
@@ -2933,14 +2974,14 @@ class EpubChapterTranslator {
     required ExtractedBlock block,
     required _ResponseHtml replyDom,
     Map<String, int>? instrumentation,
-    void Function(String html)? onLocked,
+    void Function(String html, String text)? onLocked,
   }) {
     final sourceDom = _ResponseHtml.parse(block.sourceHtml, instrumentation);
     final locked = _lockResponseDom(sourceDom, replyDom);
     final html = locked.html;
     // Single-block quality retries/degrades must retain the usable locked
     // response even when validation below rejects residual source text.
-    onLocked?.call(html);
+    onLocked?.call(html, locked.plainText);
     _validateTranslatedBlockQuality(
       config: config,
       block: block,
@@ -3057,6 +3098,12 @@ class EpubChapterTranslator {
       throw TranslationParseException(error.message);
     }
     final hasMarkup = reply.fragment.nodes.any((node) => node is dom.Element);
+    if (TranslationResponseGuard.isNonTranslationReply(
+      sourceText: sourceText,
+      translatedText: reply.plainText,
+    )) {
+      throw const NonTranslationReplyException();
+    }
     final hasOutsideText = reply.fragment.nodes.any(
       (node) => node is dom.Text && node.data.trim().isNotEmpty,
     );

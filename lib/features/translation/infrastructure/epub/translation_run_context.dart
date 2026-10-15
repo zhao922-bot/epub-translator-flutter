@@ -22,6 +22,7 @@ class TranslationRunContext {
   final TranslationCancellationCheck? isCancelled;
   final Set<String> degradedBlocks = <String>{};
   final Map<String, String> degradedReasons = <String, String>{};
+  final Map<String, String> degradedFallbacks = <String, String>{};
   int apiDegradedBlocks = 0;
   String cacheSourceIdentity = '';
   final TranslationApiMetrics styleMetrics = TranslationApiMetrics();
@@ -79,13 +80,17 @@ class TranslationRunContext {
     required String blockId,
     bool apiCounted = false,
     String? reason,
+    bool retainedPartialTranslation = false,
   }) {
     final String key = EpubRepacker.degradedKeyForBlock(
       chapterPath: chapterPath,
       blockId: blockId,
     );
     final bool added = degradedBlocks.add(key);
-    if (reason != null) degradedReasons[key] = reason;
+    degradedReasons[key] = reason ?? 'Translation validation failed';
+    degradedFallbacks[key] = retainedPartialTranslation
+        ? 'partialTranslation'
+        : 'source';
     if (added && apiCounted) apiDegradedBlocks += 1;
   }
 }

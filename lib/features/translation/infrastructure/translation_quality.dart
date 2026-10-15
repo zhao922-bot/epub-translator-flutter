@@ -503,6 +503,15 @@ class TranslationQuality {
     required bool allowBibliographicRetention,
     required String lockedGlossary,
   }) {
+    if (!_clearMatchingExplainedInlinePhrases(
+      sourceDocument,
+      translatedDocument,
+      targetLanguage: targetLanguage,
+    )) {
+      return const TranslationResidualFinding(
+        kind: TranslationResidualKind.longSourceText,
+      );
+    }
     // Capture before any exemption clears source nodes. Previously these
     // heuristics reparsed the original source HTML each time they ran.
     final sourceAuditedCores = _sourceAuditedForeignTermCores(sourceDocument);
@@ -1758,6 +1767,87 @@ class TranslationQuality {
     return RegExp(
       r'(?:\b(?:our|the|his|her|their)\s+)?(?:newsletter|magazine|journal|newspaper|column|periodical|publication|bulletin|digest)\b[,:\s]*$',
     ).hasMatch(lower);
+  }
+
+  /// A retained short quotation with an adjacent translated gloss is already
+  /// bilingual. Clear only its matching inline node in the audit copies, never
+  /// unrelated prose or another occurrence of the same words.
+  static bool _clearMatchingExplainedInlinePhrases(
+    Document source,
+    Document translated, {
+    required String targetLanguage,
+  }) {
+    if (!_isChineseTargetLanguage(targetLanguage.trim().toLowerCase())) {
+      return true;
+    }
+    final originals = source.querySelectorAll('em, i');
+    final outputs = translated.querySelectorAll('em, i');
+    if (originals.length != outputs.length) return true;
+    for (var index = 0; index < originals.length; index++) {
+      final a = originals[index], b = outputs[index];
+      final phrase = _normalizedWorkTitleText(_normalizeText(a.text));
+      if (a.children.isNotEmpty ||
+          b.children.isNotEmpty ||
+          phrase.length > 100 ||
+          _englishWordCount(phrase) < 2 ||
+          _englishWordCount(phrase) > 8 ||
+          !RegExp(r"^[A-Za-zÀ-ɏ ,.'’\-]+$").hasMatch(phrase) ||
+          !RegExp(r"^[A-Za-zÀ-ɏ ,.'’\-]+$").hasMatch(_normalizeText(b.text)) ||
+          a.localName != b.localName ||
+          _taggedElementStructurePath(a) != _taggedElementStructurePath(b)) {
+        continue;
+      }
+      String following(Element node) {
+        final siblings = node.parentNode!.nodes;
+        final next = siblings.indexOf(node) + 1;
+        return next < siblings.length && siblings[next] is Text
+            ? (siblings[next] as Text).data
+            : '';
+      }
+
+      final after = following(b);
+      // Explicit "(Chinese explanation)" or "—Chinese explanation)".
+      final marked = RegExp(
+        r'^\s*(?:[（(]\s*|[—–:：]+\s*)([^（）()\r\n]{2,160})[）)]',
+      ).firstMatch(after);
+      var gloss = marked?.group(1);
+      if (gloss == null) {
+        // A complete, standalone phrase + explanatory sentence. The source
+        // must have the same paired layout, not an emphasized word buried in
+        // an ordinary paragraph followed by unrelated translated prose.
+        final ap = a.parentNode, bp = b.parentNode;
+        if (ap is! Element ||
+            bp is! Element ||
+            ap.localName != 'p' ||
+            bp.localName != 'p' ||
+            ap.children.length != 1 ||
+            bp.children.length != 1 ||
+            ap.nodes
+                .takeWhile((n) => !identical(n, a))
+                .any((n) => (n.text ?? '').trim().isNotEmpty) ||
+            bp.nodes
+                .takeWhile((n) => !identical(n, b))
+                .any((n) => (n.text ?? '').trim().isNotEmpty) ||
+            !RegExp(r'^\s*[.。]\s*[A-Z]').hasMatch(following(a)) ||
+            _englishWordCount(following(a)) < 3) {
+          continue;
+        }
+        gloss = RegExp(
+          r'^\s*[.。]\s*([^。！？\r\n]{2,160})[。！？]\s*$',
+        ).firstMatch(after)?.group(1);
+      }
+      if (gloss == null ||
+          RegExp(r'[A-Za-z]').hasMatch(gloss) ||
+          RegExp(r'[\u3400-\u9FFF]').allMatches(gloss).length < 2) {
+        continue;
+      }
+      if (phrase != _normalizedWorkTitleText(_normalizeText(b.text))) {
+        return false;
+      }
+      a.text = '';
+      b.text = '';
+    }
+    return true;
   }
 
   static bool _clearMatchingAuditedForeignTerms(

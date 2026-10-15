@@ -424,6 +424,7 @@ class _EpubTranslationStrategy {
             chapterPath: chapterPath ?? '',
             blockId: block.id,
             apiCounted: true,
+            reason: _degradationReason(error),
           );
         }
         return batch.blocks
@@ -509,6 +510,7 @@ class _EpubTranslationStrategy {
             chapterPath: chapterPath ?? '',
             blockId: block.id,
             apiCounted: true,
+            reason: _degradationReason(error),
           );
           AppLogger.warn(
             'Block ${block.id} kept its source text after repeated '
@@ -602,7 +604,15 @@ class _EpubTranslationStrategy {
               // Capture the locked reply before quality validation below:
               // a residual-quality rejection must degrade to this usable
               // locked HTML, not to the raw source.
-              onLocked: (String html) => lastLocked = html,
+              onLocked: (String html, String text) {
+                // A later verbatim echo must not replace an earlier partial
+                // translation. Non-translation replies are rejected before
+                // this callback, even when residual checks are disabled.
+                if (text.replaceAll(RegExp(r'\s+'), ' ').trim() !=
+                    block.sourceText.replaceAll(RegExp(r'\s+'), ' ').trim()) {
+                  lastLocked = html;
+                }
+              },
             );
         return locked;
       } catch (error) {
@@ -657,15 +667,18 @@ class _EpubTranslationStrategy {
     // the raw model reply leak into the EPUB.
     String degradeFallback() {
       final String? usable = lastLocked;
-      return usable ?? block.sourceHtml;
-    }
-
-    if (lastError is FormatException && _isQualityRejection(lastError)) {
       owner._markDegradedBlock(
         chapterPath: chapterPath ?? '',
         blockId: block.id,
         apiCounted: true,
+        reason: _degradationReason(lastError!),
+        retainedPartialTranslation: usable != null,
       );
+      return usable ?? block.sourceHtml;
+    }
+
+    if (lastError is NonTranslationReplyException ||
+        (lastError is FormatException && _isQualityRejection(lastError))) {
       return degradeFallback();
     }
     if (lastError is FormatException &&
@@ -676,11 +689,6 @@ class _EpubTranslationStrategy {
       );
     }
     if (TranslationApiClient.isRequestTimeout(lastError)) {
-      owner._markDegradedBlock(
-        chapterPath: chapterPath ?? '',
-        blockId: block.id,
-        apiCounted: true,
-      );
       return degradeFallback();
     }
     if (lastError is TranslationParseException) {
@@ -692,13 +700,8 @@ class _EpubTranslationStrategy {
       // systematically broken gateway degrades every block, and the run is
       // then marked failed via allBlocksDegraded, so nothing is silently
       // shipped in the source language.
-      owner._markDegradedBlock(
-        chapterPath: chapterPath ?? '',
-        blockId: block.id,
-        apiCounted: true,
-      );
       AppLogger.warn(
-        'Block ${block.id} kept its source text: the translation API '
+        'Block ${block.id} uses fallback content: the translation API '
         'returned an unparseable response (${lastError.runtimeType}).',
         tag: 'translate',
       );
@@ -768,15 +771,29 @@ class _EpubTranslationStrategy {
   /// degrades like a 413 (see _shouldDegradeSingle), so it gets its own
   /// `HTTP 400: ...` reason instead of a blank — aligned with the main
   /// block path, which reports its HTTP status the same way.
-  static String? _oversizedReason(Object error) {
-    if (error is! DioException) return null;
-    if (error.response?.statusCode == 413) {
+  static String _degradationReason(Object error) {
+    if (error is NonTranslationReplyException) {
+      return 'Non-translation response rejected (model requested input or declined translation)';
+    }
+    if (_isQualityRejection(error)) {
+      return 'Residual quality check failed';
+    }
+    if (error is TranslationParseException) {
+      return 'Invalid translation response format';
+    }
+    if (TranslationApiClient.isRequestTimeout(error)) {
+      return 'Request timed out (${(error as DioException).type.name})';
+    }
+    if (error is DioException && error.response?.statusCode == 413) {
       return 'HTTP 413: block exceeds server request limit; source retained';
     }
     if (TranslationApiClient.isContextOverflowError(error)) {
       return 'HTTP 400: block exceeds model context limit; source retained';
     }
-    return null;
+    if (error is FormatException) {
+      return 'Translation structure validation failed';
+    }
+    return 'Translation request failed';
   }
 
   static bool _isEmptyTranslationResponse(Object error) {
@@ -966,7 +983,7 @@ class _EpubTranslationStrategy {
                     chapterPath: reference.chapter.path,
                     blockId: reference.block.id,
                     apiCounted: true,
-                    reason: _oversizedReason(singleError),
+                    reason: _degradationReason(singleError),
                   );
                   AppLogger.warn(
                     'Footnote ${reference.requestId} retained its source after ${singleError.runtimeType}.',
@@ -999,7 +1016,7 @@ class _EpubTranslationStrategy {
                 chapterPath: reference.chapter.path,
                 blockId: reference.block.id,
                 apiCounted: true,
-                reason: _oversizedReason(error),
+                reason: _degradationReason(error),
               );
               translatedById[reference.requestId] = reference.block.sourceHtml;
               AppLogger.warn(
@@ -1011,7 +1028,7 @@ class _EpubTranslationStrategy {
             rethrow;
           }
         }
-      } on FormatException {
+      } on FormatException catch (error) {
         // A malformed model reply is usually deterministic for the same
         // prompt, so the whole batch is not re-sent. Retry each reference
         // on its own; one that still comes back malformed degrades to its
@@ -1055,7 +1072,7 @@ class _EpubTranslationStrategy {
             chapterPath: reference.chapter.path,
             blockId: reference.block.id,
             apiCounted: true,
-            reason: null,
+            reason: _degradationReason(error),
           );
           translatedById[reference.requestId] = reference.block.sourceHtml;
           AppLogger.warn(
@@ -1223,7 +1240,7 @@ class _EpubTranslationStrategy {
               chapterPath: reference.chapter.path,
               blockId: reference.block.id,
               apiCounted: true,
-              reason: _oversizedReason(error),
+              reason: _degradationReason(error),
             );
             return {reference.requestId: reference.block.sourceHtml};
           }
@@ -1292,7 +1309,7 @@ class _EpubTranslationStrategy {
               chapterPath: requests.single.chapterPath,
               blockId: requests.single.block.id,
               apiCounted: apiCounted,
-              reason: _oversizedReason(singleError),
+              reason: _degradationReason(singleError),
             );
             AppLogger.warn(
               'Protected block ${requests.single.block.id} retained its source after ${singleError.runtimeType}.',
@@ -1386,7 +1403,7 @@ class _EpubTranslationStrategy {
           chapterPath: requests.single.chapterPath,
           blockId: requests.single.block.id,
           apiCounted: apiCounted,
-          reason: _oversizedReason(error),
+          reason: _degradationReason(error),
         );
         AppLogger.warn(
           'Protected block ${requests.single.block.id} retained its source after ${error.runtimeType} (HTTP ${error.response?.statusCode}).',
@@ -1417,6 +1434,7 @@ class _EpubTranslationStrategy {
               chapterPath: request.chapterPath,
               blockId: request.block.id,
               apiCounted: apiCounted,
+              reason: _degradationReason(error),
             );
           }
           return <String, String>{
@@ -2051,6 +2069,12 @@ class _EpubTranslationStrategy {
     bool checkHtmlTags = true,
   }) {
     final String trimmed = translatedText.trim();
+    if (TranslationResponseGuard.isNonTranslationReply(
+      sourceText: sourceText,
+      translatedText: trimmed,
+    )) {
+      throw const NonTranslationReplyException();
+    }
     if (trimmed.isEmpty) {
       // Deterministic: re-sending the same prompt will not make the model
       // produce content, so throw TranslationParseException (no retry) rather

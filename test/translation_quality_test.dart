@@ -1900,23 +1900,26 @@ void main() {
         expect(finding?.kind, TranslationResidualKind.longSourceText);
       });
 
-      test('does not normalize whitespace when matching an audited node', () {
-        const String sourceHtml =
-            '<p>The expression is <i> Homo economicus</i>.</p>';
-        const String translatedHtml =
-            '<p>这一表达是<i> Homo economicus</i>（经济人）。</p>';
+      test(
+        'a matching phrase with whitespace and explicit gloss is allowed',
+        () {
+          const String sourceHtml =
+              '<p>The expression is <i> Homo economicus</i>.</p>';
+          const String translatedHtml =
+              '<p>这一表达是<i> Homo economicus</i>（经济人）。</p>';
 
-        final TranslationResidualFinding? finding =
-            TranslationQuality.findSuspiciousHtmlResidual(
-              sourceHtml: sourceHtml,
-              translatedHtml: translatedHtml,
-              targetLanguage: 'Chinese',
-            );
+          final TranslationResidualFinding? finding =
+              TranslationQuality.findSuspiciousHtmlResidual(
+                sourceHtml: sourceHtml,
+                translatedHtml: translatedHtml,
+                targetLanguage: 'Chinese',
+              );
 
-        expect(finding?.kind, TranslationResidualKind.longSourceText);
-      });
+          expect(finding, isNull);
+        },
+      );
 
-      test('does not exempt an unaudited Latin-looking phrase', () {
+      test('a matching unaudited phrase with explicit gloss is allowed', () {
         final TranslationResidualFinding? finding =
             TranslationQuality.findSuspiciousHtmlResidual(
               sourceHtml: '<p>The expression is <i>Homo sapiens</i>.</p>',
@@ -1924,7 +1927,7 @@ void main() {
               targetLanguage: 'Chinese',
             );
 
-        expect(finding?.kind, TranslationResidualKind.longSourceText);
+        expect(finding, isNull);
       });
 
       test('allows two matching patria term nodes in one block', () {

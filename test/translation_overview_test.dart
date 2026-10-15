@@ -79,7 +79,8 @@ void main() {
     );
 
     expect(find.text('完成但有警告'), findsOneWidget);
-    expect(find.textContaining('2 个块未能完成翻译'), findsOneWidget);
+    expect(find.textContaining('2 个块未通过翻译检查'), findsOneWidget);
+    expect(find.textContaining('待复核译文'), findsOneWidget);
     expect(find.textContaining('保留原文'), findsOneWidget);
     expect(
       find.text('book_translated.epub', skipOffstage: false),

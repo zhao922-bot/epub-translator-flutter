@@ -9,14 +9,14 @@
 
 ## 下载安装
 
-当前版本：**1.6.34+50**。新增可选语义复核和任意段落人工校对，改进 GLM 模型适配、专名与跨段证据检索、缓存恢复及本地单双语导出。详见 [更新日志](CHANGELOG.md)。
+当前版本：**1.6.35+51**。修复带中文释义的格言误报，拦截模型非译文回复，完善重试回退、旧缓存检查与逐块失败诊断。详见 [更新日志](CHANGELOG.md)。
 
-安装包与校验值见 [v1.6.34 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.34)。
+安装包与校验值见 [v1.6.35 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.35)。
 
 | 平台 | 下载 | 说明 |
 |------|------|------|
-| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.34/epub-translator-flutter-v1.6.34-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.34/epub-translator-flutter-v1.6.34-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.6.34 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.34/epub-translator-v1.6.34-android.apk) | 沿用 v1.6.31–v1.6.33 发布签名，可覆盖升级；更早的旧签名版本需先备份设置与数据，再卸载并安装 |
+| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-flutter-v1.6.35-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-flutter-v1.6.35-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [v1.6.35 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-v1.6.35-android.apk) | 沿用 v1.6.31–v1.6.34 发布签名，可覆盖升级；更早的旧签名版本需先备份设置与数据，再卸载并安装 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -71,7 +71,7 @@ flutter pub get
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 # 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
 # 可选 EXE 安装包：先安装 Inno Setup 6.3+ 并将 ISCC 加入 PATH
-ISCC /DAppVersion=1.6.34 tool\windows_installer.iss
+ISCC /DAppVersion=1.6.35 tool\windows_installer.iss
 flutter build apk --release       # 需配置 android/key.properties 签名
 ```
 
@@ -90,7 +90,7 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 ## 开发验证
 
-v1.6.34 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：**2587 项测试通过、24 项环境／显式运行用例跳过、0 失败**，静态分析无问题。覆盖复核预算、缓存迁移、人工编辑及撤销、复杂 EPUB 导出和长书恢复；实际 API 测试使用《麦琪的礼物》及 11,780 英文词的《坎特维尔的幽灵》。后者 167 块完整导出，已知误译已修正；模型成功复核 166 块，另 1 块对照原文处理并保留模型失败记录。实书导出无新增 EPUBCheck 错误，原书自带的一处目录属性错误单列记录。Windows 本地缓存重复导出约 902 毫秒、0 API 请求；该数据不代表手机表现或接口吞吐量。
+v1.6.35 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：**2625 项测试通过、24 项环境／显式运行用例跳过、0 失败**，静态分析无问题。覆盖非译文回复拦截、格言释义、重试回退、逐块诊断、缓存复用、人工编辑、复杂 EPUB 导出和长书恢复。对用户提供的原书及译本离线核对 1124 块，定位 4 处误报和 2 处受影响正文；独立修正版通过残留规则检查，EPUBCheck 无新增问题，原书已有格式错误仍保留说明。本轮未调用付费模型接口；残留检查不等同于全书逐句语义校对。此前真实 API 翻译及性能验证记录见更新日志。
 
 ```powershell
 $env:LIVE_TRANSLATION_E2E='0'
