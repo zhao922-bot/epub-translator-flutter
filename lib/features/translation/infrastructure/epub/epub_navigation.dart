@@ -1,6 +1,5 @@
 import 'package:path/path.dart' as path;
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html_parser;
 
 import 'xhtml_html_compatibility.dart';
 import 'epub_semantics.dart';
@@ -93,9 +92,7 @@ String synchronizeEpub3Navigation({
   bool preserveSourceLabels = false,
 }) {
   validateEpubMarkupDepth(markup);
-  final document = html_parser.parse(
-    XhtmlHtmlCompatibility.normalizeForHtmlParser(markup),
-  );
+  final document = XhtmlHtmlCompatibility.parseDocument(markup);
   var changed = false;
   for (final nav in epubTags(document, const {'nav'})) {
     if (!isEpubTocElement(nav)) continue;
@@ -121,8 +118,7 @@ String synchronizeEpub3Navigation({
           changed;
     }
   }
-  return changed
-      ? serializeEpubNavigation(document, markup) : markup;
+  return changed ? serializeEpubNavigation(document, markup) : markup;
 }
 
 String serializeEpubNavigation(dom.Document document, String originalMarkup) {

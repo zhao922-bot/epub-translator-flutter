@@ -1,6 +1,7 @@
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as path;
@@ -272,13 +273,38 @@ class CacheRestorationScanner {
 /// A run-owned snapshot: later eviction of the shared cache cannot invalidate
 /// a hit counted during the initial scan. Only the current chapter is loaded.
 class CacheRestorationSpool {
+  // Static scopes capture sendable data only, not the run's callbacks.
+  static Future<void> _save(
+    String filePath,
+    Map<String, String> translations,
+  ) => Isolate.run(
+    () => writeFileAtomically(File(filePath), jsonEncode(translations)),
+  );
+
+  static Future<Map<String, String>> _load(String filePath) => Isolate.run(
+    () async =>
+        (jsonDecode(await File(filePath).readAsString())
+                as Map<String, dynamic>)
+            .cast<String, String>(),
+  );
+
   Directory? _directory;
+  Future<Directory>? _directoryFuture;
   final Set<String> _chapters = {};
+  final Map<String, Future<void>> _writes = {};
 
   Future<File> _file(String chapter) async {
-    _directory ??= await Directory.systemTemp.createTemp(
-      'epub-cache-snapshot-',
-    );
+    if (_directory == null) {
+      final pending = _directoryFuture ??= Directory.systemTemp.createTemp(
+        'epub-cache-snapshot-',
+      );
+      try {
+        _directory = await pending;
+      } catch (_) {
+        if (identical(_directoryFuture, pending)) _directoryFuture = null;
+        rethrow;
+      }
+    }
     return File(
       path.join(
         _directory!.path,
@@ -287,19 +313,30 @@ class CacheRestorationSpool {
     );
   }
 
-  Future<void> save(String chapter, Map<String, String> translations) async {
-    await writeFileAtomically(await _file(chapter), jsonEncode(translations));
-    _chapters.add(chapter);
+  Future<void> save(String chapter, Map<String, String> translations) {
+    final previous = _writes[chapter] ?? Future<void>.value();
+    final operation = previous.then((_) async {
+      final file = await _file(chapter);
+      // JSON and UTF-8 codecs must both stay off the caller isolate.
+      await _save(file.path, translations);
+      _chapters.add(chapter);
+    });
+    final settled = operation.then<void>((_) {}, onError: (_, _) {});
+    _writes[chapter] = settled;
+    return operation.whenComplete(() {
+      if (identical(_writes[chapter], settled)) _writes.remove(chapter);
+    });
   }
 
   Future<void> loadChapter(
     CacheRestorationResult result,
     String chapter,
   ) async {
+    await _writes[chapter];
     if (!_chapters.contains(chapter)) return;
     final file = await _file(chapter);
-    final json = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
-    result.translationsByChapter[chapter] = json.cast<String, String>();
+    final translations = await _load(file.path);
+    result.translationsByChapter[chapter] = translations;
     _chapters.remove(chapter);
     try {
       await file.delete();
@@ -310,6 +347,7 @@ class CacheRestorationSpool {
   }
 
   Future<void> dispose() async {
+    await Future.wait(_writes.values.toList());
     final directory = _directory;
     if (directory != null) {
       try {

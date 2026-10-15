@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
+import 'epub_foreign_content.dart';
+import 'epub_xml_characters.dart';
 
 /// Adapts XHTML syntax that an HTML5 parser would otherwise reinterpret.
 ///
@@ -14,21 +16,47 @@ import 'package:html/parser.dart' as html_parser;
 class XhtmlHtmlCompatibility {
   const XhtmlHtmlCompatibility._();
 
+  static final _tableRoot = RegExp(
+    r'^\s*(?:<!--[\s\S]*?-->\s*)*<(td|th|caption)(?=[\s/>])',
+    caseSensitive: false,
+  );
+
   /// Table cells and captions disappear in the default body context. Keep
   /// their source-owned wrapper for structure locking and protected slots.
-  static dom.DocumentFragment parseFragment(String source) {
-    final root = RegExp(
-      r'^\s*(?:<!--[\s\S]*?-->\s*)*<(td|th|caption)(?=[\s/>])',
-      caseSensitive: false,
-    ).firstMatch(source)?.group(1)?.toLowerCase();
-    return html_parser.parseFragment(
+  static dom.Document parseDocument(String source) {
+    validateEpubXmlMarkup(source);
+    final document = html_parser.parse(normalizeForHtmlParser(source));
+    restoreEpubForeignContent(document, source);
+    // Safe raw text and named HTML entities cannot introduce forbidden XML
+    // scalars. Numeric references need the decoded check (HTML also accepts
+    // references without a semicolon, which are not valid XML).
+    if (source.contains('&#')) validateEpubDomXmlCharacters(document);
+    return document;
+  }
+
+  static dom.DocumentFragment parseFragment(
+    String source, {
+    String? container,
+  }) {
+    validateEpubXmlMarkup(source);
+    // Repacking already knows the container; its per-block path need not
+    // run the table-context heuristic again.
+    final root = container == null
+        ? _tableRoot.firstMatch(source)?.group(1)?.toLowerCase()
+        : null;
+    final fragment = html_parser.parseFragment(
       normalizeForHtmlParser(source),
-      container: root == 'caption'
-          ? 'table'
-          : root != null
-          ? 'tr'
-          : 'body',
+      container:
+          container ??
+          (root == 'caption'
+              ? 'table'
+              : root != null
+              ? 'tr'
+              : 'body'),
     );
+    restoreEpubForeignContent(fragment, source);
+    if (source.contains('&#')) validateEpubDomXmlCharacters(fragment);
+    return fragment;
   }
 
   static const Set<String> _htmlVoidTags = <String>{

@@ -34,6 +34,7 @@ import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
 import 'epub_semantics.dart';
+import 'epub_xml_characters.dart';
 import 'translation_api_client.dart';
 import 'cancellable_fingerprint.dart';
 import 'translation_batch_planner.dart';
@@ -186,14 +187,15 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion = 'v18-prefixed-text-protection';
+  static const String qualityCacheSchemaVersion =
+      'v18-prefixed-text-protection';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
 
-  static ({int fixedTokens, int payloadTokens, int totalTokens}) requestBudgetForTest(
-    Map<String, dynamic> data,
-  ) => _TranslationRequestBudget.forRequest(data);
+  static ({int fixedTokens, int payloadTokens, int totalTokens})
+  requestBudgetForTest(Map<String, dynamic> data) =>
+      _TranslationRequestBudget.forRequest(data);
 
   /// Test-only merge. The [memory] JSON stands in for the in-memory
   /// [_BookMemory] (locks already resolved, e.g. from a checkpoint), so its
@@ -204,10 +206,11 @@ class EpubChapterTranslator {
     Map<String, Object?> chapter, {
     bool trustedMemoryLocks = true,
     bool trustedChapterLocks = false,
-  }) => _BookMemory.fromJson(
-    memory,
-    trustedLocks: trustedMemoryLocks,
-  ).mergeChapter(_ChapterMemory.fromJson(chapter, trustedLocks: trustedChapterLocks)).toJson();
+  }) => _BookMemory.fromJson(memory, trustedLocks: trustedMemoryLocks)
+      .mergeChapter(
+        _ChapterMemory.fromJson(chapter, trustedLocks: trustedChapterLocks),
+      )
+      .toJson();
 
   @visibleForTesting
   static List<String> Function() protectedSlotIdsForTest(ExtractedBlock block) {
@@ -222,9 +225,12 @@ class EpubChapterTranslator {
 
   /// Retains the production checkpoint's cache across saves in a test.
   @visibleForTesting
-  static Future<Future<void> Function(
-    List<({String path, Map<String, Object?> memory})> timeline,
-  )> bookMemoryCheckpointWriterForTest({
+  static Future<
+    Future<void> Function(
+      List<({String path, Map<String, Object?> memory})> timeline,
+    )
+  >
+  bookMemoryCheckpointWriterForTest({
     required TranslationCacheStore cacheStore,
     required String jobKey,
     required int chunkSize,
@@ -232,17 +238,20 @@ class EpubChapterTranslator {
   }) async {
     final checkpoint = _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize);
     if (resume) await checkpoint.load();
-    return (List<({String path, Map<String, Object?> memory})> timeline) => checkpoint.save(
-      timeline.isEmpty
-          ? _BookMemory.fromJson({})
-          : _BookMemory.fromJson(timeline.last.memory, trustedLocks: true),
-      completedChapterPaths: timeline.map((entry) => entry.path).toSet(),
-      timeline: [
-        for (final entry in timeline)
-          (path: entry.path,
-           memory: _BookMemory.fromJson(entry.memory, trustedLocks: true)),
-      ],
-    );
+    return (List<({String path, Map<String, Object?> memory})> timeline) =>
+        checkpoint.save(
+          timeline.isEmpty
+              ? _BookMemory.fromJson({})
+              : _BookMemory.fromJson(timeline.last.memory, trustedLocks: true),
+          completedChapterPaths: timeline.map((entry) => entry.path).toSet(),
+          timeline: [
+            for (final entry in timeline)
+              (
+                path: entry.path,
+                memory: _BookMemory.fromJson(entry.memory, trustedLocks: true),
+              ),
+          ],
+        );
   }
 
   static Future<void> saveBookMemoryCheckpointForTest({
@@ -259,7 +268,10 @@ class EpubChapterTranslator {
       for (final entry in timeline)
         (
           path: entry.path,
-          memory: _BookMemory.fromJson(entry.memory, trustedLocks: trustedLocks),
+          memory: _BookMemory.fromJson(
+            entry.memory,
+            trustedLocks: trustedLocks,
+          ),
         ),
     ],
     schema: schema,
@@ -269,7 +281,11 @@ class EpubChapterTranslator {
     required TranslationCacheStore cacheStore,
     required String jobKey,
     required int chunkSize,
-  }) async => (await _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize).load())?.memory.toJson();
+  }) async => (await _BookMemoryCheckpoint(
+    cacheStore,
+    jobKey,
+    chunkSize,
+  ).load())?.memory.toJson();
 
   static Future<List<Map<String, Object?>>> loadBookMemoryTimelineForTest({
     required TranslationCacheStore cacheStore,
@@ -277,7 +293,12 @@ class EpubChapterTranslator {
     required int chunkSize,
   }) async => [
     for (final entry
-        in (await _BookMemoryCheckpoint(cacheStore, jobKey, chunkSize).load())?.timeline ?? const [])
+        in (await _BookMemoryCheckpoint(
+              cacheStore,
+              jobKey,
+              chunkSize,
+            ).load())?.timeline ??
+            const [])
       {'path': entry.path, 'memory': entry.memory.toJson()},
   ];
 
@@ -297,8 +318,7 @@ class EpubChapterTranslator {
   static bool shouldRecordMemoryTimelineEntryForTest({
     required int? position,
     required int maxRecordedPosition,
-  }) =>
-      position != null && position > maxRecordedPosition;
+  }) => position != null && position > maxRecordedPosition;
 
   /// Incremental positional memory snapshot selector (性能-#38).
   ///
@@ -426,17 +446,17 @@ class EpubChapterTranslator {
   }
 
   static Future<InspectedChapter> releaseChapterSourcesForTest(
-    InspectedChapter chapter, Directory directory,
+    InspectedChapter chapter,
+    Directory directory,
   ) => _ChapterSourceSpool(directory: directory).release(chapter);
 
   static Future<InspectedChapter> restoreChapterSourcesForTest(
     InspectedChapter chapter,
     Directory directory, {
     bool Function()? isCancelled,
-  }) => _ChapterSourceSpool(directory: directory).restore(
-    chapter,
-    isCancelled: isCancelled,
-  );
+  }) => _ChapterSourceSpool(
+    directory: directory,
+  ).restore(chapter, isCancelled: isCancelled);
 
   static String chineseSecondPersonInstructionForTest({
     required TranslationConfig config,
@@ -1080,12 +1100,19 @@ class EpubChapterTranslator {
       );
       JobResumeState? previousState;
       bool unreadableResumeState = false;
-      final memoryCheckpoint = _BookMemoryCheckpoint(_cacheStore, jobKey, config.chunkSize);
+      final memoryCheckpoint = _BookMemoryCheckpoint(
+        _cacheStore,
+        jobKey,
+        config.chunkSize,
+      );
       final restoredMemory = await memoryCheckpoint.load();
       try {
         previousState = await _cacheStore.loadJobState(jobKey);
         if (previousState != null && restoredMemory == null) {
-          AppLogger.warn('Checkpoint has no compatible chunkSize/schema memory identity; discarding progress metadata.', tag: 'translate');
+          AppLogger.warn(
+            'Checkpoint has no compatible chunkSize/schema memory identity; discarding progress metadata.',
+            tag: 'translate',
+          );
           previousState = null;
         }
       } catch (error) {
@@ -1295,7 +1322,9 @@ class EpubChapterTranslator {
               styleProfileConfirmed: true,
             );
       bool initialBookMemoryAttempted = false;
-      final memoryChapters = <String>{...?restoredMemory?.completedChapterPaths};
+      final memoryChapters = <String>{
+        ...?restoredMemory?.completedChapterPaths,
+      };
       // Positional memory history for retranslated chapters: each entry is
       // the rolling memory right after its chapter's update, in book order.
       // A chapter that is (re)translated later receives the newest entry
@@ -1320,7 +1349,10 @@ class EpubChapterTranslator {
       if (restoredMemory != null) {
         bookMemory = restoredMemory.memory;
         initialBookMemoryAttempted = true;
-        AppLogger.info('Restored book memory; skipping initial API generation.', tag: 'book-memory');
+        AppLogger.info(
+          'Restored book memory; skipping initial API generation.',
+          tag: 'book-memory',
+        );
       }
 
       /// Rolling-memory snapshot for [chapter]'s own time position: the
@@ -1392,7 +1424,10 @@ class EpubChapterTranslator {
             timeline: memoryTimeline,
           );
         } catch (error) {
-          AppLogger.warn('Book memory checkpoint save failed (${error.runtimeType}).', tag: 'book-memory');
+          AppLogger.warn(
+            'Book memory checkpoint save failed (${error.runtimeType}).',
+            tag: 'book-memory',
+          );
         }
       }
 
@@ -1596,6 +1631,7 @@ class EpubChapterTranslator {
           );
           snapshotGroup.clear();
         }
+
         for (final index in pendingBlocksByChapter.keys.toList()..sort()) {
           final snapshot = bookMemorySnapshotFor(selectedChapters[index]);
           final identity = jsonEncode(snapshot);
@@ -1842,10 +1878,12 @@ class EpubChapterTranslator {
           updatedByPath[chapter.path] = _releaseChapterSourceStrings(
             updatedByPath[chapter.path]!,
           );
-          final released = await sourceSpool.release(chapter.copyWith(
-            blocks: translatedBlocks,
-            translatedBody: updatedByPath[chapter.path]!.translatedBody,
-          ));
+          final released = await sourceSpool.release(
+            chapter.copyWith(
+              blocks: translatedBlocks,
+              translatedBody: updatedByPath[chapter.path]!.translatedBody,
+            ),
+          );
           selectedChapters[chapterIndex] = released;
           updatedByPath[chapter.path] = released;
           final int? originalIndex = chapterIndexByPath[chapter.path];
@@ -2159,51 +2197,52 @@ class EpubChapterTranslator {
           if (futurePendingBlocks) {
             await ensureInitialBookMemory();
             if (!memoryChapters.contains(chapter.path)) {
-            try {
-              final Stopwatch memoryStopwatch = Stopwatch()..start();
-              bookMemory = await trackMemoryRequests(
-                () => _memory.updateBookMemoryAfterChapter(
-                  dio: dio,
-                  config: config,
-                  currentMemory: _BookMemory.fromJson(
-                    bookMemorySnapshotFor(chapter) ?? <String, Object?>{},
-                    trustedLocks: true,
+              try {
+                final Stopwatch memoryStopwatch = Stopwatch()..start();
+                bookMemory = await trackMemoryRequests(
+                  () => _memory.updateBookMemoryAfterChapter(
+                    dio: dio,
+                    config: config,
+                    currentMemory: _BookMemory.fromJson(
+                      bookMemorySnapshotFor(chapter) ?? <String, Object?>{},
+                      trustedLocks: true,
+                    ),
+                    chapter: updatedByPath[chapter.path]!,
+                    degradedBlockIds: _degradedBlocks,
+                    cancelToken: cancelToken,
                   ),
-                  chapter: updatedByPath[chapter.path]!,
-                  degradedBlockIds: _degradedBlocks,
-                  cancelToken: cancelToken,
-                ),
-              );
-              memoryStopwatch.stop();
-              memoryChapters.add(chapter.path);
-              // Resolve user locks before recording so the timeline entry
-              // carries them (previously achieved by recording after the
-              // persist, which applied the locks inside persistBookMemory).
-              bookMemory =
-                  bookMemory!.withLockedGlossary(config.lockedGlossary);
-              // Record BEFORE persist (A-2): no persist happens after the run
-              // ends, so persisting first would leave the checkpoint lagging
-              // one chapter behind after a cancellation.
-              await _recordAndPersistChapterMemory(
-                record: () => recordMemoryTimeline(chapter.path, bookMemory!),
-                persist: persistBookMemory,
-              );
-              emit(
-                chapterDoneJob,
-                s.runLogBookMemoryUpdated(
-                  chapter.title,
-                  _formatDuration(memoryStopwatch.elapsed),
-                ),
-              );
-            } catch (error) {
-              emit(
-                chapterDoneJob,
-                s.runLogBookMemoryChapterSkipped(
-                  chapter.title,
-                  _linePreview(_safeErrorText(error, config)),
-                ),
-              );
-            }
+                );
+                memoryStopwatch.stop();
+                memoryChapters.add(chapter.path);
+                // Resolve user locks before recording so the timeline entry
+                // carries them (previously achieved by recording after the
+                // persist, which applied the locks inside persistBookMemory).
+                bookMemory = bookMemory!.withLockedGlossary(
+                  config.lockedGlossary,
+                );
+                // Record BEFORE persist (A-2): no persist happens after the run
+                // ends, so persisting first would leave the checkpoint lagging
+                // one chapter behind after a cancellation.
+                await _recordAndPersistChapterMemory(
+                  record: () => recordMemoryTimeline(chapter.path, bookMemory!),
+                  persist: persistBookMemory,
+                );
+                emit(
+                  chapterDoneJob,
+                  s.runLogBookMemoryUpdated(
+                    chapter.title,
+                    _formatDuration(memoryStopwatch.elapsed),
+                  ),
+                );
+              } catch (error) {
+                emit(
+                  chapterDoneJob,
+                  s.runLogBookMemoryChapterSkipped(
+                    chapter.title,
+                    _linePreview(_safeErrorText(error, config)),
+                  ),
+                );
+              }
             }
           } else {
             emit(
@@ -2221,10 +2260,12 @@ class EpubChapterTranslator {
           updatedByPath[chapter.path] = _releaseChapterSourceStrings(
             updatedByPath[chapter.path]!,
           );
-          final released = await sourceSpool.release(chapter.copyWith(
-            blocks: translatedBlocks,
-            translatedBody: updatedByPath[chapter.path]!.translatedBody,
-          ));
+          final released = await sourceSpool.release(
+            chapter.copyWith(
+              blocks: translatedBlocks,
+              translatedBody: updatedByPath[chapter.path]!.translatedBody,
+            ),
+          );
           selectedChapters[chapterIndex] = released;
           updatedByPath[chapter.path] = released;
           final int? originalIndex = chapterIndexByPath[chapter.path];
@@ -2780,7 +2821,14 @@ class EpubChapterTranslator {
       );
     }
     _responseCount(instrumentation, 'replyParses');
-    final reply = _ResponseHtml.parse(value, instrumentation);
+    final _ResponseHtml reply;
+    try {
+      reply = _ResponseHtml.parse(value, instrumentation);
+    } on InvalidEpubXmlCharacterException catch (error) {
+      // A malformed model reply follows the existing per-block retry/source
+      // fallback policy. Invalid source/cache files retain their format error.
+      throw TranslationParseException(error.message);
+    }
     final hasMarkup = reply.fragment.nodes.any((node) => node is dom.Element);
     final hasOutsideText = reply.fragment.nodes.any(
       (node) => node is dom.Text && node.data.trim().isNotEmpty,
@@ -2870,8 +2918,10 @@ class EpubChapterTranslator {
     // dropped as protected content. 性能-#42: decided once per slot in a
     // single pass and cached — the old code walked up the ancestor chain
     // once per filter pass.
-    final Map<String, int> sourceProtectedCounts =
-        _protectedSlotCountsByTag(rebuilt, sourceSlots);
+    final Map<String, int> sourceProtectedCounts = _protectedSlotCountsByTag(
+      rebuilt,
+      sourceSlots,
+    );
     final Map<dom.Text, bool> effectiveProtectedByNode =
         Map<dom.Text, bool>.identity();
     final Map<dom.Element, bool> effectiveProtectedByElement =
@@ -2893,7 +2943,8 @@ class EpubChapterTranslator {
       final int ordinal = seenProtectedByTag[tag] ?? 0;
       seenProtectedByTag[tag] = ordinal + 1;
       final bool effective =
-          tag == 'script' || tag == 'style' ||
+          tag == 'script' ||
+          tag == 'style' ||
           ordinal < (sourceProtectedCounts[tag] ?? 0);
       effectiveProtectedByNode[slot.node] = effective;
       dom.Node? ancestor = slot.node.parentNode;
@@ -2918,15 +2969,12 @@ class EpubChapterTranslator {
     // using the same source-counterpart fallback before collecting gaps.
     for (final element in translatedDom.fragment.querySelectorAll('*')) {
       if (translatedDom.isProtected(element)) {
-        effectiveProtectedByElement.putIfAbsent(
-          element,
-          () {
-            final String tag = EpubHtmlExtractor.tagLocalName(element);
-            return tag == 'script' ||
-                tag == 'style' ||
-                (sourceProtectedCounts[tag] ?? 0) > 0;
-          },
-        );
+        effectiveProtectedByElement.putIfAbsent(element, () {
+          final String tag = EpubHtmlExtractor.tagLocalName(element);
+          return tag == 'script' ||
+              tag == 'style' ||
+              (sourceProtectedCounts[tag] ?? 0) > 0;
+        });
       }
     }
     // Positional mapping must pair unprotected slots with unprotected
@@ -3699,6 +3747,7 @@ class EpubChapterTranslator {
         visit(child, childProtected);
       }
     }
+
     for (final dom.Node node in document.fragment.nodes) {
       visit(node, false);
     }
@@ -3743,8 +3792,7 @@ class EpubChapterTranslator {
     _collectStandaloneWhitespaceGaps(
       sourceDom,
       writableSourceIndexByNode,
-      (int precedingSlot, String _) =>
-          sourceWhitespaceSlots.add(precedingSlot),
+      (int precedingSlot, String _) => sourceWhitespaceSlots.add(precedingSlot),
     );
     final List<String> result = List<String>.from(writableTexts);
     for (final gap in gaps) {
@@ -3798,6 +3846,7 @@ class EpubChapterTranslator {
         visit(child, childProtected);
       }
     }
+
     for (final dom.Node node in translatedDom.fragment.nodes) {
       visit(node, false);
     }
@@ -3951,15 +4000,14 @@ class EpubChapterTranslator {
     List<String>? slotTexts,
     List<String>? normalizedSlotTexts,
     String? normalizedBlockText,
-  }) =>
-      _EpubTranslationStrategy._blockContextSummary(
-        block,
-        slotText: slotText,
-        slotIndex: slotIndex,
-        slotTexts: slotTexts,
-        normalizedSlotTexts: normalizedSlotTexts,
-        normalizedBlockText: normalizedBlockText,
-      );
+  }) => _EpubTranslationStrategy._blockContextSummary(
+    block,
+    slotText: slotText,
+    slotIndex: slotIndex,
+    slotTexts: slotTexts,
+    normalizedSlotTexts: normalizedSlotTexts,
+    normalizedBlockText: normalizedBlockText,
+  );
 
   /// P2-#17: extracts the single block text from a retry request payload,
   /// or null when the payload is not a recognized single-block fallback.
@@ -3972,8 +4020,7 @@ class EpubChapterTranslator {
   String previewBodyFromBlocksForTest(
     List<ExtractedBlock> blocks, {
     required String fallback,
-  }) =>
-      _previewBodyFromBlocks(blocks, fallback: fallback);
+  }) => _previewBodyFromBlocks(blocks, fallback: fallback);
 
   /// 性能-#40: plain text from [html], truncated to [maxChars] when given.
   @visibleForTesting
@@ -4074,8 +4121,9 @@ class EpubChapterTranslator {
   static bool _hasNonLiteralTag(String value) {
     final RegExp tagPattern = RegExp(r'<(/?)([A-Za-z][\w:-]*)(\s[^<>]*)?/?>');
     for (final RegExpMatch match in tagPattern.allMatches(value)) {
-      final RegExpMatch? literal =
-          RegExp(r'^<([A-Za-z])>$').firstMatch(match.group(0)!);
+      final RegExpMatch? literal = RegExp(
+        r'^<([A-Za-z])>$',
+      ).firstMatch(match.group(0)!);
       if (literal != null &&
           !_singleLetterHtmlElements.contains(
             literal.group(1)!.toLowerCase(),
@@ -4133,6 +4181,7 @@ class EpubChapterTranslator {
       _apiClient.extractMessageContent(response.data),
       checkHtmlTags: false,
     );
+    validateEpubXmlCharacters(translated);
     if (translated == originalTitle.trim()) {
       return null;
     }
@@ -4689,6 +4738,11 @@ class EpubChapterTranslator {
     _ResponseHtml sourceDom,
     _ResponseHtml translatedDom,
   ) {
+    try {
+      validateEpubDomXmlCharacters(translatedDom.fragment);
+    } on InvalidEpubXmlCharacterException catch (error) {
+      throw TranslationParseException(error.message);
+    }
     bool hasBody(_ResponseHtml html) => html.slots.any(
       (slot) => !slot.protected && slot.text.trim().isNotEmpty,
     );

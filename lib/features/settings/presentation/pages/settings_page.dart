@@ -41,12 +41,18 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
       if (!mounted) return;
       final saveError = ref.read(settingsSaveErrorProvider);
       final conflict = ref.read(settingsWriteConflictProvider);
-      if (saveError != null || conflict != null) {
+      if (saveError?.message != null || conflict != null) {
+        final strings = ref.read(appStringsProvider);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              saveError?.message ??
-                  'Settings failed to load or save earlier; review before editing.',
+              saveError?.message != null
+                  ? saveError!.settingsFileLocked
+                        ? strings.settingsFileLocked(saveError.message!)
+                        : strings.settingsSaveFailed
+                  : strings.isChinese
+                  ? '设置已被其他实例修改，请重新加载后再编辑。'
+                  : 'Settings changed in another instance; reload before editing.',
             ),
           ),
         );
@@ -122,17 +128,34 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
   Widget build(BuildContext context) {
     final controller = ref.read(settingsProvider.notifier);
     // The page owns non-slider fields; each slider subscribes independently.
-    ref.watch(settingsProvider.select((c) => (
-      c.apiBaseUrl, c.apiKey, c.model, c.apiProviderSelection,
-      c.deepseekApiKey, c.customApiBaseUrl, c.customApiKey, c.customModel,
-      c.uiLanguage, c.themeMode, c.targetLanguage, c.bilingual,
-      c.outputSuffix, c.residualQualityCheck, c.styleProfileEnabled,
-      c.lockedGlossary, c.httpProxy,
-      controller.providerSelectionRevision, controller.credentialDiscardRevision,
-      controller.secretReadFailed(SettingsSecretSlot.deepSeek),
-      controller.secretReadFailed(SettingsSecretSlot.custom),
-      controller.secretReadFailed(SettingsSecretSlot.proxy),
-    )));
+    ref.watch(
+      settingsProvider.select(
+        (c) => (
+          c.apiBaseUrl,
+          c.apiKey,
+          c.model,
+          c.apiProviderSelection,
+          c.deepseekApiKey,
+          c.customApiBaseUrl,
+          c.customApiKey,
+          c.customModel,
+          c.uiLanguage,
+          c.themeMode,
+          c.targetLanguage,
+          c.bilingual,
+          c.outputSuffix,
+          c.residualQualityCheck,
+          c.styleProfileEnabled,
+          c.lockedGlossary,
+          c.httpProxy,
+          controller.providerSelectionRevision,
+          controller.credentialDiscardRevision,
+          controller.secretReadFailed(SettingsSecretSlot.deepSeek),
+          controller.secretReadFailed(SettingsSecretSlot.custom),
+          controller.secretReadFailed(SettingsSecretSlot.proxy),
+        ),
+      ),
+    );
     final config = ref.read(settingsProvider);
     final bool isRunActive = ref.watch(
       translationDashboardProvider.select(
@@ -148,13 +171,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
     final strings = ref.read(appStringsProvider);
     final bool secretKeyRotated =
         ref.watch(secretKeyRotatedNoticeProvider) != null;
-    final bool writeConflict =
-        ref.watch(settingsWriteConflictProvider) != null;
+    final bool writeConflict = ref.watch(settingsWriteConflictProvider) != null;
     // P2-#37: credential replays blocked by a route change must be visible.
     // The queued edits are retained until the user confirms the new target
     // or discards them.
-    final bool replayBlocked =
-        ref.watch(settingsReplayBlockedProvider) != null;
+    final bool replayBlocked = ref.watch(settingsReplayBlockedProvider) != null;
 
     // Surface persistence failures (e.g. the secret store timing out): the
     // fields already show the new values, so warn instead of failing silently.
@@ -202,10 +223,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                 // P2-#38: keep the conflict notice when reload failed so
                 // the user doesn't lose the recovery entry. P2-#39: the
                 // page may be disposed while the reload is in flight.
-                if (ok && mounted &&
+                if (ok &&
+                    mounted &&
                     ref.read(settingsWriteConflictProvider)?.id == eventId) {
-                  ref.read(settingsWriteConflictProvider.notifier).state =
-                      null;
+                  ref.read(settingsWriteConflictProvider.notifier).state = null;
                 }
               },
             ),
@@ -217,23 +238,27 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   ? '有 ${controller.blockedReplayCount} 个凭据修改因服务地址变更被暂缓，等待确认。确认为当前地址后将继续保存，放弃则丢弃这些修改。'
                   : '${controller.blockedReplayCount} credential change(s) are held back because the service address changed. Confirm to save them against the current address, or discard them.',
               actionLabel: strings.isChinese ? '确认应用' : 'Apply',
-              onAction: replayInProgress ? null : () async {
-                if (controller.isReplayingConflictedEdits) return;
-                final eventId = ref.read(settingsReplayBlockedProvider)?.id;
-                await controller.confirmBlockedConflictReplays();
-                if (mounted &&
-                    ref.read(settingsReplayBlockedProvider)?.id == eventId) {
-                  ref.read(settingsReplayBlockedProvider.notifier).state =
-                      null;
-                }
-              },
+              onAction: replayInProgress
+                  ? null
+                  : () async {
+                      if (controller.isReplayingConflictedEdits) return;
+                      final eventId = ref
+                          .read(settingsReplayBlockedProvider)
+                          ?.id;
+                      await controller.confirmBlockedConflictReplays();
+                      if (mounted &&
+                          ref.read(settingsReplayBlockedProvider)?.id ==
+                              eventId) {
+                        ref.read(settingsReplayBlockedProvider.notifier).state =
+                            null;
+                      }
+                    },
               secondaryActionLabel: strings.isChinese ? '放弃' : 'Discard',
               secondaryActionDisabled: replayInProgress,
               onSecondaryAction: () async {
                 controller.discardBlockedConflictReplays();
                 if (mounted) {
-                  ref.read(settingsReplayBlockedProvider.notifier).state =
-                      null;
+                  ref.read(settingsReplayBlockedProvider.notifier).state = null;
                 }
               },
             ),
@@ -414,18 +439,27 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: <Widget>[
-                Consumer(builder: (context, ref, child) {
-                  ref.watch(settingsProvider.select((c) => (
-                    c.chunkSize, c.maxConcurrent, c.timeoutSeconds,
-                    c.maxRetries, c.retryDelaySeconds,
-                  )));
-                  return TuningPresetSelector(
-                  config: ref.read(settingsProvider),
-                  controller: controller,
-                  strings: strings,
-                  enabled: !isRunActive,
-                );
-                }),
+                Consumer(
+                  builder: (context, ref, child) {
+                    ref.watch(
+                      settingsProvider.select(
+                        (c) => (
+                          c.chunkSize,
+                          c.maxConcurrent,
+                          c.timeoutSeconds,
+                          c.maxRetries,
+                          c.retryDelaySeconds,
+                        ),
+                      ),
+                    );
+                    return TuningPresetSelector(
+                      config: ref.read(settingsProvider),
+                      controller: controller,
+                      strings: strings,
+                      enabled: !isRunActive,
+                    );
+                  },
+                ),
                 const SizedBox(height: 8),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -632,7 +666,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                 const SizedBox(height: 12),
                 _SettingsSlider(
                   select: (c) => c.textScale.clamp(0.9, 1.3),
-                  label: (v) => '${strings.textScaleLabel}: ${v.toStringAsFixed(2)}x',
+                  label: (v) =>
+                      '${strings.textScaleLabel}: ${v.toStringAsFixed(2)}x',
                   min: 0.9,
                   max: 1.3,
                   divisions: 8,
@@ -651,8 +686,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
 
 class _SettingsSlider extends ConsumerWidget {
   const _SettingsSlider({
-    required this.select, required this.label, required this.min,
-    required this.max, required this.divisions, required this.onChanged,
+    required this.select,
+    required this.label,
+    required this.min,
+    required this.max,
+    required this.divisions,
+    required this.onChanged,
     required this.onChangeEnd,
     this.semanticFormatterCallback,
   });
@@ -669,22 +708,24 @@ class _SettingsSlider extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final value = ref.watch(settingsProvider.select(select));
-    return Column(children: [
-      Align(alignment: Alignment.centerLeft, child: Text(label(value))),
-      MergeSemantics(
-        child: Semantics(
-          child: Slider(
-            min: min,
-            max: max,
-            divisions: divisions,
-            value: value,
-            semanticFormatterCallback: semanticFormatterCallback ?? label,
-            onChanged: onChanged,
-            onChangeEnd: onChangeEnd,
+    return Column(
+      children: [
+        Align(alignment: Alignment.centerLeft, child: Text(label(value))),
+        MergeSemantics(
+          child: Semantics(
+            child: Slider(
+              min: min,
+              max: max,
+              divisions: divisions,
+              value: value,
+              semanticFormatterCallback: semanticFormatterCallback ?? label,
+              onChanged: onChanged,
+              onChangeEnd: onChangeEnd,
+            ),
           ),
         ),
-      ),
-    ]);
+      ],
+    );
   }
 }
 
@@ -786,47 +827,52 @@ class _SettingsWarningBanner extends StatelessWidget {
                   ),
                 ),
               ),
-              if (secondaryActionLabel != null && onSecondaryAction != null) ...[
+              if (secondaryActionLabel != null &&
+                  onSecondaryAction != null) ...[
                 const SizedBox(width: 8),
                 TextButton(
-                  onPressed: secondaryActionDisabled ? null : () {
-                    // P2-#39: an unawaited banner action must not drop
-                    // errors silently.
-                    unawaited(
-                      onSecondaryAction().then(
-                        (_) {},
-                        onError: (Object error) {
-                          AppLogger.error(
-                            'Settings banner action failed: '
-                            '${error.runtimeType}',
-                            tag: 'settings',
+                  onPressed: secondaryActionDisabled
+                      ? null
+                      : () {
+                          // P2-#39: an unawaited banner action must not drop
+                          // errors silently.
+                          unawaited(
+                            onSecondaryAction().then(
+                              (_) {},
+                              onError: (Object error) {
+                                AppLogger.error(
+                                  'Settings banner action failed: '
+                                  '${error.runtimeType}',
+                                  tag: 'settings',
+                                );
+                              },
+                            ),
                           );
                         },
-                      ),
-                    );
-                  },
                   child: Text(secondaryActionLabel),
                 ),
               ],
               if (actionLabel != null) ...[
                 const SizedBox(width: 8),
                 TextButton(
-                  onPressed: onAction == null ? null : () {
-                    // P2-#39: an unawaited banner action must not drop
-                    // errors silently.
-                    unawaited(
-                      onAction().then(
-                        (_) {},
-                        onError: (Object error) {
-                          AppLogger.error(
-                            'Settings banner action failed: '
-                            '${error.runtimeType}',
-                            tag: 'settings',
+                  onPressed: onAction == null
+                      ? null
+                      : () {
+                          // P2-#39: an unawaited banner action must not drop
+                          // errors silently.
+                          unawaited(
+                            onAction().then(
+                              (_) {},
+                              onError: (Object error) {
+                                AppLogger.error(
+                                  'Settings banner action failed: '
+                                  '${error.runtimeType}',
+                                  tag: 'settings',
+                                );
+                              },
+                            ),
                           );
                         },
-                      ),
-                    );
-                  },
                   child: Text(actionLabel),
                 ),
               ],

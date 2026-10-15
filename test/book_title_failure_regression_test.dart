@@ -51,7 +51,13 @@ class _TitleClient extends TranslationApiClient {
       data: {
         'choices': [
           {
-            'message': {'content': mode == 'empty' ? '' : '译后书名'},
+            'message': {
+              'content': mode == 'empty'
+                  ? ''
+                  : mode == 'invalid'
+                  ? '译后\u0001书名'
+                  : '译后书名',
+            },
           },
         ],
       },
@@ -60,7 +66,7 @@ class _TitleClient extends TranslationApiClient {
 }
 
 void main() {
-  for (final mode in ['error', 'empty', 'success', 'cancel']) {
+  for (final mode in ['error', 'empty', 'invalid', 'success', 'cancel']) {
     test('book title $mode preserves honest status and metadata', () async {
       final dir = await Directory.systemTemp.createTemp('title_failure_');
       addTearDown(() => dir.delete(recursive: true));
@@ -128,7 +134,8 @@ void main() {
       }
       final result = await future;
       expect(client.calls, 1);
-      final failedTitle = mode == 'error' || mode == 'empty';
+      final failedTitle =
+          mode == 'error' || mode == 'empty' || mode == 'invalid';
       expect(
         result.job.status,
         failedTitle

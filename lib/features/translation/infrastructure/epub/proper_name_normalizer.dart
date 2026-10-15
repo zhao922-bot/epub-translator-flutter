@@ -1,5 +1,8 @@
+import 'dart:convert';
+
 import 'epub_html_extractor.dart';
 import 'epub_dom.dart';
+import 'xhtml_html_compatibility.dart';
 
 /// Deterministic post-processing layer that converts every configuration-
 /// locked proper name to the canonical display form across the whole book.
@@ -21,6 +24,7 @@ import 'epub_dom.dart';
 /// already used by the surrounding block.
 class ProperNameNormalizer {
   const ProperNameNormalizer();
+  static String _text(String value) => const HtmlEscape().convert(value);
 
   /// Mutable per-book state shared across chapter renders so "first
   /// occurrence in the book" is truly book-wide and not scoped to a single
@@ -116,8 +120,9 @@ class ProperNameNormalizer {
     String html,
     RegExp pattern,
     String Function(String html, String masked, Match maskedMatch)
-    buildReplacement,
-  ) {
+    buildReplacement, {
+    bool retryRejectedSuffix = false,
+  }) {
     final String masked = _maskHtmlMarkup(html);
     if (!pattern.hasMatch(masked)) {
       return html;
@@ -125,11 +130,23 @@ class ProperNameNormalizer {
     final StringBuffer output = StringBuffer();
     int cursor = 0;
     bool changed = false;
-    for (final Match match in pattern.allMatches(masked)) {
+    var searchFrom = 0;
+    while (searchFrom < masked.length) {
+      final match = pattern.allMatches(masked, searchFrom).firstOrNull;
+      if (match == null) break;
+      final replacement = buildReplacement(html, masked, match);
+      if (retryRejectedSuffix &&
+          replacement == html.substring(match.start, match.end)) {
+        // The bounded heading may include preceding CJK prose. Try its
+        // next suffix rather than counting the Latin name a second time.
+        searchFrom = match.start + 1;
+        continue;
+      }
       output
         ..write(html.substring(cursor, match.start))
-        ..write(buildReplacement(html, masked, match));
+        ..write(replacement);
       cursor = match.end;
+      searchFrom = match.end;
       changed = true;
     }
     if (!changed) {
@@ -198,11 +215,14 @@ class ProperNameNormalizer {
       ).trim();
       // Strict: only the locked translation (after normalization) folds.
       // Anything else — an unrelated phrase, a truncation — is left alone.
-      if (_glossComparisonKey(head) != _glossComparisonKey(mapping.target)) {
+      if (_glossComparisonKey(
+            XhtmlHtmlCompatibility.parseFragment(head).text ?? '',
+          ) !=
+          _glossComparisonKey(mapping.target)) {
         return original.substring(match.start, match.end);
       }
-      return '${mapping.target}（${mapping.source}）';
-    });
+      return '${_text(mapping.target)}（${_text(mapping.source)}）';
+    }, retryRejectedSuffix: true);
   }
 
   static bool _isBibliographicOrIndexEntry(String html) {
@@ -281,14 +301,14 @@ class ProperNameNormalizer {
       if (state?.countedNames.contains(mapping.source) == true) {
         output
           ..write(html.substring(cursor, match.start))
-          ..write('$markers${mapping.target}');
+          ..write('$markers${_text(mapping.target)}');
         cursor = match.end;
         continue;
       }
       output
         ..write(html.substring(cursor, match.start))
         ..write(
-          '$markers${mapping.target}（${_cleanLooseHtmlTokens(raw, mapping.source)}）',
+          '$markers${_text(mapping.target)}（${_text(_cleanLooseHtmlTokens(raw, mapping.source))}）',
         );
       state?.countedNames.add(mapping.source);
       cursor = match.end;
@@ -397,7 +417,8 @@ class ProperNameNormalizer {
       final closing = token.group(1) == '/';
       final selfClosing = token.group(0)!.endsWith('/>');
       if (root == null) {
-        if (closing || !EpubHtmlExtractor.nonTextAncestors.contains(tag.split(':').last)) {
+        if (closing ||
+            !EpubHtmlExtractor.nonTextAncestors.contains(tag.split(':').last)) {
           continue;
         }
         out.write(html.substring(cursor, token.start));
@@ -407,14 +428,20 @@ class ProperNameNormalizer {
       } else if (tag == root) {
         if (closing) {
           depth--;
-        } else if (!selfClosing && root.split(':').last != 'script' &&
+        } else if (!selfClosing &&
+            root.split(':').last != 'script' &&
             root.split(':').last != 'style') {
           depth++;
         }
       }
       if (depth == 0 ||
           (start == token.start &&
-              (selfClosing || const {'img', 'link', 'meta'}.contains(tag.split(':').last)))) {
+              (selfClosing ||
+                  const {
+                    'img',
+                    'link',
+                    'meta',
+                  }.contains(tag.split(':').last)))) {
         out.write('\uE002' * (token.end - start));
         cursor = token.end;
         root = null;
@@ -596,13 +623,15 @@ class ProperNameNormalizer {
         match.group(2)!,
         group2Start,
       ).trim();
-      if (_glossComparisonKey(translated) !=
+      if (_glossComparisonKey(
+            XhtmlHtmlCompatibility.parseFragment(translated).text ?? '',
+          ) !=
           _glossComparisonKey(mapping.target)) {
         // Strict: anything that is not the locked translation — an appositive,
         // a truncation — is left untouched rather than disguised as a gloss.
         return original.substring(match.start, match.end);
       }
-      return '${mapping.target}（$name）';
+      return '${_text(mapping.target)}（$name）';
     });
   }
 

@@ -10,6 +10,7 @@ import 'package:path/path.dart' as path;
 import '../../../shared/platform/platform_utils.dart';
 import '../../../shared/io/atomic_file_writer.dart';
 import '../domain/models/job_resume_state.dart';
+import 'epub/epub_xml_characters.dart';
 
 final translationCacheStoreProvider = Provider<TranslationCacheStore>(
   (ref) => TranslationCacheStore(),
@@ -67,7 +68,8 @@ class TranslationCacheStore {
   /// wasted IO. Remember the (mtime, size, digest) it was last checked at;
   /// a later scan reuses the digest while the file is unchanged instead of
   /// re-reading and re-hashing it.
-  final Map<String, _RollbackCheck> _rollbackChecked = <String, _RollbackCheck>{};
+  final Map<String, _RollbackCheck> _rollbackChecked =
+      <String, _RollbackCheck>{};
 
   /// Block-cache paths in oldest-first eviction order (insertion order).
   /// Writes move their path to the end; a full scan rebuilds it from
@@ -247,15 +249,18 @@ class TranslationCacheStore {
         if (_looksLikeDamagedEnvelope(raw)) return null;
         // Legacy entries have no checksum. Trust them to preserve paid
         // progress; all new writes use the versioned integrity envelope.
+        validateEpubXmlMarkup(raw);
         return raw;
       }
       final int newline = raw.indexOf('\n');
       if (newline < 0) return null;
       final String digest = raw.substring(_envelopePrefix.length, newline);
       final String payload = raw.substring(newline + 1);
-      return sha256.convert(utf8.encode(payload)).toString() == digest
-          ? payload
-          : null;
+      if (sha256.convert(utf8.encode(payload)).toString() != digest) {
+        return null;
+      }
+      validateEpubXmlMarkup(payload);
+      return payload;
     } on FileSystemException catch (error) {
       // ENOENT on POSIX; ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND on
       // Windows. Other failures remain unreadable-cache errors to callers.
@@ -446,8 +451,7 @@ class TranslationCacheStore {
     // by the last full scan are transient (in-flight writes) or swept when
     // stale; evicting paid cache entries to make room for them is futile,
     // so they must not inflate the eviction target.
-    bool overTarget() =>
-        _estimatedBytes - _lastScanTempBytes > targetBytes;
+    bool overTarget() => _estimatedBytes - _lastScanTempBytes > targetBytes;
     for (final String filePath in _evictionOrder.toList()) {
       if (!overTarget()) break;
       final int? recorded = _sizes[filePath];
@@ -467,7 +471,8 @@ class TranslationCacheStore {
             return;
           }
           final DateTime? recordedModified = _mtimes[filePath];
-          if (recordedModified == null || current.modified != recordedModified) {
+          if (recordedModified == null ||
+              current.modified != recordedModified) {
             return;
           }
           await file.delete();
@@ -780,16 +785,13 @@ class TranslationCacheStore {
     // Serialize with checkpoint pruning on the per-file gate: without it,
     // the prune's stat-then-delete could land after a concurrent save
     // renamed a fresh checkpoint onto this same path, deleting live state.
-    await _withFileGate(
-      file,
-      () async {
-        await writeFileAtomically(
-          file,
-          const JsonEncoder.withIndent('  ').convert(state.toJson()),
-        );
-        _savedJobStats[file.path] = await file.stat();
-      },
-    );
+    await _withFileGate(file, () async {
+      await writeFileAtomically(
+        file,
+        const JsonEncoder.withIndent('  ').convert(state.toJson()),
+      );
+      _savedJobStats[file.path] = await file.stat();
+    });
     await _pruneOldJobStates();
   }
 
@@ -919,8 +921,9 @@ class TranslationCacheStore {
     for (final entry in entries) {
       final String stem = path.basenameWithoutExtension(entry.file.path);
       memoryNameToJobKey[sha256
-          .convert(utf8.encode('$stem:book-memory'))
-          .toString()] = stem;
+              .convert(utf8.encode('$stem:book-memory'))
+              .toString()] =
+          stem;
     }
     final Map<String, List<({File file, DateTime modified})>> groups =
         <String, List<({File file, DateTime modified})>>{};
@@ -936,14 +939,13 @@ class TranslationCacheStore {
       for (final entry in entries) entry.file.path: entry.modified,
     };
     // Oldest tasks first; a task is as recent as its freshest file.
-    final List<List<({File file, DateTime modified})>> tasks = groups.values
-        .toList()
-      ..sort(
-        (
-          List<({File file, DateTime modified})> a,
-          List<({File file, DateTime modified})> b,
-        ) => _newestModified(a).compareTo(_newestModified(b)),
-      );
+    final List<List<({File file, DateTime modified})>> tasks =
+        groups.values.toList()..sort(
+          (
+            List<({File file, DateTime modified})> a,
+            List<({File file, DateTime modified})> b,
+          ) => _newestModified(a).compareTo(_newestModified(b)),
+        );
     int remaining = tasks.length;
     final DateTime activeSince = _now().subtract(const Duration(minutes: 5));
     final List<({File file, DateTime modified})> candidates = [];
@@ -962,10 +964,7 @@ class TranslationCacheStore {
       for (final entry in candidates) entry.file.path,
     };
     for (final entry in candidates) {
-      final String? matePath = await _pairedCheckpointPath(
-        jobsDir,
-        entry.file,
-      );
+      final String? matePath = await _pairedCheckpointPath(jobsDir, entry.file);
       if (matePath == null ||
           candidatePaths.contains(matePath) ||
           !await File(matePath).exists()) {
@@ -984,8 +983,7 @@ class TranslationCacheStore {
     final Set<String> pairHandled = <String>{};
     for (final entry in candidates) {
       final String entryPath = entry.file.path;
-      if (!candidatePaths.contains(entryPath) ||
-          !pairHandled.add(entryPath)) {
+      if (!candidatePaths.contains(entryPath) || !pairHandled.add(entryPath)) {
         continue;
       }
       try {
@@ -1061,9 +1059,7 @@ class TranslationCacheStore {
   }
 
   /// Newest modification time in a checkpoint task group.
-  static DateTime _newestModified(
-    List<({File file, DateTime modified})> task,
-  ) {
+  static DateTime _newestModified(List<({File file, DateTime modified})> task) {
     DateTime newest = task.first.modified;
     for (final entry in task.skip(1)) {
       if (entry.modified.isAfter(newest)) newest = entry.modified;
@@ -1138,10 +1134,7 @@ class TranslationCacheStore {
   /// companion), or null when the file is not a recognized checkpoint pair
   /// member. The memory companion's envelope carries the original job key in
   /// `inputFingerprint`; a regular job checkpoint's key is its file stem.
-  Future<String?> _pairedCheckpointPath(
-    Directory jobsDir,
-    File file,
-  ) async {
+  Future<String?> _pairedCheckpointPath(Directory jobsDir, File file) async {
     Map<String, dynamic>? json;
     try {
       final Object? decoded = jsonDecode(await file.readAsString());
@@ -1158,8 +1151,9 @@ class TranslationCacheStore {
       }
       return null;
     }
-    final String memoryKey =
-        sha256.convert(utf8.encode('$stem:book-memory')).toString();
+    final String memoryKey = sha256
+        .convert(utf8.encode('$stem:book-memory'))
+        .toString();
     return path.join(jobsDir.path, '$memoryKey.json');
   }
 

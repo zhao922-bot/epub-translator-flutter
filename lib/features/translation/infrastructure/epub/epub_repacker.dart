@@ -3,7 +3,6 @@ import 'dart:math';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
 
@@ -14,7 +13,9 @@ import '../../../../shared/localization/app_strings.dart';
 import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
 import 'epub_dom.dart';
+import 'epub_xml_characters.dart';
 import 'epub_navigation.dart';
+import 'epub_semantics.dart';
 import 'epub_source_guard.dart';
 import 'proper_name_normalizer.dart';
 import 'protected_anchor_text_slots.dart';
@@ -245,8 +246,8 @@ body.epub-translator-cjk [data-translation="true"] {
     final List<ProperNameMap> nameMappings = ProperNameNormalizer.parseGlossary(
       lockedGlossary,
     );
-    final dom.Document document = html_parser.parse(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(chapter.originalHtml),
+    final dom.Document document = XhtmlHtmlCompatibility.parseDocument(
+      chapter.originalHtml,
     );
     final prefixedRoot = _prefixedXhtmlRoot(document, chapter.originalHtml);
     final chapterRoot = prefixedRoot ?? document.documentElement;
@@ -325,7 +326,7 @@ body.epub-translator-cjk [data-translation="true"] {
                   'figcaption',
                 }.contains(EpubHtmlExtractor.tagLocalName(target))
                 ? _bilingualStructuralItem(target, translationPart)
-                : '${target.outerHtml}\n$translationPart')
+                : '${EpubSemantics.sourceHtmlWithBindings(target)}\n$translationPart')
           : translationPart;
       if (isDegraded) {
         // This block fell back to source/partial content. Leave an HTML
@@ -412,9 +413,9 @@ body.epub-translator-cjk [data-translation="true"] {
   /// Preserve list numbering and the table grid (including row/col spans).
   /// Translations are content inside the original structural element.
   String _bilingualStructuralItem(dom.Element source, String translationHtml) {
-    final dom.Element item = source.clone(true);
+    final dom.Element item = EpubSemantics.cloneWithBindings(source);
     final String sourceTag = EpubHtmlExtractor.tagLocalName(source);
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
       translationHtml,
       container: _replacementContainerFor(source),
     );
@@ -444,7 +445,7 @@ body.epub-translator-cjk [data-translation="true"] {
     dom.Element target,
     String languageTag,
   ) {
-    final fragment = html_parser.parseFragment(
+    final fragment = XhtmlHtmlCompatibility.parseFragment(
       markup,
       container: _replacementContainerFor(target),
     );
@@ -626,8 +627,8 @@ body.epub-translator-cjk [data-translation="true"] {
         tag != 'figcaption') {
       return replacementHtml;
     }
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      replacementHtml,
       container: _replacementContainerFor(target),
     );
     final dom.Node? first = fragment.nodes.isEmpty
@@ -657,8 +658,8 @@ body.epub-translator-cjk [data-translation="true"] {
   }
 
   List<dom.Node> _replacementNodes(dom.Element target, String replacementHtml) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(replacementHtml),
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      replacementHtml,
       container: _replacementContainerFor(target),
     );
     final List<dom.Node> replacementNodes = fragment.nodes.toList();
@@ -679,8 +680,8 @@ body.epub-translator-cjk [data-translation="true"] {
     String? container,
     String? languageTag,
   }) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(translatedHtml),
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      translatedHtml,
       container: container ?? 'body',
     );
     for (final dom.Element element in fragment.querySelectorAll('[id]')) {
@@ -713,15 +714,15 @@ body.epub-translator-cjk [data-translation="true"] {
     String translatedHtml, {
     String container = 'body',
   }) {
-    final String parserSafe = XhtmlHtmlCompatibility.normalizeForHtmlParser(
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
       translatedHtml,
-    );
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
-      parserSafe,
       container: container,
     );
     if (!_containsCjk(fragment.text ?? '')) {
-      return parserSafe;
+      // No typography edits: keep the validated input rather than serializing
+      // every ordinary paragraph again. The downstream replacement parser
+      // applies XHTML compatibility and foreign-content restoration.
+      return translatedHtml;
     }
 
     final List<dom.Element> dropCaps = fragment
@@ -800,14 +801,15 @@ body.epub-translator-cjk [data-translation="true"] {
   /// e.g. from `&nbsp;`) are preserved — only ASCII whitespace runs are
   /// collapsed.
   String _collapseRedundantWhitespace(String translatedHtml) {
-    final dom.DocumentFragment fragment = html_parser.parseFragment(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(translatedHtml),
+    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
+      translatedHtml,
     );
     bool changed = false;
     void collapseNode(dom.Node node, bool insideLiteralContent) {
       final bool inLiteralContent =
           insideLiteralContent ||
-          (node is dom.Element && _literalContentTags.contains(epubLocalName(node)));
+          (node is dom.Element &&
+              _literalContentTags.contains(epubLocalName(node)));
       if (node is dom.Text) {
         if (!inLiteralContent) {
           final String collapsed = node.text.replaceAll(
@@ -833,7 +835,8 @@ body.epub-translator-cjk [data-translation="true"] {
   bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
     dom.Node? current = element;
     while (current is dom.Element) {
-      if (epubLocalName(current) == 'a' && _containsFootnoteMarkerClass(current)) {
+      if (epubLocalName(current) == 'a' &&
+          _containsFootnoteMarkerClass(current)) {
         return true;
       }
       current = current.parentNode;
@@ -1158,8 +1161,8 @@ body.epub-translator-cjk [data-translation="true"] {
       // TOCs are normally excluded from paid translation. Their labels can
       // still be synchronized from the already translated heading targets.
       final rendered = renderedByPath[chapter.path] ?? chapter.originalHtml;
-      final dom.Document document = html_parser.parse(
-        XhtmlHtmlCompatibility.normalizeForHtmlParser(rendered),
+      final dom.Document document = XhtmlHtmlCompatibility.parseDocument(
+        rendered,
       );
       // EPUB 3 nav documents are handled from the manifest in the isolate.
       // Applying this legacy heuristic would also overwrite page-list labels.
@@ -1231,11 +1234,7 @@ body.epub-translator-cjk [data-translation="true"] {
       final sourceElements =
           sourceElementsByChapter?[chapter.path] ??
           _extractor.extractTranslatableTextElements(
-            html_parser.parse(
-              XhtmlHtmlCompatibility.normalizeForHtmlParser(
-                chapter.originalHtml,
-              ),
-            ),
+            XhtmlHtmlCompatibility.parseDocument(chapter.originalHtml),
           );
       final elementsById = <String, dom.Element>{};
       for (var k = 0; k < sourceElements.length; k++) {
@@ -1252,18 +1251,16 @@ body.epub-translator-cjk [data-translation="true"] {
         }
         final headings = sourceElement == null
             ? epubElements(
-                html_parser.parseFragment(
-                  XhtmlHtmlCompatibility.normalizeForHtmlParser(
-                    block.sourceHtml,
-                  ),
-                ),
+                XhtmlHtmlCompatibility.parseFragment(block.sourceHtml),
               ).where(_isHeadingElement).toList()
             : [
                 if (_isHeadingElement(sourceElement)) sourceElement,
                 ...epubElements(sourceElement).where(_isHeadingElement),
               ];
         if (headings.isEmpty) continue;
-        final translated = html_parser.parseFragment(block.translatedHtml!);
+        final translated = XhtmlHtmlCompatibility.parseFragment(
+          block.translatedHtml!,
+        );
         final translatedHeadings = epubElements(
           translated,
         ).where(_isHeadingElement).toList();
@@ -1373,7 +1370,10 @@ body.epub-translator-cjk [data-translation="true"] {
         )
         .map(
           (ExtractedBlock block) =>
-              (html_parser.parseFragment(block.translatedHtml!).text ?? '')
+              (XhtmlHtmlCompatibility.parseFragment(
+                        block.translatedHtml!,
+                      ).text ??
+                      '')
                   .replaceAll(RegExp(r'\s+'), ' ')
                   .trim(),
         )
@@ -1400,6 +1400,7 @@ body.epub-translator-cjk [data-translation="true"] {
     for (final MapEntry<String, String> replacement in replacements.entries) {
       // Every replacement here is an XHTML chapter, regardless of its suffix.
       try {
+        validateEpubXmlMarkup(replacement.value);
         final document = xml.XmlDocument.parse(replacement.value);
         if (requireXhtmlNamespace &&
             (document.rootElement.name.local != 'html' ||

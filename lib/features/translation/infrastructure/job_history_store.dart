@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
@@ -157,10 +158,7 @@ class JobHistoryStore {
           'starting fresh.',
           tag: 'history',
         );
-        return (
-          jobs: const <TranslationJob>[],
-          clearedAt: preservedClearedAt,
-        );
+        return (jobs: const <TranslationJob>[], clearedAt: preservedClearedAt);
       }
       try {
         final Object? decoded = jsonDecode(stripLeadingBom(raw));
@@ -200,10 +198,7 @@ class JobHistoryStore {
           tag: 'history',
           error: parseError,
         );
-        return (
-          jobs: const <TranslationJob>[],
-          clearedAt: preservedClearedAt,
-        );
+        return (jobs: const <TranslationJob>[], clearedAt: preservedClearedAt);
       }
     } on FileSystemException catch (error) {
       // Transient IO failure (an antivirus/indexer lock on Windows, a
@@ -274,11 +269,7 @@ class JobHistoryStore {
         // stale backup. Re-verify under the cross-process history lock; if
         // the file appeared, the newer history wins and the backup stays in
         // place as evidence.
-        await _restoreBackupIfStillAbsent(
-          file,
-          backup,
-          lockHeld: lockHeld,
-        );
+        await _restoreBackupIfStillAbsent(file, backup, lockHeld: lockHeld);
         return 0;
       }
       await _pruneCorruptBackups(file.parent);
@@ -658,21 +649,21 @@ class JobHistoryStore {
 class _HistoryStreamReader {
   _HistoryStreamReader(this.file);
   final File file;
-  late StreamIterator<String> tokens;
+  late Iterator<String> tokens;
   String? current;
 
-  Future<void> advance() async {
-    current = await tokens.moveNext() ? tokens.current : null;
+  void advance() {
+    current = tokens.moveNext() ? tokens.current : null;
   }
 
   Never invalid() => throw const FormatException('Invalid history JSON');
 
-  Future<void> expectToken(String token) async {
+  void expectToken(String token) {
     if (current != token) invalid();
-    await advance();
+    advance();
   }
 
-  Future<Object?> value() async {
+  Object? value() {
     final text = StringBuffer();
     var depth = 0;
     do {
@@ -683,17 +674,17 @@ class _HistoryStreamReader {
       text.write(' ');
       if (token == '[' || token == '{') depth++;
       if (token == ']' || token == '}') depth--;
-      await advance();
+      advance();
     } while (depth > 0);
     return jsonDecode(text.toString());
   }
 
-  Future<List<TranslationJob>> jobs() async {
-    await expectToken('[');
+  List<TranslationJob> jobs() {
+    expectToken('[');
     final result = <TranslationJob>[];
     if (current != ']') {
       while (true) {
-        final item = await value();
+        final item = value();
         if (result.length < 20 && item is Map<String, dynamic>) {
           try {
             result.add(TranslationJob.fromJson(item));
@@ -702,55 +693,83 @@ class _HistoryStreamReader {
           }
         }
         if (current != ',') break;
-        await advance();
+        advance();
       }
     }
-    await expectToken(']');
+    expectToken(']');
     return result.toList(growable: false);
   }
 
-  Future<({List<TranslationJob> jobs, int clearedAt})> read() async {
-    tokens = StreamIterator(_tokens(file.openRead().transform(utf8.decoder)));
+  Future<({List<TranslationJob> jobs, int clearedAt})> read() =>
+      _readOnWorker(file.path);
+
+  static Future<({List<TranslationJob> jobs, int clearedAt})> _readOnWorker(
+    String filePath,
+  ) => Isolate.run(() => _HistoryStreamReader(File(filePath))._readSync());
+
+  ({List<TranslationJob> jobs, int clearedAt}) _readSync() {
+    final handle = file.openSync();
     try {
-      await advance();
+      tokens = _tokens(_decodedChunks(handle)).iterator;
+      advance();
       var clearedAt = 0;
       List<TranslationJob>? result;
       if (current == '[') {
-        result = await jobs();
+        result = jobs();
       } else {
-        await expectToken('{');
+        expectToken('{');
         if (current != '}') {
           while (true) {
-            final key = await value();
+            final key = value();
             if (key is! String) invalid();
-            await expectToken(':');
+            expectToken(':');
             if (key == 'jobs' && current == '[') {
-              result = await jobs();
+              result = jobs();
             } else {
-              final item = await value();
+              final item = value();
               if (key == 'jobs') result = null;
               if (key == 'clearedAt') clearedAt = item is int ? item : 0;
             }
             if (current != ',') break;
-            await advance();
+            advance();
           }
         }
-        await expectToken('}');
+        expectToken('}');
       }
       if (current != null || result == null) invalid();
       return (jobs: result, clearedAt: clearedAt);
     } finally {
-      await tokens.cancel();
+      handle.closeSync();
     }
   }
 
-  static Stream<String> _tokens(Stream<String> chunks) async* {
+  /// UTF-8 state crosses 64 KiB boundaries; peak input stays one chunk.
+  /// The worker owns the handle and closes it even for a corrupt tail.
+  static Iterable<String> _decodedChunks(RandomAccessFile handle) sync* {
+    final buffer = StringBuffer();
+    final decoder = utf8.decoder.startChunkedConversion(
+      StringConversionSink.fromStringSink(buffer),
+    );
+    while (true) {
+      final bytes = handle.readSync(64 * 1024);
+      if (bytes.isEmpty) {
+        decoder.close();
+        if (buffer.isNotEmpty) yield buffer.toString();
+        return;
+      }
+      decoder.add(bytes);
+      yield buffer.toString();
+      buffer.clear();
+    }
+  }
+
+  static Iterable<String> _tokens(Iterable<String> chunks) sync* {
     var buffer = StringBuffer();
     var quoted = false;
     var escaped = false;
     var first = true;
     const punctuation = '{}[]:,';
-    await for (final chunk in chunks) {
+    for (final chunk in chunks) {
       for (var i = 0; i < chunk.length; i++) {
         final c = chunk[i];
         if (first) {
@@ -768,8 +787,12 @@ class _HistoryStreamReader {
             yield buffer.toString();
             buffer = StringBuffer();
           }
-        } else if (c == '"' || punctuation.contains(c) ||
-            c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+        } else if (c == '"' ||
+            punctuation.contains(c) ||
+            c == ' ' ||
+            c == '\n' ||
+            c == '\r' ||
+            c == '\t') {
           if (buffer.isNotEmpty) {
             yield buffer.toString();
             buffer = StringBuffer();

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:html/parser.dart' as html_parser;
 
 import 'xhtml_html_compatibility.dart';
+import 'epub_xml_characters.dart';
 
 /// Encoding-aware text decoding for EPUB payloads (chapter HTML and package
 /// metadata such as container.xml / OPF / NCX).
@@ -64,6 +65,7 @@ String decodeEpubText({
   if (!strict) {
     _throwIfMostlyUndecodable(decoded, filePath);
   }
+  validateEpubXmlMarkup(decoded);
   return decoded;
 }
 

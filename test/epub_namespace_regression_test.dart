@@ -31,6 +31,72 @@ String prefixed(String body) =>
     '<x:body>$body</x:body></x:html>';
 
 void main() {
+  for (final bilingual in [false, true]) {
+    test(
+      'inline prefixed SVG retains case, namespaces and references ($bilingual)',
+      () {
+        final source =
+            '<x:html xmlns:x="$ns" xmlns:s="http://www.w3.org/2000/svg" xmlns:l="http://www.w3.org/1999/xlink"><x:head><x:title>Book</x:title></x:head><x:body><x:p>Hello. <s:svg viewBox="0 0 20 20"><s:defs><s:linearGradient id="g"><s:stop offset="0"/></s:linearGradient></s:defs><s:use l:href="#shape"/><s:rect id="shape" width="20" height="20" fill="url(#g)"/></s:svg></x:p></x:body></x:html>';
+        final chapter = translatedChapter(source, 'Hello.', '你好。');
+        expect(chapter.blocks.single.sourceHtml, contains('viewBox'));
+        final output = EpubRepacker().renderTranslatedChapter(
+          chapter: chapter,
+          bilingual: bilingual,
+        );
+        final xml = XmlDocument.parse(output);
+        final svgs = xml.descendants
+            .whereType<XmlElement>()
+            .where((e) => e.name.local == 'svg')
+            .toList();
+        expect(svgs, hasLength(bilingual ? 2 : 1));
+        for (final svg in svgs) {
+          expect(svg.getAttribute('viewBox'), '0 0 20 20');
+          expect(
+            svg.descendants.whereType<XmlElement>().any(
+              (e) => e.name.local == 'linearGradient',
+            ),
+            isTrue,
+          );
+          expect(
+            svg.descendants
+                .whereType<XmlElement>()
+                .singleWhere((e) => e.name.local == 'use')
+                .getAttribute(
+                  'href',
+                  namespace: 'http://www.w3.org/1999/xlink',
+                ),
+            '#shape',
+          );
+        }
+      },
+    );
+  }
+
+  test('MathML and SVG foreignObject preserve XML case and raw script text', () {
+    final source =
+        '<html xmlns="$ns"><head><title>Book</title></head><body><p>Hello.</p><m:math xmlns:m="http://www.w3.org/1998/Math/MathML" display="block"><m:mi mathvariant="bold">x</m:mi></m:math><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><foreignObject width="10" height="10"><div xmlns="$ns">Keep</div></foreignObject><script><![CDATA[if (a < b && c > d) run();]]></script></svg></body></html>';
+    final output = EpubRepacker().renderTranslatedChapter(
+      chapter: translatedChapter(source, 'Hello.', '你好。'),
+      bilingual: false,
+    );
+    final xml = XmlDocument.parse(output);
+    final nodes = xml.descendants.whereType<XmlElement>();
+    expect(
+      nodes.singleWhere((e) => e.name.local == 'math').namespaceUri,
+      'http://www.w3.org/1998/Math/MathML',
+    );
+    expect(
+      nodes
+          .singleWhere((e) => e.name.local == 'foreignObject')
+          .getAttribute('width'),
+      '10',
+    );
+    expect(
+      nodes.singleWhere((e) => e.name.local == 'script').innerText,
+      'if (a < b && c > d) run();',
+    );
+    expect(nodes.singleWhere((e) => e.name.local == 'div').namespaceUri, ns);
+  });
   test('R01 correct prefixed code retention must pass residual quality', () {
     const literal = 'print the original value and then return the result';
     for (final p in ['', 'x:']) {

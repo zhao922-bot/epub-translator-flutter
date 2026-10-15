@@ -132,6 +132,70 @@ Future<void> _page(WidgetTester tester, ProviderContainer container) =>
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('successful save and reopening settings never shows a failure', (
+    tester,
+  ) async {
+    final file = (await tester.runAsync(_file))!;
+    final container = _container(
+      SettingsStore(
+        settingsFileProvider: () async => file,
+        secretStore: _Secrets(),
+      ),
+    );
+    await tester.runAsync(
+      () => container.read(settingsProvider.notifier).ready,
+    );
+    final controller = container.read(settingsProvider.notifier);
+    await tester.runAsync(() => controller.setApiKey('saved-key'));
+    expect(container.read(settingsSaveErrorProvider), isNull);
+    // Also accept an empty event left by older state owners.
+    container.read(settingsSaveErrorProvider.notifier).state = (
+      id: 1,
+      message: null,
+      settingsFileLocked: false,
+    );
+    await _page(tester, container);
+    await tester.pumpAndSettle();
+    expect(find.byType(SnackBar), findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await _page(tester, container);
+    await tester.pumpAndSettle();
+    expect(find.byType(SnackBar), findsNothing);
+    expect(container.read(settingsProvider).apiKey, 'saved-key');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+    'an existing genuine save failure uses the selected UI language',
+    (tester) async {
+      final file = (await tester.runAsync(_file))!;
+      final container = _container(
+        SettingsStore(
+          settingsFileProvider: () async => file,
+          secretStore: _Secrets(),
+        ),
+      );
+      await tester.runAsync(
+        () => container.read(settingsProvider.notifier).ready,
+      );
+      final controller = container.read(settingsProvider.notifier);
+      await tester.runAsync(() => controller.setUiLanguage(UiLanguage.chinese));
+      container.read(settingsSaveErrorProvider.notifier).state = (
+        id: 1,
+        message: 'private error details',
+        settingsFileLocked: false,
+      );
+      await _page(tester, container);
+      await tester.pumpAndSettle();
+      expect(
+        find.text(const AppStrings(UiLanguage.chinese).settingsSaveFailed),
+        findsOneWidget,
+      );
+      expect(find.text('private error details'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   test(
     'C-03 failed proxy migration survives theme save and restart, then migrates securely',
     () async {

@@ -1,5 +1,4 @@
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 
 import '../../domain/models/inspected_chapter.dart';
@@ -105,9 +104,7 @@ class EpubHtmlExtractor {
     // of degrading into U+FFFD confetti that would burn translation tokens.
     final String decoded = decodeEpubText(bytes: bytes, filePath: chapterPath);
     validateEpubMarkupDepth(decoded);
-    final dom.Document document = html_parser.parse(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(decoded),
-    );
+    final dom.Document document = XhtmlHtmlCompatibility.parseDocument(decoded);
     final dom.Element? titleElement = _firstByTagName(document, const {
       'title',
     });

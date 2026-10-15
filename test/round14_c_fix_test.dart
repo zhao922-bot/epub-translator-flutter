@@ -10,6 +10,7 @@ import 'package:epub_translator_flutter/features/translation/infrastructure/job_
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:epub_translator_flutter/shared/io/settings_file_lock.dart';
 import 'package:epub_translator_flutter/shared/logging/app_logger.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -87,19 +88,25 @@ class _SecretStore implements SettingsSecretStore {
   @override
   Future<String?> readApiKey() async => values[SettingsSecretSlot.legacy];
   @override
-  Future<String?> readDeepSeekApiKey() async => values[SettingsSecretSlot.deepSeek];
+  Future<String?> readDeepSeekApiKey() async =>
+      values[SettingsSecretSlot.deepSeek];
   @override
   Future<String?> readCustomApiKey() async => values[SettingsSecretSlot.custom];
   @override
-  Future<String?> readProxyAuthentication() async => values[SettingsSecretSlot.proxy];
+  Future<String?> readProxyAuthentication() async =>
+      values[SettingsSecretSlot.proxy];
   @override
-  Future<void> writeApiKey(String value) => _write(SettingsSecretSlot.legacy, value);
+  Future<void> writeApiKey(String value) =>
+      _write(SettingsSecretSlot.legacy, value);
   @override
-  Future<void> writeDeepSeekApiKey(String value) => _write(SettingsSecretSlot.deepSeek, value);
+  Future<void> writeDeepSeekApiKey(String value) =>
+      _write(SettingsSecretSlot.deepSeek, value);
   @override
-  Future<void> writeCustomApiKey(String value) => _write(SettingsSecretSlot.custom, value);
+  Future<void> writeCustomApiKey(String value) =>
+      _write(SettingsSecretSlot.custom, value);
   @override
-  Future<void> writeProxyAuthentication(String value) => _write(SettingsSecretSlot.proxy, value);
+  Future<void> writeProxyAuthentication(String value) =>
+      _write(SettingsSecretSlot.proxy, value);
   @override
   Future<void> deleteApiKey() => writeApiKey('');
   @override
@@ -129,7 +136,8 @@ void main() {
   late List<Object?> notices;
 
   setUp(() async {
-    NativePlatformBridge.debugWindowsProcessStarter = (_, _) async => _ProbeProcess();
+    NativePlatformBridge.debugWindowsProcessStarter = (_, _) async =>
+        _ProbeProcess();
     addTearDown(() => NativePlatformBridge.debugWindowsProcessStarter = null);
     store = _ReplayStore();
     notices = [];
@@ -172,16 +180,18 @@ void main() {
     await controller.reloadSettings();
   }
 
-  test('C-P2-2 overlapping slider replay retains blocked composite key',
-      () async {
-    await queueBlockedComposite();
-    expect(controller.blockedReplayCount, 1);
-    expect(store.persisted.chunkSize, 70);
-    expect(store.persisted.apiKey, isNot('held-key'));
-    await controller.confirmBlockedConflictReplays();
-    expect(store.persisted.apiKey, 'held-key');
-    expect(controller.blockedReplayCount, 0);
-  });
+  test(
+    'C-P2-2 overlapping slider replay retains blocked composite key',
+    () async {
+      await queueBlockedComposite();
+      expect(controller.blockedReplayCount, 1);
+      expect(store.persisted.chunkSize, 70);
+      expect(store.persisted.apiKey, isNot('held-key'));
+      await controller.confirmBlockedConflictReplays();
+      expect(store.persisted.apiKey, 'held-key');
+      expect(controller.blockedReplayCount, 0);
+    },
+  );
 
   test('C-P2-3 normal key save retires an older failed key replay', () async {
     store.saveError = SettingsWriteConflict();
@@ -194,147 +204,167 @@ void main() {
     expect(store.persisted.apiKey, 'new-key');
   });
 
-  test('C-P2-4 new immediate edit invalidates an unprocessed replay member',
-      () async {
-    store.saveError = SettingsWriteConflict();
-    expect(await controller.setTargetLanguage('French'), isFalse);
-    expect(await controller.setOutputSuffix('_old'), isFalse);
-    store.saveError = null;
-    final gate = store.saveGate = Completer<void>();
-    final started = store.saveStarted = Completer<void>();
-    final reload = controller.reloadSettings();
-    await started.future;
-    final edit = controller.setOutputSuffix('_new');
-    gate.complete();
-    expect(await edit, isTrue);
-    await reload;
-    expect(controller.state.outputSuffix, '_new');
-    expect(store.persisted.outputSuffix, '_new');
-    store.attempts.clear();
-    await controller.reloadSettings();
-    expect(store.attempts, isEmpty);
-  });
+  test(
+    'C-P2-4 new immediate edit invalidates an unprocessed replay member',
+    () async {
+      store.saveError = SettingsWriteConflict();
+      expect(await controller.setTargetLanguage('French'), isFalse);
+      expect(await controller.setOutputSuffix('_old'), isFalse);
+      store.saveError = null;
+      final gate = store.saveGate = Completer<void>();
+      final started = store.saveStarted = Completer<void>();
+      final reload = controller.reloadSettings();
+      await started.future;
+      final edit = controller.setOutputSuffix('_new');
+      gate.complete();
+      expect(await edit, isTrue);
+      await reload;
+      expect(controller.state.outputSuffix, '_new');
+      expect(store.persisted.outputSuffix, '_new');
+      store.attempts.clear();
+      await controller.reloadSettings();
+      expect(store.attempts, isEmpty);
+    },
+  );
 
-  test('C-P2-5 reload observes failure of an already started slider flush',
-      () async {
-    final slider = controller.setChunkSize(60);
-    store.saveError = StateError('disk full');
-    final gate = store.saveGate = Completer<void>();
-    final started = store.saveStarted = Completer<void>();
-    final flush = controller.flushSliderChanges();
-    await started.future;
-    final loads = store.loads;
-    final reload = controller.reloadSettings();
-    gate.complete();
-    expect(await flush, isFalse);
-    expect(await reload, isFalse);
-    await slider;
-    expect(store.loads, loads);
-    expect(controller.state.chunkSize, 60);
-  });
+  test(
+    'C-P2-5 reload observes failure of an already started slider flush',
+    () async {
+      final slider = controller.setChunkSize(60);
+      store.saveError = StateError('disk full');
+      final gate = store.saveGate = Completer<void>();
+      final started = store.saveStarted = Completer<void>();
+      final flush = controller.flushSliderChanges();
+      await started.future;
+      final loads = store.loads;
+      final reload = controller.reloadSettings();
+      gate.complete();
+      expect(await flush, isFalse);
+      expect(await reload, isFalse);
+      await slider;
+      expect(store.loads, loads);
+      expect(controller.state.chunkSize, 60);
+    },
+  );
 
-  test('C-P2-6 ordinary recovery cancels discarded slider transformation',
-      () async {
-    final slider = controller.setChunkSize(60);
-    store.loadError = StateError('load failed');
-    expect(await controller.setOutputSuffix('_recovered'), isTrue);
-    await slider;
-    expect(await controller.flushSliderChanges(), isTrue);
-    expect(controller.state.chunkSize, TranslationConfig.defaults().chunkSize);
-    expect(store.persisted.chunkSize, controller.state.chunkSize);
-    expect(store.attempts, hasLength(1));
-  });
-
-  test('C-P2-7 endpoint edit waits for initial key and model snapshot',
-      () async {
-    final initialStore = _ReplayStore()
-      ..persisted = TranslationConfig.defaults().copyWith(
-        apiProviderSelection: ApiProviderSelection.custom,
-        apiKey: 'saved-custom-key',
-        customApiKey: 'saved-custom-key',
-        model: 'saved-model',
+  test(
+    'C-P2-6 ordinary recovery cancels discarded slider transformation',
+    () async {
+      final slider = controller.setChunkSize(60);
+      store.loadError = StateError('load failed');
+      expect(await controller.setOutputSuffix('_recovered'), isTrue);
+      await slider;
+      expect(await controller.flushSliderChanges(), isTrue);
+      expect(
+        controller.state.chunkSize,
+        TranslationConfig.defaults().chunkSize,
       );
-    final gate = initialStore.loadGate = Completer<void>();
-    final initialController = SettingsController(initialStore);
-    addTearDown(initialController.dispose);
-    final edit = initialController.setApiBaseUrl('https://custom.example/v1');
-    gate.complete();
-    expect(await edit, isTrue);
-    expect(initialStore.persisted.customApiKey, 'saved-custom-key');
-    expect(initialStore.persisted.apiKey, 'saved-custom-key');
-    expect(initialStore.persisted.customModel, 'saved-model');
-  });
+      expect(store.persisted.chunkSize, controller.state.chunkSize);
+      expect(store.attempts, hasLength(1));
+    },
+  );
 
-  test('C-P2-8 replay busy status covers the entire asynchronous save',
-      () async {
-    store.saveError = SettingsWriteConflict();
-    await controller.setApiKey('held-key');
-    store.saveError = null;
-    final gate = store.saveGate = Completer<void>();
-    final started = store.saveStarted = Completer<void>();
-    final replay = controller.confirmBlockedConflictReplays();
-    await started.future;
-    expect(controller.isReplayingConflictedEdits, isTrue);
-    gate.complete();
-    await replay;
-    expect(controller.isReplayingConflictedEdits, isFalse);
-  });
+  test(
+    'C-P2-7 endpoint edit waits for initial key and model snapshot',
+    () async {
+      final initialStore = _ReplayStore()
+        ..persisted = TranslationConfig.defaults().copyWith(
+          apiProviderSelection: ApiProviderSelection.custom,
+          apiKey: 'saved-custom-key',
+          customApiKey: 'saved-custom-key',
+          model: 'saved-model',
+        );
+      final gate = initialStore.loadGate = Completer<void>();
+      final initialController = SettingsController(initialStore);
+      addTearDown(initialController.dispose);
+      final edit = initialController.setApiBaseUrl('https://custom.example/v1');
+      gate.complete();
+      expect(await edit, isTrue);
+      expect(initialStore.persisted.customApiKey, 'saved-custom-key');
+      expect(initialStore.persisted.apiKey, 'saved-custom-key');
+      expect(initialStore.persisted.customModel, 'saved-model');
+    },
+  );
 
-  test('C-P2-9 older asynchronous success cannot clear a newer conflict',
-      () async {
-    store.saveError = SettingsWriteConflict();
-    final gate = store.saveGate = Completer<void>();
-    final started = store.saveStarted = Completer<void>();
-    final failing = controller.setOutputSuffix('_failed');
-    await started.future;
-    store.saveError = null;
-    final succeeding = controller.setTargetLanguage('French');
-    gate.complete();
-    expect(await failing, isFalse);
-    expect(await succeeding, isTrue);
-    expect(notices.last, isA<SettingsWriteConflict>());
-  });
+  test(
+    'C-P2-8 replay busy status covers the entire asynchronous save',
+    () async {
+      store.saveError = SettingsWriteConflict();
+      await controller.setApiKey('held-key');
+      store.saveError = null;
+      final gate = store.saveGate = Completer<void>();
+      final started = store.saveStarted = Completer<void>();
+      final replay = controller.confirmBlockedConflictReplays();
+      await started.future;
+      expect(controller.isReplayingConflictedEdits, isTrue);
+      gate.complete();
+      await replay;
+      expect(controller.isReplayingConflictedEdits, isFalse);
+    },
+  );
+
+  test(
+    'C-P2-9 older asynchronous success cannot clear a newer conflict',
+    () async {
+      store.saveError = SettingsWriteConflict();
+      final gate = store.saveGate = Completer<void>();
+      final started = store.saveStarted = Completer<void>();
+      final failing = controller.setOutputSuffix('_failed');
+      await started.future;
+      store.saveError = null;
+      final succeeding = controller.setTargetLanguage('French');
+      gate.complete();
+      expect(await failing, isFalse);
+      expect(await succeeding, isTrue);
+      expect(notices.last, isA<SettingsWriteConflict>());
+    },
+  );
 
   // C-07 invariant: even when an unrelated save's implicit retry actually
   // persists a previously failed key, the failure notice stays until the
   // user's explicit retry. (This test previously pinned the v1.6.26
   // regression where unrelated saves cleared the notice.)
-  test('C-P2-10 implicit secret persistence keeps the failure notice',
-      () async {
-    store.saveError = SettingsSecretSaveException({
-      SettingsSecretSlot.legacy: StateError('secret unavailable'),
-      SettingsSecretSlot.deepSeek: StateError('secret unavailable'),
-    });
-    expect(await controller.setApiKey('retry-key'), isFalse);
-    store.saveError = null;
-    expect(await controller.setOutputSuffix('_implicit'), isTrue);
-    // The implicit retry did persist the key...
-    expect(store.persisted.apiKey, 'retry-key');
-    // ...but the notice is not cleared by the unrelated save.
-    expect(notices.last, isNotNull);
-  });
+  test(
+    'C-P2-10 implicit secret persistence keeps the failure notice',
+    () async {
+      store.saveError = SettingsSecretSaveException({
+        SettingsSecretSlot.legacy: StateError('secret unavailable'),
+        SettingsSecretSlot.deepSeek: StateError('secret unavailable'),
+      });
+      expect(await controller.setApiKey('retry-key'), isFalse);
+      store.saveError = null;
+      expect(await controller.setOutputSuffix('_implicit'), isTrue);
+      // The implicit retry did persist the key...
+      expect(store.persisted.apiKey, 'retry-key');
+      // ...but the notice is not cleared by the unrelated save.
+      expect(notices.last, isNotNull);
+    },
+  );
 
   Future<ProviderContainer> showSettings(WidgetTester tester) async {
-    final container = ProviderContainer(overrides: [
-      settingsStoreProvider.overrideWithValue(store),
-    ]);
+    final container = ProviderContainer(
+      overrides: [settingsStoreProvider.overrideWithValue(store)],
+    );
     addTearDown(container.dispose);
     await container.read(settingsProvider.notifier).ready;
-    await tester.pumpWidget(UncontrolledProviderScope(
-      container: container,
-      child: const MaterialApp(home: Scaffold(body: SettingsPage())),
-    ));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+      ),
+    );
     await tester.pump();
     return container;
   }
 
   Finder action(String english, String chinese) => find.widgetWithText(
-        TextButton,
-        find.text(english).evaluate().isNotEmpty ? english : chinese,
-      );
+    TextButton,
+    find.text(english).evaluate().isNotEmpty ? english : chinese,
+  );
 
-  testWidgets('C-P2-8 Apply stays visible but disabled throughout replay',
-      (tester) async {
+  testWidgets('C-P2-8 Apply stays visible but disabled throughout replay', (
+    tester,
+  ) async {
     final container = await showSettings(tester);
     final uiController = container.read(settingsProvider.notifier);
     store.saveError = SettingsWriteConflict();
@@ -346,15 +376,18 @@ void main() {
     await tester.tap(action('Apply', '确认应用'));
     await tester.pump();
     expect(uiController.isReplayingConflictedEdits, isTrue);
-    expect(tester.widget<TextButton>(action('Apply', '确认应用')).onPressed,
-        isNull);
+    expect(
+      tester.widget<TextButton>(action('Apply', '确认应用')).onPressed,
+      isNull,
+    );
     gate.complete();
     await tester.pump();
     expect(uiController.isReplayingConflictedEdits, isFalse);
   });
 
-  testWidgets('C-P2-9 reload completion preserves a newer conflict event',
-      (tester) async {
+  testWidgets('C-P2-9 reload completion preserves a newer conflict event', (
+    tester,
+  ) async {
     final container = await showSettings(tester);
     container.read(settingsWriteConflictProvider.notifier).state = (id: 1);
     await tester.pump();
@@ -367,8 +400,9 @@ void main() {
     expect(container.read(settingsWriteConflictProvider)?.id, 2);
   });
 
-  testWidgets('C-P2-9 Apply completion preserves a newer blocked event',
-      (tester) async {
+  testWidgets('C-P2-9 Apply completion preserves a newer blocked event', (
+    tester,
+  ) async {
     final container = await showSettings(tester);
     final uiController = container.read(settingsProvider.notifier);
     store.saveError = SettingsWriteConflict();
@@ -385,8 +419,9 @@ void main() {
     expect(container.read(settingsReplayBlockedProvider)?.id, 2);
   });
 
-  testWidgets('C-P2-15 Discard disabled while replay in progress',
-      (tester) async {
+  testWidgets('C-P2-15 Discard disabled while replay in progress', (
+    tester,
+  ) async {
     final container = await showSettings(tester);
     final uiController = container.read(settingsProvider.notifier);
     store.saveError = SettingsWriteConflict();
@@ -394,25 +429,28 @@ void main() {
     store.saveError = null;
     container.read(settingsReplayBlockedProvider.notifier).state = (id: 1);
     await tester.pump();
-    expect(tester.widget<TextButton>(action('Discard', '放弃')).onPressed,
-        isNotNull);
+    expect(
+      tester.widget<TextButton>(action('Discard', '放弃')).onPressed,
+      isNotNull,
+    );
     final gate = store.saveGate = Completer<void>();
     await tester.tap(action('Apply', '确认应用'));
     await tester.pump();
     expect(container.read(settingsReplayInProgressProvider), isTrue);
     expect(action('Discard', '放弃'), findsOneWidget);
-    expect(tester.widget<TextButton>(action('Discard', '放弃')).onPressed,
-        isNull);
+    expect(
+      tester.widget<TextButton>(action('Discard', '放弃')).onPressed,
+      isNull,
+    );
     gate.complete();
     await tester.pump();
     expect(store.persisted.apiKey, 'held-key');
   });
 
-  testWidgets('C-P2-16 pre-existing error shown on page init',
-      (tester) async {
-    final container = ProviderContainer(overrides: [
-      settingsStoreProvider.overrideWithValue(store),
-    ]);
+  testWidgets('C-P2-16 pre-existing error shown on page init', (tester) async {
+    final container = ProviderContainer(
+      overrides: [settingsStoreProvider.overrideWithValue(store)],
+    );
     addTearDown(container.dispose);
     final uiController = container.read(settingsProvider.notifier);
     await uiController.ready;
@@ -421,37 +459,50 @@ void main() {
     final error = container.read(settingsSaveErrorProvider);
     expect(error, isNotNull);
     expect(error?.message, isNotNull);
-    await tester.pumpWidget(UncontrolledProviderScope(
-      container: container,
-      child: const MaterialApp(home: Scaffold(body: SettingsPage())),
-    ));
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Scaffold(body: SettingsPage())),
+      ),
+    );
     await tester.pump();
-    expect(find.descendant(
-      of: find.byType(SnackBar),
-      matching: find.text(error!.message!),
-    ), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(SnackBar),
+        matching: find.text(
+          container.read(appStringsProvider).settingsSaveFailed,
+        ),
+      ),
+      findsOneWidget,
+    );
   });
 
-  testWidgets('C-P2-16 pre-existing conflict shows fallback on page init',
-      (tester) async {
-    final container = ProviderContainer(overrides: [
-      settingsStoreProvider.overrideWithValue(store),
-    ]);
+  testWidgets('C-P2-16 pre-existing conflict shows fallback on page init', (
+    tester,
+  ) async {
+    final container = ProviderContainer(
+      overrides: [settingsStoreProvider.overrideWithValue(store)],
+    );
     addTearDown(container.dispose);
     await container.read(settingsProvider.notifier).ready;
     container.read(settingsWriteConflictProvider.notifier).state = (id: 1);
     expect(container.read(settingsSaveErrorProvider), isNull);
-    await tester.pumpWidget(UncontrolledProviderScope(
-      container: container,
-      child: const MaterialApp(home: Scaffold(body: SettingsPage())),
-    ));
-    await tester.pump();
-    expect(find.descendant(
-      of: find.byType(SnackBar),
-      matching: find.text(
-        'Settings failed to load or save earlier; review before editing.',
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: const MaterialApp(home: Scaffold(body: SettingsPage())),
       ),
-    ), findsOneWidget);
+    );
+    await tester.pump();
+    expect(
+      find.descendant(
+        of: find.byType(SnackBar),
+        matching: find.text(
+          'Settings changed in another instance; reload before editing.',
+        ),
+      ),
+      findsOneWidget,
+    );
   });
 
   testWidgets('C-P2-17 paused flushes text debounce', (tester) async {
@@ -464,8 +515,8 @@ void main() {
     // No elapsed pump: the 800ms text debounce has not fired.
     expect(container.read(settingsProvider).model, originalModel);
     expect(store.persisted.model, originalModel);
-    final observer = tester.state(find.byType(SettingsPage))
-        as WidgetsBindingObserver;
+    final observer =
+        tester.state(find.byType(SettingsPage)) as WidgetsBindingObserver;
     observer.didChangeAppLifecycleState(AppLifecycleState.paused);
     await tester.pump();
     expect(container.read(settingsProvider).model, 'background-model');
@@ -574,8 +625,10 @@ void main() {
       final recovered = await history.loadWithTombstone();
       expect(recovered.jobs, isEmpty);
       expect(recovered.clearedAt, clearedAt);
-      final backups = await root.list().where((entity) =>
-          entity.path.contains('job-history.json.bad-')).toList();
+      final backups = await root
+          .list()
+          .where((entity) => entity.path.contains('job-history.json.bad-'))
+          .toList();
       expect(backups, hasLength(1));
       expect(await File(backups.single.path).readAsBytes(), bytes);
 
@@ -612,8 +665,10 @@ void main() {
 
       await history.save([]);
 
-      final backups = await root.list().where((entity) =>
-          entity.path.contains('job-history.json.bad-')).toList();
+      final backups = await root
+          .list()
+          .where((entity) => entity.path.contains('job-history.json.bad-'))
+          .toList();
       expect(backups, hasLength(1));
       expect(await File(backups.single.path).readAsString(), raw);
       final persisted = jsonDecode(await file.readAsString()) as Map;
@@ -629,32 +684,46 @@ void main() {
       helperCalls++;
     }
 
-    final overhead = utf8.encode(NativePlatformBridge.macosSecretStoreCommand(
-      'epub-translator', 'api-key', '',
-    )).length;
+    final overhead = utf8
+        .encode(
+          NativePlatformBridge.macosSecretStoreCommand(
+            'epub-translator',
+            'api-key',
+            '',
+          ),
+        )
+        .length;
     for (final password in <String>[
       'x' * (4001 - overhead),
       '密' * 1400,
       r'\' * 2000,
     ]) {
       final command = NativePlatformBridge.macosSecretStoreCommand(
-        'epub-translator', 'api-key', password,
+        'epub-translator',
+        'api-key',
+        password,
       );
       expect(utf8.encode(command).length, greaterThan(4000));
       await expectLater(
         NativePlatformBridge.writeMacosSecretForTest(
-          'api-key', password, storeCommand: helper,
+          'api-key',
+          password,
+          storeCommand: helper,
         ),
-        throwsA(isA<StateError>().having(
-          (error) => error.message,
-          'message',
-          'Secret too long for macOS keychain write; refusing to overwrite.',
-        )),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            'Secret too long for macOS keychain write; refusing to overwrite.',
+          ),
+        ),
       );
       expect(helperCalls, 0);
     }
     await NativePlatformBridge.writeMacosSecretForTest(
-      'api-key', 'x' * (4000 - overhead), storeCommand: helper,
+      'api-key',
+      'x' * (4000 - overhead),
+      storeCommand: helper,
     );
     expect(helperCalls, 1);
   });
@@ -704,12 +773,16 @@ void main() {
     void capture(OutputEvent event) {
       if (event.level != Level.warning) return;
       warnings.addAll(event.lines);
-      if (event.lines.any((line) => line.contains(
-            'Credential version mismatch after late completion',
-          )) && !warned.isCompleted) {
+      if (event.lines.any(
+            (line) => line.contains(
+              'Credential version mismatch after late completion',
+            ),
+          ) &&
+          !warned.isCompleted) {
         warned.complete();
       }
     }
+
     Logger.addOutputListener(capture);
     addTearDown(() => Logger.removeOutputListener(capture));
     final saving = runZoned(
@@ -728,13 +801,16 @@ void main() {
         },
       ),
     );
-    final failed = expectLater(saving, throwsA(
-      isA<SettingsSecretSaveException>().having(
-        (error) => error.failures[SettingsSecretSlot.custom],
-        'custom timeout',
-        isA<TimeoutException>(),
+    final failed = expectLater(
+      saving,
+      throwsA(
+        isA<SettingsSecretSaveException>().having(
+          (error) => error.failures[SettingsSecretSlot.custom],
+          'custom timeout',
+          isA<TimeoutException>(),
+        ),
       ),
-    ));
+    );
     try {
       (await timeoutReady.future)();
       await failed;
@@ -751,41 +827,59 @@ void main() {
     expect(settings.lastPersistedSecretSlots, isEmpty);
   });
 
-  test('C-P2-12 partial secret failure updates lastPersistedSecretSlots',
-      () async {
-    final root = await Directory.systemTemp.createTemp('round14-c12-');
-    addTearDown(() => root.delete(recursive: true));
-    final secrets = _SecretStore();
-    final settings = SettingsStore(
-      settingsFileProvider: () async => File('${root.path}/settings.json'),
-      secretStore: secrets,
-    );
-    final config = await settings.load();
-    await settings.save(config, explicitSecretMutations:
-        SettingsSecretSlot.values.toSet());
-    expect(settings.lastPersistedSecretSlots,
-        unorderedEquals(SettingsSecretSlot.values));
-    secrets.failures.add(SettingsSecretSlot.custom);
-    await expectLater(settings.save(config.copyWith(
-      apiKey: 'saved-legacy',
-      deepseekApiKey: 'saved-deepseek',
-      customApiKey: 'failed-custom',
-      outputSuffix: '_partial',
-    )), throwsA(isA<SettingsSecretSaveException>().having(
-      (error) => error.failures.keys,
-      'failed slots',
-      unorderedEquals([SettingsSecretSlot.custom]),
-    )));
-    expect(settings.lastPersistedSecretSlots, unorderedEquals([
-      SettingsSecretSlot.legacy,
-      SettingsSecretSlot.deepSeek,
-    ]));
-    expect(secrets.values[SettingsSecretSlot.legacy], 'saved-legacy');
-    expect(secrets.values[SettingsSecretSlot.deepSeek], 'saved-deepseek');
-    expect(secrets.values[SettingsSecretSlot.custom], isNull);
-    final json = jsonDecode(await File('${root.path}/settings.json').readAsString()) as Map;
-    expect(json['outputSuffix'], '_partial');
-  });
+  test(
+    'C-P2-12 partial secret failure updates lastPersistedSecretSlots',
+    () async {
+      final root = await Directory.systemTemp.createTemp('round14-c12-');
+      addTearDown(() => root.delete(recursive: true));
+      final secrets = _SecretStore();
+      final settings = SettingsStore(
+        settingsFileProvider: () async => File('${root.path}/settings.json'),
+        secretStore: secrets,
+      );
+      final config = await settings.load();
+      await settings.save(
+        config,
+        explicitSecretMutations: SettingsSecretSlot.values.toSet(),
+      );
+      expect(
+        settings.lastPersistedSecretSlots,
+        unorderedEquals(SettingsSecretSlot.values),
+      );
+      secrets.failures.add(SettingsSecretSlot.custom);
+      await expectLater(
+        settings.save(
+          config.copyWith(
+            apiKey: 'saved-legacy',
+            deepseekApiKey: 'saved-deepseek',
+            customApiKey: 'failed-custom',
+            outputSuffix: '_partial',
+          ),
+        ),
+        throwsA(
+          isA<SettingsSecretSaveException>().having(
+            (error) => error.failures.keys,
+            'failed slots',
+            unorderedEquals([SettingsSecretSlot.custom]),
+          ),
+        ),
+      );
+      expect(
+        settings.lastPersistedSecretSlots,
+        unorderedEquals([
+          SettingsSecretSlot.legacy,
+          SettingsSecretSlot.deepSeek,
+        ]),
+      );
+      expect(secrets.values[SettingsSecretSlot.legacy], 'saved-legacy');
+      expect(secrets.values[SettingsSecretSlot.deepSeek], 'saved-deepseek');
+      expect(secrets.values[SettingsSecretSlot.custom], isNull);
+      final json =
+          jsonDecode(await File('${root.path}/settings.json').readAsString())
+              as Map;
+      expect(json['outputSuffix'], '_partial');
+    },
+  );
 
   test('C-P2-13 file lock normalizes dot-dot paths', () async {
     final root = await Directory.systemTemp.createTemp('round14-c13-');
@@ -846,15 +940,20 @@ void main() {
     await settings.load();
     expect(settings.didCorruptReset, isTrue);
     expect(settings.lastCorruptBackupPath, isNotNull);
-    expect(await File(settings.lastCorruptBackupPath!).readAsString(), '{broken');
+    expect(
+      await File(settings.lastCorruptBackupPath!).readAsString(),
+      '{broken',
+    );
     for (var i = 0; i < recent.length; i++) {
       expect(await recent[i].readAsString(), 'recent-$i');
     }
     for (var i = 0; i < old.length; i++) {
       expect(await old[i].exists(), i >= 2);
     }
-    final backups = await root.list().where((entry) =>
-        entry.path.contains('settings.json.bad-')).toList();
+    final backups = await root
+        .list()
+        .where((entry) => entry.path.contains('settings.json.bad-'))
+        .toList();
     expect(backups, hasLength(13));
   });
 
@@ -887,8 +986,11 @@ void main() {
       gate.complete();
       await replay;
     }
-    expect(blockedNotices, 0,
-        reason: 'A discarded item in the replay snapshot must be skipped.');
+    expect(
+      blockedNotices,
+      0,
+      reason: 'A discarded item in the replay snapshot must be skipped.',
+    );
     expect(store.attempts, hasLength(1));
     expect(store.persisted.outputSuffix, '_retained');
     expect(store.persisted.apiKey, isNot('discarded-key'));
@@ -982,14 +1084,17 @@ void main() {
     final file = File('${root.path}/job-history.json');
     final history = JobHistoryStore(historyFileProvider: () async => file);
     final entries = <Object?>[
-      null, 42, 'skip',
-      for (var i = 0; i < 35; i++) {
-        'id': 'job-$i',
-        'inputPath': '/book-$i.epub',
-        'fileName': '书$i \\" } ], ${'字' * 3000}',
-        'status': 'completed',
-        'createdAt': '2026-01-01T00:00:00.000Z',
-      },
+      null,
+      42,
+      'skip',
+      for (var i = 0; i < 35; i++)
+        {
+          'id': 'job-$i',
+          'inputPath': '/book-$i.epub',
+          'fileName': '书$i \\" } ], ${'字' * 3000}',
+          'status': 'completed',
+          'createdAt': '2026-01-01T00:00:00.000Z',
+        },
     ];
     final raw = jsonEncode(entries);
     final decoded = jsonDecode(raw) as List;
@@ -1029,13 +1134,21 @@ void main() {
         if (fail) throw StateError('launch failed');
         return _ProbeProcess();
       };
-      final queries = List.generate(20,
-          (_) => NativePlatformBridge.windowsLongPathsEnabled());
+      final queries = List.generate(
+        20,
+        (_) => NativePlatformBridge.windowsLongPathsEnabled(),
+      );
       expect(starts, 1);
       expect(queries.every((q) => identical(q, queries.first)), isTrue);
       gate.complete();
-      expect(await Future.wait(queries), List<bool?>.filled(20, fail ? null : true));
-      expect(await NativePlatformBridge.windowsLongPathsEnabled(), fail ? null : true);
+      expect(
+        await Future.wait(queries),
+        List<bool?>.filled(20, fail ? null : true),
+      );
+      expect(
+        await NativePlatformBridge.windowsLongPathsEnabled(),
+        fail ? null : true,
+      );
       expect(starts, 1, reason: 'completed outcomes remain cached');
     }
   });
@@ -1088,8 +1201,13 @@ void main() {
       final chinese = language == UiLanguage.chinese;
       final expected = chinese
           ? ['分块大小 1000 字符', '并发数 2', '超时 120 秒', '最多重试 3 次', '重试间隔 4 秒']
-          : ['Chunk size 1000 characters', 'Concurrency 2',
-              'Timeout 120 seconds', 'Maximum retries 3', 'Retry delay 4 seconds'];
+          : [
+              'Chunk size 1000 characters',
+              'Concurrency 2',
+              'Timeout 120 seconds',
+              'Maximum retries 3',
+              'Retry delay 4 seconds',
+            ];
       final samples = [1000.0, 2.0, 120.0, 3.0, 4.0];
       for (var i = 0; i < 5; i++) {
         final finder = sliders.at(i);
@@ -1104,8 +1222,10 @@ void main() {
           matching: find.byType(MergeSemantics),
         );
         expect(merged, findsOneWidget);
-        expect(find.descendant(of: merged, matching: find.byType(Semantics)),
-            findsWidgets);
+        expect(
+          find.descendant(of: merged, matching: find.byType(Semantics)),
+          findsWidgets,
+        );
         final node = tester.getSemantics(merged).getSemanticsData();
         expect(node.value, formatter(slider.value));
         expect(node.increasedValue, isNotEmpty);

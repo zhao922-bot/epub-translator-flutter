@@ -26,11 +26,7 @@ final settingsProvider =
           final notifier = ref.read(settingsSaveErrorProvider.notifier);
           if (error == null) {
             // Successful persist: clear any previous failure notice.
-            notifier.state = (
-              id: DateTime.now().microsecondsSinceEpoch,
-              message: null,
-              settingsFileLocked: false,
-            );
+            notifier.state = null;
             // A save that went through also resolves a pending write
             // conflict (the snapshot is fresh again).
             ref.read(settingsWriteConflictProvider.notifier).state = null;
@@ -326,7 +322,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   /// Slider setters are absolute and independent: retain just the latest
   /// setter per field, including no-op setters. Never nest closures per event.
-  final _debouncedSetters = <String, TranslationConfig Function(TranslationConfig)>{};
+  final _debouncedSetters =
+      <String, TranslationConfig Function(TranslationConfig)>{};
   TranslationConfig Function(TranslationConfig)? get _debouncedEdit {
     if (_debouncedSetters.isEmpty) return null;
     final setters = _debouncedSetters.values.toList(growable: false);
@@ -539,8 +536,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     final effectiveUpdate = debounced == null
         ? update
         : isConflictReplay
-            ? (TranslationConfig config) => debounced(update(config))
-            : (TranslationConfig config) => update(debounced(config));
+        ? (TranslationConfig config) => debounced(update(config))
+        : (TranslationConfig config) => update(debounced(config));
     // P2-#29: the swallowed slider transformation must also be applied to
     // the state being saved, not just recorded for replay — otherwise the
     // save persists the pre-slider value. Slider setters are absolute, so
@@ -692,11 +689,13 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       // notice: it stays until the user's explicit retry of that action.
       if (pendingEdit != null) {
         final fields = pendingEdit.changedFields;
-        _conflictedEdits.removeWhere((edit) =>
-            olderEdits.contains(edit) &&
-            !_isReplayBlockedByRouteChange(edit) &&
-            edit.credentialRoute.secretSlots.every(persisted.contains) &&
-            edit.changedFields.any(fields.contains));
+        _conflictedEdits.removeWhere(
+          (edit) =>
+              olderEdits.contains(edit) &&
+              !_isReplayBlockedByRouteChange(edit) &&
+              edit.credentialRoute.secretSlots.every(persisted.contains) &&
+              edit.changedFields.any(fields.contains),
+        );
       }
       if (mounted) {
         // Secret read status can change even when the displayed value doesn't.
