@@ -103,6 +103,9 @@ void main() {
         'CHECKPOINT 100=$bytesAt100 bytes; 600=${cache.bytes} bytes; largest=${cache.largestWrite} bytes',
       );
     },
+    // Complexity is asserted through bytes written, not disk throughput.
+    // Allow slow Windows CI disks to finish 600 durable checkpoints and reads.
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 
   test('failed save leaves the watermark at the durable head', () async {
