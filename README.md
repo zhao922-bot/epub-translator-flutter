@@ -9,14 +9,14 @@
 
 ## 下载安装
 
-当前版本：**1.6.35+51**。修复带中文释义的格言误报，拦截模型非译文回复，完善重试回退、旧缓存检查与逐块失败诊断。详见 [更新日志](CHANGELOG.md)。
+当前版本：**1.6.36+52**。修复格言标点本地化、公司名单小写品牌名导致的残留误报，并为失败日志补充经过脱敏的具体原因。详见 [更新日志](CHANGELOG.md)。
 
-安装包与校验值见 [v1.6.35 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.35)。
+安装包与校验值见 [v1.6.36 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.36)。
 
 | 平台 | 下载 | 说明 |
 |------|------|------|
-| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-flutter-v1.6.35-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-flutter-v1.6.35-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.6.35 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.35/epub-translator-v1.6.35-android.apk) | 沿用 v1.6.31–v1.6.34 发布签名，可覆盖升级；更早的旧签名版本需先备份设置与数据，再卸载并安装 |
+| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-flutter-v1.6.36-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-flutter-v1.6.36-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [v1.6.36 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-v1.6.36-android.apk) | 沿用 v1.6.31–v1.6.35 发布签名，可覆盖升级；更早的旧签名版本需先备份设置与数据，再卸载并安装 |
 
 > Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
 
@@ -71,7 +71,7 @@ flutter pub get
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 # 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
 # 可选 EXE 安装包：先安装 Inno Setup 6.3+ 并将 ISCC 加入 PATH
-ISCC /DAppVersion=1.6.35 tool\windows_installer.iss
+ISCC /DAppVersion=1.6.36 tool\windows_installer.iss
 flutter build apk --release       # 需配置 android/key.properties 签名
 ```
 
@@ -90,7 +90,7 @@ flutter build apk --release       # 需配置 android/key.properties 签名
 
 ## 开发验证
 
-v1.6.35 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：**2625 项测试通过、24 项环境／显式运行用例跳过、0 失败**，静态分析无问题。覆盖非译文回复拦截、格言释义、重试回退、逐块诊断、缓存复用、人工编辑、复杂 EPUB 导出和长书恢复。对用户提供的原书及译本离线核对 1124 块，定位 4 处误报和 2 处受影响正文；独立修正版通过残留规则检查，EPUBCheck 无新增问题，原书已有格式错误仍保留说明。本轮未调用付费模型接口；残留检查不等同于全书逐句语义校对。此前真实 API 翻译及性能验证记录见更新日志。
+v1.6.36 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：完整 Flutter 测试 2645 项通过、22 项环境／显式运行用例跳过、0 失败，静态分析无问题。覆盖格言标点本地化、公司名单、真实漏译拦截、缓存复用、日志脱敏及既有翻译流程。对最新实书译本离线核对 1124 块，确认两处残留警告为误报，修复后规则检查无警告。独立修正版保留现有译文，EPUBCheck 无新增问题，原书已有格式错误仍保留说明。本轮未调用付费模型接口；残留检查不等同于全书逐句语义校对。此前真实 API 翻译及性能验证记录见更新日志。
 
 ```powershell
 $env:LIVE_TRANSLATION_E2E='0'

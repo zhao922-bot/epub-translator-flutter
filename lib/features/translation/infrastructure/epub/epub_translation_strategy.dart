@@ -424,7 +424,7 @@ class _EpubTranslationStrategy {
             chapterPath: chapterPath ?? '',
             blockId: block.id,
             apiCounted: true,
-            reason: _degradationReason(error),
+            reason: _degradationReason(error, config),
           );
         }
         return batch.blocks
@@ -510,7 +510,7 @@ class _EpubTranslationStrategy {
             chapterPath: chapterPath ?? '',
             blockId: block.id,
             apiCounted: true,
-            reason: _degradationReason(error),
+            reason: _degradationReason(error, config),
           );
           AppLogger.warn(
             'Block ${block.id} kept its source text after repeated '
@@ -671,7 +671,7 @@ class _EpubTranslationStrategy {
         chapterPath: chapterPath ?? '',
         blockId: block.id,
         apiCounted: true,
-        reason: _degradationReason(lastError!),
+        reason: _degradationReason(lastError!, config),
         retainedPartialTranslation: usable != null,
       );
       return usable ?? block.sourceHtml;
@@ -771,12 +771,17 @@ class _EpubTranslationStrategy {
   /// degrades like a 413 (see _shouldDegradeSingle), so it gets its own
   /// `HTTP 400: ...` reason instead of a blank — aligned with the main
   /// block path, which reports its HTTP status the same way.
-  static String _degradationReason(Object error) {
+  static String _degradationReason(Object error, TranslationConfig config) {
     if (error is NonTranslationReplyException) {
       return 'Non-translation response rejected (model requested input or declined translation)';
     }
     if (_isQualityRejection(error)) {
-      return 'Residual quality check failed';
+      final detail = SensitiveText.redact(
+        error is FormatException ? error.message : error.toString(),
+        configuredApiKey: config.apiKey,
+      ).replaceAll(RegExp(r'\s+'), ' ').trim();
+      return 'Residual quality check failed: '
+          '${EpubChapterTranslator._truncateUtf16(detail, 240)}';
     }
     if (error is TranslationParseException) {
       return 'Invalid translation response format';
@@ -983,7 +988,7 @@ class _EpubTranslationStrategy {
                     chapterPath: reference.chapter.path,
                     blockId: reference.block.id,
                     apiCounted: true,
-                    reason: _degradationReason(singleError),
+                    reason: _degradationReason(singleError, config),
                   );
                   AppLogger.warn(
                     'Footnote ${reference.requestId} retained its source after ${singleError.runtimeType}.',
@@ -1016,7 +1021,7 @@ class _EpubTranslationStrategy {
                 chapterPath: reference.chapter.path,
                 blockId: reference.block.id,
                 apiCounted: true,
-                reason: _degradationReason(error),
+                reason: _degradationReason(error, config),
               );
               translatedById[reference.requestId] = reference.block.sourceHtml;
               AppLogger.warn(
@@ -1072,7 +1077,7 @@ class _EpubTranslationStrategy {
             chapterPath: reference.chapter.path,
             blockId: reference.block.id,
             apiCounted: true,
-            reason: _degradationReason(error),
+            reason: _degradationReason(error, config),
           );
           translatedById[reference.requestId] = reference.block.sourceHtml;
           AppLogger.warn(
@@ -1240,7 +1245,7 @@ class _EpubTranslationStrategy {
               chapterPath: reference.chapter.path,
               blockId: reference.block.id,
               apiCounted: true,
-              reason: _degradationReason(error),
+              reason: _degradationReason(error, config),
             );
             return {reference.requestId: reference.block.sourceHtml};
           }
@@ -1309,7 +1314,7 @@ class _EpubTranslationStrategy {
               chapterPath: requests.single.chapterPath,
               blockId: requests.single.block.id,
               apiCounted: apiCounted,
-              reason: _degradationReason(singleError),
+              reason: _degradationReason(singleError, config),
             );
             AppLogger.warn(
               'Protected block ${requests.single.block.id} retained its source after ${singleError.runtimeType}.',
@@ -1403,7 +1408,7 @@ class _EpubTranslationStrategy {
           chapterPath: requests.single.chapterPath,
           blockId: requests.single.block.id,
           apiCounted: apiCounted,
-          reason: _degradationReason(error),
+          reason: _degradationReason(error, config),
         );
         AppLogger.warn(
           'Protected block ${requests.single.block.id} retained its source after ${error.runtimeType} (HTTP ${error.response?.statusCode}).',
@@ -1434,7 +1439,7 @@ class _EpubTranslationStrategy {
               chapterPath: request.chapterPath,
               blockId: request.block.id,
               apiCounted: apiCounted,
-              reason: _degradationReason(error),
+              reason: _degradationReason(error, config),
             );
           }
           return <String, String>{

@@ -716,6 +716,11 @@ class TranslationQuality {
     }
     _clearMatchingInvertedIndexPersonNames(sourceDocument, translatedDocument);
     _clearRetainedProperNames(sourceDocument, translatedDocument);
+    _clearSourceOwnedCompanyLists(
+      sourceDocument,
+      translatedDocument,
+      targetLanguage: targetLanguage,
+    );
 
     final String? adjacentLowercaseWord = _findCjkAdjacentLowercaseWord(
       _stripSourceAuditedForeignTermsFromText(
@@ -1785,14 +1790,17 @@ class TranslationQuality {
     if (originals.length != outputs.length) return true;
     for (var index = 0; index < originals.length; index++) {
       final a = originals[index], b = outputs[index];
-      final phrase = _normalizedWorkTitleText(_normalizeText(a.text));
+      final phrase = _normalizedWorkTitleText(
+        _normalizedExplainedPhrase(a.text),
+      );
+      final translatedPhrase = _normalizedExplainedPhrase(b.text);
       if (a.children.isNotEmpty ||
           b.children.isNotEmpty ||
           phrase.length > 100 ||
           _englishWordCount(phrase) < 2 ||
           _englishWordCount(phrase) > 8 ||
           !RegExp(r"^[A-Za-zÀ-ɏ ,.'’\-]+$").hasMatch(phrase) ||
-          !RegExp(r"^[A-Za-zÀ-ɏ ,.'’\-]+$").hasMatch(_normalizeText(b.text)) ||
+          !RegExp(r"^[A-Za-zÀ-ɏ ,.'’\-]+$").hasMatch(translatedPhrase) ||
           a.localName != b.localName ||
           _taggedElementStructurePath(a) != _taggedElementStructurePath(b)) {
         continue;
@@ -1841,7 +1849,7 @@ class TranslationQuality {
           RegExp(r'[\u3400-\u9FFF]').allMatches(gloss).length < 2) {
         continue;
       }
-      if (phrase != _normalizedWorkTitleText(_normalizeText(b.text))) {
+      if (phrase != _normalizedWorkTitleText(translatedPhrase)) {
         return false;
       }
       a.text = '';
@@ -1849,6 +1857,12 @@ class TranslationQuality {
     }
     return true;
   }
+
+  // Chinese typesetting may localize punctuation while retaining the exact
+  // words of an explained quotation. This normalization is audit-only.
+  static String _normalizedExplainedPhrase(String text) => _normalizeText(
+    text,
+  ).replaceAll('。', '.').replaceAll('．', '.').replaceAll('，', ',');
 
   static bool _clearMatchingAuditedForeignTerms(
     Document sourceDocument,
@@ -2327,6 +2341,70 @@ class TranslationQuality {
     }
     final int wordCount = _englishWorkTitleWords(title).length;
     return wordCount <= 4 || !_looksLikeSentenceOrInstruction(title);
+  }
+
+  /// Recognize bounded, source-owned company/brand enumerations. A lowercase
+  /// brand between named companies is not a prose sentence. Require explicit
+  /// source context, at least three single-token names and two capitalized or
+  /// mixed-case anchors; exempt only the same ordered list in translated text.
+  static void _clearSourceOwnedCompanyLists(
+    Document source,
+    Document translated, {
+    required String targetLanguage,
+  }) {
+    final targets = _textNodes(translated);
+    if (!_hasTargetScript(
+      translated.body?.text ?? '',
+      targetLanguage: targetLanguage,
+    )) {
+      return;
+    }
+    const name = r"[A-Za-z][A-Za-z0-9'’\-]{1,39}";
+    final lists = RegExp(
+      r'\b(?:invested\s+in|(?:companies|brands|platforms|firms)'
+      r'(?:\s+(?:include|including|such\s+as|like|called|named))?)\s+'
+      '($name(?:\\s*,\\s*(?:and\\s+)?$name){2,7})'
+      r'(?=\s*(?:[,;.)]|$))',
+      caseSensitive: false,
+    );
+    for (final original in _textNodes(source)) {
+      for (final match in lists.allMatches(original.data).toList()) {
+        final list = match
+            .group(1)!
+            .replaceFirst(
+              RegExp(
+                r',\s*(?:and\s+)?(?:others|more|etc)$',
+                caseSensitive: false,
+              ),
+              '',
+            );
+        final names = list
+            .split(',')
+            .map(
+              (item) => item.trim().replaceFirst(
+                RegExp(r'^and\s+', caseSensitive: false),
+                '',
+              ),
+            )
+            .toList();
+        if (names.length < 3 ||
+            names.where((item) => RegExp(r'[A-Z]').hasMatch(item)).length < 2 ||
+            _looksLikeSentenceOrInstruction(names.join(' '))) {
+          continue;
+        }
+        final retained = RegExp(
+          r"(?<![A-Za-z0-9'’\-])" +
+              names.map(RegExp.escape).join(r'\s*[,，、]\s*(?:and\s+)?') +
+              r"(?![A-Za-z0-9'’\-]|\s+[A-Za-z])",
+        );
+        for (final target in targets) {
+          if (!retained.hasMatch(target.data)) continue;
+          target.data = target.data.replaceFirst(retained, ' ');
+          original.data = original.data.replaceFirst(list, ' ');
+          break;
+        }
+      }
+    }
   }
 
   static void _clearRetainedProperNames(
