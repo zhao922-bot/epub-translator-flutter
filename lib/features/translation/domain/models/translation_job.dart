@@ -51,7 +51,20 @@ class TranslationJob {
     this.styleProfileConfirmed = false,
     this.styleProfileEnabled,
     this.selectedChapterPaths,
+    this.apiUsage = const {},
+    this.qualityReportPath,
+    this.elapsedMilliseconds = 0,
+    this.reviewSuggestionCount = 0,
+    this.consistencyWarningCount = 0,
+    this.unreviewedBlockCount = 0,
   });
+
+  final Map<String, Object> apiUsage;
+  final String? qualityReportPath;
+  final int elapsedMilliseconds;
+  final int reviewSuggestionCount;
+  final int consistencyWarningCount;
+  final int unreviewedBlockCount;
 
   final String id;
   final String inputPath;
@@ -125,6 +138,14 @@ class TranslationJob {
       throw const FormatException('Translation job id is required.');
     }
     return TranslationJob(
+      apiUsage: _readUsage(json['apiUsage']),
+      qualityReportPath: _readNullableString(json['qualityReportPath']),
+      elapsedMilliseconds: _readNonNegativeInt(json['elapsedMilliseconds']),
+      reviewSuggestionCount: _readNonNegativeInt(json['reviewSuggestionCount']),
+      consistencyWarningCount: _readNonNegativeInt(
+        json['consistencyWarningCount'],
+      ),
+      unreviewedBlockCount: _readNonNegativeInt(json['unreviewedBlockCount']),
       id: id,
       inputPath: _readString(json['inputPath']),
       outputPath: _readString(json['outputPath']),
@@ -165,6 +186,12 @@ class TranslationJob {
   }
 
   TranslationJob copyWith({
+    Map<String, Object>? apiUsage,
+    Object? qualityReportPath = _unset,
+    int? elapsedMilliseconds,
+    int? reviewSuggestionCount,
+    int? consistencyWarningCount,
+    int? unreviewedBlockCount,
     String? id,
     String? inputPath,
     String? outputPath,
@@ -194,6 +221,16 @@ class TranslationJob {
     Object? selectedChapterPaths = _unset,
   }) {
     return TranslationJob(
+      apiUsage: apiUsage ?? this.apiUsage,
+      qualityReportPath: identical(qualityReportPath, _unset)
+          ? this.qualityReportPath
+          : qualityReportPath as String?,
+      elapsedMilliseconds: elapsedMilliseconds ?? this.elapsedMilliseconds,
+      reviewSuggestionCount:
+          reviewSuggestionCount ?? this.reviewSuggestionCount,
+      consistencyWarningCount:
+          consistencyWarningCount ?? this.consistencyWarningCount,
+      unreviewedBlockCount: unreviewedBlockCount ?? this.unreviewedBlockCount,
       id: id ?? this.id,
       inputPath: inputPath ?? this.inputPath,
       outputPath: outputPath ?? this.outputPath,
@@ -239,6 +276,12 @@ class TranslationJob {
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
+      if (apiUsage.isNotEmpty) 'apiUsage': apiUsage,
+      if (qualityReportPath != null) 'qualityReportPath': qualityReportPath,
+      'elapsedMilliseconds': elapsedMilliseconds,
+      'reviewSuggestionCount': reviewSuggestionCount,
+      'consistencyWarningCount': consistencyWarningCount,
+      'unreviewedBlockCount': unreviewedBlockCount,
       'id': id,
       'inputPath': inputPath,
       'outputPath': outputPath,
@@ -297,7 +340,7 @@ String? _readNullableString(Object? value) => value is String ? value : null;
 int _readNonNegativeInt(Object? value) {
   final int? parsed = switch (value) {
     int value => value,
-    double value => value.round(),
+    double value when value.isFinite => value.round(),
     String value => int.tryParse(value),
     _ => null,
   };
@@ -358,4 +401,42 @@ TranslationJobPhase _readPhase(
     return TranslationJobPhase.translation;
   }
   return TranslationJobPhase.inspection;
+}
+
+// History stores counters only, never arbitrary response data or credentials.
+Map<String, Object> _readUsage(Object? value) {
+  if (value is! Map) return const {};
+  const counters = [
+    'requests',
+    'errors',
+    'promptTokens',
+    'completionTokens',
+    'elapsedMs',
+    'usageReportedRequests',
+  ];
+  const kinds = [
+    'styleProfile',
+    'initialBookMemory',
+    'chapterMemory',
+    'translation',
+    'semanticReview',
+    'bookTitle',
+    'probe',
+  ];
+  return {
+    for (final key in counters)
+      if (value.containsKey(key)) key: _readNonNegativeInt(value[key]),
+    for (final key in [
+      'byKind',
+      'elapsedMsByKind',
+      'promptTokensByKind',
+      'completionTokensByKind',
+    ])
+      if (value[key] is Map)
+        key: <String, int>{
+          for (final kind in kinds)
+            if ((value[key] as Map).containsKey(kind))
+              kind: _readNonNegativeInt((value[key] as Map)[kind]),
+        },
+  };
 }

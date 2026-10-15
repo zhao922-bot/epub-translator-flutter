@@ -1,4 +1,6 @@
 import 'dart:math';
+import 'dart:convert';
+import 'package:crypto/crypto.dart';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -142,6 +144,8 @@ body.epub-translator-cjk [data-translation="true"] {
     Set<String> degradedBlockIds = const <String>{},
     String? translatedTitle,
     void Function(int completedChapters, int totalChapters)? onProgress,
+    Set<String> reviewChapterPaths = const {},
+    Map<String, Object?>? reviewSnapshots,
   }) async {
     void throwIfCancelled() {
       if (cancelToken?.isCancelled == true || (isCancelled?.call() ?? false)) {
@@ -151,12 +155,18 @@ body.epub-translator-cjk [data-translation="true"] {
 
     throwIfCancelled();
     final prepared = await EpubIsolateWorker.prepareWithProgress(
-      operation: _preparationOperation(chapters, config, degradedBlockIds),
+      operation: _preparationOperation(
+        chapters,
+        config,
+        degradedBlockIds,
+        reviewChapterPaths,
+      ),
       isCancelled: () =>
           cancelToken?.isCancelled == true || (isCancelled?.call() ?? false),
       onProgress: onProgress,
     );
     throwIfCancelled();
+    reviewSnapshots?.addAll(prepared.review);
     final bool committed;
     try {
       committed = await EpubIsolateWorker.writeTranslatedEpub(
@@ -191,21 +201,41 @@ body.epub-translator-cjk [data-translation="true"] {
   }
 
   // Construct the sendable closure in a scope without UI callbacks/tokens.
-  ({Map<String, String> html, Map<String, String> labels}) Function(
-    void Function(int, int),
-  )
+  ({
+    Map<String, String> html,
+    Map<String, String> labels,
+    Map<String, Object?> review,
+  })
+  Function(void Function(int, int))
   _preparationOperation(
     List<InspectedChapter> chapters,
     TranslationConfig config,
     Set<String> degradedBlockIds,
+    Set<String> reviewChapterPaths,
   ) => (reportProgress) {
     final ProperNameBookState properNameState =
         ProperNameNormalizer.bookState();
     final Map<String, String> translatedHtmlByPath = <String, String>{};
     final navigationLabelsByPath = <String, String>{};
+    final review = <String, Object?>{};
     int completedChapters = 0;
     reportProgress(0, chapters.length);
     for (final InspectedChapter chapter in chapters) {
+      if (reviewChapterPaths.contains(chapter.path) ||
+          (reviewChapterPaths.isNotEmpty && _isTocLikeChapter(chapter))) {
+        review[chapter.path] = {
+          'originalHtml': chapter.originalHtml,
+          'includeInTranslation': chapter.includeInTranslation,
+          'translations': {
+            for (final block in chapter.blocks)
+              if (block.translatedHtml != null) block.id: block.translatedHtml,
+          },
+          'countedNames': properNameState.countedNames.toList(),
+          'degraded': degradedBlockIds
+              .where((k) => k.startsWith('${chapter.path}\u0000'))
+              .toList(),
+        };
+      }
       if (!chapter.includeInTranslation) {
         reportProgress(++completedChapters, chapters.length);
         continue;
@@ -232,8 +262,35 @@ body.epub-translator-cjk [data-translation="true"] {
     // inside the isolate from the same decoded archive, so the whole book is
     // never loaded into the main isolate just to read three small XML files.
     _validateXmlReplacements(translatedHtmlByPath);
-    return (html: translatedHtmlByPath, labels: navigationLabelsByPath);
+    for (final e in review.entries) {
+      (e.value as Map<String, Object?>)['baseHtmlSha256'] = sha256
+          .convert(
+            utf8.encode(
+              translatedHtmlByPath[e.key] ??
+                  (e.value as Map)['originalHtml'] as String,
+            ),
+          )
+          .toString();
+    }
+    return (
+      html: translatedHtmlByPath,
+      labels: navigationLabelsByPath,
+      review: review,
+    );
   };
+
+  void synchronizeReviewNavigation(
+    Map<String, String> rendered,
+    List<InspectedChapter> chapters,
+    Map<String, String> labels,
+    TranslationConfig config,
+  ) => _synchronizeHtmlTocLabels(
+    rendered,
+    chapters,
+    labelsByPath: labels,
+    targetLanguage: config.targetLanguage,
+    bilingual: config.bilingual,
+  );
 
   String renderTranslatedChapter({
     required InspectedChapter chapter,

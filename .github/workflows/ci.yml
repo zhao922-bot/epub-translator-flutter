@@ -28,3 +28,26 @@ jobs:
 
       - name: Test
         run: flutter test --concurrency=2
+
+      - name: Setup Java for EPUBCheck
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Validate exported EPUBs
+        shell: pwsh
+        run: |
+          $checkerZip = Join-Path $env:RUNNER_TEMP 'epubcheck-5.4.0.zip'
+          Invoke-WebRequest 'https://github.com/w3c/epubcheck/releases/download/v5.4.0/epubcheck-5.4.0.zip' -OutFile $checkerZip
+          if ((Get-FileHash -LiteralPath $checkerZip -Algorithm SHA256).Hash -ne '33350C61038E71DFB3D45A76AED04BF5481E6D5500CB780F6E98DB8BBD15A28C') { throw 'EPUBCheck archive checksum mismatch' }
+          $checkerDir = Join-Path $env:RUNNER_TEMP 'epubcheck-tool'
+          Expand-Archive -LiteralPath $checkerZip -DestinationPath $checkerDir
+          $env:EPUBCHECK_OUTPUT_DIR = Join-Path $env:RUNNER_TEMP 'epub-export-fixtures'
+          flutter test test/epubcheck_export_fixture_test.dart
+          if ($LASTEXITCODE -ne 0) { throw 'Export fixture generation failed' }
+          $checkerJar = Join-Path $checkerDir 'epubcheck-5.4.0/epubcheck.jar'
+          foreach ($epub in Get-ChildItem -LiteralPath $env:EPUBCHECK_OUTPUT_DIR -Filter '*.epub') {
+            java -jar $checkerJar $epub.FullName --json ($epub.FullName + '.check.json')
+            if ($LASTEXITCODE -ne 0) { throw "EPUBCheck failed: $($epub.Name)" }
+          }

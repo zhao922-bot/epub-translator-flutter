@@ -15,6 +15,7 @@ class _EpubBookMemory {
     required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
     void Function()? throwIfCancelled,
+    bool useCache = true,
   }) async {
     throwIfCancelled?.call();
     final List<Map<String, String>> sourceChapters =
@@ -53,9 +54,16 @@ class _EpubBookMemory {
           'Prefer executable style rules over marketing labels. '
           'Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language. '
           'If evidence is thin, still provide a best-effort primaryGenre with confidence low. '
+          'Keep this profile compact: at most 4 translationConstraints and 3 avoid rules, each under 18 words. '
           'Do not wrap the JSON in markdown fences.',
       cancelToken: cancelToken,
       throwIfCancelled: throwIfCancelled,
+      cacheScope: [
+        for (final c in chapters)
+          if (c.includeInTranslation)
+            '${c.path}:${c.sourceIdentity?.sha256 ?? ''}',
+      ],
+      useCache: useCache,
     );
     return _parseStyleProfileResponse(jsonPayload);
   }
@@ -65,6 +73,8 @@ class _EpubBookMemory {
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
     CancelToken? cancelToken,
+    bool includeStyleProfile = true,
+    bool useCache = true,
   }) async {
     final List<Map<String, String>> sourceChapters =
         _initialMemorySourceChapters(chapters);
@@ -77,8 +87,10 @@ class _EpubBookMemory {
       'targetLanguage': config.targetLanguage,
       'styleProfileEnabled': config.styleProfileEnabled,
       'chapters': sourceChapters,
+      ...owner._run.sourceHints,
     };
-    final String styleProfilePrompt = config.styleProfileEnabled
+    final includeProfile = config.styleProfileEnabled && includeStyleProfile;
+    final String styleProfilePrompt = includeProfile
         ? ' Also return styleProfile as an object with keys: primaryGenre, secondaryGenres, tone, sentenceStyle, translationConstraints, avoid, confidence. primaryGenre should be a practical book type such as business nonfiction, science fiction, romance, historical fiction, literary fiction, mystery, fantasy, memoir, or self-help. secondaryGenres is a short string array. tone and sentenceStyle are short phrases. translationConstraints and avoid are short actionable string arrays for translators. confidence must be one of: high, medium, low. If evidence is weak, set confidence to low and keep constraints conservative. Prefer executable style rules over marketing labels. Never instruct translators to keep whole English quotations, dialogue, or epigraphs untranslated when the target language is not English; only proper names, work titles, URLs, and short technical terms may remain in the source language.'
         : ' Do not invent a styleProfile.';
     final Map<String, dynamic> jsonPayload = await requestJson(
@@ -86,8 +98,14 @@ class _EpubBookMemory {
       config: config,
       payload: payload,
       systemPrompt:
-          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${config.styleProfileEnabled ? ', styleProfile' : ''}. Keep bookSummary under 120 words. styleGuide is a short string array. glossary is an array of objects with source and target. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
+          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${includeProfile ? ', styleProfile' : ''}. Keep bookSummary under 80 words. styleGuide is at most 4 short rules. glossary is an array of at most 32 objects with source and target. Include repeated single-word surnames and brands from recurringNames as separate aliases, even when their longer names also appear. Keep each alias translation consistent with the full name. Prioritize recurringTerms (brands, places, character names and aliases) and choose one canonical target for each repeated entity. Each source must be an actual contiguous name, not slash-separated alternatives. Use relationshipEvidence to record family age/order in styleGuide; do not infer older/younger relatives from an unqualified English word. Do not invent medical diagnoses or choose a plant/object meaning unsupported by context. Preserve currency units, numbers, negation and emotional contrasts. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
       cancelToken: cancelToken,
+      cacheScope: [
+        for (final c in chapters)
+          if (c.includeInTranslation)
+            '${c.path}:${c.sourceIdentity?.sha256 ?? ''}',
+      ],
+      useCache: useCache,
     );
     final _BookMemory memory = _BookMemory.fromJson(jsonPayload);
     if (!config.styleProfileEnabled) {
@@ -153,8 +171,30 @@ class _EpubBookMemory {
     required String systemPrompt,
     CancelToken? cancelToken,
     void Function()? throwIfCancelled,
-  }) {
-    return owner._apiClient.runRetried<Map<String, dynamic>>(
+    List<String> cacheScope = const [],
+    bool useCache = true,
+  }) async {
+    final canCache =
+        useCache &&
+        (payload['kind'] == 'styleProfile' ||
+            payload['kind'] == 'initialBookMemory');
+    final key = TranslationArtifactCache.key(config, 'memory-json-v2', [
+      cacheScope,
+      systemPrompt,
+      payload,
+    ]);
+    throwIfCancelled?.call();
+    owner._run.throwIfCancelled();
+    if (canCache) {
+      final cached = await owner._artifactCache.read(key);
+      owner._run.throwIfCancelled();
+      if (cached != null &&
+          (payload['kind'] != 'styleProfile' ||
+              !_parseStyleProfileResponse(cached).isEmpty)) {
+        return cached;
+      }
+    }
+    final result = await owner._apiClient.runRetried<Map<String, dynamic>>(
       config: config,
       shouldRetry: TranslationApiClient.shouldRetryBatchError,
       cancelToken: cancelToken,
@@ -169,7 +209,7 @@ class _EpubBookMemory {
           data: <String, dynamic>{
             'model': config.model,
             'temperature': 0.1,
-            'max_tokens': 900,
+            'max_tokens': payload['kind'] == 'initialBookMemory' ? 2400 : 900,
             'messages': <Map<String, String>>[
               <String, String>{'role': 'system', 'content': systemPrompt},
               <String, String>{'role': 'user', 'content': jsonEncode(payload)},
@@ -181,6 +221,13 @@ class _EpubBookMemory {
         return owner._apiClient.decodeBatchJsonPayload(response.data);
       },
     );
+    if (canCache &&
+        (payload['kind'] != 'styleProfile' ||
+            !_parseStyleProfileResponse(result).isEmpty)) {
+      await owner._artifactCache.write(key, result);
+    }
+    owner._run.throwIfCancelled();
+    return result;
   }
 
   static const int _initialMemoryFrontMatterLimit = 2;
@@ -371,8 +418,16 @@ class _EpubBookMemory {
     );
     return excludedWords.hasMatch(fileName) ||
         excludedWords.hasMatch(normalizedTitle) ||
-        const ['_ind_', '_toc_', '_cop_', '_cvi_', '_tp_', '_ack_', '_ill_', '_ata_']
-            .any(normalizedPath.contains);
+        const [
+          '_ind_',
+          '_toc_',
+          '_cop_',
+          '_cvi_',
+          '_tp_',
+          '_ack_',
+          '_ill_',
+          '_ata_',
+        ].any(normalizedPath.contains);
   }
 
   static bool _isMeaningfulFrontMatter(InspectedChapter chapter) {
@@ -383,7 +438,8 @@ class _EpubBookMemory {
       caseSensitive: false,
     );
     final fileName = chapter.path.replaceAll('\\', '/').split('/').last;
-    return words.hasMatch(chapter.title) || words.hasMatch(fileName) ||
+    return words.hasMatch(chapter.title) ||
+        words.hasMatch(fileName) ||
         chapter.path.toLowerCase().contains('_prf_');
   }
 
@@ -751,7 +807,8 @@ class _BookMemory {
         trustedLocks: trustedLocks,
       ),
       styleProfile: styleProfile,
-      styleProfileConfirmed: trustedLocks && json['styleProfileConfirmed'] == true,
+      styleProfileConfirmed:
+          trustedLocks && json['styleProfileConfirmed'] == true,
     );
   }
 
@@ -861,20 +918,20 @@ class _BookMemory {
           if (source.isEmpty || target.isEmpty) {
             return null;
           }
-           // A model-declared locked:true is never trusted: only
-           // user-supplied locks (withLockedGlossary) and restored
-           // checkpoints (trustedLocks) may mark an entry locked. Otherwise
-           // a model lock could freeze a stale model term against the user's
-           // explicit lock.
-           return <String, String>{
-             'source': source,
-             'target': target,
-             if (trustedLocks &&
-                 (item['locked'] == true || item['locked'] == 'true'))
-               'locked': 'true',
-             if (int.tryParse('${item['lastUsed']}') != null)
-               'lastUsed': '${item['lastUsed']}',
-           };
+          // A model-declared locked:true is never trusted: only
+          // user-supplied locks (withLockedGlossary) and restored
+          // checkpoints (trustedLocks) may mark an entry locked. Otherwise
+          // a model lock could freeze a stale model term against the user's
+          // explicit lock.
+          return <String, String>{
+            'source': source,
+            'target': target,
+            if (trustedLocks &&
+                (item['locked'] == true || item['locked'] == 'true'))
+              'locked': 'true',
+            if (int.tryParse('${item['lastUsed']}') != null)
+              'lastUsed': '${item['lastUsed']}',
+          };
         })
         .whereType<Map<String, String>>()
         .toList(growable: false);
@@ -935,16 +992,23 @@ class _BookMemory {
       };
     }
     while (merged.length > _EpubBookMemory._memoryGlossaryLimit) {
-      final candidates = merged.entries.where((entry) => entry.value['locked'] != 'true').toList();
+      final candidates = merged.entries
+          .where((entry) => entry.value['locked'] != 'true')
+          .toList();
       // Locked entries are exempt even when the user locks more than 32 terms.
       if (candidates.isEmpty) break;
       candidates.sort((a, b) {
-        final age = int.parse(a.value['lastUsed']!).compareTo(int.parse(b.value['lastUsed']!));
+        final age = int.parse(
+          a.value['lastUsed']!,
+        ).compareTo(int.parse(b.value['lastUsed']!));
         return age != 0 ? age : a.key.compareTo(b.key);
       });
       final evicted = candidates.first;
       merged.remove(evicted.key);
-      AppLogger.warn('Rolling glossary LRU evicted: ${evicted.value['source']}', tag: 'book-memory');
+      AppLogger.warn(
+        'Rolling glossary LRU evicted: ${evicted.value['source']}',
+        tag: 'book-memory',
+      );
     }
     return merged.values.toList(growable: false);
   }
@@ -955,9 +1019,15 @@ class _BookMemory {
   _BookMemory withLockedGlossary(String mappings) {
     final locked = <Map<String, String>>[];
     for (final line in mappings.split('\n')) {
-      final match = RegExp(r'^\s*(.+?)\s*(?:=>|=|→|：|:)\s*(.+?)\s*$').firstMatch(line);
+      final match = RegExp(
+        r'^\s*(.+?)\s*(?:=>|=|→|：|:)\s*(.+?)\s*$',
+      ).firstMatch(line);
       if (match != null) {
-        locked.add({'source': match[1]!, 'target': match[2]!, 'locked': 'true'});
+        locked.add({
+          'source': match[1]!,
+          'target': match[2]!,
+          'locked': 'true',
+        });
       }
     }
     return copyWith(glossary: _mergeGlossary(glossary, locked));
@@ -1024,7 +1094,8 @@ class _ChapterMemory {
 /// memory envelope lives in currentChapter on this internal-only checkpoint.
 class _BookMemoryCheckpoint {
   _BookMemoryCheckpoint(this.cacheStore, this.jobKey, this.chunkSize);
-  static const historySchema = '${EpubChapterTranslator.qualityCacheSchemaVersion}:memory-history-v1';
+  static const historySchema =
+      '${EpubChapterTranslator.qualityCacheSchemaVersion}:memory-history-v1';
   final TranslationCacheStore cacheStore;
   final String jobKey;
   final int chunkSize;
@@ -1057,7 +1128,8 @@ class _BookMemoryCheckpoint {
       }
       final decoded = jsonDecode(state.currentChapter);
       if (decoded is! Map<String, dynamic> ||
-          (decoded['schema'] != EpubChapterTranslator.qualityCacheSchemaVersion &&
+          (decoded['schema'] !=
+                  EpubChapterTranslator.qualityCacheSchemaVersion &&
               decoded['schema'] != historySchema) ||
           decoded['chunkSize'] != chunkSize ||
           decoded['jobKey'] != jobKey ||
@@ -1090,9 +1162,13 @@ class _BookMemoryCheckpoint {
       }
       var rawTimeline = decoded['memoryTimeline'];
       final head = decoded['timelineHead'];
-      if ((decoded['schema'] == historySchema && decoded['timelineFormat'] != 1) ||
-          (decoded['schema'] != historySchema && decoded.containsKey('timelineFormat'))) {
-        throw const FormatException('Memory schema and history format mismatch.');
+      if ((decoded['schema'] == historySchema &&
+              decoded['timelineFormat'] != 1) ||
+          (decoded['schema'] != historySchema &&
+              decoded.containsKey('timelineFormat'))) {
+        throw const FormatException(
+          'Memory schema and history format mismatch.',
+        );
       }
       if (decoded.containsKey('timelineFormat') &&
           decoded['timelineFormat'] != 1) {
@@ -1275,7 +1351,8 @@ class _BookMemoryCheckpoint {
           // Old binaries must reject the new envelope rather than accepting
           // its latest memory without the positional history it references.
           'schema': schema == EpubChapterTranslator.qualityCacheSchemaVersion
-              ? historySchema : schema,
+              ? historySchema
+              : schema,
           'jobKey': jobKey,
           'chunkSize': chunkSize,
           'memory': memory.toJson(),
@@ -1322,14 +1399,25 @@ class _TranslationRequestBudget {
   static int estimateTokens(String value) =>
       (utf8.encode(value).length / bytesPerToken * conservativeFactor).ceil();
 
-  static ({int fixedTokens, int payloadTokens, int totalTokens}) forRequest(Map<String, dynamic> data) {
+  static ({int fixedTokens, int payloadTokens, int totalTokens}) forRequest(
+    Map<String, dynamic> data,
+  ) {
     final messages = data['messages'] as List<Map<String, String>>;
-    final fixed = messages.where((m) => m['role'] != 'user').map((m) => m['content'] ?? '').join('\n');
-    final payload = messages.where((m) => m['role'] == 'user').map((m) => m['content'] ?? '').join('\n');
+    final fixed = messages
+        .where((m) => m['role'] != 'user')
+        .map((m) => m['content'] ?? '')
+        .join('\n');
+    final payload = messages
+        .where((m) => m['role'] == 'user')
+        .map((m) => m['content'] ?? '')
+        .join('\n');
     final fixedTokens = estimateTokens(fixed);
     final payloadTokens = estimateTokens(payload);
-    return (fixedTokens: fixedTokens, payloadTokens: payloadTokens,
-      totalTokens: fixedTokens + payloadTokens);
+    return (
+      fixedTokens: fixedTokens,
+      payloadTokens: payloadTokens,
+      totalTokens: fixedTokens + payloadTokens,
+    );
   }
 
   static void apply(Map<String, dynamic> data) {
@@ -1339,8 +1427,10 @@ class _TranslationRequestBudget {
     // accounting fields are sent to OpenAI-compatible gateways. The model
     // output ceiling keeps a misestimated input from sending a max_tokens
     // value the provider rejects outright.
-    data['max_tokens'] =
-        min(_adaptiveCeiling(data), max(256, budget.totalTokens));
+    data['max_tokens'] = min(
+      _adaptiveCeiling(data),
+      max(256, budget.totalTokens),
+    );
   }
 
   /// Ceiling for [apply]: the default [maxOutputTokensCeiling] for normal
@@ -1417,8 +1507,7 @@ class _TranslationRequestBudget {
         if (slots is List) {
           final texts = <String>[
             for (final slot in slots)
-              if (slot is Map && slot['text'] is String)
-                slot['text'] as String,
+              if (slot is Map && slot['text'] is String) slot['text'] as String,
           ];
           if (texts.isNotEmpty) return texts.join('\n');
         }

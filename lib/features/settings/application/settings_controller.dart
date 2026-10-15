@@ -215,6 +215,27 @@ Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
     changed.add('lockedGlossary');
   }
   if (before.httpProxy != after.httpProxy) changed.add('httpProxy');
+  if (before.reasoningEffort != after.reasoningEffort) {
+    changed.add('reasoningEffort');
+  }
+  if (before.maxOutputTokens != after.maxOutputTokens) {
+    changed.add('maxOutputTokens');
+  }
+  if (before.retryIncompleteReviews != after.retryIncompleteReviews) {
+    changed.add('retryIncompleteReviews');
+  }
+  if (before.semanticQualityCheck != after.semanticQualityCheck) {
+    changed.add('semanticQualityCheck');
+  }
+  if (before.maxSemanticReviewRequests != after.maxSemanticReviewRequests) {
+    changed.add('maxSemanticReviewRequests');
+  }
+  if (before.semanticReviewScope != after.semanticReviewScope) {
+    changed.add('semanticReviewScope');
+  }
+  if (before.maxSemanticReviewTokens != after.maxSemanticReviewTokens) {
+    changed.add('maxSemanticReviewTokens');
+  }
   return changed;
 }
 
@@ -1157,6 +1178,31 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setStyleProfileEnabled(bool value) =>
       _update((config) => config.copyWith(styleProfileEnabled: value));
+
+  Future<void> setReasoningEffort(ModelReasoningEffort value) =>
+      _update((config) => config.copyWith(reasoningEffort: value));
+  Future<void> setMaxOutputTokens(double value) => _update(
+    (config) =>
+        config.copyWith(maxOutputTokens: value.round().clamp(512, 32768)),
+    debounceField: 'maxOutputTokens',
+  );
+  Future<void> setRetryIncompleteReviews(bool value) =>
+      _update((config) => config.copyWith(retryIncompleteReviews: value));
+  Future<void> setSemanticQualityCheck(bool value) =>
+      _update((config) => config.copyWith(semanticQualityCheck: value));
+  Future<void> setSemanticReviewScope(SemanticReviewScope value) =>
+      _update((config) => config.copyWith(semanticReviewScope: value));
+  Future<void> setMaxSemanticReviewTokens(double value) => _update(
+    (config) => config.copyWith(
+      maxSemanticReviewTokens: value.round().clamp(4000, 1024000),
+    ),
+    debounceField: 'maxSemanticReviewTokens',
+  );
+  Future<void> setMaxSemanticReviewRequests(double value) => _update(
+    (config) =>
+        config.copyWith(maxSemanticReviewRequests: value.round().clamp(1, 64)),
+    debounceField: 'maxSemanticReviewRequests',
+  );
 
   Future<void> setTextScale(double value) => _update(
     (config) => config.copyWith(textScale: value.clamp(0.9, 1.3)),

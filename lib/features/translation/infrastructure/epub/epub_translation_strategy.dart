@@ -147,7 +147,21 @@ class _EpubTranslationStrategy {
   }) async {
     final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
+    final Map<String, String> translatedById = <String, String>{};
     for (final ExtractedBlock block in batch.blocks) {
+      if (config.semanticQualityCheck) {
+        final draft = await owner._semanticReviewer.readDraft(
+          config,
+          chapterPath ?? '',
+          block,
+          batch.context,
+        );
+        owner._run.throwIfCancelled();
+        if (draft != null) {
+          translatedById[block.id] = draft;
+          continue;
+        }
+      }
       final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
         block.sourceHtml,
       );
@@ -165,7 +179,6 @@ class _EpubTranslationStrategy {
       htmlBlocks.add(block);
     }
 
-    final Map<String, String> translatedById = <String, String>{};
     if (htmlBlocks.isNotEmpty) {
       final List<String> translatedHtml = await translateHtmlBlockBatch(
         dio: dio,
@@ -175,7 +188,7 @@ class _EpubTranslationStrategy {
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
-        onValidated: onValidated,
+        onValidated: config.semanticQualityCheck ? null : onValidated,
       );
       for (int index = 0; index < htmlBlocks.length; index += 1) {
         translatedById[htmlBlocks[index].id] = translatedHtml[index];
@@ -191,9 +204,28 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           apiCounted: true,
-          onValidated: onValidated,
+          onValidated: config.semanticQualityCheck ? null : onValidated,
         ),
       );
+    }
+    if (config.semanticQualityCheck) {
+      await owner._semanticReviewer.review(
+        dio: dio,
+        config: config,
+        batch: batch,
+        translations: translatedById,
+        chapterPath: chapterPath ?? '',
+        cancelToken: cancelToken,
+      );
+      for (final block in batch.blocks) {
+        if (!owner._isDegradedBlock(
+              chapterPath: chapterPath ?? '',
+              blockId: block.id,
+            ) &&
+            !owner._run.isUnreviewed(chapterPath ?? '', block.id)) {
+          await onValidated?.call(block.id, translatedById[block.id]!);
+        }
+      }
     }
     return batch.blocks
         .map((ExtractedBlock block) => translatedById[block.id]!)
@@ -249,7 +281,7 @@ class _EpubTranslationStrategy {
               <String, String>{
                 'role': 'system',
                 'content':
-                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
+                    'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include read-only context before and after the requested blocks plus a compact bookMemory summary of earlier chapters. Use that context only for continuity, pronouns, tone, terminology, and paragraph flow. Reuse canonical bookMemory glossary targets for repeated names and brands; never alternate transliteration with paraphrases. Honor known family relationships; do not guess gender or older/younger status from unqualified English nouns. Choose ambiguous plant, object, historical and medical terms from context, without adding unsupported specificity. Translate only items in "blocks"; never include context items in the response. Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain the original "id" and the translated HTML in "html". Do not omit any block and keep the same order.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
               },
               <String, String>{'role': 'user', 'content': payload},
             ],
@@ -755,6 +787,79 @@ class _EpubTranslationStrategy {
   }
 
   Future<Map<String, String>> _translateFootnoteBatch({
+    required Dio dio,
+    required TranslationConfig config,
+    required FootnoteTranslationBatch batch,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    void Function()? onRequestAttempt,
+    Future<void> Function(String id, String html)? onValidated,
+  }) async {
+    if (!config.semanticQualityCheck) {
+      return _translateFootnoteBatchRaw(
+        dio: dio,
+        config: config,
+        batch: batch,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+        onRequestAttempt: onRequestAttempt,
+        onValidated: onValidated,
+      );
+    }
+    final translations = <String, String>{};
+    final pending = <FootnoteBlockReference>[];
+    for (final reference in batch.references) {
+      final draft = await owner._semanticReviewer.readDraft(
+        config,
+        reference.chapter.path,
+        reference.block,
+        batch.context,
+      );
+      owner._run.throwIfCancelled();
+      if (draft == null) {
+        pending.add(reference);
+      } else {
+        translations[reference.requestId] = draft;
+      }
+    }
+    if (pending.isNotEmpty) {
+      translations.addAll(
+        await _translateFootnoteBatchRaw(
+          dio: dio,
+          config: config,
+          batch: FootnoteTranslationBatch(pending, context: batch.context),
+          retryDelayOverride: retryDelayOverride,
+          cancelToken: cancelToken,
+          onRequestAttempt: onRequestAttempt,
+        ),
+      );
+    }
+    await owner._semanticReviewer.reviewFootnotes(
+      dio: dio,
+      config: config,
+      batch: batch,
+      translations: translations,
+      cancelToken: cancelToken,
+    );
+    for (final reference in batch.references) {
+      if (!owner._isDegradedBlock(
+            chapterPath: reference.chapter.path,
+            blockId: reference.block.id,
+          ) &&
+          !owner._run.isUnreviewed(
+            reference.chapter.path,
+            reference.block.id,
+          )) {
+        await onValidated?.call(
+          reference.requestId,
+          translations[reference.requestId]!,
+        );
+      }
+    }
+    return translations;
+  }
+
+  Future<Map<String, String>> _translateFootnoteBatchRaw({
     required Dio dio,
     required TranslationConfig config,
     required FootnoteTranslationBatch batch,
@@ -1488,8 +1593,7 @@ class _EpubTranslationStrategy {
               );
             }
             _validateIndividualSlotTranslation(
-              sourceText:
-                  request.template.slotTexts[slotIndexById[rawSlotId]!],
+              sourceText: request.template.slotTexts[slotIndexById[rawSlotId]!],
               translatedText: rawText,
               // Batch slots may carry HTML that the renderer escapes;
               // only the non-HTML wrapper checks apply here.
@@ -1934,8 +2038,7 @@ class _EpubTranslationStrategy {
   // P2-#8: also matches an unterminated comment (`<!-- note` with no
   // `-->`): the old pattern only caught closed comments, so an unclosed
   // one slipped through the wrapper checks.
-  static final RegExp _slotHtmlCommentPattern =
-      RegExp(r'<!--[\s\S]*?(-->|$)');
+  static final RegExp _slotHtmlCommentPattern = RegExp(r'<!--[\s\S]*?(-->|$)');
 
   static void _validateIndividualSlotTranslation({
     required String sourceText,

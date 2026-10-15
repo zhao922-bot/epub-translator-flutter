@@ -827,6 +827,12 @@ class TranslationDashboardController
       textScale: settingsConfig.textScale,
       lockedGlossary: settingsConfig.lockedGlossary,
       httpProxy: settingsConfig.httpProxy,
+      reasoningEffort: settingsConfig.reasoningEffort,
+      maxOutputTokens: settingsConfig.maxOutputTokens,
+      semanticQualityCheck: settingsConfig.semanticQualityCheck,
+      semanticReviewScope: settingsConfig.semanticReviewScope,
+      maxSemanticReviewTokens: settingsConfig.maxSemanticReviewTokens,
+      maxSemanticReviewRequests: settingsConfig.maxSemanticReviewRequests,
     );
     state = state.copyWith(
       config: nextConfig,
@@ -1656,6 +1662,8 @@ class TranslationDashboardController
           : null;
       final TranslationJob terminalJob = _translationHistoryJob(
         result.job.copyWith(
+          apiUsage: result.apiUsage,
+          qualityReportPath: result.qualityReportPath,
           // Exported results already report translation in the repository.
           // An explicit cacheRestoration result has not entered that phase
           // (e.g. a cache-only terminal path); do not invent a transition or

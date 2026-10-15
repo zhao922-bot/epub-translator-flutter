@@ -798,7 +798,10 @@ class TranslationQuality {
     final wordPattern = RegExp(r"[A-Za-z][A-Za-z'’\-]*|\d+");
     // Numbers and citation cues cannot exempt letters the tokenizer did not
     // consume. Check before every affirmative metadata branch.
-    if (RegExp(r'\p{L}', unicode: true).hasMatch(body.replaceAll(wordPattern, ''))) {
+    if (RegExp(
+      r'\p{L}',
+      unicode: true,
+    ).hasMatch(body.replaceAll(wordPattern, ''))) {
       return false;
     }
     final List<String> words = wordPattern

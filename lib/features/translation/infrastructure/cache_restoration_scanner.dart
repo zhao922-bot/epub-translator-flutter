@@ -107,6 +107,12 @@ class CacheRestorationScanner {
     required CacheKeyResolver cacheKeyFor,
     required void Function() throwIfCancelled,
     CacheRestorationProgressCallback? onProgress,
+    Future<bool> Function(
+      InspectedChapter chapter,
+      ExtractedBlock block,
+      String html,
+    )?
+    acceptCached,
     Future<void> Function(String chapterPath, Map<String, String> translations)?
     persistChapter,
   }) async {
@@ -233,7 +239,9 @@ class CacheRestorationScanner {
         }
       }
       final String cachedTranslation = translatedHtml?.trim() ?? '';
-      if (cachedTranslation.isNotEmpty) {
+      if (cachedTranslation.isNotEmpty &&
+          (acceptCached == null ||
+              await acceptCached(chapter, block, translatedHtml!))) {
         translationsByChapter.putIfAbsent(
           chapter.path,
           () => <String, String>{},

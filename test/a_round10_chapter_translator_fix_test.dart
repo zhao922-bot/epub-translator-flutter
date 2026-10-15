@@ -40,7 +40,12 @@ void main() {
           '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
       'book.opf':
           '<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Title</dc:title></metadata></package>',
-      for (final name in ['one.xhtml', 'notes-fn.xhtml', 'later.xhtml', 'last.xhtml'])
+      for (final name in [
+        'one.xhtml',
+        'notes-fn.xhtml',
+        'later.xhtml',
+        'last.xhtml',
+      ])
         name: '<html><body><p>Prose for $name</p></body></html>',
     };
     for (final entry in files.entries) {
@@ -48,16 +53,28 @@ void main() {
     }
     await File(input).writeAsBytes(ZipEncoder().encodeBytes(archive));
     chapters = [
-      for (final name in ['one.xhtml', 'notes-fn.xhtml', 'later.xhtml', 'last.xhtml'])
-        const EpubHtmlExtractor().inspectChapterBytes(
-          chapterPath: name,
-          bytes: utf8.encode(files[name]!),
-        ).copyWith(category: ChapterCategory.content, includeInTranslation: true),
+      for (final name in [
+        'one.xhtml',
+        'notes-fn.xhtml',
+        'later.xhtml',
+        'last.xhtml',
+      ])
+        const EpubHtmlExtractor()
+            .inspectChapterBytes(
+              chapterPath: name,
+              bytes: utf8.encode(files[name]!),
+            )
+            .copyWith(
+              category: ChapterCategory.content,
+              includeInTranslation: true,
+            ),
     ];
   });
   tearDown(() => temp.delete(recursive: true));
 
-  Future<void> run(_Cache cache, _Api api, {
+  Future<void> run(
+    _Cache cache,
+    _Api api, {
     TranslationStyleProfile? profile,
     List<InspectedChapter>? selected,
     List<String>? logs,
@@ -84,19 +101,27 @@ void main() {
     expect(blocks, isNotEmpty);
     for (final payload in blocks) {
       final memory = (payload['context'] as Map)['bookMemory'] as Map;
-      expect(memory['styleProfileConfirmed'], isTrue);
+      expect(memory.containsKey('styleProfileConfirmed'), isFalse);
+      expect(memory.containsKey('styleProfile'), isFalse);
       expect(jsonEncode(memory), isNot(contains('AUTO_STYLE')));
     }
     expect(api.systems.join(), isNot(contains('AUTO_STYLE')));
   });
 
-  test('A-P2-6 confirmed empty and automatic profiles have distinct cache keys', () {
-    final block = chapters.first.blocks.first;
-    String key(TranslationStyleProfile? profile) => EpubChapterTranslator.blockCacheKeyForTest(
-      config: config, block: block, chapterPath: 'one.xhtml', confirmedStyleProfile: profile,
-    );
-    expect(key(TranslationStyleProfile.empty), isNot(key(null)));
-  });
+  test(
+    'A-P2-6 confirmed empty and automatic profiles have distinct cache keys',
+    () {
+      final block = chapters.first.blocks.first;
+      String key(TranslationStyleProfile? profile) =>
+          EpubChapterTranslator.blockCacheKeyForTest(
+            config: config,
+            block: block,
+            chapterPath: 'one.xhtml',
+            confirmedStyleProfile: profile,
+          );
+      expect(key(TranslationStyleProfile.empty), isNot(key(null)));
+    },
+  );
 
   test('A-P2-7 restored footnote uses memory before its position', () async {
     final cache = _Cache();
@@ -104,8 +129,11 @@ void main() {
     cache.blocks.clear();
     final api = _Api();
     await run(cache, api);
-    final payload = api.payloads.singleWhere((p) =>
-      (p['blocks'] as List?)?.any((b) => '${b['id']}'.startsWith('f1:')) ?? false);
+    final payload = api.payloads.singleWhere(
+      (p) =>
+          (p['blocks'] as List?)?.any((b) => '${b['id']}'.startsWith('f1:')) ??
+          false,
+    );
     final memory = (payload['context'] as Map)['bookMemory'] as Map;
     final recent = memory['recentChapters'] as List;
     expect(recent.map((c) => c['path']), ['one.xhtml']);
@@ -130,21 +158,41 @@ void main() {
 
   test('A-P2-9 v17 invalidates the v15 block identity', () {
     final block = chapters.first.blocks.first;
-    String historicalKey(String schema) => sha256.convert(utf8.encode([
-      schema, EpubChapterTranslator.qualityCacheSchemaVersion,
-      const TranslationApiClient().normalizedBaseUrl(config.apiBaseUrl),
-      config.model.trim(), config.targetLanguage.trim(), config.lockedGlossary.trim(),
-      config.chunkSize, config.residualQualityCheck, config.styleProfileEnabled,
-      'none', 'test-book', 'one.xhtml', block.id, block.sourceHtml,
-    ].join('|'))).toString();
+    String historicalKey(String schema) => sha256
+        .convert(
+          utf8.encode(
+            [
+              schema,
+              EpubChapterTranslator.qualityCacheSchemaVersion,
+              const TranslationApiClient().normalizedBaseUrl(config.apiBaseUrl),
+              config.model.trim(),
+              config.targetLanguage.trim(),
+              config.lockedGlossary.trim(),
+              config.chunkSize,
+              config.residualQualityCheck,
+              config.styleProfileEnabled,
+              'none',
+              'test-book',
+              'one.xhtml',
+              block.id,
+              block.sourceHtml,
+            ].join('|'),
+          ),
+        )
+        .toString();
     final actual = EpubChapterTranslator.blockCacheKeyForTest(
-      config: config, block: block, chapterPath: 'one.xhtml',
+      config: config,
+      block: block,
+      chapterPath: 'one.xhtml',
     );
     expect(actual, historicalKey('v17-structure-repair'));
     expect(actual, isNot(historicalKey('v15-second-person-and-idiom')));
   });
 
-  for (final source in ['<p><em>First</em><b>Second</b><i>Third</i></p>', '<p>First</p>']) {
+  for (final source in [
+    '<p><em>First</em><b>Second</b><i>Third</i></p>',
+    '<p>First</p>',
+  ]) {
     test('A-P2-10 fallback code preserves standalone spaces for $source', () {
       final result = EpubChapterTranslator.lockHtmlStructureForTest(
         sourceHtml: source,
@@ -155,7 +203,10 @@ void main() {
   }
 
   for (final tag in ['script', 'style']) {
-    for (final source in ['<p>First</p>', '<p><em>First</em><b>Second</b></p>']) {
+    for (final source in [
+      '<p>First</p>',
+      '<p><em>First</em><b>Second</b></p>',
+    ]) {
       test('A-P2-11 extra $tag stays non-prose for $source', () {
         final result = EpubChapterTranslator.lockHtmlStructureForTest(
           sourceHtml: source,
@@ -168,17 +219,35 @@ void main() {
   }
 
   for (final failAll in [false, true]) {
-    test('A-P2-12 memory attempts include retries and failures ($failAll)', () async {
-      final api = _Api(retryMemory: true, failAllMemory: failAll);
-      final logs = <String>[];
-      await run(_Cache(), api, selected: [chapters.first, chapters.last], logs: logs);
-      expect(api.memoryAttempts, 4);
-      final report = logs.singleWhere((s) => s.contains('book memory') && s.contains('new blocks'));
-      expect(report, contains('across 4 requests'));
-      final duration = RegExp(r'book memory (\d+(?:\.\d+)?)(ms|s)').firstMatch(report)!;
-      final milliseconds = double.parse(duration[1]!) * (duration[2] == 's' ? 1000 : 1);
-      expect(milliseconds, greaterThanOrEqualTo(200), reason: 'All four attempts, including failures, take at least 60ms each.');
-    });
+    test(
+      'A-P2-12 memory attempts include retries and failures ($failAll)',
+      () async {
+        final api = _Api(retryMemory: true, failAllMemory: failAll);
+        final logs = <String>[];
+        await run(
+          _Cache(),
+          api,
+          selected: [chapters.first, chapters.last],
+          logs: logs,
+        );
+        expect(api.memoryAttempts, 4);
+        final report = logs.singleWhere(
+          (s) => s.contains('book memory') && s.contains('new blocks'),
+        );
+        expect(report, contains('across 4 requests'));
+        final duration = RegExp(
+          r'book memory (\d+(?:\.\d+)?)(ms|s)',
+        ).firstMatch(report)!;
+        final milliseconds =
+            double.parse(duration[1]!) * (duration[2] == 's' ? 1000 : 1);
+        expect(
+          milliseconds,
+          greaterThanOrEqualTo(200),
+          reason:
+              'All four attempts, including failures, take at least 60ms each.',
+        );
+      },
+    );
   }
 }
 
@@ -188,21 +257,30 @@ class _Cache extends TranslationCacheStore with MemoryHistoryCache {
   @override
   Future<String?> getBlockTranslation(String key) async => blocks[key];
   @override
-  Future<void> putBlockTranslation(String key, String html) async { blocks[key] = html; }
+  Future<void> putBlockTranslation(String key, String html) async {
+    blocks[key] = html;
+  }
+
   @override
   Future<JobResumeState?> loadJobState(String key) async => states[key];
   @override
-  Future<void> saveJobState(JobResumeState state) async { states[state.jobKey] = state; }
+  Future<void> saveJobState(JobResumeState state) async {
+    states[state.jobKey] = state;
+  }
 
   void rewriteMemory(void Function(Map<String, dynamic>) rewrite) {
     for (final entry in states.entries.toList()) {
       if (!entry.value.currentChapter.startsWith('{')) continue;
-      var memory = jsonDecode(entry.value.currentChapter) as Map<String, dynamic>;
-      if (memory.containsKey('timelineFormat')) memory = expandMemoryState(memory);
+      var memory =
+          jsonDecode(entry.value.currentChapter) as Map<String, dynamic>;
+      if (memory.containsKey('timelineFormat')) {
+        memory = expandMemoryState(memory);
+      }
       if (!memory.containsKey('memoryTimeline')) continue;
       rewrite(memory);
       states[entry.key] = JobResumeState.fromJson({
-        ...entry.value.toJson(), 'currentChapter': jsonEncode(memory),
+        ...entry.value.toJson(),
+        'currentChapter': jsonEncode(memory),
       });
     }
   }
@@ -211,12 +289,20 @@ class _Cache extends TranslationCacheStore with MemoryHistoryCache {
 class _Repacker extends EpubRepacker {
   @override
   Future<void> writeTranslatedEpub({
-    required String inputPath, required String outputFilePath,
-    required TranslationConfig config, required List<InspectedChapter> chapters,
-    CancelToken? cancelToken, bool Function()? isCancelled,
-    Set<String> degradedBlockIds = const {}, String? translatedTitle,
+    Set<String> reviewChapterPaths = const {},
+    Map<String, Object?>? reviewSnapshots,
+    required String inputPath,
+    required String outputFilePath,
+    required TranslationConfig config,
+    required List<InspectedChapter> chapters,
+    CancelToken? cancelToken,
+    bool Function()? isCancelled,
+    Set<String> degradedBlockIds = const {},
+    String? translatedTitle,
     void Function(int, int)? onProgress,
-  }) async { await File(outputFilePath).writeAsString('output'); }
+  }) async {
+    await File(outputFilePath).writeAsString('output');
+  }
 }
 
 class _Api extends TranslationApiClient {
@@ -229,18 +315,28 @@ class _Api extends TranslationApiClient {
 
   @override
   Future<T> runRetried<T>({
-    required TranslationConfig config, required Future<T> Function() operation,
-    bool Function(Object)? shouldRetry, Duration? retryDelayOverride,
-    CancelToken? cancelToken, int? maxAttemptsOverride, void Function()? throwIfCancelled,
+    required TranslationConfig config,
+    required Future<T> Function() operation,
+    bool Function(Object)? shouldRetry,
+    Duration? retryDelayOverride,
+    CancelToken? cancelToken,
+    int? maxAttemptsOverride,
+    void Function()? throwIfCancelled,
   }) => super.runRetried(
-    config: config, operation: operation, shouldRetry: shouldRetry,
-    retryDelayOverride: Duration.zero, cancelToken: cancelToken,
-    maxAttemptsOverride: maxAttemptsOverride, throwIfCancelled: throwIfCancelled,
+    config: config,
+    operation: operation,
+    shouldRetry: shouldRetry,
+    retryDelayOverride: Duration.zero,
+    cancelToken: cancelToken,
+    maxAttemptsOverride: maxAttemptsOverride,
+    throwIfCancelled: throwIfCancelled,
   );
 
   @override
   Future<Response<dynamic>> postChatCompletions({
-    required Dio dio, required Map<String, dynamic> data, CancelToken? cancelToken,
+    required Dio dio,
+    required Map<String, dynamic> data,
+    CancelToken? cancelToken,
   }) async {
     final messages = data['messages'] as List;
     systems.add(messages.first['content'] as String);
@@ -249,25 +345,49 @@ class _Api extends TranslationApiClient {
     if (user.startsWith('{')) {
       final payload = jsonDecode(user) as Map<String, dynamic>;
       payloads.add(payload);
-      if (payload['kind'] == 'initialBookMemory' || payload['kind'] == 'chapterMemory') {
+      if (payload['kind'] == 'initialBookMemory' ||
+          payload['kind'] == 'chapterMemory') {
         memoryAttempts++;
-        if (retryMemory) await Future<void>.delayed(const Duration(milliseconds: 60));
-        if (retryMemory && (failAllMemory || memoryAttempts.isOdd)) {
-          throw DioException(requestOptions: RequestOptions(), type: DioExceptionType.connectionTimeout);
+        if (retryMemory) {
+          await Future<void>.delayed(const Duration(milliseconds: 60));
         }
-        reply = payload['kind'] == 'initialBookMemory' ? {
-          'bookSummary': 'Initial context',
-          'styleProfile': {'primaryGenre': 'AUTO_STYLE', 'confidence': 'high'},
-        } : {'title': 'Chapter', 'summary': 'Chapter summary', 'glossary': []};
+        if (retryMemory && (failAllMemory || memoryAttempts.isOdd)) {
+          throw DioException(
+            requestOptions: RequestOptions(),
+            type: DioExceptionType.connectionTimeout,
+          );
+        }
+        reply = payload['kind'] == 'initialBookMemory'
+            ? {
+                'bookSummary': 'Initial context',
+                'styleProfile': {
+                  'primaryGenre': 'AUTO_STYLE',
+                  'confidence': 'high',
+                },
+              }
+            : {
+                'title': 'Chapter',
+                'summary': 'Chapter summary',
+                'glossary': [],
+              };
       } else {
-        reply = {'blocks': [
-          for (final block in payload['blocks'] as List)
-            {'id': block['id'], 'html': '<p>译文</p>'},
-        ]};
+        reply = {
+          'blocks': [
+            for (final block in payload['blocks'] as List)
+              {'id': block['id'], 'html': '<p>译文</p>'},
+          ],
+        };
       }
     }
-    return Response(requestOptions: RequestOptions(), data: {
-      'choices': [{'message': {'content': reply is String ? reply : jsonEncode(reply)}}],
-    });
+    return Response(
+      requestOptions: RequestOptions(),
+      data: {
+        'choices': [
+          {
+            'message': {'content': reply is String ? reply : jsonEncode(reply)},
+          },
+        ],
+      },
+    );
   }
 }

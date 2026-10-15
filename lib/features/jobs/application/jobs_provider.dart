@@ -39,6 +39,9 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
       .map(
         (TranslationJob job) => JobSummary(
           id: job.id,
+          apiUsage: job.apiUsage,
+          qualityReportPath: job.qualityReportPath,
+          elapsedMilliseconds: job.elapsedMilliseconds,
           title: path.basename(job.inputPath),
           status: job.status,
           progressLabel: _progressLabel(job, strings),

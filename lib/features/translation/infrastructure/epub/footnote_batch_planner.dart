@@ -42,7 +42,9 @@ class FootnoteBatchPlanner {
     // exceeds chunkSize. Mirrors TranslationBatchPlanner's fixed overhead.
     final int sharedContextOverhead =
         batchChapterTitle.length +
-        TranslationBatchPlanner.serializedJsonSize(bookMemory);
+        TranslationBatchPlanner.serializedJsonSize(
+          promptBookMemory(bookMemory),
+        );
 
     // Keep original indices (checkpoint/cache request IDs depend on them),
     // but visit only this run, never the rest of the book. Empty entries keep
@@ -74,7 +76,12 @@ class FootnoteBatchPlanner {
         final int blockBudget = batchPlanner.blockBudgetFor(block);
         final bool exceedsBudget =
             current.isNotEmpty &&
-            currentBudget + blockBudget + sharedContextOverhead >
+            currentBudget +
+                    blockBudget +
+                    min(
+                      sharedContextOverhead,
+                      safeChunkSize - safeChunkSize ~/ 2,
+                    ) >
                 safeChunkSize;
         final bool reachedReferenceLimit =
             current.isNotEmpty && current.length >= safeMaxReferences;

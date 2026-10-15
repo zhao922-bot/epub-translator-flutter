@@ -10,6 +10,7 @@ import 'package:html/dom.dart' as dom;
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/io/atomic_file_writer.dart';
 import '../../../../shared/logging/app_logger.dart';
 import '../../../../shared/platform/native_platform_bridge.dart';
 import '../../../../shared/security/sensitive_text.dart';
@@ -34,8 +35,13 @@ import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
 import 'epub_semantics.dart';
+import 'book_source_index.dart';
 import 'epub_xml_characters.dart';
 import 'translation_api_client.dart';
+import 'translation_artifact_cache.dart';
+import 'translation_consistency_checker.dart';
+import 'review_text_patch.dart';
+import 'review_evidence_validator.dart';
 import 'cancellable_fingerprint.dart';
 import 'translation_batch_planner.dart';
 import 'translation_progress_persistence.dart';
@@ -44,12 +50,23 @@ import 'translation_work_queue.dart';
 
 part 'epub_book_memory.dart';
 part 'epub_translation_strategy.dart';
+part 'epub_semantic_reviewer.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
 ///
 /// ZIP inspect/repack live in [EpubInspector] / [EpubRepacker]. HTTP details in
 /// [TranslationApiClient]; batch sizing/context in [TranslationBatchPlanner].
 class EpubChapterTranslator {
+  /// Revalidate a user-selected suggestion before creating a reviewed EPUB.
+  static String validateReviewSuggestion({
+    required TranslationConfig config,
+    required ExtractedBlock block,
+    required String translatedHtml,
+  }) => _lockAndValidateTranslatedBlock(
+    config: config,
+    block: block,
+    translatedHtml: translatedHtml,
+  );
   EpubChapterTranslator({
     TranslationCacheStore? cacheStore,
     EpubRepacker? repacker,
@@ -129,6 +146,21 @@ class EpubChapterTranslator {
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
   late final _EpubBookMemory _memory = _EpubBookMemory(this);
+  late final TranslationArtifactCache _artifactCache = TranslationArtifactCache(
+    _cacheStore,
+  );
+  late final _EpubSemanticReviewer _semanticReviewer = _EpubSemanticReviewer(
+    this,
+  );
+  ({String identity, TranslationApiMetrics usage})? _pendingStyleUsage;
+
+  String _styleUsageIdentity(
+    TranslationConfig config,
+    List<InspectedChapter> chapters,
+  ) => TranslationArtifactCache.key(config, 'style-usage', [
+    for (final c in chapters)
+      if (c.includeInTranslation) [c.path, c.sourceIdentity?.sha256],
+  ]);
   late final _EpubTranslationStrategy _strategy = _EpubTranslationStrategy(
     this,
   );
@@ -187,8 +219,7 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion =
-      'v18-prefixed-text-protection';
+  static const String qualityCacheSchemaVersion = 'v19-book-terms-context';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
@@ -771,6 +802,7 @@ class EpubChapterTranslator {
       dio: dio,
       config: config,
       chapters: chapters,
+      useCache: false,
     )).toJson();
   }
 
@@ -795,13 +827,21 @@ class EpubChapterTranslator {
       await validateInspectedSource(chapters);
       run.throwIfCancelled();
       dio = _apiClient.buildDio(config);
-      return await _invocation(run)._memory.generateStyleProfile(
+      final profile = await _invocation(run)._memory.generateStyleProfile(
         dio: dio,
         config: config,
         chapters: chapters,
         cancelToken: run.cancelToken,
         throwIfCancelled: run.throwIfCancelled,
       );
+      final identity = _styleUsageIdentity(config, chapters);
+      final usage = TranslationApiMetrics()..add(_apiClient.metricsFor(dio));
+      final previous = _pendingStyleUsage;
+      if (previous != null && previous.identity == identity) {
+        usage.add(previous.usage);
+      }
+      _pendingStyleUsage = (identity: identity, usage: usage);
+      return profile;
     } finally {
       // Fresh Dio per call (own HttpClient pool); close it so sockets/FDs
       // do not accumulate across runs.
@@ -830,6 +870,7 @@ class EpubChapterTranslator {
         chapters: chapters,
         cancelToken: run.cancelToken,
         throwIfCancelled: run.throwIfCancelled,
+        useCache: false,
       );
     } finally {
       run.dispose();
@@ -880,6 +921,12 @@ class EpubChapterTranslator {
       isCancelled: isCancelled,
     );
     final EpubChapterTranslator invocation = _invocation(run);
+    final styleUsage = _pendingStyleUsage;
+    _pendingStyleUsage = null;
+    if (styleUsage != null &&
+        styleUsage.identity == _styleUsageIdentity(config, chapters)) {
+      run.styleMetrics.add(styleUsage.usage);
+    }
     invocation._rateLimitConfig = config;
     _run = run;
     run.watchCancellation();
@@ -925,6 +972,7 @@ class EpubChapterTranslator {
     // closed in the finally below so sockets/FDs do not accumulate (see M7).
     late final Dio dio;
     bool dioReady = false;
+    TranslationJob? lastProgressJob;
     final sourceSpool = ChapterSourceSpool();
     final cacheSpool = CacheRestorationSpool();
     final invocationChapters = chapters;
@@ -1098,6 +1146,7 @@ class EpubChapterTranslator {
         chapters: selectedChapters,
         confirmedStyleProfile: userStyleProfile,
       );
+      _run.cacheSourceIdentity = inputFingerprint;
       JobResumeState? previousState;
       bool unreadableResumeState = false;
       final memoryCheckpoint = _BookMemoryCheckpoint(
@@ -1150,7 +1199,20 @@ class EpubChapterTranslator {
       );
 
       void emit(TranslationJob job, String logLine) {
+        job = job.copyWith(
+          apiUsage: dioReady
+              ? (TranslationApiMetrics()
+                      ..add(_apiClient.metricsFor(dio))
+                      ..add(_run.styleMetrics))
+                    .toJson()
+              : const {},
+          elapsedMilliseconds: translationStopwatch.elapsedMilliseconds,
+          reviewSuggestionCount: _run.semanticCorrections.length,
+          unreviewedBlockCount: _run.semanticUnreviewed.length,
+          consistencyWarningCount: _run.consistencyFindings.length,
+        );
         currentJob = job;
+        lastProgressJob = job;
         try {
           onProgress?.call(job, logLine);
         } catch (error) {
@@ -1230,6 +1292,35 @@ class EpubChapterTranslator {
         emit(currentJob, s.runLogCheckpointUnreadable);
       }
 
+      _run.sourceHints = BookSourceIndex.build(selectedChapters);
+      if (config.semanticQualityCheck) {
+        for (final chapter in selectedChapters) {
+          final seen = <String>{};
+          for (var index = 0; index < chapter.blocks.length; index++) {
+            final block = chapter.blocks[index];
+            _run.semanticEvidence.add(
+              block.sourceText,
+              before: index > 0 ? chapter.blocks[index - 1].sourceText : '',
+              after: index + 1 < chapter.blocks.length
+                  ? chapter.blocks[index + 1].sourceText
+                  : '',
+            );
+            // Audit a bounded sample of distinct substantial paragraphs, even
+            // without a deterministic risk flag. Repeated boilerplate is free.
+            if (seen.length < 4096 &&
+                block.sourceText.length >= 120 &&
+                seen.add(block.sourceText) &&
+                seen.length % 8 == 0) {
+              _run.semanticAuditSamples.add(
+                EpubRepacker.degradedKeyForBlock(
+                  chapterPath: chapter.path,
+                  blockId: block.id,
+                ),
+              );
+            }
+          }
+        }
+      }
       emit(
         currentJob,
         s.runLogRestoringCache(selectedChapters.length, totalBlocks),
@@ -1243,6 +1334,14 @@ class EpubChapterTranslator {
           ).scan(
             chapters: selectedChapters,
             persistChapter: cacheSpool.save,
+            acceptCached: config.semanticQualityCheck
+                ? (chapter, block, html) => _semanticReviewer.restore(
+                    config,
+                    chapter.path,
+                    block,
+                    html,
+                  )
+                : null,
             cacheKeyFor: (InspectedChapter chapter, ExtractedBlock block) =>
                 _blockCacheKey(
                   config,
@@ -1452,6 +1551,7 @@ class EpubChapterTranslator {
               config: config,
               chapters: chapters,
               cancelToken: cancelToken,
+              includeStyleProfile: userStyleProfile == null,
             ),
           );
           bookMemory = userStyleProfile == null
@@ -2090,7 +2190,16 @@ class EpubChapterTranslator {
               final List<String> translatedBatch = timedBatch.translatedBlocks;
               chapterApiElapsed += timedBatch.elapsed;
               totalApiElapsed += timedBatch.elapsed;
-              chapterApiBlocks += batch.blocks.length;
+              chapterApiBlocks += batch.blocks
+                  .where(
+                    (block) => !_run.reusedDraftBlocks.contains(
+                      EpubRepacker.degradedKeyForBlock(
+                        chapterPath: chapter.path,
+                        blockId: block.id,
+                      ),
+                    ),
+                  )
+                  .length;
               apiTranslatedBlocks += batch.blocks.length;
               emit(
                 currentJob.copyWith(
@@ -2397,6 +2506,7 @@ class EpubChapterTranslator {
               dio: dio,
               config: config,
               originalTitle: originalTitle,
+              inputFingerprint: inputFingerprint,
               cancelToken: cancelToken,
             );
           } catch (error) {
@@ -2416,7 +2526,12 @@ class EpubChapterTranslator {
           }
         }
       }
+      final reviewSnapshots = <String, Object?>{};
       await _repacker.writeTranslatedEpub(
+        reviewSnapshots: reviewSnapshots,
+        reviewChapterPaths: config.semanticQualityCheck
+            ? selectedChapters.map((c) => c.path).toSet()
+            : const {},
         inputPath: inputPath,
         outputFilePath: outputFilePath,
         config: config,
@@ -2440,13 +2555,31 @@ class EpubChapterTranslator {
 
       final bool allBlocksDegraded =
           totalBlocks > 0 && degradedBlockCount >= totalBlocks;
-      final bool hasWarnings = degradedBlockCount > 0 || titleTranslationFailed;
+      final bool hasWarnings =
+          degradedBlockCount > 0 ||
+          titleTranslationFailed ||
+          _run.semanticUnreviewed.isNotEmpty ||
+          _run.semanticCorrections.isNotEmpty ||
+          _run.consistencyFindings.isNotEmpty;
       final TranslationJobStatus terminalStatus = allBlocksDegraded
           ? TranslationJobStatus.failed
           : hasWarnings
           ? TranslationJobStatus.completedWithWarnings
           : TranslationJobStatus.completed;
+      final apiUsage =
+          (TranslationApiMetrics()
+                ..add(_apiClient.metricsFor(dio))
+                ..add(_run.styleMetrics))
+              .toJson();
       final TranslationJob terminalJob = currentJob.copyWith(
+        apiUsage: apiUsage,
+        elapsedMilliseconds: translationStopwatch.elapsedMilliseconds,
+        qualityReportPath: config.semanticQualityCheck
+            ? "$outputFilePath.quality.json"
+            : null,
+        reviewSuggestionCount: _run.semanticCorrections.length,
+        consistencyWarningCount: _run.consistencyFindings.length,
+        unreviewedBlockCount: _run.semanticUnreviewed.length,
         status: terminalStatus,
         phase: TranslationJobPhase.translation,
         progress: 1,
@@ -2479,6 +2612,10 @@ class EpubChapterTranslator {
       committedResult = TranslationRunResult(
         job: terminalJob,
         chapters: updatedChapters,
+        apiUsage: apiUsage,
+        qualityReportPath: config.semanticQualityCheck
+            ? '$outputFilePath.quality.json'
+            : null,
       );
       emit(
         terminalJob,
@@ -2492,14 +2629,86 @@ class EpubChapterTranslator {
         terminalJob,
         s.runLogRepackPerformance(_formatDuration(repackStopwatch.elapsed)),
       );
+      final usage = committedResult.apiUsage;
+      emit(
+        terminalJob,
+        s.isChinese
+            ? 'API 全流程统计：${usage['requests']} 次请求，${_apiRequestBreakdown(usage)}；输入 ${usage['promptTokens']} / 输出 ${usage['completionTokens']} tokens；累计请求耗时 ${usage['elapsedMs']}ms（含风格、记忆、正文、复核、书名及重试）。'
+            : 'API totals: ${jsonEncode(usage)} (style, memory, body, review, title and retries).',
+      );
+      if (config.semanticQualityCheck) {
+        emit(
+          terminalJob,
+          s.isChinese
+              ? '语义复核：${_run.semanticRequests} 次请求，${_run.semanticCorrections.length} 条待确认建议，${_run.semanticUnreviewed.length} 个文本块未完成复核。报告：$outputFilePath.quality.json'
+              : 'Semantic review: ${_run.semanticRequests} requests, ${_run.semanticCorrections.length} suggestions awaiting approval, ${_run.semanticUnreviewed.length} unreviewed blocks. Report: $outputFilePath.quality.json',
+        );
+        try {
+          await writeFileAtomically(
+            File('$outputFilePath.quality.json'),
+            const JsonEncoder.withIndent('  ').convert({
+              'version': 2,
+              'outputPath': outputFilePath,
+              'reviewScope': config.semanticReviewScope.name,
+              'reservedTokens': _run.semanticReservedTokens,
+              'tokenLimit': config.maxSemanticReviewTokens,
+              'reviewedBlocks': _run.semanticReviewed.length,
+              'skippedLowRiskBlocks': _run.semanticSkipped.length,
+              'findings': [
+                for (final e in _run.consistencyFindings.entries)
+                  {'block': e.key.replaceAll('\u0000', ':'), 'checks': e.value},
+              ],
+              'rendering': {
+                'completeSnapshot': true,
+                'bilingual': config.bilingual,
+                'targetLanguage': config.targetLanguage,
+                'lockedGlossary': config.lockedGlossary,
+                'residualQualityCheck': config.residualQualityCheck,
+                'chapters': reviewSnapshots,
+              },
+              'complete':
+                  _run.semanticUnreviewed.isEmpty && _degradedBlocks.isEmpty,
+              'degradedBlocks': _degradedBlocks
+                  .map((id) => id.replaceAll('\u0000', ':'))
+                  .toList(),
+              'requests': _run.semanticRequests,
+              'requestLimit': config.maxSemanticReviewRequests,
+              'corrections': _run.semanticCorrections,
+              'auditSampleBlocks': _run.semanticAuditSamples.length,
+              'draftReusedBlocks': _run.reusedDraftBlocks.length,
+              'unreviewedReasons': {
+                for (final e in _run.semanticUnreviewedReasons.entries)
+                  e.key.replaceAll('\u0000', ':'): e.value,
+              },
+              'unreviewed': _run.semanticUnreviewed
+                  .map((id) => id.replaceAll('\u0000', ':'))
+                  .toList(),
+              'apiUsage': usage,
+            }),
+          );
+        } catch (error) {
+          AppLogger.warn(
+            'Quality report write failed (${error.runtimeType}).',
+            tag: 'translate',
+          );
+        }
+      }
       // Degraded blocks kept their source text (they were billed but not
       // translated), so they must not be counted as "translated" blocks in
       // the performance report.
       final int genuinelyTranslatedBlocks =
-          (apiTranslatedBlocks - _apiDegradedBlocks).clamp(
-            0,
-            apiTranslatedBlocks,
-          );
+          (apiTranslatedBlocks -
+                  _apiDegradedBlocks -
+                  _run.reusedDraftBlocks.length)
+              .clamp(0, apiTranslatedBlocks);
+      if (_run.reusedDraftBlocks.isNotEmpty) {
+        emit(
+          terminalJob,
+          s.isChinese
+              ? '复用已有草稿 ${_run.reusedDraftBlocks.length} 块；这些块仅补做复核，不计为新翻译。'
+              : 'Reused ${_run.reusedDraftBlocks.length} existing drafts for review; excluded from newly translated blocks.',
+        );
+      }
       emit(
         terminalJob,
         s.runLogFinalPerformance(
@@ -2548,6 +2757,24 @@ class EpubChapterTranslator {
           tag: 'translate',
         );
         return done;
+      }
+      if (dioReady && lastProgressJob != null) {
+        try {
+          onProgress?.call(
+            lastProgressJob!.copyWith(
+              apiUsage:
+                  (TranslationApiMetrics()
+                        ..add(_apiClient.metricsFor(dio))
+                        ..add(_run.styleMetrics))
+                      .toJson(),
+            ),
+            config.uiLanguage == UiLanguage.chinese
+                ? '任务已中断；已完成请求计入用量统计。'
+                : 'Run interrupted; completed requests are included in usage.',
+          );
+        } catch (_) {
+          /* Preserve the original interruption. */
+        }
       }
       if (error is TranslationCancelledException) {
         rethrow;
@@ -4155,10 +4382,25 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required String originalTitle,
+    String inputFingerprint = '',
     CancelToken? cancelToken,
   }) async {
     if (titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
       return null;
+    }
+    final key = TranslationArtifactCache.key(config, 'book-title-v2', [
+      inputFingerprint,
+      originalTitle,
+    ]);
+    final cached = await _artifactCache.read(key);
+    if (cached?['title'] case final String title) {
+      try {
+        final clean = _cleanBookTitle(title, checkHtmlTags: false);
+        validateEpubXmlCharacters(clean);
+        return clean == originalTitle.trim() ? null : clean;
+      } on FormatException {
+        /* A corrupt semantic value is a cache miss. */
+      }
     }
     final Map<String, dynamic> requestData = <String, dynamic>{
       'model': config.model,
@@ -4182,6 +4424,7 @@ class EpubChapterTranslator {
       checkHtmlTags: false,
     );
     validateEpubXmlCharacters(translated);
+    await _artifactCache.write(key, {'title': translated});
     if (translated == originalTitle.trim()) {
       return null;
     }
@@ -4194,6 +4437,24 @@ class EpubChapterTranslator {
       return collapsed;
     }
     return '${collapsed.substring(0, 69)}...';
+  }
+
+  static String _apiRequestBreakdown(Map<String, Object> usage) {
+    const labels = {
+      'styleProfile': '风格',
+      'initialBookMemory': '初始记忆',
+      'chapterMemory': '章节记忆',
+      'translation': '正文',
+      'semanticReview': '语义复核',
+      'bookTitle': '书名',
+      'probe': '连接测试',
+    };
+    final byKind = usage['byKind'] as Map;
+    return byKind.isEmpty
+        ? '全部缓存命中'
+        : byKind.entries
+              .map((e) => '${labels[e.key] ?? e.key} ${e.value} 次')
+              .join('，');
   }
 
   String _safeErrorText(Object error, TranslationConfig config) {
@@ -4571,6 +4832,19 @@ class EpubChapterTranslator {
               config.bilingual,
               config.lockedGlossary.trim(),
               config.residualQualityCheck,
+              if (config.effectiveReasoningEffort != null ||
+                  config.maxOutputTokens != 8192 ||
+                  config.semanticQualityCheck) ...[
+                config.effectiveReasoningEffort ?? 'provider-default',
+                config.maxOutputTokens,
+                config.semanticQualityCheck,
+              ],
+              if (config.semanticQualityCheck) ...[
+                config.maxSemanticReviewRequests,
+                config.maxSemanticReviewTokens,
+                config.semanticReviewScope.name,
+                "semantic-suggestions-v2",
+              ],
               config.styleProfileEnabled,
               _styleProfileCacheValue(confirmedStyleProfile),
               chapters
@@ -4602,6 +4876,17 @@ class EpubChapterTranslator {
               config.lockedGlossary.trim(),
               config.chunkSize,
               config.residualQualityCheck,
+              if (config.effectiveReasoningEffort != null ||
+                  config.maxOutputTokens != 8192 ||
+                  config.semanticQualityCheck) ...[
+                config.effectiveReasoningEffort ?? 'provider-default',
+                config.maxOutputTokens,
+                config.semanticQualityCheck,
+              ],
+              if (config.semanticQualityCheck) ...[
+                'semantic-suggestions-v2',
+                config.semanticReviewScope.name,
+              ],
               config.styleProfileEnabled,
               _styleProfileCacheValue(confirmedStyleProfile),
               inputFingerprint,

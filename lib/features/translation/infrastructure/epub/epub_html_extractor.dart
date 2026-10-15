@@ -116,12 +116,49 @@ class EpubHtmlExtractor {
                 'h3',
               })?.text.trim().replaceAll(RegExp(r'\s+'), ' ') ??
               path.basenameWithoutExtension(chapterPath);
-    final ChapterCategory category = categorizeChapter(chapterPath, title);
+    var category = categorizeChapter(chapterPath, title);
     final List<ExtractedBlock> blocks = extractBlocks(
       document,
       chapterPath: chapterPath,
       detectAuthorSignatures: category == ChapterCategory.frontMatter,
     );
+    // Gutenberg filenames are opaque. Match dedicated publication pages,
+    // never arbitrary mentions of copyright/license in a story or textbook.
+    final firstText = blocks.isEmpty ? '' : blocks.first.sourceText.trim();
+    // Some editions keep the header and the whole novel in one spine item.
+    // The START marker separates that mixed item from a header-only page.
+    final startMarker = blocks.indexWhere(
+      (block) => RegExp(
+        r'^\*{3}\s*start of (?:the )?project gutenberg ebook\b',
+        caseSensitive: false,
+      ).hasMatch(block.sourceText.trim()),
+    );
+    final hasBodyAfterHeader =
+        startMarker >= 0 &&
+        blocks
+            .skip(startMarker + 1)
+            .takeWhile(
+              (block) => !RegExp(
+                r'^\*{3}\s*end of (?:the )?project gutenberg ebook\b',
+                caseSensitive: false,
+              ).hasMatch(block.sourceText.trim()),
+            )
+            .any((block) => block.sourceText.trim().isNotEmpty);
+    if (RegExp(
+          r'^the full project gutenberg[™®]? license$',
+          caseSensitive: false,
+        ).hasMatch(title.trim()) ||
+        (!hasBodyAfterHeader &&
+            RegExp(
+              r'^the project gutenberg ebook of ',
+              caseSensitive: false,
+            ).hasMatch(firstText)) ||
+        RegExp(
+          r'^\*{3}\s*end of (?:the )?project gutenberg ebook\b',
+          caseSensitive: false,
+        ).hasMatch(firstText)) {
+      category = ChapterCategory.ancillary;
+    }
     final String bodyText = limitPreviewText(
       blocks.isNotEmpty
           ? blocks

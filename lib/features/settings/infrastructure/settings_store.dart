@@ -222,16 +222,15 @@ class SettingsStore {
   /// slot. The record lets a stale operation's watcher wait for the newer
   /// one to fully settle (snapshot updated) before repairing, so the repair
   /// always targets the final value (P1-#4).
-  final Map<SettingsSecretSlot, _InflightCredentialOp>
-  _inflightCredentialOps = <SettingsSecretSlot, _InflightCredentialOp>{};
+  final Map<SettingsSecretSlot, _InflightCredentialOp> _inflightCredentialOps =
+      <SettingsSecretSlot, _InflightCredentialOp>{};
 
   /// Secret slots actually persisted by the most recent [_saveSecrets] call,
   /// as opposed to skipped as unreadable. Lets the settings controller's
   /// conflict-replay drop only entries that really landed (P2-#27): a key
   /// entry skipped because its slot read failed must stay queued even when
   /// a later non-credential save succeeds.
-  Set<SettingsSecretSlot> _lastPersistedSecretSlots =
-      <SettingsSecretSlot>{};
+  Set<SettingsSecretSlot> _lastPersistedSecretSlots = <SettingsSecretSlot>{};
 
   /// Slots persisted by the last [_saveSecrets] call. Lets the settings
   /// controller's conflict-replay drop only queue entries whose secret
@@ -665,9 +664,7 @@ class SettingsStore {
       if (now.difference(modified).inSeconds < 60) continue;
       backups.add((file: f, modified: modified));
     }
-    backups.sort(
-      (a, b) => a.modified.compareTo(b.modified),
-    );
+    backups.sort((a, b) => a.modified.compareTo(b.modified));
     for (int i = 0; i + _maxCorruptBackups < backups.length; i++) {
       try {
         await backups[i].file.delete();
@@ -1157,8 +1154,7 @@ class SettingsStore {
     }
     final String trimmed = value.trim();
     final int opGeneration = _credentialGeneration;
-    final Future<void> backendOp =
-        trimmed.isEmpty ? delete() : write(trimmed);
+    final Future<void> backendOp = trimmed.isEmpty ? delete() : write(trimmed);
     final Completer<void> settled = Completer<void>();
     _inflightCredentialOps[slot] = _InflightCredentialOp(
       backendOp,
@@ -1224,37 +1220,40 @@ class SettingsStore {
     String? writtenValue,
   }) {
     unawaited(
-      backendOp.then((_) async {
-        // Wait for the bounded save to publish its snapshot (or time out).
-        // Even without a later save/generation, a timed-out write can land
-        // after the old fingerprint has already been committed to JSON.
-        if (settled != null) await settled;
-        if (opGeneration == _credentialGeneration) {
-          if (writtenValue != null && _secretSnapshot?[slot] != writtenValue) {
-            AppLogger.warn(
-              'Credential version mismatch after late completion for '
-              '${_slotLabel(slot)}: in-memory and backend secrets differ; '
-              'save settings again to reconcile.',
-              tag: 'settings',
-            );
-          }
-          return;
-        }
-        // A newer operation for this slot may still be settling; wait for
-        // it (bounded) so the re-assert targets the final snapshot value,
-        // not a mid-save one.
-        final _InflightCredentialOp? newer = _inflightCredentialOps[slot];
-        if (newer != null && !identical(newer.op, backendOp)) {
-          try {
-            await newer.settled.timeout(_secretOpTimeout);
-          } catch (_) {
-            // Best effort; re-assert anyway.
-          }
-        }
-        _reassertCredentialSlot(slot, write: write, delete: delete);
-      }).catchError((Object _) {
-        // A failed backend operation changes nothing; nothing to repair.
-      }),
+      backendOp
+          .then((_) async {
+            // Wait for the bounded save to publish its snapshot (or time out).
+            // Even without a later save/generation, a timed-out write can land
+            // after the old fingerprint has already been committed to JSON.
+            if (settled != null) await settled;
+            if (opGeneration == _credentialGeneration) {
+              if (writtenValue != null &&
+                  _secretSnapshot?[slot] != writtenValue) {
+                AppLogger.warn(
+                  'Credential version mismatch after late completion for '
+                  '${_slotLabel(slot)}: in-memory and backend secrets differ; '
+                  'save settings again to reconcile.',
+                  tag: 'settings',
+                );
+              }
+              return;
+            }
+            // A newer operation for this slot may still be settling; wait for
+            // it (bounded) so the re-assert targets the final snapshot value,
+            // not a mid-save one.
+            final _InflightCredentialOp? newer = _inflightCredentialOps[slot];
+            if (newer != null && !identical(newer.op, backendOp)) {
+              try {
+                await newer.settled.timeout(_secretOpTimeout);
+              } catch (_) {
+                // Best effort; re-assert anyway.
+              }
+            }
+            _reassertCredentialSlot(slot, write: write, delete: delete);
+          })
+          .catchError((Object _) {
+            // A failed backend operation changes nothing; nothing to repair.
+          }),
     );
   }
 

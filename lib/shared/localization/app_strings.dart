@@ -540,8 +540,8 @@ class AppStrings {
       ? '复用了 $cached 个缓存块，本次缓存恢复未产生 API 请求。继续翻译剩余 $remaining 个块。'
       : 'Reused $cached cached blocks; cache restoration made no API requests. Continuing with $remaining blocks.';
   String runLogCacheRestoredAll(int total) => isChinese
-      ? '复用了全部 $total 个块，本次运行未产生 API 请求。'
-      : 'Reused all $total blocks; this run made no API requests.';
+      ? '复用了全部 $total 个正文块，无需再次翻译正文；书名等附加请求将在最终统计中列出。'
+      : 'Reused all $total body blocks; no body translation needed. Metadata requests are included in the final API totals.';
   String runLogStyleProfileConfirmed(String summary) => isChinese
       ? '风格画像：使用用户确认的画像（$summary）。'
       : 'Style profile: using user-confirmed profile $summary.';
@@ -669,8 +669,8 @@ class AppStrings {
       : 'Book title translation failed; the original title was kept.';
 
   String runLogRunCompletedWithWarnings(String path) => isChinese
-      ? '翻译完成（有警告）。已将部分 EPUB 写入 $path'
-      : 'Translation completed with warnings. Wrote partial EPUB to $path';
+      ? '翻译完成（有警告）。已将 EPUB 写入 $path，请查看降级和复核详情。'
+      : 'Translation completed with warnings. Wrote EPUB to $path; check fallback and review details.';
   String runLogRunComplete(String path) => isChinese
       ? '翻译完成。已将译后 EPUB 写入 $path'
       : 'Translation complete. Wrote translated EPUB to $path';

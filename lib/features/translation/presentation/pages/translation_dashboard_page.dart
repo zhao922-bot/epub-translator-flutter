@@ -167,6 +167,9 @@ class _DashboardInputs extends ConsumerWidget {
           inputPath: s.inputPath,
           outputDirectory: s.outputDirectory,
           targetLanguage: s.config.targetLanguage,
+          reviewEnabled: s.config.semanticQualityCheck,
+          reviewRequests: s.config.maxSemanticReviewRequests,
+          reviewTokens: s.config.maxSemanticReviewTokens,
           bilingual: s.config.bilingual,
           isRunActive: s.isRunActive,
           inspectedChapters: s.inspectedChapters,
@@ -231,6 +234,15 @@ class _DashboardInputs extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
+        if (inputs.reviewEnabled)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Text(
+              strings.isChinese
+                  ? '语义复核最多增加 ${inputs.reviewRequests} 次请求，预估 token 预算 ${inputs.reviewTokens}；达到上限后保留译文并标记未完成的复核。'
+                  : 'Review adds at most ${inputs.reviewRequests} calls with an estimated ${inputs.reviewTokens}-token budget. Remaining reviews are flagged when either limit is reached.',
+            ),
+          ),
         TranslationInputs(
           key: const ValueKey<String>('translation-inputs'),
           actions: primaryActions,

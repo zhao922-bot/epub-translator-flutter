@@ -179,25 +179,31 @@ void main() {
     expect(adapter.requests, 1);
   });
 
-  test('callback cancels synchronously before entering retry backoff', () async {
-    bool cancelled = false;
-    final token = CancelToken();
-    final adapter = _Adapter(retry: true, onFailure: () => cancelled = true);
-    final future = EpubChapterTranslator(apiClient: _Api(adapter))
-        .generateStyleProfile(
-          config: config,
-          chapters: _chapters,
-          cancelToken: token,
-          isCancelled: () => cancelled,
-        );
-    final expectation = expectLater(
-      future,
-      throwsA(isA<TranslationCancelledException>()),
-    );
-    // Flush request completion without advancing the 25ms callback watcher.
-    await pumpEventQueue(times: 20);
-    expect(token.isCancelled, isTrue);
-    await expectation;
-    expect(adapter.requests, 1);
-  });
+  test(
+    'callback cancels synchronously before entering retry backoff',
+    () async {
+      bool cancelled = false;
+      final token = CancelToken();
+      final adapter = _Adapter(retry: true, onFailure: () => cancelled = true);
+      final future = EpubChapterTranslator(apiClient: _Api(adapter))
+          .generateStyleProfile(
+            config: config,
+            chapters: _chapters,
+            cancelToken: token,
+            isCancelled: () => cancelled,
+          );
+      final expectation = expectLater(
+        future,
+        throwsA(isA<TranslationCancelledException>()),
+      );
+      // Flush request completion without advancing the 25ms callback watcher.
+      // Cache lookup now performs real IO; wait for the intended failure event
+      // instead of assuming source restoration completed in 20 microtasks.
+      await adapter.started.future;
+      await pumpEventQueue(times: 20);
+      expect(token.isCancelled, isTrue);
+      await expectation;
+      expect(adapter.requests, 1);
+    },
+  );
 }

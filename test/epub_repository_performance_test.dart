@@ -167,9 +167,11 @@ void main() {
       expect(
         events.take(firstApiIndex),
         hasLength(
-          inspection.chapters.fold<int>(
-            0,
-            (int sum, chapter) => sum + chapter.blocks.length,
+          greaterThanOrEqualTo(
+            inspection.chapters.fold<int>(
+              0,
+              (int sum, chapter) => sum + chapter.blocks.length,
+            ),
           ),
         ),
       );
@@ -1016,12 +1018,13 @@ class _EventRecordingCacheStore extends TranslationCacheStore {
   final List<String> events;
   final bool throwOnLoadJobState;
   final Map<String, String> translations = <String, String>{};
+  final Map<String, String> metadata = <String, String>{};
   JobResumeState? jobState;
 
   @override
   Future<String?> getBlockTranslation(String cacheKey) async {
     events.add('cache');
-    return translations[cacheKey];
+    return translations[cacheKey] ?? metadata[cacheKey];
   }
 
   @override
@@ -1029,7 +1032,11 @@ class _EventRecordingCacheStore extends TranslationCacheStore {
     String cacheKey,
     String translatedHtml,
   ) async {
-    translations[cacheKey] = translatedHtml;
+    if (translatedHtml.startsWith('{"artifactVersion":1,')) {
+      metadata[cacheKey] = translatedHtml;
+    } else {
+      translations[cacheKey] = translatedHtml;
+    }
   }
 
   @override

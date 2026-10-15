@@ -1194,22 +1194,34 @@ void main() {
       of: find.byType(ExpansionTile),
       matching: find.byType(Slider),
     );
-    expect(sliders, findsNWidgets(5));
+    expect(sliders, findsNWidgets(8));
     for (final language in [UiLanguage.chinese, UiLanguage.english]) {
       await container.read(settingsProvider.notifier).setUiLanguage(language);
       await tester.pumpAndSettle();
       final chinese = language == UiLanguage.chinese;
       final expected = chinese
-          ? ['分块大小 1000 字符', '并发数 2', '超时 120 秒', '最多重试 3 次', '重试间隔 4 秒']
+          ? [
+              '单次输出上限 8192 tokens',
+              '复核预估 token 预算：64000',
+              '语义复核最多 8 次请求',
+              '分块大小 1000 字符',
+              '并发数 2',
+              '超时 120 秒',
+              '最多重试 3 次',
+              '重试间隔 4 秒',
+            ]
           : [
+              'Output limit 8192 tokens',
+              'Estimated review token budget: 64000',
+              'Maximum semantic review requests 8',
               'Chunk size 1000 characters',
               'Concurrency 2',
               'Timeout 120 seconds',
               'Maximum retries 3',
               'Retry delay 4 seconds',
             ];
-      final samples = [1000.0, 2.0, 120.0, 3.0, 4.0];
-      for (var i = 0; i < 5; i++) {
+      final samples = [8192.0, 64000.0, 8.0, 1000.0, 2.0, 120.0, 3.0, 4.0];
+      for (var i = 0; i < samples.length; i++) {
         final finder = sliders.at(i);
         await tester.ensureVisible(finder);
         await tester.pumpAndSettle();

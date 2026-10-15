@@ -126,6 +126,8 @@ class _Repacker extends EpubRepacker {
 
   @override
   Future<void> writeTranslatedEpub({
+    Set<String> reviewChapterPaths = const {},
+    Map<String, Object?>? reviewSnapshots,
     required String inputPath,
     required String outputFilePath,
     required TranslationConfig config,

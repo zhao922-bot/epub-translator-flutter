@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../translation/presentation/widgets/translation_run_details.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../domain/models/job_summary.dart';
 import '../../../translation/domain/models/translation_job.dart';
@@ -105,6 +106,15 @@ class JobRow extends StatelessWidget {
             color: scheme.onSurfaceVariant,
           ),
         ),
+        if (job.apiUsage.isNotEmpty || job.qualityReportPath != null)
+          TranslationRunDetails(
+            apiUsage: job.apiUsage,
+            outputPath: job.outputPath,
+            reportPath: job.qualityReportPath,
+            elapsedMilliseconds: job.elapsedMilliseconds,
+            isChinese: strings.isChinese,
+            enabled: !job.isActive && !job.retryBlocked,
+          ),
         if (job.hasWarnings) ...[
           const SizedBox(height: 5),
           Text(

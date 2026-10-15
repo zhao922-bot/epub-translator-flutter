@@ -146,6 +146,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
           c.outputSuffix,
           c.residualQualityCheck,
           c.styleProfileEnabled,
+          c.reasoningEffort,
+          c.semanticQualityCheck,
+          c.retryIncompleteReviews,
+          c.semanticReviewScope,
           c.lockedGlossary,
           c.httpProxy,
           controller.providerSelectionRevision,
@@ -485,6 +489,171 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                   tilePadding: EdgeInsets.zero,
                   title: Text(strings.advancedTuning),
                   children: <Widget>[
+                    DropdownButtonFormField<ModelReasoningEffort>(
+                      key: ValueKey('reasoning-${config.reasoningEffort.name}'),
+                      initialValue: config.reasoningEffort,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: strings.isChinese
+                            ? '模型推理强度'
+                            : 'Model reasoning effort',
+                      ),
+                      items: [
+                        for (final value in ModelReasoningEffort.values)
+                          DropdownMenuItem(
+                            value: value,
+                            child: Text(switch (value) {
+                              ModelReasoningEffort.automatic =>
+                                strings.isChinese
+                                    ? '自动（按模型适配）'
+                                    : 'Automatic (model-aware)',
+                              ModelReasoningEffort.low =>
+                                strings.isChinese ? '较低' : 'Low',
+                              ModelReasoningEffort.high =>
+                                strings.isChinese ? '较高' : 'High',
+                              ModelReasoningEffort.max =>
+                                strings.isChinese ? '最高' : 'Maximum',
+                            }),
+                          ),
+                      ],
+                      onChanged: isRunActive
+                          ? null
+                          : (value) {
+                              if (value != null) {
+                                controller.setReasoningEffort(value);
+                              }
+                            },
+                    ),
+                    Text(
+                      strings.isChinese
+                          ? '自动为已适配模型选择较低强度；手动选项需要接口支持。'
+                          : 'Automatic uses low effort for supported models; manual options require API support.',
+                    ),
+                    _SettingsSlider(
+                      select: (c) => c.maxOutputTokens.toDouble(),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '单次输出上限 ${v.round()} tokens'
+                          : 'Output limit ${v.round()} tokens',
+                      label: (v) => strings.isChinese
+                          ? '单次输出上限：${v.round()} tokens'
+                          : 'Output limit: ${v.round()} tokens',
+                      min: 512,
+                      max: 32768,
+                      divisions: 63,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setMaxOutputTokens,
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        strings.isChinese
+                            ? '译文语义复核'
+                            : 'Semantic translation review',
+                      ),
+                      subtitle: Text(
+                        strings.isChinese
+                            ? '先检查数字、币种与术语，再请求模型复核；修改建议需在结果页确认。额外请求会产生 API 费用。'
+                            : 'Check numbers, currencies and terms, then request model review. Approve suggestions on the results page. Additional API calls incur costs.',
+                      ),
+                      value: config.semanticQualityCheck,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setSemanticQualityCheck,
+                    ),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        strings.isChinese
+                            ? '重试上次未通过的复核'
+                            : 'Retry previously rejected reviews',
+                      ),
+                      subtitle: Text(
+                        strings.isChinese
+                            ? '默认保留结果和原因，不重复请求。开启后下次翻译会补审，可能增加 API 费用；仅导出已有译文请使用结果页的本地导出。'
+                            : 'Normally retain rejected results and reasons. Enable to retry on the next run; additional API costs may apply. Use local export to reuse existing text.',
+                      ),
+                      value: config.retryIncompleteReviews,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setRetryIncompleteReviews,
+                    ),
+                    DropdownButtonFormField<SemanticReviewScope>(
+                      key: ValueKey(
+                        'review-scope-${config.semanticReviewScope.name}',
+                      ),
+                      initialValue: config.semanticReviewScope,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: strings.isChinese ? '复核范围' : 'Review scope',
+                      ),
+                      items: [
+                        DropdownMenuItem(
+                          value: SemanticReviewScope.risksOnly,
+                          child: Text(
+                            strings.isChinese
+                                ? '风险段落与少量抽查（推荐）'
+                                : 'Risks and spot checks (recommended)',
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: SemanticReviewScope.all,
+                          child: Text(
+                            strings.isChinese
+                                ? '全部段落（受预算限制）'
+                                : 'All paragraphs (within budget)',
+                          ),
+                        ),
+                      ],
+                      onChanged: isRunActive
+                          ? null
+                          : (v) {
+                              if (v != null) {
+                                controller.setSemanticReviewScope(v);
+                              }
+                            },
+                    ),
+                    _SettingsSlider(
+                      select: (c) => c.maxSemanticReviewTokens.toDouble(),
+                      label: (v) => strings.isChinese
+                          ? '复核预估 token 预算：${v.round()}'
+                          : 'Estimated review token budget: ${v.round()}',
+                      min: 4000,
+                      max: 1024000,
+                      divisions: 255,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setMaxSemanticReviewTokens,
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
+                    ),
+                    Text(
+                      strings.isChinese
+                          ? '按输入字节和最大输出保守预留预算；达到任一上限即停止新增复核，保留原译文。实际账单由服务商计费。'
+                          : 'Conservatively reserves input bytes and maximum output. Either limit stops new reviews and keeps drafts. Provider billing may differ.',
+                    ),
+                    _SettingsSlider(
+                      select: (c) => c.maxSemanticReviewRequests.toDouble(),
+                      semanticFormatterCallback: (v) => strings.isChinese
+                          ? '语义复核最多 ${v.round()} 次请求'
+                          : 'Maximum semantic review requests ${v.round()}',
+                      label: (v) => strings.isChinese
+                          ? '语义复核最多额外请求：${v.round()} 次'
+                          : 'Maximum extra review requests: ${v.round()}',
+                      min: 1,
+                      max: 64,
+                      divisions: 63,
+                      onChanged: isRunActive
+                          ? null
+                          : controller.setMaxSemanticReviewRequests,
+                      onChangeEnd: isRunActive
+                          ? null
+                          : (_) => controller.flushSliderChanges(),
+                    ),
                     _SettingsSlider(
                       select: (c) => c.chunkSize.toDouble(),
                       label: (v) => strings.chunkSizeLabel(v.round()),

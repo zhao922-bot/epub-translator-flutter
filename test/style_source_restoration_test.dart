@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -8,6 +9,7 @@ import 'package:epub_translator_flutter/features/translation/domain/repositories
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_html_extractor.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 InspectedChapter _source(int index) => const EpubHtmlExtractor()
@@ -94,8 +96,15 @@ void main() {
           ),
       ];
       final adapter = _StyleAdapter();
-      final profile = await EpubChapterTranslator(apiClient: _StyleApi(adapter))
-          .generateStyleProfile(
+      final cacheDir = await Directory.systemTemp.createTemp(
+        'style_source_cache_',
+      );
+      addTearDown(() => cacheDir.delete(recursive: true));
+      final profile =
+          await EpubChapterTranslator(
+            apiClient: _StyleApi(adapter),
+            cacheStore: TranslationCacheStore(cacheRoot: cacheDir),
+          ).generateStyleProfile(
             config: TranslationConfig.defaults().copyWith(
               styleProfileEnabled: true,
             ),

@@ -26,15 +26,20 @@ import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 
 class _Cache extends TranslationCacheStore with MemoryHistoryCache {
   final values = <String, String>{};
+  final metadata = <String, String>{};
   @override
   Future<String?> getBlockTranslation(String cacheKey) async =>
-      values[cacheKey];
+      values[cacheKey] ?? metadata[cacheKey];
   @override
   Future<void> putBlockTranslation(
     String cacheKey,
     String translatedHtml,
   ) async {
-    values[cacheKey] = translatedHtml;
+    if (translatedHtml.startsWith('{"artifactVersion":1,')) {
+      metadata[cacheKey] = translatedHtml;
+    } else {
+      values[cacheKey] = translatedHtml;
+    }
   }
 
   @override
@@ -46,6 +51,8 @@ class _Cache extends TranslationCacheStore with MemoryHistoryCache {
 class _Repacker extends EpubRepacker {
   @override
   Future<void> writeTranslatedEpub({
+    Set<String> reviewChapterPaths = const {},
+    Map<String, Object?>? reviewSnapshots,
     required String inputPath,
     required String outputFilePath,
     required TranslationConfig config,
@@ -434,11 +441,9 @@ void main() {
       final memory = (payload['context'] as Map)['bookMemory'] as Map;
       expect(memory['bookSummary'], 'context');
       expect((memory['glossary'] as List).first['target'], '银行');
-      expect(
-        (memory['styleProfile'] as Map)['primaryGenre'],
-        profile.primaryGenre,
-      );
-      expect(memory['styleProfileConfirmed'], isTrue);
+      expect(memory.containsKey('styleProfile'), isFalse);
+      expect(memory.containsKey('styleProfileConfirmed'), isFalse);
+      expect(api.systems.join(), contains(profile.primaryGenre));
     },
   );
 
@@ -866,22 +871,41 @@ void main() {
     },
   );
 
-  test('completed recoverable chapters release source and still support reruns', () async {
-    final identity = EpubSourceIdentity(
-      inputPath: input, sha256: sha256.convert(await File(input).readAsBytes()).toString(),
-    );
-    final cache = _Cache();
-    final api = _Api();
-    final first = await run(cache, api, [for (final c in chapters) c.copyWith(sourceIdentity: identity)]);
-    expect(first.chapters.every((c) => c.originalHtml.isEmpty), isTrue);
-    expect(first.chapters.every((c) => c.body.isNotEmpty && c.translatedBody!.isNotEmpty), isTrue);
-    final paidRequests = api.sourceRequests.length;
-    final second = await run(cache, api, first.chapters);
-    expect(second.job.cachedBlocks, 2);
-    expect(api.sourceRequests.length, paidRequests);
-    await run(cache, api, second.chapters, configuration: config.copyWith(targetLanguage: 'Korean'));
-    expect(api.sourceRequests.skip(paidRequests), ['<p>bank</p>', '<p>river</p>']);
-  });
+  test(
+    'completed recoverable chapters release source and still support reruns',
+    () async {
+      final identity = EpubSourceIdentity(
+        inputPath: input,
+        sha256: sha256.convert(await File(input).readAsBytes()).toString(),
+      );
+      final cache = _Cache();
+      final api = _Api();
+      final first = await run(cache, api, [
+        for (final c in chapters) c.copyWith(sourceIdentity: identity),
+      ]);
+      expect(first.chapters.every((c) => c.originalHtml.isEmpty), isTrue);
+      expect(
+        first.chapters.every(
+          (c) => c.body.isNotEmpty && c.translatedBody!.isNotEmpty,
+        ),
+        isTrue,
+      );
+      final paidRequests = api.sourceRequests.length;
+      final second = await run(cache, api, first.chapters);
+      expect(second.job.cachedBlocks, 2);
+      expect(api.sourceRequests.length, paidRequests);
+      await run(
+        cache,
+        api,
+        second.chapters,
+        configuration: config.copyWith(targetLanguage: 'Korean'),
+      );
+      expect(api.sourceRequests.skip(paidRequests), [
+        '<p>bank</p>',
+        '<p>river</p>',
+      ]);
+    },
+  );
 
   test(
     'expanding selection matches a clean full translation with different glossary',

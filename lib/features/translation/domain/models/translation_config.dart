@@ -8,6 +8,10 @@ enum ApiProviderSelection { deepseek, custom }
 
 enum TranslationTuningPreset { stable, balanced, fast }
 
+enum SemanticReviewScope { risksOnly, all }
+
+enum ModelReasoningEffort { automatic, low, high, max }
+
 class TranslationConfig {
   const TranslationConfig({
     required this.apiBaseUrl,
@@ -33,6 +37,13 @@ class TranslationConfig {
     required this.textScale,
     required this.lockedGlossary,
     required this.httpProxy,
+    this.reasoningEffort = ModelReasoningEffort.automatic,
+    this.maxOutputTokens = 8192,
+    this.semanticQualityCheck = false,
+    this.retryIncompleteReviews = false,
+    this.maxSemanticReviewRequests = 8,
+    this.semanticReviewScope = SemanticReviewScope.risksOnly,
+    this.maxSemanticReviewTokens = 64000,
   });
 
   final String apiBaseUrl;
@@ -75,6 +86,28 @@ class TranslationConfig {
   /// are not visible to Dart's HttpClient, hence this manual override).
   /// Local and private destinations always bypass it (no_proxy semantics).
   final String httpProxy;
+
+  final ModelReasoningEffort reasoningEffort;
+  final int maxOutputTokens;
+  final bool semanticQualityCheck;
+  final bool retryIncompleteReviews;
+  final int maxSemanticReviewRequests;
+  final SemanticReviewScope semanticReviewScope;
+
+  /// Conservative local reservation, including maximum response tokens.
+  final int maxSemanticReviewTokens;
+
+  /// Only auto-configure models with verified reasoning-effort support.
+  /// Other compatible APIs keep their own defaults unless explicitly opted in.
+  bool get isGlm53 => RegExp(
+    r'(^|/)glm-5\.3(?:-flash)?$',
+    caseSensitive: false,
+  ).hasMatch(model.trim());
+
+  String? get effectiveReasoningEffort =>
+      reasoningEffort == ModelReasoningEffort.automatic
+      ? (isGlm53 ? 'low' : null)
+      : reasoningEffort.name;
 
   /// Persistence separates the proxy endpoint from its entire authentication
   /// component. Keep the combined URL in memory for the existing UI/client.
@@ -156,9 +189,19 @@ class TranslationConfig {
     double? textScale,
     String? lockedGlossary,
     String? httpProxy,
+    ModelReasoningEffort? reasoningEffort,
+    int? maxOutputTokens,
+    bool? semanticQualityCheck,
+    bool? retryIncompleteReviews,
+    int? maxSemanticReviewRequests,
+    SemanticReviewScope? semanticReviewScope,
+    int? maxSemanticReviewTokens,
   }) {
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
+      semanticReviewScope: semanticReviewScope ?? this.semanticReviewScope,
+      maxSemanticReviewTokens:
+          maxSemanticReviewTokens ?? this.maxSemanticReviewTokens,
       apiKey: apiKey ?? this.apiKey,
       model: model ?? this.model,
       apiProviderSelection: apiProviderSelection ?? this.apiProviderSelection,
@@ -181,6 +224,13 @@ class TranslationConfig {
       textScale: textScale ?? this.textScale,
       lockedGlossary: lockedGlossary ?? this.lockedGlossary,
       httpProxy: httpProxy ?? this.httpProxy,
+      reasoningEffort: reasoningEffort ?? this.reasoningEffort,
+      maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
+      semanticQualityCheck: semanticQualityCheck ?? this.semanticQualityCheck,
+      retryIncompleteReviews:
+          retryIncompleteReviews ?? this.retryIncompleteReviews,
+      maxSemanticReviewRequests:
+          maxSemanticReviewRequests ?? this.maxSemanticReviewRequests,
     );
   }
 
@@ -215,6 +265,13 @@ class TranslationConfig {
       'textScale': textScale,
       'lockedGlossary': lockedGlossary,
       'httpProxy': httpProxyAddress,
+      'reasoningEffort': reasoningEffort.name,
+      'maxOutputTokens': maxOutputTokens,
+      'semanticQualityCheck': semanticQualityCheck,
+      'retryIncompleteReviews': retryIncompleteReviews,
+      'maxSemanticReviewRequests': maxSemanticReviewRequests,
+      'semanticReviewScope': semanticReviewScope.name,
+      'maxSemanticReviewTokens': maxSemanticReviewTokens,
     };
   }
 
@@ -329,6 +386,34 @@ class TranslationConfig {
             .toDouble();
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl,
+      reasoningEffort: ModelReasoningEffort.values.firstWhere(
+        (v) => v.name == json['reasoningEffort'],
+        orElse: () => ModelReasoningEffort.automatic,
+      ),
+      maxOutputTokens: _readBoundedInt(
+        json['maxOutputTokens'],
+        fallback: 8192,
+        min: 512,
+        max: 32768,
+      ),
+      semanticQualityCheck: json['semanticQualityCheck'] == true,
+      retryIncompleteReviews: json['retryIncompleteReviews'] == true,
+      semanticReviewScope: SemanticReviewScope.values.firstWhere(
+        (v) => v.name == json['semanticReviewScope'],
+        orElse: () => SemanticReviewScope.risksOnly,
+      ),
+      maxSemanticReviewTokens: _readBoundedInt(
+        json['maxSemanticReviewTokens'],
+        fallback: 64000,
+        min: 4000,
+        max: 1024000,
+      ),
+      maxSemanticReviewRequests: _readBoundedInt(
+        json['maxSemanticReviewRequests'],
+        fallback: 8,
+        min: 1,
+        max: 64,
+      ),
       apiKey: _readTrimmedString(json['apiKey']),
       model: model,
       apiProviderSelection: providerSelection,

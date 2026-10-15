@@ -118,10 +118,16 @@ void main() {
         expect(() => XmlDocument.parse(chapter), returnsNormally);
         final blocks = Directory('${cacheDir.path}/blocks');
         if (await blocks.exists()) {
-          expect(
-            await blocks.list(recursive: true).where((e) => e is File).length,
-            0,
-          );
+          // Legitimate title/memory artifacts may be cached even when every
+          // body response is invalid; no body HTML may become a cache hit.
+          await for (final entity in blocks.list(recursive: true)) {
+            if (entity is File) {
+              expect(
+                await entity.readAsString(),
+                contains('"artifactVersion":1'),
+              );
+            }
+          }
         }
       } finally {
         await cache.waitForMaintenanceForTest();

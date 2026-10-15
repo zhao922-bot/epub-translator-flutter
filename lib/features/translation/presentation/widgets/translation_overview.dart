@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'translation_run_details.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
@@ -157,7 +158,11 @@ class TranslationOverview extends StatelessWidget {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    strings.degradedBlocksWarning(job!.degradedBlockCount),
+                    job!.degradedBlockCount > 0
+                        ? strings.degradedBlocksWarning(job!.degradedBlockCount)
+                        : (strings.isChinese
+                              ? "译本已导出；请查看待确认建议或尚未完成的检查。"
+                              : "EPUB exported; review pending suggestions or incomplete checks."),
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: scheme.onTertiaryContainer,
                       fontWeight: FontWeight.w600,
@@ -222,6 +227,16 @@ class TranslationOverview extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ],
+          if (job != null &&
+              (job!.apiUsage.isNotEmpty || job!.qualityReportPath != null))
+            TranslationRunDetails(
+              apiUsage: job!.apiUsage,
+              outputPath: job!.outputPath,
+              reportPath: job!.qualityReportPath,
+              elapsedMilliseconds: job!.elapsedMilliseconds,
+              isChinese: strings.isChinese,
+              enabled: canExport && !canCancel,
+            ),
           if (canExport) ...<Widget>[
             const SizedBox(height: 12),
             Row(

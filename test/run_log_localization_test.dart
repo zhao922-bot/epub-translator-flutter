@@ -155,7 +155,8 @@ void main() {
         zh.runLogCacheRestoredPartial(6, 4),
         '复用了 6 个缓存块，本次缓存恢复未产生 API 请求。继续翻译剩余 4 个块。',
       );
-      expect(zh.runLogCacheRestoredAll(10), '复用了全部 10 个块，本次运行未产生 API 请求。');
+      expect(zh.runLogCacheRestoredAll(10), contains('无需再次翻译正文'));
+      expect(zh.runLogCacheRestoredAll(10), contains('附加请求'));
       expect(zh.runProgressRepacking, '正在重新打包 EPUB');
       expect(en.runProgressRepacking, 'Repacking EPUB');
       expect(

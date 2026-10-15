@@ -13,8 +13,8 @@ class TranslationBatchPlanner {
     int tinyBlockTextThreshold = 80,
     int tinyBlockHtmlThreshold = 360,
     int tinyBlockBudget = 48,
-  // Keep the public named parameters and private raw storage for const callers.
-  // ignore: prefer_initializing_formals
+    // Keep the public named parameters and private raw storage for const callers.
+    // ignore: prefer_initializing_formals
   }) : _contextBeforeBlockCount = contextBeforeBlockCount,
        // ignore: prefer_initializing_formals
        _contextAfterBlockCount = contextAfterBlockCount,
@@ -55,17 +55,56 @@ class TranslationBatchPlanner {
     if (value >= low && value <= high) return value;
     final warned = _warned[this] ??= <String>{};
     if (warned.add(name)) {
-      AppLogger.warn('Invalid $name=$value; using $fallback (range $low..$high).', tag: 'batch-planner');
+      AppLogger.warn(
+        'Invalid $name=$value; using $fallback (range $low..$high).',
+        tag: 'batch-planner',
+      );
     }
     return fallback;
   }
 
-  int get contextBeforeBlockCount => _bounded('contextBeforeBlockCount', _contextBeforeBlockCount, minContextCount, maxContextCount, 2);
-  int get contextAfterBlockCount => _bounded('contextAfterBlockCount', _contextAfterBlockCount, minContextCount, maxContextCount, 1);
-  int get contextTextLimit => _bounded('contextTextLimit', _contextTextLimit, minContextTextLimit, maxContextTextLimit, 240);
-  int get tinyBlockTextThreshold => _bounded('tinyBlockTextThreshold', _tinyBlockTextThreshold, minTinyThreshold, maxTinyThreshold, 80);
-  int get tinyBlockHtmlThreshold => _bounded('tinyBlockHtmlThreshold', _tinyBlockHtmlThreshold, minTinyThreshold, maxTinyThreshold, 360);
-  int get tinyBlockBudget => _bounded('tinyBlockBudget', _tinyBlockBudget, minTinyBudget, maxTinyBudget, 48);
+  int get contextBeforeBlockCount => _bounded(
+    'contextBeforeBlockCount',
+    _contextBeforeBlockCount,
+    minContextCount,
+    maxContextCount,
+    2,
+  );
+  int get contextAfterBlockCount => _bounded(
+    'contextAfterBlockCount',
+    _contextAfterBlockCount,
+    minContextCount,
+    maxContextCount,
+    1,
+  );
+  int get contextTextLimit => _bounded(
+    'contextTextLimit',
+    _contextTextLimit,
+    minContextTextLimit,
+    maxContextTextLimit,
+    240,
+  );
+  int get tinyBlockTextThreshold => _bounded(
+    'tinyBlockTextThreshold',
+    _tinyBlockTextThreshold,
+    minTinyThreshold,
+    maxTinyThreshold,
+    80,
+  );
+  int get tinyBlockHtmlThreshold => _bounded(
+    'tinyBlockHtmlThreshold',
+    _tinyBlockHtmlThreshold,
+    minTinyThreshold,
+    maxTinyThreshold,
+    360,
+  );
+  int get tinyBlockBudget => _bounded(
+    'tinyBlockBudget',
+    _tinyBlockBudget,
+    minTinyBudget,
+    maxTinyBudget,
+    48,
+  );
 
   List<TranslationBlockBatch> plan({
     required List<ExtractedBlock> pendingBlocks,
@@ -77,7 +116,13 @@ class TranslationBatchPlanner {
     final List<TranslationBlockBatch> batches = <TranslationBlockBatch>[];
     List<ExtractedBlock> current = <ExtractedBlock>[];
     int currentBudget = 0;
-    final int safeChunkSize = _bounded('chunkSize:$chunkSize', chunkSize, minChunkSize, maxChunkSize, defaultChunkSize);
+    final int safeChunkSize = _bounded(
+      'chunkSize:$chunkSize',
+      chunkSize,
+      minChunkSize,
+      maxChunkSize,
+      defaultChunkSize,
+    );
     // The read-only context appended to every batch (chapter title,
     // bookMemory summary, before/after snippets) shares the request window
     // with the blocks, so it must come out of the same budget. The title
@@ -89,7 +134,11 @@ class TranslationBatchPlanner {
     // blockBudgetFor already pads every block by 96 chars, which absorbs
     // it.
     final int fixedContextOverhead =
-        chapterTitle.length + _serializedJsonSize(bookMemory);
+        chapterTitle.length + _serializedJsonSize(promptBookMemory(bookMemory));
+    // Reserve a body budget independently of large fixed style/memory notes.
+    // The transport still computes/caps the full token window. Otherwise a
+    // long confirmed profile silently turns every paragraph into a paid call.
+    final int bodyReserve = safeChunkSize ~/ 2;
     final Map<String, int> indexById = <String, int>{
       for (int index = 0; index < chapterBlocks.length; index += 1)
         chapterBlocks[index].id: index,
@@ -136,8 +185,10 @@ class TranslationBatchPlanner {
           current.isNotEmpty &&
           currentBudget +
                   blockBudget +
-                  fixedContextOverhead +
-                  candidateSnippetOverhead >
+                  min(
+                    fixedContextOverhead + candidateSnippetOverhead,
+                    safeChunkSize - bodyReserve,
+                  ) >
               safeChunkSize;
       if (exceedsCurrent) {
         emitBatch();
@@ -378,10 +429,19 @@ class TranslationBatchContext {
           .map((TranslationContextSnippet snippet) => snippet.toJson())
           .toList(growable: false),
       if (bookMemory != null && bookMemory!.isNotEmpty)
-        'bookMemory': bookMemory,
+        'bookMemory': promptBookMemory(bookMemory),
       'instruction': 'Read-only context for continuity; translate only blocks.',
     };
   }
+}
+
+/// Style is already injected once in the system instruction. Retain the full
+/// profile in memory/checkpoints, but don't bill for it twice in every payload.
+Map<String, Object?>? promptBookMemory(Map<String, Object?>? memory) {
+  if (memory == null) return null;
+  return Map<String, Object?>.from(memory)
+    ..remove('styleProfile')
+    ..remove('styleProfileConfirmed');
 }
 
 class TranslationContextSnippet {

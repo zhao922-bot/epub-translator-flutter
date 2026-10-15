@@ -129,20 +129,21 @@ List<String> recoveryBudgetDeletions(
       entry.kind == RecoveryBudgetKind.fallbackTmp ||
       (entry.kind == RecoveryBudgetKind.recoverySpare &&
           RegExp(r'\.recovery\.\d+$').hasMatch(entry.name));
-  final ordered = [...entries]..sort((a, b) {
-    final aIsIndex = a.kind == RecoveryBudgetKind.indexLedger;
-    final bIsIndex = b.kind == RecoveryBudgetKind.indexLedger;
-    if (aIsIndex != bIsIndex) return aIsIndex ? 1 : -1;
-    // Compare timestamps across prefixes, rather than sorting all tmp files
-    // after all recovery files regardless of age.
-    final suffix = RegExp(r'\.(\d+)$');
-    final aStamp = int.tryParse(suffix.firstMatch(a.name)?.group(1) ?? '');
-    final bStamp = int.tryParse(suffix.firstMatch(b.name)?.group(1) ?? '');
-    if (aStamp != null && bStamp != null && aStamp != bStamp) {
-      return aStamp.compareTo(bStamp);
-    }
-    return a.name.compareTo(b.name);
-  });
+  final ordered = [...entries]
+    ..sort((a, b) {
+      final aIsIndex = a.kind == RecoveryBudgetKind.indexLedger;
+      final bIsIndex = b.kind == RecoveryBudgetKind.indexLedger;
+      if (aIsIndex != bIsIndex) return aIsIndex ? 1 : -1;
+      // Compare timestamps across prefixes, rather than sorting all tmp files
+      // after all recovery files regardless of age.
+      final suffix = RegExp(r'\.(\d+)$');
+      final aStamp = int.tryParse(suffix.firstMatch(a.name)?.group(1) ?? '');
+      final bStamp = int.tryParse(suffix.firstMatch(b.name)?.group(1) ?? '');
+      if (aStamp != null && bStamp != null && aStamp != bStamp) {
+        return aStamp.compareTo(bStamp);
+      }
+      return a.name.compareTo(b.name);
+    });
   var remaining = ordered.length;
   var complete = ordered.where(isComplete).length;
   var totalBytes = ordered.fold<int>(0, (sum, entry) => sum + entry.sizeBytes);
@@ -593,70 +594,71 @@ class EpubIsolateWorker {
   static Future<String?> readBookTitleForTest(
     String inputPath, {
     required int limitBytes,
-  }) =>
-      Isolate.run(
-        () => _readBookTitleSync(inputPath, limitBytesOverride: limitBytes),
-      );
+  }) => Isolate.run(
+    () => _readBookTitleSync(inputPath, limitBytesOverride: limitBytes),
+  );
 
   static String? _readBookTitleSync(
     String inputPath, {
     String? expectedSourceFingerprint,
     int? limitBytesOverride,
   }) {
-    final archive =
-        _decodeEpubArchive(inputPath, expectedSourceFingerprint).archive;
+    final archive = _decodeEpubArchive(
+      inputPath,
+      expectedSourceFingerprint,
+    ).archive;
     try {
       final containerFile = archive.find('META-INF/container.xml');
-        if (containerFile == null || !containerFile.isFile) return null;
-        final container = xml.XmlDocument.parse(
-          decodeEpubText(
-            bytes: _fileBytes(
-              containerFile,
-              inputPath: inputPath,
-              limitBytesOverride: limitBytesOverride,
-            ),
-            filePath: 'META-INF/container.xml',
-            strict: true,
+      if (containerFile == null || !containerFile.isFile) return null;
+      final container = xml.XmlDocument.parse(
+        decodeEpubText(
+          bytes: _fileBytes(
+            containerFile,
+            inputPath: inputPath,
+            limitBytesOverride: limitBytesOverride,
           ),
-        );
-        final opfPath = container.descendants
-            .whereType<xml.XmlElement>()
-            .where((e) => e.name.local == 'rootfile')
-            .firstOrNull
-            ?.getAttribute('full-path');
-        if (opfPath == null || opfPath.isEmpty) return null;
-        final opfFile = archive.find(opfPath);
-        if (opfFile == null || !opfFile.isFile) return null;
-        final opf = xml.XmlDocument.parse(
-          decodeEpubText(
-            bytes: _fileBytes(
-              opfFile,
-              inputPath: inputPath,
-              limitBytesOverride: limitBytesOverride,
-            ),
-            filePath: opfPath,
-            strict: true,
+          filePath: 'META-INF/container.xml',
+          strict: true,
+        ),
+      );
+      final opfPath = container.descendants
+          .whereType<xml.XmlElement>()
+          .where((e) => e.name.local == 'rootfile')
+          .firstOrNull
+          ?.getAttribute('full-path');
+      if (opfPath == null || opfPath.isEmpty) return null;
+      final opfFile = archive.find(opfPath);
+      if (opfFile == null || !opfFile.isFile) return null;
+      final opf = xml.XmlDocument.parse(
+        decodeEpubText(
+          bytes: _fileBytes(
+            opfFile,
+            inputPath: inputPath,
+            limitBytesOverride: limitBytesOverride,
           ),
-        );
-        final title = opf.descendants
-            .whereType<xml.XmlElement>()
-            .where(
-              (e) =>
-                  e.name.local == 'title' &&
-                  e.name.namespaceUri == 'http://purl.org/dc/elements/1.1/',
-            )
-            .firstOrNull
-            ?.innerText
-            .trim();
-        return title == null || title.isEmpty ? null : title;
-      } on EpubDecompressionLimitException {
-        // P2-#14: a zip-bomb guard tripping while reading the title must
-        // fail loudly, not degrade into "the book has no title" — swallowing
-        // it here would let a malicious archive continue into translation.
-        rethrow;
-      } catch (_) {
-        return null;
-      }
+          filePath: opfPath,
+          strict: true,
+        ),
+      );
+      final title = opf.descendants
+          .whereType<xml.XmlElement>()
+          .where(
+            (e) =>
+                e.name.local == 'title' &&
+                e.name.namespaceUri == 'http://purl.org/dc/elements/1.1/',
+          )
+          .firstOrNull
+          ?.innerText
+          .trim();
+      return title == null || title.isEmpty ? null : title;
+    } on EpubDecompressionLimitException {
+      // P2-#14: a zip-bomb guard tripping while reading the title must
+      // fail loudly, not degrade into "the book has no title" — swallowing
+      // it here would let a malicious archive continue into translation.
+      rethrow;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Repacks an EPUB, replacing selected XHTML payloads, on a background isolate.
@@ -1005,7 +1007,8 @@ class EpubIsolateWorker {
         if (docTitleText != null) {
           docTitleText.innerText = ncxTitle;
           if (languageTag != null) {
-            docTitleText.setAttribute('xml:lang', languageTag);
+            // NCX text only permits id/class. Language belongs on docTitle/root.
+            docTitleText.removeAttribute('xml:lang');
             (docTitleText.parent as xml.XmlElement).setAttribute(
               'xml:lang',
               languageTag,
@@ -1088,9 +1091,7 @@ class EpubIsolateWorker {
         changed = replaceNavigationAnchorLabel(anchor, label) || changed;
       }
     }
-    return changed
-        ? serializeEpubNavigation(document, markup)
-        : markup;
+    return changed ? serializeEpubNavigation(document, markup) : markup;
   }
 
   /// Declare the namespace on the new element itself: a declaration on a
@@ -1361,8 +1362,7 @@ class EpubIsolateWorker {
   static Future<void> reclaimStaleBackupsForTest(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
-  }) =>
-      _reclaimStaleBackups(finalFile, deleteForTest: deleteForTest);
+  }) => _reclaimStaleBackups(finalFile, deleteForTest: deleteForTest);
 
   /// Deletes `.tmp.*` orphans left by a previous process that died after
   /// the isolate wrote the temp EPUB but before [commitTempFile] promoted
@@ -1433,11 +1433,7 @@ class EpubIsolateWorker {
     File tempFile, {
     Future<void> Function(File file)? deleteForTest,
   }) =>
-      _reclaimStaleTempFiles(
-        finalFile,
-        tempFile,
-        deleteForTest: deleteForTest,
-      );
+      _reclaimStaleTempFiles(finalFile, tempFile, deleteForTest: deleteForTest);
 
   /// Rename before reporting the path so automatic orphan sweeping cannot
   /// destroy the sole translated copy deliberately retained for recovery.
@@ -1501,7 +1497,8 @@ class EpubIsolateWorker {
       final String prefix = '${path.basename(finalFile.path)}.recovery.';
       // `<basename>.recovery-index` does not start with
       // `<basename>.recovery.` — match it explicitly.
-      final String indexName = '${path.basename(finalFile.path)}.recovery-index';
+      final String indexName =
+          '${path.basename(finalFile.path)}.recovery-index';
       final Future<void> Function(File file) deleteFile =
           deleteForTest ?? _deleteBestEffort;
       final indexedTemps = await _indexedRecoveryTemps(finalFile);
@@ -1609,7 +1606,8 @@ class EpubIsolateWorker {
       // `<basename>.recovery-index` does not start with
       // `<basename>.recovery.` — match it explicitly so the ledger is
       // reclaimed together with the spares it describes.
-      final String indexName = '${path.basename(finalFile.path)}.recovery-index';
+      final String indexName =
+          '${path.basename(finalFile.path)}.recovery-index';
       final Future<void> Function(File file) deleteFile =
           deleteForTest ?? _deleteBestEffort;
       final indexedTemps = await _indexedRecoveryTemps(finalFile);
@@ -1620,7 +1618,9 @@ class EpubIsolateWorker {
             sameFilesystemPath(entity.path, committedTempFile.path)) {
           continue;
         }
-        if (name.startsWith(prefix) || name == indexName || indexedTemps.contains(name)) {
+        if (name.startsWith(prefix) ||
+            name == indexName ||
+            indexedTemps.contains(name)) {
           try {
             await deleteFile(entity);
             if (!await entity.exists()) {
@@ -1640,20 +1640,18 @@ class EpubIsolateWorker {
   static Future<void> enforceRecoveryBudgetForTest(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
-  }) =>
-      _enforceRecoveryBudget(finalFile, deleteForTest: deleteForTest);
+  }) => _enforceRecoveryBudget(finalFile, deleteForTest: deleteForTest);
 
   @visibleForTesting
   static Future<void> reclaimRecoveryFilesForTest(
     File finalFile, {
     Future<void> Function(File file)? deleteForTest,
     File? committedTempFile,
-  }) =>
-      _reclaimRecoveryFiles(
-        finalFile,
-        deleteForTest: deleteForTest,
-        committedTempFile: committedTempFile,
-      );
+  }) => _reclaimRecoveryFiles(
+    finalFile,
+    deleteForTest: deleteForTest,
+    committedTempFile: committedTempFile,
+  );
 
   /// Sync helper used by tests that exercise pure filesystem commit logic.
   static void commitTempFileSyncForTest(File tempFile, File finalFile) {
@@ -2161,7 +2159,10 @@ class EpubIsolateWorker {
     String declaredMimetype = '';
     if (mimetypeFile != null) {
       declaredMimetype = utf8
-          .decode(_fileBytes(mimetypeFile, inputPath: inputPath), allowMalformed: true)
+          .decode(
+            _fileBytes(mimetypeFile, inputPath: inputPath),
+            allowMalformed: true,
+          )
           .trim();
     }
     final List<int> mimetypeBytes = utf8.encode(
@@ -2216,7 +2217,8 @@ class EpubIsolateWorker {
     for (final ArchiveFile sourceFile in dedupedSource.values) {
       if (sourceFile.name == 'mimetype') {
         continue;
-      }      if (!sourceFile.isFile) {
+      }
+      if (!sourceFile.isFile) {
         repacked.add(
           ArchiveFile.directory(sourceFile.name)
             ..lastModTime = sourceFile.lastModTime
@@ -2391,19 +2393,16 @@ class EpubIsolateWorker {
       // ArchiveFile.isCompressed stays intact for the repacker.
       final int limit = limitBytesOverride ?? _kMaxEpubUncompressedBytes;
       if (bytesCache != null) {
-        return bytesCache.putIfAbsent(
-          file,
-          () {
-            final List<int> bytes = _inflateZipFileGuarded(
-              inputPath: inputPath,
-              file: file,
-              zipFile: raw,
-              limitBytes: limit,
-            );
-            onCacheInsert?.call(file, bytes);
-            return bytes;
-          },
-        );
+        return bytesCache.putIfAbsent(file, () {
+          final List<int> bytes = _inflateZipFileGuarded(
+            inputPath: inputPath,
+            file: file,
+            zipFile: raw,
+            limitBytes: limit,
+          );
+          onCacheInsert?.call(file, bytes);
+          return bytes;
+        });
       }
       return _inflateZipFileGuarded(
         inputPath: inputPath,

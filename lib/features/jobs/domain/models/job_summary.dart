@@ -15,8 +15,14 @@ class JobSummary {
     this.canResume = false,
     this.phaseLabel = '',
     this.degradedBlockCount = 0,
+    this.apiUsage = const {},
+    this.qualityReportPath,
+    this.elapsedMilliseconds = 0,
   });
 
+  final Map<String, Object> apiUsage;
+  final String? qualityReportPath;
+  final int elapsedMilliseconds;
   final String id;
   final String title;
   final TranslationJobStatus status;

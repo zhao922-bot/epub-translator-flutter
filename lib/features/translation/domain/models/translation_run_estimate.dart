@@ -224,15 +224,14 @@ class TranslationRunEstimate {
       if (FootnoteBatchPlanner.isStandaloneFootnoteChapter(chapter)) {
         footnotePending[i] = chapter.blocks;
       } else {
-        count +=
-            const TranslationBatchPlanner()
-                .plan(
-                  pendingBlocks: chapter.blocks,
-                  chunkSize: chunkSize,
-                  chapterBlocks: chapter.blocks,
-                  chapterTitle: chapter.title,
-                )
-                .length;
+        count += const TranslationBatchPlanner()
+            .plan(
+              pendingBlocks: chapter.blocks,
+              chunkSize: chunkSize,
+              chapterBlocks: chapter.blocks,
+              chapterTitle: chapter.title,
+            )
+            .length;
       }
     }
     if (footnotePending.isNotEmpty) {

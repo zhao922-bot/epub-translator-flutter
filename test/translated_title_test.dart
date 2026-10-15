@@ -57,7 +57,11 @@ void main() {
     expect(opf, contains('<dc:title xml:lang="zh-CN">麦琪的礼物</dc:title>'));
     expect(opf, isNot(contains('The Gift of the Magi')));
     final String ncx = result['OEBPS/toc.ncx']!;
-    expect(ncx, contains('<text xml:lang="zh-CN">麦琪的礼物</text>'));
+    expect(ncx, contains('<text>麦琪的礼物</text>'));
+    expect(
+      xml.XmlDocument.parse(ncx).rootElement.getAttribute('xml:lang'),
+      'zh-CN',
+    );
   });
 
   test('translated title overrides local source-language declarations', () {
@@ -87,7 +91,10 @@ void main() {
           in document.descendants.whereType<xml.XmlElement>().where(
             (e) => ['title', 'docTitle', 'text'].contains(e.name.local),
           )) {
-        expect(element.getAttribute('xml:lang'), 'zh-TW');
+        expect(
+          element.getAttribute('xml:lang'),
+          element.name.local == 'text' ? isNull : 'zh-TW',
+        );
       }
     }
   });

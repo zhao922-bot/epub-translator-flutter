@@ -47,7 +47,8 @@ class TranslationRequestBudget {
     }
   }
 
-  Future<T> run<T>(Future<T> Function() request, {
+  Future<T> run<T>(
+    Future<T> Function() request, {
     void Function()? throwIfCancelled,
   }) async {
     if (_active < limit) {

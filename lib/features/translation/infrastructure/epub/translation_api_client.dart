@@ -42,6 +42,53 @@ class ProxyAuthenticationException implements Exception {
   String toString() => message;
 }
 
+/// Counts actual HTTP attempts (including bounded truncation retries), not
+/// orchestration calls. No headers, prompts or reply content are retained.
+class TranslationApiMetrics {
+  int requests = 0,
+      errors = 0,
+      promptTokens = 0,
+      completionTokens = 0,
+      elapsedMs = 0;
+  int usageReportedRequests = 0;
+  final Map<String, int> byKind = {};
+  final Map<String, int> elapsedMsByKind = {},
+      promptTokensByKind = {},
+      completionTokensByKind = {};
+  Map<String, Object> toJson() => {
+    'requests': requests,
+    'errors': errors,
+    'promptTokens': promptTokens,
+    'completionTokens': completionTokens,
+    'elapsedMs': elapsedMs,
+    'byKind': Map<String, int>.from(byKind),
+    'usageReportedRequests': usageReportedRequests,
+    'elapsedMsByKind': Map<String, int>.from(elapsedMsByKind),
+    'promptTokensByKind': Map<String, int>.from(promptTokensByKind),
+    'completionTokensByKind': Map<String, int>.from(completionTokensByKind),
+  };
+  void add(TranslationApiMetrics other) {
+    usageReportedRequests += other.usageReportedRequests;
+    for (final pair in [
+      (elapsedMsByKind, other.elapsedMsByKind),
+      (promptTokensByKind, other.promptTokensByKind),
+      (completionTokensByKind, other.completionTokensByKind),
+    ]) {
+      for (final e in pair.$2.entries) {
+        pair.$1.update(e.key, (v) => v + e.value, ifAbsent: () => e.value);
+      }
+    }
+    requests += other.requests;
+    errors += other.errors;
+    promptTokens += other.promptTokens;
+    completionTokens += other.completionTokens;
+    elapsedMs += other.elapsedMs;
+    for (final e in other.byKind.entries) {
+      byKind.update(e.key, (v) => v + e.value, ifAbsent: () => e.value);
+    }
+  }
+}
+
 // Some Dart SDKs retry cached Basic proxy credentials without invoking
 // authenticateProxy again. Scope the transport guard to each adapter fetch,
 // so concurrent requests and later successful requests have separate budgets.
@@ -80,6 +127,10 @@ class TranslationApiClient {
 
   /// Allows offline transport fixtures to advance retries without real waits.
   final Duration? sharedRateLimitDelayOverride;
+
+  TranslationApiMetrics metricsFor(Dio dio) =>
+      dio.options.extra.putIfAbsent('apiMetrics', TranslationApiMetrics.new)
+          as TranslationApiMetrics;
 
   static final RegExp _whitespace = RegExp(r'\s');
   static final RegExp _leadingReasoningBlocks = RegExp(
@@ -130,6 +181,12 @@ class TranslationApiClient {
     final Dio dio = Dio(
       BaseOptions(
         baseUrl: normalizedBaseUrl(config.apiBaseUrl),
+        extra: <String, dynamic>{
+          'reasoningEffort': config.effectiveReasoningEffort,
+          'reasoningModel':
+              config.isGlm53 || config.effectiveReasoningEffort != null,
+          'maxOutputTokens': config.maxOutputTokens.clamp(512, 32768),
+        },
         headers: <String, String>{
           'Authorization': 'Bearer ${config.apiKey}',
           'Content-Type': 'application/json',
@@ -139,6 +196,64 @@ class TranslationApiClient {
         connectTimeout: Duration(seconds: config.timeoutSeconds),
         receiveTimeout: Duration(seconds: config.timeoutSeconds),
         sendTimeout: Duration(seconds: config.timeoutSeconds),
+      ),
+    );
+    final metrics = metricsFor(dio);
+    void finish(RequestOptions options, dynamic data, {bool failed = false}) {
+      final watch = options.extra.remove('apiWatch') as Stopwatch?;
+      if (watch == null) return;
+      final kind = options.extra['requestKind'] as String? ?? 'translation';
+      metrics.elapsedMsByKind.update(
+        kind,
+        (v) => v + watch.elapsedMilliseconds,
+        ifAbsent: () => watch.elapsedMilliseconds,
+      );
+      metrics.elapsedMs += watch.elapsedMilliseconds;
+      if (failed) metrics.errors++;
+      final usage = data is Map ? data['usage'] : null;
+      if (usage is Map) {
+        if (usage['prompt_tokens'] is int &&
+            usage['completion_tokens'] is int) {
+          metrics.usageReportedRequests++;
+        }
+        if (usage['prompt_tokens'] is int) {
+          final count = max(0, usage['prompt_tokens'] as int);
+          metrics.promptTokens += count;
+          metrics.promptTokensByKind.update(
+            kind,
+            (v) => v + count,
+            ifAbsent: () => count,
+          );
+        }
+        if (usage['completion_tokens'] is int) {
+          final count = max(0, usage['completion_tokens'] as int);
+          metrics.completionTokens += count;
+          metrics.completionTokensByKind.update(
+            kind,
+            (v) => v + count,
+            ifAbsent: () => count,
+          );
+        }
+      }
+    }
+
+    dio.interceptors.add(
+      InterceptorsWrapper(
+        onRequest: (options, handler) {
+          options.extra['apiWatch'] = Stopwatch()..start();
+          metrics.requests++;
+          final kind = options.extra['requestKind'] as String? ?? 'translation';
+          metrics.byKind.update(kind, (v) => v + 1, ifAbsent: () => 1);
+          handler.next(options);
+        },
+        onResponse: (response, handler) {
+          finish(response.requestOptions, response.data);
+          handler.next(response);
+        },
+        onError: (error, handler) {
+          finish(error.requestOptions, error.response?.data, failed: true);
+          handler.next(error);
+        },
       ),
     );
 
@@ -487,7 +602,7 @@ class TranslationApiClient {
     required Dio dio,
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
-  }) {
+  }) async {
     // Dio concatenates baseUrl and a relative path as strings. Construct the
     // absolute endpoint first so a base query/fragment cannot absorb the path.
     final Uri base = Uri.parse(dio.options.baseUrl);
@@ -495,11 +610,61 @@ class TranslationApiClient {
       path: '${base.path.replaceAll(RegExp(r'/+$'), '')}/chat/completions',
       fragment: '',
     );
-    return dio.post<dynamic>(
-      endpoint.toString(),
-      data: data,
-      cancelToken: cancelToken,
+    final request = Map<String, dynamic>.from(data);
+    final cap = (dio.options.extra['maxOutputTokens'] as int? ?? 8192).clamp(
+      512,
+      32768,
     );
+    final reasoning = dio.options.extra['reasoningEffort'] as String?;
+    if (reasoning != null) request['reasoning_effort'] = reasoning;
+    final requested = request['max_tokens'] as int? ?? 900;
+    request['max_tokens'] =
+        (dio.options.extra['reasoningModel'] == true
+                ? max(4096, requested)
+                : requested)
+            .clamp(1, cap);
+    // A length-truncated answer cannot be cached as complete. Retry at most
+    // once with a genuinely larger budget, never repeat an identical paid call.
+    var kind = 'translation';
+    final messages = request['messages'];
+    if (messages is List && messages.isNotEmpty) {
+      final system = messages.first is Map
+          ? messages.first['content'].toString()
+          : '';
+      if (system.contains('connectivity probe')) kind = 'probe';
+      if (system.startsWith('Translate the book title')) kind = 'bookTitle';
+      try {
+        final payload = jsonDecode((messages.last as Map)['content'] as String);
+        if (payload is Map && payload['kind'] is String) {
+          kind = payload['kind'] as String;
+        }
+      } on Object {
+        /* Normal prose/title requests are not JSON. */
+      }
+    }
+    for (var attempt = 0; ; attempt++) {
+      final response = await dio.post<dynamic>(
+        endpoint.toString(),
+        data: request,
+        cancelToken: cancelToken,
+        options: Options(extra: {'requestKind': kind}),
+      );
+      final body = response.data;
+      final choices = body is Map ? body['choices'] : null;
+      final truncated =
+          choices is List &&
+          choices.isNotEmpty &&
+          choices.first is Map &&
+          choices.first['finish_reason'] == 'length';
+      final budget = request['max_tokens'] as int;
+      if (!truncated ||
+          kind == 'semanticReview' ||
+          attempt == 1 ||
+          budget >= cap) {
+        return response;
+      }
+      request['max_tokens'] = min(cap, budget * 2);
+    }
   }
 
   Future<T> runRetried<T>({
@@ -615,7 +780,8 @@ class TranslationApiClient {
     if (finishReason != null && finishReason != 'stop') {
       throw TranslationParseException(
         'Translation API response did not finish normally '
-        '(finish_reason=$finishReason).',
+        '(finish_reason=$finishReason). '
+        '${finishReason == 'length' ? 'Increase the output token limit or reduce reasoning effort in settings.' : ''}',
       );
     }
     final dynamic rawMessage = firstChoice['message'];
