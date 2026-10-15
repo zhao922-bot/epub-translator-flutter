@@ -14,6 +14,7 @@ import '../epub_isolate_worker.dart';
 import 'epub_html_extractor.dart';
 import 'epub_dom.dart';
 import 'epub_xml_characters.dart';
+import 'epub_xml_names.dart';
 import 'epub_navigation.dart';
 import 'epub_semantics.dart';
 import 'epub_source_guard.dart';
@@ -30,8 +31,9 @@ class EpubRepacker {
 
   static const String _xhtmlNamespace = 'http://www.w3.org/1999/xhtml';
   static final RegExp _possibleHeading = RegExp(
-    r'<(?:[A-Za-z][\w.-]*:)?h[1-6](?=[\s/>])',
+    '<(?:$epubXmlNcName:)?h[1-6](?=[\\s/>])',
     caseSensitive: false,
+    unicode: true,
   );
 
   /// Chapter-scoped key for a degraded block. Block ids restart per chapter
@@ -277,11 +279,11 @@ body.epub-translator-cjk [data-translation="true"] {
       final isDegraded = degradedBlockIds.contains(
         degradedKeyForBlock(chapterPath: chapter.path, blockId: block.id),
       );
-      final String normalizedTranslation = _collapseRedundantWhitespace(
-        _normalizeCjkInitialTypography(
-          translatedHtml,
-          container: _replacementContainerFor(target),
-        ),
+      // Whitespace can be significant through inherited/external CSS, which
+      // is unavailable when rendering a detached block. Leave it to readers.
+      final String normalizedTranslation = _normalizeCjkInitialTypography(
+        translatedHtml,
+        container: _replacementContainerFor(target),
       );
       containsCjkTranslation =
           containsCjkTranslation || _containsCjk(normalizedTranslation);
@@ -789,47 +791,6 @@ body.epub-translator-cjk [data-translation="true"] {
       }
     }
     return fragment.outerHtml;
-  }
-
-  /// Collapse runs of ASCII whitespace in translated text to a single space.
-  ///
-  /// Models sometimes emit multiple consecutive spaces; renderers collapse
-  /// them visually, but the redundant whitespace litters the EPUB source.
-  /// Literal-content subtrees are left untouched: code, scripts, styles and
-  /// textarea values can give whitespace semantic meaning just like pre.
-  /// Non-breaking spaces (U+00A0,
-  /// e.g. from `&nbsp;`) are preserved — only ASCII whitespace runs are
-  /// collapsed.
-  String _collapseRedundantWhitespace(String translatedHtml) {
-    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      translatedHtml,
-    );
-    bool changed = false;
-    void collapseNode(dom.Node node, bool insideLiteralContent) {
-      final bool inLiteralContent =
-          insideLiteralContent ||
-          (node is dom.Element &&
-              _literalContentTags.contains(epubLocalName(node)));
-      if (node is dom.Text) {
-        if (!inLiteralContent) {
-          final String collapsed = node.text.replaceAll(
-            RegExp(r'[ \t\n\r\f\v]+'),
-            ' ',
-          );
-          if (collapsed != node.text) {
-            node.text = collapsed;
-            changed = true;
-          }
-        }
-        return;
-      }
-      for (final dom.Node child in node.nodes.toList()) {
-        collapseNode(child, inLiteralContent);
-      }
-    }
-
-    collapseNode(fragment, false);
-    return changed ? fragment.outerHtml : translatedHtml;
   }
 
   bool _isInsideFootnoteMarkerAnchor(dom.Element element) {

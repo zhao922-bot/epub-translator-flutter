@@ -7,7 +7,6 @@ import 'dart:isolate';
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
-import 'package:html/parser.dart' as html_parser;
 import 'package:path/path.dart' as path;
 import 'package:xml/xml.dart' as xml;
 
@@ -1069,9 +1068,7 @@ class EpubIsolateWorker {
         preserveSourceLabels: preserveSourceLabels,
       );
     }
-    final document = html_parser.parse(
-      XhtmlHtmlCompatibility.normalizeForHtmlParser(markup),
-    );
+    final document = XhtmlHtmlCompatibility.parseDocument(markup);
     var changed = false;
     for (final nav in epubTags(document, const {'nav'})) {
       if (!isEpubTocElement(nav)) continue;

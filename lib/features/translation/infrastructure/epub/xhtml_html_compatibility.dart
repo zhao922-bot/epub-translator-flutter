@@ -3,8 +3,12 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
+import 'package:xml/xml.dart' as xml;
+import 'epub_dom.dart';
 import 'epub_foreign_content.dart';
 import 'epub_xml_characters.dart';
+import 'epub_xml_dom.dart';
+import 'epub_xml_names.dart';
 
 /// Adapts XHTML syntax that an HTML5 parser would otherwise reinterpret.
 ///
@@ -25,6 +29,13 @@ class XhtmlHtmlCompatibility {
   /// their source-owned wrapper for structure locking and protected slots.
   static dom.Document parseDocument(String source) {
     validateEpubXmlMarkup(source);
+    final xmlDocument = _xmlForUnsupportedNames(source);
+    if (xmlDocument != null) {
+      return dom.Document()
+        ..nodes.addAll([
+          for (final node in xmlDocument.children) epubXmlNodeToHtml(node),
+        ]);
+    }
     final document = html_parser.parse(normalizeForHtmlParser(source));
     restoreEpubForeignContent(document, source);
     // Safe raw text and named HTML entities cannot introduce forbidden XML
@@ -39,6 +50,14 @@ class XhtmlHtmlCompatibility {
     String? container,
   }) {
     validateEpubXmlMarkup(source);
+    final xmlDocument = _xmlForUnsupportedNames(source, fragment: true);
+    if (xmlDocument != null) {
+      return dom.DocumentFragment()
+        ..nodes.addAll([
+          for (final node in xmlDocument.rootElement.children)
+            epubXmlNodeToHtml(node),
+        ]);
+    }
     // Repacking already knows the container; its per-block path need not
     // run the table-context heuristic again.
     final root = container == null
@@ -57,6 +76,27 @@ class XhtmlHtmlCompatibility {
     restoreEpubForeignContent(fragment, source);
     if (source.contains('&#')) validateEpubDomXmlCharacters(fragment);
     return fragment;
+  }
+
+  // HTML only recognizes ASCII letters immediately after '<'. For this
+  // uncommon valid-XML case, construct the same internal DOM from XML. The
+  // normal tolerant HTML path remains available for malformed legacy books.
+  static final _unsupportedStart = RegExp(r'</?[^A-Za-z!/?\s>]');
+
+  static xml.XmlDocument? _xmlForUnsupportedNames(
+    String source, {
+    bool fragment = false,
+  }) {
+    if (!_unsupportedStart.hasMatch(source)) return null;
+    validateEpubMarkupDepth(source);
+    try {
+      return xml.XmlDocument.parse(
+        fragment ? '<epub-wrapper>$source</epub-wrapper>' : source,
+        entityMapping: const xml.XmlDefaultEntityMapping.html5(),
+      );
+    } on xml.XmlParserException {
+      return null;
+    }
   }
 
   static const Set<String> _htmlVoidTags = <String>{
@@ -91,23 +131,18 @@ class XhtmlHtmlCompatibility {
     int copyFrom = 0;
     int cursor = 0;
     while (cursor < source.length) {
-      if (source.codeUnitAt(cursor) != _lessThan ||
-          cursor + 1 >= source.length ||
-          !_isAsciiLetter(source.codeUnitAt(cursor + 1))) {
+      if (source.codeUnitAt(cursor) != _lessThan) {
+        cursor++;
+        continue;
+      }
+      final name = _openingTag.matchAsPrefix(source, cursor);
+      if (name == null) {
         cursor += 1;
         continue;
       }
 
       final int nameStart = cursor + 1;
-      int nameEnd = nameStart;
-      while (nameEnd < source.length &&
-          _isQualifiedNameCharacter(source.codeUnitAt(nameEnd))) {
-        nameEnd += 1;
-      }
-      if (nameEnd == nameStart) {
-        cursor += 1;
-        continue;
-      }
+      final int nameEnd = name.end;
 
       int? quote;
       int tagEnd = nameEnd;
@@ -256,19 +291,18 @@ class XhtmlHtmlCompatibility {
     int copyFrom = 0;
     int cursor = 0;
     while (cursor < xmlEntitySafe.length) {
-      if (xmlEntitySafe.codeUnitAt(cursor) != _lessThan ||
-          cursor + 1 >= xmlEntitySafe.length ||
-          !_isAsciiLetter(xmlEntitySafe.codeUnitAt(cursor + 1))) {
+      if (xmlEntitySafe.codeUnitAt(cursor) != _lessThan) {
+        cursor++;
+        continue;
+      }
+      final name = _openingTag.matchAsPrefix(xmlEntitySafe, cursor);
+      if (name == null) {
         cursor += 1;
         continue;
       }
 
       final int nameStart = cursor + 1;
-      int nameEnd = nameStart;
-      while (nameEnd < xmlEntitySafe.length &&
-          _isQualifiedNameCharacter(xmlEntitySafe.codeUnitAt(nameEnd))) {
-        nameEnd += 1;
-      }
+      final int nameEnd = name.end;
 
       int? quote;
       int tagEnd = nameEnd;
@@ -473,25 +507,14 @@ class XhtmlHtmlCompatibility {
   }
 
   static const int _lessThan = 0x3C;
-  static final RegExp _openingTag = RegExp(r'<([A-Za-z][\w:.-]*)(?=[\s/>])');
+  static final RegExp _openingTag = RegExp(
+    '<($epubXmlQualifiedName)(?=[\\s/>])',
+    unicode: true,
+  );
   static const int _greaterThan = 0x3E;
   static const int _slash = 0x2F;
   static const int _singleQuote = 0x27;
   static const int _doubleQuote = 0x22;
-
-  static bool _isAsciiLetter(int character) {
-    return (character >= 0x41 && character <= 0x5A) ||
-        (character >= 0x61 && character <= 0x7A);
-  }
-
-  static bool _isQualifiedNameCharacter(int character) {
-    return _isAsciiLetter(character) ||
-        (character >= 0x30 && character <= 0x39) ||
-        character == 0x3A ||
-        character == 0x2E ||
-        character == 0x5F ||
-        character == 0x2D;
-  }
 
   static bool _isWhitespace(int character) {
     return character == 0x20 ||

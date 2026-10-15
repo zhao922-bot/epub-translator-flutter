@@ -2,14 +2,8 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// Regression tests for redundant-whitespace collapsing in translated HTML.
-///
-/// Found during the 2026-10-05 live test (SiliconFlow DeepSeek-V4-Flash,
-/// Project Gutenberg "The Yellow Wallpaper"): the model emitted runs of
-/// multiple spaces (e.g. "限制。     您可以"), which renderers collapse
-/// visually but which litter the EPUB source. The repack step now collapses
-/// ASCII whitespace runs to a single space, leaving `<pre>` and non-breaking
-/// spaces untouched.
+/// Readers decide whether spaces collapse using the book's CSS. Repacking
+/// cannot remove them safely: external or inherited styles may preserve them.
 void main() {
   InspectedChapter singleBlockChapter(String translatedHtml) {
     return InspectedChapter(
@@ -32,14 +26,12 @@ void main() {
     );
   }
 
-  test('multiple spaces collapse to one in translated text', () {
+  test('ASCII and non-breaking spaces survive for reader CSS processing', () {
     final String output = EpubRepacker().renderTranslatedChapter(
       chapter: singleBlockChapter('<p>限制。     您可以&#160;&#160;继续。</p>'),
       bilingual: false,
     );
-    // ASCII runs collapse; the two non-breaking spaces survive.
-    expect(output, contains('限制。 您可以'));
-    expect(output.contains('限制。     您可以'), isFalse);
+    expect(output, contains('限制。     您可以'));
     expect(output, contains('&#160;&#160;'));
   });
 

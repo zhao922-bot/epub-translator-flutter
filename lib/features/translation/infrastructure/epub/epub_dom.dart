@@ -1,11 +1,15 @@
 import 'package:html/dom.dart' as dom;
 import 'package:xml/xml.dart' as xml;
+import 'epub_xml_names.dart';
 
 dom.Element? epubPrefixedXhtmlRoot(dom.Document document, String markup) {
   if (!markup.contains(':html')) return null;
   final xml.XmlElement sourceRoot;
   try {
-    sourceRoot = xml.XmlDocument.parse(markup).rootElement;
+    sourceRoot = xml.XmlDocument.parse(
+      markup,
+      entityMapping: const xml.XmlDefaultEntityMapping.html5(),
+    ).rootElement;
   } on xml.XmlParserException {
     return null;
   }
@@ -17,6 +21,7 @@ dom.Element? epubPrefixedXhtmlRoot(dom.Document document, String markup) {
   final root = epubElements(document)
       .where(
         (element) =>
+            element.localName == sourceRoot.name.qualified ||
             element.localName == sourceRoot.name.qualified.toLowerCase(),
       )
       .firstOrNull;
@@ -86,7 +91,10 @@ void validateEpubDomDepth(dom.Node root, {int maxDepth = 132}) {
 /// Quote-aware tokens shared by markup protection and the pre-parser depth
 /// guard. Comments and CDATA are single opaque tokens.
 final epubMarkupTokens = RegExp(
-  r'''<!--[\s\S]*?(?:-->|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<(/?)([A-Za-z][\w:.-]*)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>|<![^>]*>|<\?[^>]*\?>''',
+  r'''<!--[\s\S]*?(?:-->|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<(/?)(''' +
+      epubXmlQualifiedName +
+      r''')(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>|<![^>]*>|<\?[^>]*\?>''',
+  unicode: true,
 );
 
 void validateEpubMarkupDepth(String markup, {int maxDepth = 128}) {

@@ -177,8 +177,8 @@ void main() {
   group('14: literal content survives export postprocessing', () {
     for (final tag in ['pre', 'code', 'script', 'style', 'textarea']) {
       test('$tag retains whitespace and typography classes', () {
-        // Include CJK and redundant prose whitespace to activate both cleanup
-        // passes. Nested code spans ensure protection applies to descendants.
+        // Include CJK prose so typography cleanup runs. Nested code spans
+        // ensure protection applies to descendants; whitespace stays intact.
         const literal = '甲  乙\n   丙';
         final content = tag == 'code' || tag == 'pre'
             ? '<span class="dropcap small-caps">$literal</span>'
@@ -209,7 +209,8 @@ void main() {
             containsAll(['dropcap', 'small-caps']),
           );
         }
-        expect(document.querySelector('blockquote p')!.text, '正文 多空格 下一行');
+        // Ordinary prose may inherit white-space from book/reader CSS too.
+        expect(document.querySelector('blockquote p')!.text, '正文   多空格\n 下一行');
       });
     }
   });

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
@@ -12,9 +11,9 @@ import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/logging/app_logger.dart';
-import '../../../../shared/io/atomic_file_writer.dart';
 import '../../../../shared/platform/native_platform_bridge.dart';
 import '../../../../shared/security/sensitive_text.dart';
+import '../../../../shared/text/unicode_prefix.dart';
 import '../../domain/models/inspected_chapter.dart';
 import '../../domain/models/job_resume_state.dart';
 import '../../domain/models/translation_config.dart';
@@ -29,6 +28,7 @@ import '../epub_isolate_worker.dart';
 import 'epub_repacker.dart';
 import 'epub_html_extractor.dart';
 import 'chapter_source_restorer.dart';
+import 'chapter_source_spool.dart';
 import 'epub_source_guard.dart';
 import 'xhtml_html_compatibility.dart';
 import 'footnote_batch_planner.dart';
@@ -448,13 +448,13 @@ class EpubChapterTranslator {
   static Future<InspectedChapter> releaseChapterSourcesForTest(
     InspectedChapter chapter,
     Directory directory,
-  ) => _ChapterSourceSpool(directory: directory).release(chapter);
+  ) => ChapterSourceSpool(directory: directory).release(chapter);
 
   static Future<InspectedChapter> restoreChapterSourcesForTest(
     InspectedChapter chapter,
     Directory directory, {
     bool Function()? isCancelled,
-  }) => _ChapterSourceSpool(
+  }) => ChapterSourceSpool(
     directory: directory,
   ).restore(chapter, isCancelled: isCancelled);
 
@@ -925,7 +925,7 @@ class EpubChapterTranslator {
     // closed in the finally below so sockets/FDs do not accumulate (see M7).
     late final Dio dio;
     bool dioReady = false;
-    final sourceSpool = _ChapterSourceSpool();
+    final sourceSpool = ChapterSourceSpool();
     final cacheSpool = CacheRestorationSpool();
     final invocationChapters = chapters;
     try {
@@ -4880,10 +4880,14 @@ class EpubChapterTranslator {
       if (keptBlocks >= 12 || remaining <= 0) {
         break;
       }
-      final String? text = _plainTextFromHtml(
-        block.translatedHtml,
-        maxChars: remaining,
-      );
+      final String? text;
+      try {
+        text = _plainTextFromHtml(block.translatedHtml, maxChars: remaining);
+      } on FormatException {
+        // A UI excerpt must not abort a completed chapter. Full translation
+        // and export retain their independent XML/structure validation.
+        continue;
+      }
       final String trimmed = text?.trim() ?? '';
       if (trimmed.isEmpty) {
         continue;
@@ -4911,13 +4915,13 @@ class EpubChapterTranslator {
     final String boundedHtml =
         maxChars == null || html.length <= maxChars * _previewHtmlHeadroomFactor
         ? html
-        : html.substring(0, maxChars * _previewHtmlHeadroomFactor);
+        : unicodeSafePrefix(html, maxChars * _previewHtmlHeadroomFactor);
     final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
       boundedHtml,
     );
     String text = (fragment.text ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
     if (maxChars != null && text.length > maxChars) {
-      text = text.substring(0, maxChars).trimRight();
+      text = unicodeSafePrefix(text, maxChars).trimRight();
     }
     return text;
   }

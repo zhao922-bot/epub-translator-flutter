@@ -1,13 +1,16 @@
 import 'package:html/dom.dart' as dom;
 import 'package:xml/xml.dart' as xml;
+import 'epub_xml_dom.dart';
+import 'epub_xml_names.dart';
 
 const _foreignNamespaces = {
   'http://www.w3.org/2000/svg',
   'http://www.w3.org/1998/Math/MathML',
 };
 final _foreignRoot = RegExp(
-  r'<(?:[A-Za-z][\w.-]*:)?(?:svg|math)(?=[\s/>])',
+  '<(?:$epubXmlNcName:)?(?:svg|math)(?=[\\s/>])',
   caseSensitive: false,
+  unicode: true,
 );
 
 /// HTML tokenization lowercases qualified SVG/MathML names and attributes.
@@ -17,10 +20,16 @@ void restoreEpubForeignContent(dom.Node parsed, String source) {
   if (!_foreignRoot.hasMatch(source)) return;
   xml.XmlDocument document;
   try {
-    document = xml.XmlDocument.parse(source);
+    document = xml.XmlDocument.parse(
+      source,
+      entityMapping: const xml.XmlDefaultEntityMapping.html5(),
+    );
   } on xml.XmlParserException {
     try {
-      document = xml.XmlDocument.parse('<epub-wrapper>$source</epub-wrapper>');
+      document = xml.XmlDocument.parse(
+        '<epub-wrapper>$source</epub-wrapper>',
+        entityMapping: const xml.XmlDefaultEntityMapping.html5(),
+      );
     } on xml.XmlParserException {
       // Legacy malformed HTML keeps the existing tolerant parsing behavior.
       return;
@@ -54,41 +63,6 @@ void restoreEpubForeignContent(dom.Node parsed, String source) {
       'EPUB foreign-content structure changed during HTML parsing.',
     );
   }
-  dom.Node convert(xml.XmlNode node, [int depth = 0]) {
-    if (depth > 128) {
-      throw const FormatException(
-        'EPUB foreign content exceeds the element depth limit.',
-      );
-    }
-    if (node is xml.XmlElement) {
-      final element = dom.Document().createElementNS(
-        node.namespaceUri,
-        node.name.qualified,
-      );
-      for (final attr in node.attributes) {
-        element.attributes[attr.name.qualified] = attr.value;
-      }
-      element.nodes.addAll(
-        node.children.map((child) => convert(child, depth + 1)),
-      );
-      return element;
-    }
-    if (node is xml.XmlComment) return dom.Comment(node.value);
-    if (node is xml.XmlProcessing) {
-      return dom.Comment('?${node.target} ${node.value}?');
-    }
-    // html's serializer emits unqualified script/style Text without escaping.
-    // Keep XML text/CDATA lexemes there so '<' and '&' cannot break XHTML.
-    final parent = node.parent;
-    if ((node is xml.XmlText || node is xml.XmlCDATA) &&
-        parent is xml.XmlElement &&
-        parent.name.prefix == null &&
-        const {'script', 'style'}.contains(parent.name.local)) {
-      return dom.Text(node.toXmlString());
-    }
-    return dom.Text(node.value ?? '');
-  }
-
   for (var i = 0; i < candidates.length; i++) {
     final old = candidates[i];
     final original = sources[i];
@@ -102,6 +76,9 @@ void restoreEpubForeignContent(dom.Node parsed, String source) {
     if (parent == null) continue;
     final index = parent.nodes.indexOf(old);
     old.remove();
-    parent.nodes.insert(index, convert(original));
+    parent.nodes.insert(
+      index,
+      epubXmlNodeToHtml(original, inheritNamespaces: true),
+    );
   }
 }
