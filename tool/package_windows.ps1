@@ -15,7 +15,7 @@
          the exe. Aborts with a clear message if they cannot be found.
       3. Validates the release folder (exe, data folder, flutter_windows.dll,
          the copied runtime DLLs).
-      4. Creates dist\epub-translator-flutter-v<version>-windows-x64.zip and
+      4. Creates dist\folioferry-v<version>-windows-x64.zip and
          validates the zip contents.
 
 .PARAMETER Version
@@ -272,7 +272,7 @@ Invoke-Step 'Create portable zip' {
     if (-not (Test-Path -Path $OutDir -PathType Container)) {
         New-Item -Path $OutDir -ItemType Directory | Out-Null
     }
-    $zipName = "epub-translator-flutter-v$Version-windows-x64.zip"
+    $zipName = "folioferry-v$Version-windows-x64.zip"
     $zipPath = Join-Path $OutDir $zipName
     if (Test-Path -Path $zipPath -PathType Leaf) {
         Remove-Item -Path $zipPath -Force

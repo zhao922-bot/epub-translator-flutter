@@ -20,7 +20,7 @@ void main() {
           script.path,
           'store',
           '--label',
-          'EPUB Translator (api_key)',
+          'FolioFerry (api_key)',
           'service',
           'epub-translator',
           'name',
@@ -42,28 +42,35 @@ void main() {
       skip: Platform.isWindows ? 'Needs a POSIX shell.' : null,
     );
 
-    test('reports a non-zero helper exit as StateError', () async {
-      final File script = await _writeFailingScript('fake-secret-helper');
-      addTearDown(() => script.parent.delete(recursive: true));
+    test(
+      'reports a non-zero helper exit as StateError',
+      () async {
+        final File script = await _writeFailingScript('fake-secret-helper');
+        addTearDown(() => script.parent.delete(recursive: true));
 
-      await expectLater(
-        NativePlatformBridge.runDesktopSecretHelperForTest(
-          script.path,
-          <String>[script.path, 'lookup'],
-        ),
-        throwsA(isA<StateError>()),
-      );
-    }, skip: Platform.isWindows ? 'Needs a POSIX shell.' : null);
+        await expectLater(
+          NativePlatformBridge.runDesktopSecretHelperForTest(
+            script.path,
+            <String>[script.path, 'lookup'],
+          ),
+          throwsA(isA<StateError>()),
+        );
+      },
+      skip: Platform.isWindows ? 'Needs a POSIX shell.' : null,
+    );
 
-    test('throws UnsupportedError when the helper executable is missing', () async {
-      await expectLater(
-        NativePlatformBridge.runDesktopSecretHelperForTest(
-          '/nonexistent/definitely-not-a-secret-helper',
-          <String>['/nonexistent/definitely-not-a-secret-helper', 'lookup'],
-        ),
-        throwsA(isA<UnsupportedError>()),
-      );
-    });
+    test(
+      'throws UnsupportedError when the helper executable is missing',
+      () async {
+        await expectLater(
+          NativePlatformBridge.runDesktopSecretHelperForTest(
+            '/nonexistent/definitely-not-a-secret-helper',
+            <String>['/nonexistent/definitely-not-a-secret-helper', 'lookup'],
+          ),
+          throwsA(isA<UnsupportedError>()),
+        );
+      },
+    );
   });
 
   group('macos security -i command', () {
@@ -99,7 +106,10 @@ void main() {
     });
 
     test('securityInteractiveQuote escapes backslash and double quote', () {
-      expect(NativePlatformBridge.securityInteractiveQuote('simple'), '"simple"');
+      expect(
+        NativePlatformBridge.securityInteractiveQuote('simple'),
+        '"simple"',
+      );
       // Single quotes are literal inside security -i double quotes.
       expect(NativePlatformBridge.securityInteractiveQuote("it's"), '"it\'s"');
       expect(NativePlatformBridge.securityInteractiveQuote(''), '""');

@@ -153,6 +153,8 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
       return _androidChannel.invokeMethod<String>('appDocumentsDirectory');
     }
 
+    // Keep the legacy data directory when the display brand changes: settings,
+    // encrypted credentials, job history and translation caches live here.
     final String? appData = Platform.environment['APPDATA'];
     if (appData != null && appData.isNotEmpty) {
       return path.join(appData, 'EPUB Translator');
@@ -383,7 +385,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
       'secret-tool',
       'store',
       '--label',
-      'EPUB Translator ($name)',
+      'FolioFerry ($name)',
       'service',
       service,
       'name',
@@ -476,9 +478,7 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
   /// escape backslashes and double quotes inside.
   @visibleForTesting
   static String securityInteractiveQuote(String value) {
-    final String escaped = value
-        .replaceAll(r'\', r'\\')
-        .replaceAll('"', r'\"');
+    final String escaped = value.replaceAll(r'\', r'\\').replaceAll('"', r'\"');
     return '"$escaped"';
   }
 

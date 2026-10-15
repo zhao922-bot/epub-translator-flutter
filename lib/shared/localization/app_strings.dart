@@ -17,8 +17,8 @@ class AppStrings {
 
   bool get isChinese => language == UiLanguage.chinese;
 
-  String get appTitle => isChinese ? 'EPUB 翻译器' : 'EPUB Translator';
-  String get appSubtitle => isChinese ? '本地 EPUB 翻译' : 'Local EPUB translation';
+  String get appTitle => isChinese ? '页渡' : 'FolioFerry';
+  String get appSubtitle => isChinese ? 'AI 电子书翻译' : 'AI ebook translation';
   String get navTranslate => isChinese ? '翻译' : 'Translate';
   String get navJobs => isChinese ? '任务' : 'Jobs';
   String get navPreview => isChinese ? '预览' : 'Preview';
@@ -988,7 +988,7 @@ class AppStrings {
 
   /// C-M7: Android foreground-service notification while translating.
   String get foregroundServiceTitle =>
-      isChinese ? 'EPUB 翻译器正在翻译' : 'EPUB Translator is translating';
+      isChinese ? '页渡正在翻译' : 'FolioFerry is translating';
   String get foregroundServiceText => isChinese
       ? '翻译进行中，可在通知栏查看进度。'
       : 'Translation in progress; check the notification for progress.';

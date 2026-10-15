@@ -1,104 +1,147 @@
-# EPUB Translator Flutter
+<div align="center">
+  <img src="assets/icons/app_icon.png" width="112" height="112" alt="页渡 FolioFerry 图标：书页化作渡船" />
+  <h1>页渡 · FolioFerry</h1>
+  <p><strong>让好书跨越语言。</strong><br />Great books, in your language.</p>
+</div>
 
-![GitHub Release](https://img.shields.io/github/v/release/zhao922-bot/epub-translator-flutter)
-![Windows](https://img.shields.io/badge/Windows-x64-0078D6?logo=windows&logoColor=white)
-![Android](https://img.shields.io/badge/Android-APK-3DDC84?logo=android&logoColor=white)
-![License](https://img.shields.io/github/license/zhao922-bot/epub-translator-flutter)
+[![Release](https://img.shields.io/github/v/release/zhao922-bot/epub-translator-flutter)](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest)
+[![CI](https://github.com/zhao922-bot/epub-translator-flutter/actions/workflows/ci.yml/badge.svg)](https://github.com/zhao922-bot/epub-translator-flutter/actions/workflows/ci.yml)
+![Windows](https://img.shields.io/badge/Windows-x64-162B43?logo=windows)
+![Android](https://img.shields.io/badge/Android-APK-162B43?logo=android)
+[![License](https://img.shields.io/github/license/zhao922-bot/epub-translator-flutter)](LICENSE)
 
-整本书的 AI 翻译工具：解析 EPUB 结构 → 生成可确认的风格档案 → 按块批量翻译 → 质量校验 → 输出兼容的译本。支持断点续传，中断不用从头开始。
+**页渡是一款面向 Windows 和 Android 的 AI 电子书翻译工具。** 导入 EPUB、连接自己的模型接口，即可按章节翻译整本书，检查疑似漏译，并导出中文、其他目标语言或双语对照的 EPUB。
 
-## 下载安装
+从 **1.7** 开始，EPUB Translator Flutter 正式更名为 **页渡 / FolioFerry**，采用“书页化作渡船”的新图标。GitHub 仓库地址保持不变。
 
-当前版本：**1.6.36+52**。修复格言标点本地化、公司名单小写品牌名导致的残留误报，并为失败日志补充经过脱敏的具体原因。详见 [更新日志](CHANGELOG.md)。
+## 下载与升级
 
-安装包与校验值见 [v1.6.36 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.6.36)。
+当前版本：**1.7.0+53**。安装包与 SHA-256 校验文件见 [1.7.0 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.7.0)。
 
-| 平台 | 下载 | 说明 |
-|------|------|------|
-| Windows x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-flutter-v1.6.36-windows-x64-setup.exe) / [便携 ZIP](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-flutter-v1.6.36-windows-x64.zip) | 安装包为当前用户安装；便携包解压后运行 `epub_translator_flutter_clean.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [v1.6.36 APK](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.6.36/epub-translator-v1.6.36-android.apk) | 沿用 v1.6.31–v1.6.35 发布签名，可覆盖升级；更早的旧签名版本需先备份设置与数据，再卸载并安装 |
+| 平台 | 下载 | 使用方式 |
+| --- | --- | --- |
+| Windows 10 / 11 x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.0/folioferry-v1.7.0-windows-x64-setup.exe) | 为当前用户安装，可从开始菜单启动 |
+| Windows 便携版 | [ZIP 压缩包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.0/folioferry-v1.7.0-windows-x64.zip) | 完整解压后运行 `FolioFerry.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [APK 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.0/folioferry-v1.7.0-android.apk) | 中文系统显示“页渡”，其他系统显示“FolioFerry” |
 
-> Windows 首次运行可能被 SmartScreen 拦截（暂未商业代码签名），选择"仍要运行"即可。
+- **Android 升级**：沿用 v1.6.31–v1.6.36 的应用标识与发布签名，可覆盖安装这些版本，无需为更名卸载软件。更早的签名不同版本需先备份设置与数据。
+- **Windows 升级**：安装包沿用原应用标识，已有安装会继续使用原安装目录；设置、密钥、任务记录和缓存继续从原数据位置读取。
+- Windows 安装包目前未进行商业代码签名。若系统提示未知发布者，请核对下载来源及发布页提供的 SHA-256。
 
-## 核心能力
+## 五步开始
 
-- **整书工作流**：章节选择、工作量预估、按块批量翻译，上下文与术语锁定保证前后连贯
-- **风格档案**：翻译前采样分析文体语气，展示置信度供你确认修改，AI 误判不会扩散到全书
-- **质量校验**：漏翻、源语言残留、异常输出自动检测重试；失败块可保留原文，输出可用译本
-- **断点续传**：中断后复用有效缓存；重试保留章节选择。Android 使用前台服务维持后台任务，仍可能受系统省电策略限制
-- **EPUB 兼容**：保留图片、目录、章节顺序与排版，输出前校验 XML，降低损坏概率
-- **内容保护**：保留表格单元格和标题属性、正文 CDATA、代码与公式；术语替换跳过受保护内容，双语导出避免重复锚点并保留源语言元数据
-- **源文件校验**：检查后若 EPUB 内容发生变化，翻译或导出会提示重新检查，避免混用旧章节与新文件
-- **隐私**：Windows 下 API Key 系统级加密存储，日志自动脱敏；API Key 用于向你配置的服务商认证，不内置服务商密钥
+1. **配置接口**：打开“设置”，选择 DeepSeek 或 Custom，填写接口地址、API Key 和模型名称。Custom 用于兼容 OpenAI Chat Completions 格式的服务。
+2. **测试连接**：确认所填模型能够返回正常文本；API Key 和服务商用量由你自行提供与管理。
+3. **导入 EPUB**：检查章节结构，选择需要翻译的章节，查看文本块数量与粗略工作量估算。
+4. **确认风格并翻译**：按需生成、修改书籍风格档案，再开始翻译。中断后可继续，符合当前配置的有效缓存会被复用。
+5. **检查并导出**：查看完成状态、警告和可选复核建议，将导出的 EPUB 保存到下载目录或交给阅读器打开。
 
-## 使用流程
+首次使用建议先选一个短章节，确认模型、译文风格与费用符合预期。
 
-1. 在"设置"页选择 DeepSeek 或 Custom，填写接口地址、API Key 和模型
-2. 导入无 DRM 的 EPUB，选择章节，查看块数与费用预估
-3. 生成风格档案，检查 AI 的判断并按需修改
-4. 开始翻译；完成后将译本导入阅读器验收
+## 主要功能
 
-<details>
-<summary>API 配置说明</summary>
+| 功能 | 能做什么 |
+| --- | --- |
+| 整书翻译 | 按章节与文本块组织请求，结合上下文、术语和滚动摘要协助保持连贯 |
+| 书籍风格档案 | 从开篇内容分析文体与语气，由你确认或修改后用于后续翻译 |
+| 结构与残留检查 | 检查异常回复、疑似漏译和结构问题，重试失败块并记录原因 |
+| 缓存与续传 | 复用有效译文，中断后继续；支持在有效缓存基础上切换单语与双语导出 |
+| 译文语义复核 | 可选检查数字、术语及语义风险，提供有原文依据的修改建议 |
+| 人工校对 | 搜索原文、译文或段落编号，确认、修改并导出独立校对版 |
+| EPUB 导出 | 尽量保留目录、章节顺序、图片、链接、脚注、代码、公式与原排版 |
+| 用量记录 | 展示请求次数、接口返回的输入/输出 token、耗时和缓存命中情况 |
 
-- **DeepSeek**：默认接口 `https://api.deepseek.com`，默认模型 `deepseek-v4-flash`
-- **Custom**：兼容 OpenAI Chat Completions 格式的第三方服务，配置独立保存，切换不互相覆盖
-- 第三方服务即使声称兼容，也可能在返回格式、限流、模型行为上有差异，建议先用短章节验证
-- API 请求会把待翻译文本发往你配置的服务商，请确认其隐私政策与计费规则
+Android 翻译期间使用前台服务显示进度。系统省电、后台时限和强制停止仍可能中断任务，恢复后可继续处理未完成部分。
 
-</details>
+## 如何理解“完成但有警告”
 
-### 模型与质量设置
+进度达到 **100%** 表示本次任务流程已处理完成；部分段落仍可能没有通过检查。页渡会在日志中记录章节、文本块编号、失败原因，以及保留的是原文还是待复核译文。
 
-“设置 → 翻译 → 高级调优”可调整模型推理强度和单次输出上限。自动模式已适配 GLM-5.3/Flash，其他模型保留服务商默认行为；手动强度需要接口支持。
+你可以查看这些段落，再决定重试或人工校对。残留规则允许有原文依据的专名、公司名单及附带中文释义的外语短语；它只能识别部分风险，**不能证明整本书的翻译完全准确**。
 
-可选的“译文语义复核”默认关闭。开启后默认优先检查有数字、币种、术语或语义风险的段落，也可选择全部段落。数字检查识别阿拉伯数字、常见英文数字词及中文数字；人物检查结合锁定术语和书籍记忆。检查结果是待核实的提示，不会自动改写译文。
+## 可选复核与人工校对
 
-复核模型需要提供明确的原文依据；文风润色、缺少依据和不确定的改写会被拒绝，并标记未完成复核。通过结构校验的建议也需要用户确认：在“运行概览”或“任务历史”打开“查看检查结果与修改建议”，逐条选择后导出新的复核版 EPUB。取消选择并再次导出可撤销修改，原译本和翻译缓存保留。基准译本发生变化时拒绝套用旧建议。报告和原译本需要保留在原位置。
+“译文语义复核”默认关闭。开启后，可优先检查风险段落或检查全部段落，并设置额外请求次数与 token 预算。
 
-复核同时受额外请求次数和预估 token 预算限制。预算按输入 UTF-8 字节及最大输出额度保守预留，达到任一上限即停止新增复核，保留草稿供续跑；它是本地控制值，不代表服务商账单。重新运行时复用已完成的复核及修改建议，恢复尚未完成的工作。
+- 模型提出的修改建议需要原文依据，并经过结构校验；不会自动覆盖已导出的译本。
+- 在“运行概览”或“任务历史”打开检查结果，逐条选择建议，再导出新的复核版 EPUB。
+- 也可搜索任意已翻译段落进行人工校对。复杂行内排版采用精确文字替换，以保留链接、强调和脚注。
+- 原译本与翻译缓存保留；取消选择后可重新导出。基准译本变化时，旧建议不会被直接套用。
+- 译本旁的 `.epub.quality.json` 包含复核记录及重新导出所需内容，请与译本一起保存。
 
-风格、正文及书名有效缓存可跨单双语导出复用；运行概览和历史记录保存本次 API 请求量、服务商返回的输入/输出 token、任务耗时及各阶段累计请求耗时。并发请求耗时会重叠；未返回 usage 的请求标为用量未知。质量建议和未复核清单保存在译本旁的 `.epub.quality.json`，其中包含用于重新导出的章节内容。
+## 模型、费用与数据
 
-审阅页支持“人工校对任意段落”，可搜索原文、译文或段落编号，修改或确认译文后本地导出。带行内排版的段落使用精确文字替换，保留链接、强调和脚注。人工核对与模型复核分别记录；模型复核失败的原因不会被人工操作改写成通过。
+页渡不附带模型额度。翻译质量、速度、可用模型和费用取决于你选择的服务商与配置。
 
-## 从源码构建
+- 待翻译文本，以及启用风格分析、摘要或复核时所需的书籍片段，会发送到你配置的 API 服务。
+- API Key 使用平台提供的安全存储机制或加密保护；日志对常见凭据进行脱敏。请勿将密钥写入公开仓库。
+- 书籍、设置、历史记录和缓存由应用保存在本机；导出的诊断与复核文件可能包含书籍内容。
+- 工作量估算与 token 预算是本地参考值；界面统计以服务商返回的 usage 为依据，未返回的用量标记为未知，最终费用以服务商账单为准。
+- 第三方接口的“兼容”程度可能不同。可以在高级设置中调整输出上限及受服务商支持的推理强度。
 
-需要 Flutter 3.44+ / Dart 3.12+：
+## 支持范围
+
+- 当前提供 **Windows x64** 与 **Android APK**；仓库中的 macOS / Linux 工程尚不提供本轮验证过的安装包。
+- 输入为无 DRM 的 EPUB；无法处理受 DRM 保护的书籍。
+- 原书已有的格式问题、复杂 CSS、字体及阅读器差异，仍可能影响最终显示。
+- 建议保留原始 EPUB，并使用有权处理的书籍；重要内容需要人工核对。
+
+## 从源码运行与构建
+
+发布环境使用 **Flutter 3.44.0 / Dart 3.12.0**。确保 `flutter` 和 `dart` 命令可用。
 
 ```powershell
+git clone https://github.com/zhao922-bot/epub-translator-flutter.git
+cd epub-translator-flutter
 flutter pub get
-powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
-# 产物: dist\epub-translator-flutter-v<版本>-windows-x64.zip（便携包）
-# 可选 EXE 安装包：先安装 Inno Setup 6.3+ 并将 ISCC 加入 PATH
-ISCC /DAppVersion=1.6.36 tool\windows_installer.iss
-flutter build apk --release       # 需配置 android/key.properties 签名
+flutter run -d windows
 ```
 
-> Windows 便携包说明：`flutter build windows` 的输出不含 VC++ 运行库（`msvcp140.dll` 等），
-> 在干净的 Win10/11 上会启动失败。`tool\package_windows.ps1` 会自动从本机查找并附带这些 DLL；
-> 若本机没有安装 Visual Studio / VC++ Redistributable，脚本会明确报错并给出下载链接。
-> 打包前请确认两点：① 用 64 位 PowerShell 运行脚本（32 位会直接报错并给出正确的重跑命令）；
-> ② 仓库路径不要太深（超过约 200 字符脚本会拒绝打包，请移到如 `C:\src\epub-translator-flutter` 的浅目录），
-> 否则 PowerShell 5.1 的 `Compress-Archive` 会因长路径莫名失败。
-
-## 已知边界
-
-- 不支持 DRM 保护的 EPUB；极少数自定义脚本、字体或复杂 CSS 在不同阅读器表现可能不同
-- 翻译质量、速度、费用取决于模型与服务商；建议保留原始 EPUB，先用短章节验证
-- v1.4.4 更新了表格单元格、表格标题和含代码/公式等受保护内容的缓存键；对应旧缓存可能需要重新翻译，其他未受影响的块仍可复用
-
-## 开发验证
-
-v1.6.36 在 Windows x64、Flutter 3.44.0 / Dart 3.12.0 下验证：完整 Flutter 测试 2645 项通过、22 项环境／显式运行用例跳过、0 失败，静态分析无问题。覆盖格言标点本地化、公司名单、真实漏译拦截、缓存复用、日志脱敏及既有翻译流程。对最新实书译本离线核对 1124 块，确认两处残留警告为误报，修复后规则检查无警告。独立修正版保留现有译文，EPUBCheck 无新增问题，原书已有格式错误仍保留说明。本轮未调用付费模型接口；残留检查不等同于全书逐句语义校对。此前真实 API 翻译及性能验证记录见更新日志。
+Windows 需要 Visual Studio 的“使用 C++ 的桌面开发”组件。打包脚本会附带必要的 VC++ 运行库；请使用 64 位 PowerShell，并将仓库放在较短的路径中。
 
 ```powershell
-$env:LIVE_TRANSLATION_E2E='0'
+# Windows 便携 ZIP
+powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
+
+# Windows EXE 安装包：需 Inno Setup 6.3+，先完成上述打包
+ISCC /DAppVersion=1.7.0 tool\windows_installer.iss
+
+# Android：需 Android SDK 与 JDK（发布使用 JDK 21）
+# 将 android/key.properties.example 复制为 android/key.properties，填写本机签名配置
+flutter build apk --release
+```
+
+签名文件与密码不要提交到 Git。发布构建缺少签名配置时会报错，不会自动使用调试签名。
+
+### 图标资源
+
+批准的原图保存在 `assets/branding/folioferry-master.png`。以下脚本从同一原图生成应用内 PNG、Android 各密度图标、自适应图标素材、Windows 多尺寸 ICO 与 macOS 图标：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tool\generate_app_icons.ps1
+```
+
+Android 自适应图标由系统套用圆形或圆角蒙版；图案留有安全边距。图标资源的生成只调整尺寸和编码，不重新设计图案。
+
+### 开发验证
+
+```powershell
 flutter analyze --no-pub
 flutter test --no-pub --concurrency=2
 ```
 
-## 更多
+GitHub CI 执行静态分析、完整测试，并使用 EPUBCheck 5.4.0 验证导出样本。需要真实服务的测试默认跳过；历史实书测试、性能与回归结果见 [更新日志](CHANGELOG.md)。
 
+为兼容旧版数据，Dart 包名、Android applicationId、密钥服务标识及桌面数据目录保留原值。更名时请勿将这些持久化标识与显示名称一并替换。
+
+## English
+
+**FolioFerry** is an AI-powered EPUB translator for Windows and Android. Connect your own compatible API, select chapters, review the book's style, and export a translated or bilingual EPUB. Valid translations can be reused through caching and resume support. Optional review suggestions and manual corrections are applied only when you select and export them.
+
+Version 1.7 introduces the **FolioFerry / 页渡** name and the book-and-ferry icon. Existing application identities and data locations are retained for upgrade compatibility. See [Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) for downloads.
+
+## 反馈与许可
+
+- [提交问题或建议](https://github.com/zhao922-bot/epub-translator-flutter/issues)：请注明版本、系统与复现步骤，分享日志前检查是否含私人书籍内容或凭据。
 - [更新日志](CHANGELOG.md)
-- 本项目使用 [MIT License](LICENSE)
+- 项目使用 [MIT License](LICENSE)。

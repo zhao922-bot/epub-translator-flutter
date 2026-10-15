@@ -1962,7 +1962,7 @@ class MainActivity : FlutterActivity() {
      */
     private fun startTranslationService(call: MethodCall, result: MethodChannel.Result) {
         val title = call.argument<String>("title")?.takeIf { it.isNotBlank() }
-            ?: "EPUB Translator"
+            ?: getString(R.string.app_name)
         val text = call.argument<String>("text").orEmpty()
         val stopLabel = call.argument<String>("stopLabel")?.takeIf { it.isNotBlank() }
             ?: "Stop"

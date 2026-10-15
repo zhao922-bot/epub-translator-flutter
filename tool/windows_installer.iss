@@ -1,10 +1,10 @@
-; Run after tool/package_windows.ps1 has bundled the VC++ runtime:
-; ISCC /DAppVersion=1.4.9 tool/windows_installer.iss
+﻿; Run after tool/package_windows.ps1 has bundled the VC++ runtime:
+; ISCC /DAppVersion=1.7.0 tool/windows_installer.iss
 #ifndef AppVersion
-  #error AppVersion is required (for example /DAppVersion=1.4.9).
+  #error AppVersion is required (for example /DAppVersion=1.7.0).
 #endif
-#define AppName "EPUB Translator"
-#define AppExe "epub_translator_flutter_clean.exe"
+#define AppName "页渡 · FolioFerry"
+#define AppExe "FolioFerry.exe"
 #ifndef ReleaseDir
   #define ReleaseDir "..\build\windows\x64\runner\Release"
 #endif
@@ -17,7 +17,9 @@ AppPublisher=zhao922-bot
 AppPublisherURL=https://github.com/zhao922-bot/epub-translator-flutter
 AppSupportURL=https://github.com/zhao922-bot/epub-translator-flutter/issues
 AppUpdatesURL=https://github.com/zhao922-bot/epub-translator-flutter/releases
-DefaultDirName={localappdata}\Programs\EPUB Translator
+DefaultDirName={localappdata}\Programs\FolioFerry
+UsePreviousAppDir=yes
+UsePreviousTasks=yes
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -25,7 +27,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 OutputDir=..\dist
-OutputBaseFilename=epub-translator-flutter-v{#AppVersion}-windows-x64-setup
+OutputBaseFilename=folioferry-v{#AppVersion}-windows-x64-setup
 SetupIconFile=..\windows\runner\resources\app_icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2
@@ -42,7 +44,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#ReleaseDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Existing custom shortcuts can keep launching the legacy filename after an upgrade.
+Source: "{#ReleaseDir}\{#AppExe}"; DestDir: "{app}"; DestName: "epub_translator_flutter_clean.exe"; Flags: ignoreversion; Check: HasLegacyExecutable
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+
+[InstallDelete]
+Type: files; Name: "{autoprograms}\EPUB Translator.lnk"
+Type: files; Name: "{autodesktop}\EPUB Translator.lnk"
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
@@ -50,3 +58,9 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function HasLegacyExecutable: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\epub_translator_flutter_clean.exe'));
+end;

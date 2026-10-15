@@ -22,7 +22,7 @@ import androidx.core.app.NotificationManagerCompat
  */
 class TranslationForegroundService : Service() {
 
-    private var lastTitle: String = "EPUB Translator"
+    private var lastTitle: String = "FolioFerry"
     private var lastText: String = ""
     private var lastProgress: Int = 0
     private var stopLabel: String = "Stop"
@@ -34,6 +34,7 @@ class TranslationForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        lastTitle = getString(R.string.app_name)
         instance = this
         createNotificationChannel()
     }

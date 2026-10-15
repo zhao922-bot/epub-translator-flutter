@@ -26,33 +26,41 @@ void main() {
     expect(decoded, isNull);
   });
 
-  test('runs Windows dialog scripts with UTF-8 stdout', () async {
-    const String selectedPath =
-        r'C:\Users\Yang\Desktop\薬屋のひとりごと 15 (日向夏 ,しのとうこ) (z-library.sk, 1lib.sk, z-lib.sk).epub';
-    const String script = r'''
+  test(
+    'runs Windows dialog scripts with UTF-8 stdout',
+    () async {
+      const String selectedPath =
+          r'C:\Users\Yang\Desktop\薬屋のひとりごと 15 (日向夏 ,しのとうこ) (z-library.sk, 1lib.sk, z-lib.sk).epub';
+      const String script = r'''
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = $utf8NoBom
 $OutputEncoding = $utf8NoBom
 [Console]::Out.WriteLine('C:\Users\Yang\Desktop\薬屋のひとりごと 15 (日向夏 ,しのとうこ) (z-library.sk, 1lib.sk, z-lib.sk).epub')
 ''';
 
-    final String? decoded =
-        await NativePlatformBridge.runWindowsDialogScriptForTest(script);
+      final String? decoded =
+          await NativePlatformBridge.runWindowsDialogScriptForTest(script);
 
-    expect(decoded, selectedPath);
-  }, skip: Platform.isWindows ? null : 'Windows-only PowerShell process test.');
+      expect(decoded, selectedPath);
+    },
+    skip: Platform.isWindows ? null : 'Windows-only PowerShell process test.',
+  );
 
-  test('round trips Windows secrets through DPAPI storage', () async {
-    final String name = 'codex_test_${DateTime.now().microsecondsSinceEpoch}';
-    addTearDown(() => NativePlatformBridge.deleteSecret(name));
+  test(
+    'round trips Windows secrets through DPAPI storage',
+    () async {
+      final String name = 'codex_test_${DateTime.now().microsecondsSinceEpoch}';
+      addTearDown(() => NativePlatformBridge.deleteSecret(name));
 
-    await NativePlatformBridge.writeSecret(name, 'sk-secret-value');
-    final String? restored = await NativePlatformBridge.readSecret(name);
-    await NativePlatformBridge.deleteSecret(name);
+      await NativePlatformBridge.writeSecret(name, 'sk-secret-value');
+      final String? restored = await NativePlatformBridge.readSecret(name);
+      await NativePlatformBridge.deleteSecret(name);
 
-    expect(restored, 'sk-secret-value');
-    expect(await NativePlatformBridge.readSecret(name), isNull);
-  }, skip: Platform.isWindows ? null : 'Windows-only DPAPI storage test.');
+      expect(restored, 'sk-secret-value');
+      expect(await NativePlatformBridge.readSecret(name), isNull);
+    },
+    skip: Platform.isWindows ? null : 'Windows-only DPAPI storage test.',
+  );
 
   test('parses LongPathsEnabled registry output', () {
     expect(NativePlatformBridge.parseLongPathsEnabledOutput('1\r\n'), isTrue);
@@ -193,7 +201,7 @@ $OutputEncoding = $utf8NoBom
         'secret-tool',
         'store',
         '--label',
-        'EPUB Translator (api_key)',
+        'FolioFerry (api_key)',
         'service',
         'epub-translator',
         'name',
@@ -249,21 +257,25 @@ $OutputEncoding = $utf8NoBom
     );
   });
 
-  test('missing Linux secret: null with a backend, UnsupportedError without one', () async {
-    // A never-stored key degrades to null only when a secret backend is
-    // actually present. Without secret-tool there is no backend at all:
-    // the bridge reports UnsupportedError (deterministic) instead of
-    // pretending the key is merely missing, so the settings store records
-    // it distinctly from a transient read failure. Either way desktop
-    // startup is never interrupted (the store catches per slot).
-    final String name =
-        'codex_test_missing_${DateTime.now().microsecondsSinceEpoch}';
-    try {
-      expect(await NativePlatformBridge.readSecret(name), isNull);
-    } on UnsupportedError {
-      // No secret backend on this machine: the expected new behavior.
-    }
-  }, skip: Platform.isLinux ? null : 'Linux-only secret-tool lookup test.');
+  test(
+    'missing Linux secret: null with a backend, UnsupportedError without one',
+    () async {
+      // A never-stored key degrades to null only when a secret backend is
+      // actually present. Without secret-tool there is no backend at all:
+      // the bridge reports UnsupportedError (deterministic) instead of
+      // pretending the key is merely missing, so the settings store records
+      // it distinctly from a transient read failure. Either way desktop
+      // startup is never interrupted (the store catches per slot).
+      final String name =
+          'codex_test_missing_${DateTime.now().microsecondsSinceEpoch}';
+      try {
+        expect(await NativePlatformBridge.readSecret(name), isNull);
+      } on UnsupportedError {
+        // No secret backend on this machine: the expected new behavior.
+      }
+    },
+    skip: Platform.isLinux ? null : 'Linux-only secret-tool lookup test.',
+  );
 
   group('observeWindowsPath', () {
     test('OneDrive path fires the placeholder notice', () async {
@@ -275,16 +287,20 @@ $OutputEncoding = $utf8NoBom
       expect(notices, contains(WindowsPathNotice.oneDrivePlaceholder));
     });
 
-    test('ordinary path fires no notices off Windows', () async {
-      // On Linux the PowerShell registry read fails and is swallowed, so a
-      // long path produces no notice instead of crashing the picker flow.
-      final List<WindowsPathNotice> notices = <WindowsPathNotice>[];
-      await NativePlatformBridge.observeWindowsPath(
-        '/home/user/${'a' * 250}.epub',
-        notices.add,
-      );
-      expect(notices, isEmpty);
-    }, skip: Platform.isLinux ? null : 'Linux-only behavior test.');
+    test(
+      'ordinary path fires no notices off Windows',
+      () async {
+        // On Linux the PowerShell registry read fails and is swallowed, so a
+        // long path produces no notice instead of crashing the picker flow.
+        final List<WindowsPathNotice> notices = <WindowsPathNotice>[];
+        await NativePlatformBridge.observeWindowsPath(
+          '/home/user/${'a' * 250}.epub',
+          notices.add,
+        );
+        expect(notices, isEmpty);
+      },
+      skip: Platform.isLinux ? null : 'Linux-only behavior test.',
+    );
 
     test('never throws for an empty path', () async {
       await NativePlatformBridge.observeWindowsPath('', (_) {});
