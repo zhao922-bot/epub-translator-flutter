@@ -116,12 +116,21 @@ void main() {
         final doc = XmlDocument.parse(
           utf8.decode(exported.findFile('OPS/c2.xhtml')!.content as List<int>),
         );
-        expect(
-          doc.descendants.whereType<XmlElement>().where(
-            (e) => e.name.local == 'em',
-          ),
-          hasLength(1),
-        );
+        final styles = doc.descendants
+            .whereType<XmlElement>()
+            .where((e) => e.name.local == 'em')
+            .toList();
+        if (mode == 'reverse-split-source' ||
+            mode == 'reverse-encoded-source') {
+          expect(styles.map((e) => e.innerText).join(), '亚当·斯密');
+          expect(
+            styles.where((e) => e.getAttribute('id') == 'name-style'),
+            hasLength(1),
+          );
+          expect(styles.where((e) => e.innerText.isNotEmpty), hasLength(1));
+        } else {
+          expect(styles, hasLength(1));
+        }
       }
       expect(
         second,

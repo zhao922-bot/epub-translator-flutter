@@ -119,7 +119,24 @@ void main() {
             targetLanguage: 'Chinese',
             state: state,
           );
-          expect(_tags(result), _tags(input), reason: input);
+          final doc = XmlDocument.parse(result);
+          final styles = doc.findAllElements('em').toList();
+          expect(
+            styles.where((e) => e.getAttribute('id') == 'style'),
+            hasLength(1),
+          );
+          // A wrapper crossing the two names must split to keep the style on
+          // its original characters. Verify those characters, not just tags.
+          final order = later ? [6, 7] : [6, 7, 5, 0, 1, 2, 3, 4, 8];
+          final expectedStyle = order
+              .where((i) => i >= start && i < end)
+              .map((i) => name[i])
+              .join();
+          expect(
+            styles.map((e) => e.innerText).join(),
+            expectedStyle,
+            reason: input,
+          );
           expect(
             _text(result),
             later ? '斯密继续。' : '斯密（Smith）继续。',
@@ -141,7 +158,8 @@ void main() {
         targetLanguage: 'Chinese',
         state: state,
       );
-      expect(_tags(result), _tags(input));
+      final styles = XmlDocument.parse(result).findAllElements('em');
+      expect(styles.map((e) => e.innerText).join(), later ? '斯密' : '斯密（ith');
       expect(_text(result), later ? '斯密继续。' : '斯密（Smith）继续。');
     }
   });

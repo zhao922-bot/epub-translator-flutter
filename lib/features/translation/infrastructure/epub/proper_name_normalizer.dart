@@ -6,6 +6,165 @@ import 'xhtml_html_compatibility.dart';
 
 typedef _NameOccurrence = ({int start, int end});
 
+/// Text runs retain their original ancestor identities when a reverse gloss
+/// changes order. A wrapper crossing both names can be reopened, but its ID
+/// (or legacy named-anchor identity) must only be emitted once.
+class _NameWrapper {
+  _NameWrapper(this.name, this.opening, this.start, this.firstPiece);
+  final String name, opening;
+  final int start, firstPiece;
+  String closing = '';
+
+  static final _attributes = RegExp(
+    r'''\s+([^\s=<>/]+)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''',
+  );
+  String get continuation => opening.replaceAllMapped(_attributes, (match) {
+    return const {
+          'id',
+          'xml:id',
+          'name',
+        }.contains(match.group(1)!.toLowerCase())
+        ? ''
+        : match.group(0)!;
+  });
+}
+
+class _NamePiece {
+  _NamePiece(this.start, this.end, this.raw, this.parents, {this.text = true});
+  final int start, end;
+  final String raw;
+  final List<_NameWrapper> parents;
+  final bool text;
+  _NamePiece withText(String value) =>
+      _NamePiece(start, end, value, parents, text: text);
+}
+
+class _NameMarkup {
+  _NameMarkup(this.pieces);
+  final List<_NamePiece> pieces;
+
+  static _NameMarkup? parse(String html) {
+    final pieces = <_NamePiece>[];
+    final parents = <_NameWrapper>[];
+    var cursor = 0;
+    for (final token in epubMarkupTokens.allMatches(html)) {
+      if (cursor < token.start) {
+        pieces.add(
+          _NamePiece(
+            cursor,
+            token.start,
+            html.substring(cursor, token.start),
+            List.of(parents),
+          ),
+        );
+      }
+      final name = token.group(2)?.toLowerCase();
+      final raw = token.group(0)!;
+      if (name == null ||
+          raw.endsWith('/>') ||
+          const {
+            'area',
+            'base',
+            'br',
+            'col',
+            'embed',
+            'hr',
+            'img',
+            'input',
+            'link',
+            'meta',
+            'param',
+            'source',
+            'track',
+            'wbr',
+          }.contains(name.split(':').last)) {
+        pieces.add(
+          _NamePiece(
+            token.start,
+            token.end,
+            raw,
+            List.of(parents),
+            text: false,
+          ),
+        );
+      } else if (token.group(1) == '/') {
+        if (parents.isEmpty || parents.last.name != name) return null;
+        final parent = parents.removeLast()..closing = raw;
+        if (pieces.length == parent.firstPiece) {
+          pieces.add(
+            _NamePiece(
+              parent.start,
+              token.end,
+              html.substring(parent.start, token.end),
+              List.of(parents),
+              text: false,
+            ),
+          );
+        }
+      } else {
+        parents.add(_NameWrapper(name, raw, token.start, pieces.length));
+      }
+      cursor = token.end;
+    }
+    if (parents.isNotEmpty) return null;
+    if (cursor < html.length) {
+      pieces.add(_NamePiece(cursor, html.length, html.substring(cursor), []));
+    }
+    return _NameMarkup(pieces);
+  }
+
+  Iterable<_NamePiece> slice(int start, int end) sync* {
+    if (start >= end) return;
+    var low = 0, high = pieces.length;
+    while (low < high) {
+      final middle = (low + high) ~/ 2;
+      if (pieces[middle].end <= start) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    for (var i = low; i < pieces.length && pieces[i].start < end; i++) {
+      final piece = pieces[i];
+      final from = start > piece.start ? start : piece.start;
+      final to = end < piece.end ? end : piece.end;
+      yield _NamePiece(
+        from,
+        to,
+        piece.raw.substring(from - piece.start, to - piece.start),
+        piece.parents,
+        text: piece.text,
+      );
+    }
+  }
+
+  static String render(Iterable<_NamePiece> pieces) {
+    final out = StringBuffer();
+    final active = <_NameWrapper>[];
+    final emitted = <_NameWrapper>{};
+    for (final piece in pieces) {
+      var common = 0;
+      while (common < active.length &&
+          common < piece.parents.length &&
+          identical(active[common], piece.parents[common])) {
+        common++;
+      }
+      while (active.length > common) {
+        out.write(active.removeLast().closing);
+      }
+      for (final parent in piece.parents.skip(common)) {
+        out.write(emitted.add(parent) ? parent.opening : parent.continuation);
+        active.add(parent);
+      }
+      out.write(piece.raw);
+    }
+    for (final parent in active.reversed) {
+      out.write(parent.closing);
+    }
+    return out.toString();
+  }
+}
+
 /// Visible text offsets for forward name glosses. Formatting markup is
 /// transparent, while block and non-prose boundaries remain opaque. Keeping
 /// offsets lets removal preserve the exact original tags and owned anchors.
@@ -684,14 +843,13 @@ class ProperNameNormalizer {
   }
 
   /// Word-boundary check tuned for mixed CJK/Latin prose: a bare name must
-  /// not be glued to ASCII letters, digits or `_` on either side, so a
+  /// not be glued to Latin letters, combining marks, digits or `_`, so a
   /// locked `Li` never fires inside "alliance" and a locked `Smith` never
   /// fires inside "blacksmith". CJK characters, punctuation, whitespace,
   /// the opaque mask (`\uE002`) and the identifier sentinels all count as
   /// boundaries; the empty-tag mask (`\uE003`) is transparent and looked
   /// through, so `Li<span></span>mited` is seen as the glued word it is.
   static bool _hasNameWordBoundary(String masked, _NameOccurrence match) {
-    bool isWordChar(String char) => RegExp(r'[A-Za-z0-9_]').hasMatch(char);
     int start = match.start;
     while (start > 0 && masked[start - 1] == '\uE003') {
       start--;
@@ -700,13 +858,41 @@ class ProperNameNormalizer {
     while (end < masked.length && masked[end] == '\uE003') {
       end++;
     }
-    if (start > 0 && isWordChar(masked[start - 1])) {
+    if (start > 0 &&
+        _nameWordCharacter.hasMatch(_scalarBefore(masked, start))) {
       return false;
     }
-    if (end < masked.length && isWordChar(masked[end])) {
+    if (end < masked.length &&
+        _nameWordCharacter.hasMatch(_scalarAt(masked, end))) {
       return false;
     }
     return true;
+  }
+
+  static final _nameWordCharacter = RegExp(
+    r'[\p{Script=Latin}\p{M}\p{Nd}_]',
+    unicode: true,
+  );
+  static String _scalarBefore(String text, int end) {
+    final unit = text.codeUnitAt(end - 1);
+    final pair =
+        end > 1 &&
+        unit >= 0xDC00 &&
+        unit <= 0xDFFF &&
+        text.codeUnitAt(end - 2) >= 0xD800 &&
+        text.codeUnitAt(end - 2) <= 0xDBFF;
+    return text.substring(end - (pair ? 2 : 1), end);
+  }
+
+  static String _scalarAt(String text, int start) {
+    final unit = text.codeUnitAt(start);
+    final pair =
+        start + 1 < text.length &&
+        unit >= 0xD800 &&
+        unit <= 0xDBFF &&
+        text.codeUnitAt(start + 1) >= 0xDC00 &&
+        text.codeUnitAt(start + 1) <= 0xDFFF;
+    return text.substring(start, start + (pair ? 2 : 1));
   }
 
   /// Builds a matching regex for a possibly multi-token proper name. Tokens
@@ -818,12 +1004,8 @@ class ProperNameNormalizer {
         r')\s*[（(]\s*'
         r'([^()（）]{0,40}?[\u3400-\u9FFF][^()（）]{0,24}?)\s*[)）]';
     final RegExp reverse = RegExp(pattern, caseSensitive: false);
-    String markup(int start, int end) => epubMarkupTokens
-        .allMatches(html, start)
-        .takeWhile((token) => token.start < end)
-        .map((token) => token.group(0)!)
-        .join();
-    final output = StringBuffer();
+    _NameMarkup? markup;
+    final output = <_NamePiece>[];
     var cursor = 0;
     for (final match in reverse.allMatches(index.visible)) {
       final sourceEnd = match.start + match.group(1)!.length;
@@ -843,26 +1025,54 @@ class ProperNameNormalizer {
       ).matchAsPrefix(index.visible, sourceEnd)!;
       final targetStart = index.offsets[separator.end];
       final targetEnd = index.ends[separator.end + match.group(2)!.length - 1];
-      final translated = html.substring(targetStart, targetEnd).trim();
-      final target = epubMarkupTokens.hasMatch(translated)
-          ? translated
-          : _text(mapping.target);
-      final name = _text(
-        _cleanLooseHtmlTokens(match.group(1)!, mapping.source),
-      );
-      // Remove only the old name and parentheses. Keep every tag in order,
-      // including wrappers crossing the source, target, or either parenthesis.
+      markup ??= _NameMarkup.parse(html);
+      // A malformed fragment cannot safely have its wrappers reordered.
+      if (markup == null) return html;
+      final sourceRawEnd = index.ends[sourceEnd - 1];
+      var opening = sourceEnd;
+      while (index.visible[opening] != '(' && index.visible[opening] != '（') {
+        opening++;
+      }
+      final closing = match.end - 1;
+      Iterable<_NamePiece> markers(int start, int end) =>
+          markup!.slice(start, end).map((p) => p.text ? p.withText('') : p);
+      final targetPieces = markup.slice(targetStart, targetEnd).toList();
+      // Preserve formatted/encoded target text; unify plain spelling variants.
+      if (targetPieces.length == 1) {
+        targetPieces[0] = targetPieces[0].withText(_text(mapping.target));
+      }
+      var previousSpace = false;
+      final sourcePieces = markup.slice(start, sourceRawEnd).map((piece) {
+        if (!piece.text) return piece;
+        final decoded =
+            XhtmlHtmlCompatibility.parseFragment(piece.raw).text ?? '';
+        var value = decoded.replaceAll(RegExp(r'\s+'), ' ');
+        if (previousSpace && value.startsWith(' ')) value = value.substring(1);
+        if (value.isNotEmpty) previousSpace = value.endsWith(' ');
+        return piece.withText(_text(value));
+      });
+      // Reorder text together with its original wrappers, including the
+      // parentheses. Crossed wrappers are reopened without duplicate IDs.
       output
-        ..write(html.substring(cursor, start))
-        ..write(markup(start, targetStart))
-        ..write(target)
-        ..write(markup(targetEnd, end))
-        ..write('（$name）');
+        ..addAll(markup.slice(cursor, start))
+        ..addAll(markers(sourceRawEnd, index.offsets[opening]))
+        ..addAll(markers(index.ends[opening], targetStart))
+        ..addAll(targetPieces)
+        ..addAll(markers(targetEnd, index.offsets[closing]))
+        ..addAll(
+          markup
+              .slice(index.offsets[opening], index.ends[opening])
+              .map((p) => p.withText('（')),
+        )
+        ..addAll(sourcePieces)
+        ..addAll(
+          markup.slice(index.offsets[closing], end).map((p) => p.withText('）')),
+        );
       cursor = end;
     }
     if (cursor == 0) return html;
-    output.write(html.substring(cursor));
-    return output.toString();
+    output.addAll(markup!.slice(cursor, html.length));
+    return _NameMarkup.render(output);
   }
 
   /// Guesses the bracket style already used by the surrounding block so the
@@ -898,18 +1108,45 @@ class ProperNameNormalizer {
   ) {
     // Protect footnote-back link anchors: <a ...>II</a> etc. Those are pure
     // anchor text and must not be treated as a name occurrence.
-    String out = html.replaceAllMapped(
-      RegExp(r'<a\b[^>]*>([^<]*)</a>', caseSensitive: false),
-      (Match match) {
-        final raw = match.group(1)!;
-        if (raw.length > 12 && !raw.contains('&')) return match.group(0)!;
-        // Entity spelling length must not turn a short link into prose.
+    final anchors = <Match>[];
+    final spans = <(int, int)>[];
+    for (final token in epubMarkupTokens.allMatches(html)) {
+      final name = token.group(2)?.toLowerCase();
+      if (name?.split(':').last != 'a' || token.group(0)!.endsWith('/>')) {
+        continue;
+      }
+      if (token.group(1) != '/') {
+        anchors.add(token);
+      } else if (anchors.isNotEmpty &&
+          anchors.last.group(2)!.toLowerCase() == name) {
+        final opening = anchors.removeLast();
+        final raw = html.substring(opening.end, token.start);
+        if (!raw.contains('&') &&
+            !raw.contains('<') &&
+            raw.runes.take(13).length > 12) {
+          continue;
+        }
         final text = XhtmlHtmlCompatibility.parseFragment(raw).text ?? '';
-        return text.trim().isEmpty || text.length > 12
-            ? match.group(0)!
-            : '\uE000${_protect(match.group(0)!)}\uE001';
-      },
-    );
+        if (text.trim().isNotEmpty && text.runes.length <= 12) {
+          spans.add((opening.start, token.end));
+        }
+      }
+    }
+    spans.sort((a, b) => a.$1.compareTo(b.$1));
+    final protected = StringBuffer();
+    var cursor = 0;
+    for (final span in spans) {
+      // An outer protected anchor already covers any nested anchor.
+      if (span.$1 < cursor) continue;
+      protected
+        ..write(html.substring(cursor, span.$1))
+        ..write('\uE000')
+        ..write(html.substring(span.$1, span.$2))
+        ..write('\uE001');
+      cursor = span.$2;
+    }
+    protected.write(html.substring(cursor));
+    String out = protected.toString();
     // Protect inline work titles in 《》 already carrying the original Latin
     // gloss, e.g. 《国富论》（The Wealth of Nations） — but NOT when the
     // parenthesized span is itself a locked proper name (`《国富论》(Adam
