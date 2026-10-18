@@ -618,6 +618,7 @@ class TranslationDashboardController
   }
 
   void setInputPath(String value) {
+    if (!mounted) return;
     if (state.isRunActive) {
       state = state.copyWith(logs: <String>[...state.logs, _s.logInputLocked]);
       return;
@@ -776,6 +777,7 @@ class TranslationDashboardController
   }
 
   void setOutputDirectory(String value) {
+    if (!mounted) return;
     if (state.isRunActive) {
       state = state.copyWith(logs: <String>[...state.logs, _s.logOutputLocked]);
       return;
@@ -833,6 +835,7 @@ class TranslationDashboardController
       semanticReviewScope: settingsConfig.semanticReviewScope,
       maxSemanticReviewTokens: settingsConfig.maxSemanticReviewTokens,
       maxSemanticReviewRequests: settingsConfig.maxSemanticReviewRequests,
+      retryIncompleteReviews: settingsConfig.retryIncompleteReviews,
     );
     state = state.copyWith(
       config: nextConfig,
@@ -1977,88 +1980,67 @@ class TranslationDashboardController
     }
   }
 
-  Future<void> openJobOutput(String jobId) async {
-    // H2: same share re-entrancy guard as exportTranslatedEpub (history
-    // items share through the same native channel).
-    if (_isSharing) {
-      return;
-    }
+  /// Returns a localized failure for callers that do not display dashboard logs.
+  Future<String?> openJobOutput(String jobId) async {
+    if (!mounted || _isSharing) return null;
     _isSharing = true;
     state = state.copyWith(isSharing: true);
+    String failure(String message) {
+      if (mounted) {
+        state = state.copyWith(logs: <String>[...state.logs, message]);
+      }
+      return message;
+    }
+
     try {
-      final TranslationJob? job = _findKnownJob(jobId);
-      final String outputPath = job?.outputPath ?? '';
+      final job = _findKnownJob(jobId);
       if (job == null || !job.hasExportableEpub) {
-        state = state.copyWith(
-          logs: <String>[...state.logs, _s.logNoOutputForHistory],
-        );
-        return;
+        return failure(_s.logNoOutputForHistory);
       }
-
-      final File outputFile = File(outputPath);
-      final FileSystemEntityType type = await FileSystemEntity.type(outputPath);
-      if (!mounted) return;
+      final outputPath = job.outputPath;
+      final outputFile = File(outputPath);
+      final type = await FileSystemEntity.type(outputPath);
+      if (!mounted) return null;
       if (type != FileSystemEntityType.file || !await outputFile.exists()) {
-        if (!mounted) return;
-        state = state.copyWith(
-          logs: <String>[...state.logs, _s.logOutputNotFound(outputPath)],
-        );
-        return;
+        if (!mounted) return null;
+        return failure(_s.logOutputNotFound(outputPath));
       }
-      if (!mounted) return;
-
-      try {
-        if (PlatformUtils.isAndroid) {
-          await PlatformUtils.shareFile(
-            sourcePath: outputPath,
-            displayName: path.basename(outputPath),
-            // C-M4: localized chooser title (Track C adds the optional
-            // `chooserTitle` parameter to the Dart share method).
-            chooserTitle: _s.shareChooserTitle,
-          );
-          if (!mounted) {
-            // The provider was disposed while the share sheet was open:
-            // assigning state now would throw; finally still resets the
-            // sharing flag under its own mounted guard.
-            return;
-          }
+      if (!mounted) return null;
+      if (PlatformUtils.isAndroid) {
+        await PlatformUtils.shareFile(
+          sourcePath: outputPath,
+          displayName: path.basename(outputPath),
+          chooserTitle: _s.shareChooserTitle,
+        );
+        if (mounted) {
           state = state.copyWith(
             logs: <String>[
               ...state.logs,
               _s.logOpenedShare(path.basename(outputPath)),
             ],
           );
-          return;
         }
-        final OpenResult result = await OpenFilex.open(outputPath);
-        if (!mounted) {
-          return;
-        }
-        state = state.copyWith(
-          logs: <String>[
-            ...state.logs,
-            result.type == ResultType.done
-                ? _s.logOpenedEpub(path.basename(outputPath))
-                : _s.logCouldNotOpenEpub(result.message),
-          ],
-        );
-      } catch (error) {
-        // C-M6: permanently-denied storage permission gets its own notice.
-        if (_handlePermanentPermissionDenial(error)) {
-          return;
-        }
-        if (!mounted) {
-          return;
-        }
-        state = state.copyWith(
-          logs: <String>[...state.logs, debugOpenJobOutputErrorLogLine(error)],
-        );
+        return null;
       }
+      final result = await OpenFilex.open(outputPath);
+      if (!mounted) return null;
+      if (result.type != ResultType.done) {
+        return failure(_s.logCouldNotOpenEpub(result.message));
+      }
+      state = state.copyWith(
+        logs: <String>[
+          ...state.logs,
+          _s.logOpenedEpub(path.basename(outputPath)),
+        ],
+      );
+      return null;
+    } catch (error) {
+      if (!mounted) return null;
+      if (_handlePermanentPermissionDenial(error)) return state.logs.last;
+      return failure(debugOpenJobOutputErrorLogLine(error));
     } finally {
       _isSharing = false;
-      if (mounted) {
-        state = state.copyWith(isSharing: false);
-      }
+      if (mounted) state = state.copyWith(isSharing: false);
     }
   }
 
@@ -2228,6 +2210,7 @@ class TranslationDashboardController
     // jobs once the load completes; deriving the watermark earlier lets a
     // clock rollback slip pre-rollback records past the clear.
     await _initialJobHistoryLoad;
+    if (mounted && _logIfRunActive(_s.logRunAlreadyActiveGeneric)) return false;
     _historyClearRevision += 1;
     // Our own clear is the newest tombstone by definition; keep it
     // strictly monotonic so a same-millisecond double clear cannot tie.

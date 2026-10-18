@@ -12,6 +12,7 @@ class _ReplayStore extends SettingsStore {
   /// When non-null, fail the save with this 1-based attempt number.
   int? failAttemptNumber;
   int attemptCount = 0;
+  final failedAttempts = <int>[];
   final attempts = <String>[];
 
   /// Error thrown for [failAttemptNumber]; defaults to StateError.
@@ -49,8 +50,10 @@ class _ReplayStore extends SettingsStore {
       await gate.future;
     }
     if (failAttemptNumber == attemptCount) {
+      failedAttempts.add(attemptCount);
       final Object error =
-          failAttemptErrorFactory?.call() ?? StateError('injected disk failure');
+          failAttemptErrorFactory?.call() ??
+          StateError('injected disk failure');
       _recordConflictLoadError(error);
       throw error;
     }
@@ -86,8 +89,7 @@ void main() {
   });
 
   group('P2-#28 superseded queue entries are dropped', () {
-    test('B is dropped when C changes the same field after B failed',
-        () async {
+    test('B is dropped when C changes the same field after B failed', () async {
       store.saveError = SettingsWriteConflict();
       expect(await controller.setOutputSuffix('_a'), isFalse);
       expect(await controller.setOutputSuffix('_b'), isFalse);
@@ -95,19 +97,28 @@ void main() {
       store.saveError = null;
 
       // Replay: fail the 2nd save (B), let A and C succeed.
+      store.attemptCount = 0;
       store.failAttemptNumber = 2;
       await controller.reloadSettings();
-      expect(store.persisted.outputSuffix, '_c',
-          reason: 'C (newest) must win');
+      expect(store.failedAttempts, [
+        2,
+      ], reason: 'B must actually fail once during replay.');
+      expect(store.persisted.outputSuffix, '_c', reason: 'C (newest) must win');
       store.failAttemptNumber = null;
 
       // Next reload must NOT re-apply stale B.
       store.attempts.clear();
       await controller.reloadSettings();
-      expect(store.persisted.outputSuffix, '_c',
-          reason: 'Stale B must not revert C\'s newer value');
-      expect(store.attempts, isEmpty,
-          reason: 'B must have been dropped when C succeeded');
+      expect(
+        store.persisted.outputSuffix,
+        '_c',
+        reason: 'Stale B must not revert C\'s newer value',
+      );
+      expect(
+        store.attempts,
+        isEmpty,
+        reason: 'B must have been dropped when C succeeded',
+      );
     });
 
     test('edits to different fields are retained', () async {
@@ -123,51 +134,58 @@ void main() {
   });
 
   group('P2-#29 slider wins during replay', () {
-    test('swallowed slider (newer) beats queued replay (older) on same field',
-        () async {
-      // Queue TWO chunkSize edits via conflicted debounced flushes.
-      store.saveError = SettingsWriteConflict();
-      final s1 = controller.setChunkSize(60);
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-      await s1;
-      final s2 = controller.setChunkSize(70);
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-      await s2;
-      store.saveError = null;
-      // Queue now: [chunkSize=60, chunkSize=70]. Persisted is still default.
+    test(
+      'swallowed slider (newer) beats queued replay (older) on same field',
+      () async {
+        // Queue TWO chunkSize edits via conflicted debounced flushes.
+        store.saveError = SettingsWriteConflict();
+        final s1 = controller.setChunkSize(60);
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await s1;
+        final s2 = controller.setChunkSize(70);
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await s2;
+        store.saveError = null;
+        // Queue now: [chunkSize=60, chunkSize=70]. Persisted is still default.
 
-      // Replay with a stalled first save. During the stall, move the slider
-      // to 100. The second replay item will swallow the pending slider.
-      // The slider (100, newer) must beat the queued edit (70, older).
-      final gate = Completer<void>();
-      store.saveGate = gate;
-      store.saveStarted = Completer<void>();
-      final reload = controller.reloadSettings();
-      await store.saveStarted!.future;
-      // First replay item's save is stalled. Move the slider now.
-      final slider = controller.setChunkSize(100);
-      // Let the slider's _update run (it waits for load phase, which is done).
-      await Future<void>.delayed(Duration.zero);
-      await Future<void>.delayed(Duration.zero);
-      // Release the stalled save.
-      gate.complete();
-      await reload;
-      try {
-        await slider.timeout(const Duration(seconds: 2));
-      } on TimeoutException {
-        // Swallowed by the second replay item; its save completed the future.
-      }
+        // Replay with a stalled first save. During the stall, move the slider
+        // to 100. The second replay item will swallow the pending slider.
+        // The slider (100, newer) must beat the queued edit (70, older).
+        final gate = Completer<void>();
+        store.saveGate = gate;
+        store.saveStarted = Completer<void>();
+        final reload = controller.reloadSettings();
+        await store.saveStarted!.future;
+        // First replay item's save is stalled. Move the slider now.
+        final slider = controller.setChunkSize(100);
+        // Let the slider's _update run (it waits for load phase, which is done).
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+        // Release the stalled save.
+        gate.complete();
+        await reload;
+        try {
+          await slider.timeout(const Duration(seconds: 2));
+        } on TimeoutException {
+          // Swallowed by the second replay item; its save completed the future.
+        }
 
-      expect(controller.state.chunkSize, 100,
-          reason: 'Slider (newer) must win over queued replay (older)');
-      expect(store.persisted.chunkSize, 100,
-          reason: 'Persisted value must be the slider value');
-    });
+        expect(
+          controller.state.chunkSize,
+          100,
+          reason: 'Slider (newer) must win over queued replay (older)',
+        );
+        expect(
+          store.persisted.chunkSize,
+          100,
+          reason: 'Persisted value must be the slider value',
+        );
+      },
+    );
   });
 
   group('P2-#28 changedFields includes swallowed slider fields', () {
-    test(
-        'non-replay swallow: B supersedes the stale slider entry A it '
+    test('non-replay swallow: B supersedes the stale slider entry A it '
         'swallowed', () async {
       // ① Slider 4->8, flush hits a write conflict -> queued as A with
       // changedFields={chunkSize}.
@@ -216,8 +234,7 @@ void main() {
       );
     });
 
-    test(
-        'replay swallow: justChanged merges slider fields swallowed '
+    test('replay swallow: justChanged merges slider fields swallowed '
         'mid-replay', () async {
       // Queue A (slider 4->8) and C (bilingual toggle) via conflicts.
       store.saveError = SettingsWriteConflict();
@@ -260,7 +277,8 @@ void main() {
       expect(
         store.persisted.chunkSize,
         10,
-        reason: 'Stale slider entry A must have been dropped when C\'s replay '
+        reason:
+            'Stale slider entry A must have been dropped when C\'s replay '
             'persisted the swallowed slider value',
       );
       expect(

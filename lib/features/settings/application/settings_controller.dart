@@ -465,6 +465,7 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     void Function(Set<String> swallowedFields)? onSwallowedSlider,
   }) async {
     if (!_loaded) await _initialLoad;
+    if (!mounted) return false;
     // C-P1-1: capture the credential target before reload or recovery changes state.
     final slots = secretMutationsFor?.call(state) ?? explicitSecretMutations;
     final credentialRoute = (

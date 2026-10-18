@@ -50,11 +50,23 @@ void main() {
       expect(rendered, contains('>你好</em>'));
     });
 
-    test('gloss paren sees through an empty inline tag', () {
-      expect(
-        _normalizeAdam('<p>Adam Smith<span></span>（亚当·斯密）写中文。</p>'),
-        '<p>Adam Smith<span></span>（亚当·斯密）写中文。</p>',
-      );
+    test('reverse gloss keeps empty markers and avoids double glosses', () {
+      // The visible-text reverse pass now canonicalizes this existing gloss.
+      // Keep the original no-duplication guarantee and verify owned anchors,
+      // including the subsequent book-wide occurrence.
+      for (final marker in ['<span></span>', '<span id="page"></span>']) {
+        final state = ProperNameNormalizer.bookState();
+        final input = '<p>Adam Smith$marker（亚当·斯密）写中文。</p>';
+        String normalize() => ProperNameNormalizer.normalizeHtml(
+          input,
+          const [ProperNameMap(source: 'Adam Smith', target: '亚当·斯密')],
+          targetLanguage: 'zh',
+          state: state,
+        );
+        expect(normalize(), '<p>$marker亚当·斯密（Adam Smith）写中文。</p>');
+        expect(normalize(), '<p>$marker亚当·斯密写中文。</p>');
+        expect(state.countedNames, {'Adam Smith'});
+      }
     });
 
     test('gloss paren in half-width brackets is not double-glossed', () {

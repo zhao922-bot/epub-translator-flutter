@@ -1905,7 +1905,11 @@ void main() {
 
     await controller.retryJob('failed-cache');
 
-    expect(controller.state.logs, contains('已复用全部 1 块，本次未产生 API 请求。'));
+    expect(
+      controller.state.logs,
+      contains('已复用全部 1 块；正文缓存恢复未调用 API，书名和复核等后续步骤仍可能产生请求。'),
+    );
+    expect(controller.state.logs, isNot(contains('已复用全部 1 块，本次未产生 API 请求。')));
   });
 
   test(

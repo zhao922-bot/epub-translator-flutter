@@ -264,10 +264,9 @@ void main() {
     test('ledger still evicted when no fallback payload needs it', () {
       // Pre-existing behavior: a lone recovery spare needs no ledger, so the
       // ledger remains the evictable entry.
-      expect(
-        recoveryBudgetDeletions([recovery(1, 600 * mib), ledger]),
-        [ledger.name],
-      );
+      expect(recoveryBudgetDeletions([recovery(1, 600 * mib), ledger]), [
+        ledger.name,
+      ]);
     });
 
     test('count pressure evicts spares, never the ledger or its payload', () {
@@ -331,7 +330,8 @@ void main() {
         ),
         isTrue,
       );
-      final repacked = ZipDecoder().decodeBytes(
+      final outputDecoder = ZipDecoder();
+      final repacked = outputDecoder.decodeBytes(
         File(output).readAsBytesSync(),
       );
       for (final file in repacked) {
@@ -342,9 +342,19 @@ void main() {
           reason: 'CRC mismatch for ${file.name}',
         );
       }
-      // The surviving copy is the decoder's first-seen payload.
+      // The worker resolves raw duplicates last-wins before CRC-safe repacking.
+      expect(
+        repacked.files.where((f) => f.name == 'OPS/dup.css'),
+        hasLength(1),
+      );
+      expect(
+        outputDecoder.directory.fileHeaders.where(
+          (h) => h.file?.filename == 'OPS/dup.css',
+        ),
+        hasLength(1),
+      );
       final dup = repacked.find('OPS/dup.css')!;
-      expect(utf8.decode(dup.content), 'p{color:red}');
+      expect(utf8.decode(dup.content), 'p{color:blue}');
     });
   });
 
@@ -409,4 +419,3 @@ void main() {
     });
   });
 }
-

@@ -68,13 +68,9 @@ class _EpubTranslationStrategy {
           'Response block structure/id mismatch.',
         );
       }
-      if (slotIds == null) {
-        if (item['html'] is! String) {
-          throw const _DeterministicBatchStructureException(
-            'Response block is missing string html.',
-          );
-        }
-      } else {
+      // ID mapping is validated for the whole batch. Bad HTML payloads are
+      // per-item failures handled below, preserving healthy paid results.
+      if (slotIds != null) {
         final slots = item['slots'];
         final expected = slotIds[item['id']]!;
         final seenSlots = <String>{};

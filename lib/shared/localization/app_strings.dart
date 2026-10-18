@@ -187,9 +187,20 @@ class AppStrings {
   ) => isChinese
       ? '$selectedChapters/$totalChapters 章 · $selectedBlocks 块'
       : '$selectedChapters/$totalChapters chapters · $selectedBlocks blocks';
-  String chapterCategoryBlocks(String category, int blockCount) => isChinese
-      ? '$category · $blockCount 块'
-      : '$category · $blockCount blocks';
+  String chapterCategoryBlocks(String category, int blockCount) {
+    final label = isChinese
+        ? switch (category) {
+            'Content' => '正文',
+            'Front matter' => '前言',
+            'Back matter' => '后记',
+            'Reference' => '参考资料',
+            'Skip by default' => '默认跳过',
+            _ => category,
+          }
+        : category;
+    return isChinese ? '$label · $blockCount 块' : '$label · $blockCount blocks';
+  }
+
   String get manualOverrideTooltip =>
       isChinese ? '已手动覆盖默认过滤' : 'Manually overridden';
   String get defaultLabel => isChinese ? '默认' : 'Default';
@@ -306,23 +317,22 @@ class AppStrings {
 
   /// Commit-time variant: the translation is already fully done and the
   /// temp file was preserved, so the user does NOT lose paid work — they
-  /// close the locking program and retry (the block cache makes the retry
-  /// fast with no extra API cost), or rename the temp file manually.
+  /// close the locking program and retry with available cache, or rename the
+  /// temp file manually. Other uncached steps can still make API requests.
   String outputFileLockedAtCommit(String outputPath, String tempPath) =>
       isChinese
-      ? '输出文件被其他程序占用，无法完成写入：$outputPath。已翻译好的文件保留在：$tempPath（将其重命名为 .epub 即可使用）。请关闭占用该文件的程序后重新翻译，已翻译内容会被复用，无需重复付费。'
+      ? '输出文件被其他程序占用，无法完成写入：$outputPath。已翻译好的文件保留在：$tempPath（将其重命名为 .epub 即可使用）。请关闭占用该文件的程序后重新翻译，可用缓存会被复用；缓存缺失、书名或复核可能需要额外 API 请求。'
       : 'The output file is locked by another program and could not be written: $outputPath. '
             'The translated file was kept at: $tempPath (rename it to .epub to use it). '
-            'Close the program holding the file, then translate again — translated content is reused from the cache with no extra API cost.';
+            'Close the program holding the file, then translate again — available cached translations will be reused; missing cache entries, titles or reviews may require additional API requests.';
 
   /// Repack/inspect-time variant: the SOURCE file is locked (Windows sharing
-  /// violation), usually a reader the user opened mid-run. No API work is
-  /// lost beyond what was already billed — the block cache on disk is
-  /// intact, so retrying after closing the reader is cheap.
+  /// violation), usually a reader the user opened mid-run. Available block
+  /// cache is reused; failed cache writes and other steps may require requests.
   String inputFileLocked(String path) => isChinese
-      ? '源文件被其他程序占用，无法读取：$path。请关闭正在打开它的阅读器后重试；已翻译的块已缓存，重试不会重复计费。'
+      ? '源文件被其他程序占用，无法读取：$path。请关闭正在打开它的阅读器后重试；可用的翻译缓存会被复用，缺失缓存及其他步骤可能产生额外 API 请求。'
       : 'The source file is locked by another program and could not be read: $path. '
-            'Close the reader that has it open and retry — translated blocks are cached, so the retry costs no extra API calls.';
+            'Close the reader that has it open and retry — available cached translations will be reused, but missing cache entries and other steps may require additional API requests.';
 
   /// Run-start precheck: the final output path plus the `.tmp.<16 digits>`
   /// suffix the commit appends would exceed Windows MAX_PATH (260) while the
@@ -746,8 +756,8 @@ class AppStrings {
       ? '已复用 $reused 块；缓存恢复阶段未产生 API 请求。'
       : 'Reused $reused blocks; cache restoration made no API requests.';
   String logAllBlocksRestoredNoApi(int total) => isChinese
-      ? '已复用全部 $total 块，本次未产生 API 请求。'
-      : 'Reused all $total blocks; this run made no API requests.';
+      ? '已复用全部 $total 块；正文缓存恢复未调用 API，书名和复核等后续步骤仍可能产生请求。'
+      : 'Reused all $total blocks; body cache restoration made no API requests. Later title or review steps may still make requests.';
   String logTranslationFailed(String error) =>
       isChinese ? '翻译失败：$error' : 'Translation failed: $error';
   String logCheckpointed(int blocks) => isChinese

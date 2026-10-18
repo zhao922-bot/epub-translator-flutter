@@ -29,13 +29,10 @@ class _TranslationReviewPageState extends State<TranslationReviewPage> {
   final _edited = <String, String>{};
   final _manualEdits = <String, String>{};
   final _manuallyReviewed = <String>{};
-  int get _remaining => ((_report?['unreviewed'] as List?) ?? [])
-      .where(
-        (id) => !_manuallyReviewed.any(
-          (key) => key.replaceAll('\u0000', ':') == id,
-        ),
-      )
-      .length;
+  int get _remaining => TranslationReviewStore.unresolvedBlockIds(
+    _report ?? {},
+    _manuallyReviewed,
+  ).length;
 
   String t(String zh, String en) => widget.isChinese ? zh : en;
 
@@ -47,7 +44,10 @@ class _TranslationReviewPageState extends State<TranslationReviewPage> {
 
   Future<void> _load() async {
     try {
-      final report = await _store.load(widget.reportPath);
+      final report = await _store.load(
+        widget.reportPath,
+        expectedOutputPath: widget.outputPath,
+      );
       if (!mounted) return;
       setState(() {
         _report = report;
@@ -269,6 +269,7 @@ class _TranslationReviewPageState extends State<TranslationReviewPage> {
   @override
   Widget build(BuildContext context) {
     final report = _report;
+    final remaining = _remaining;
     final items = report == null
         ? const <Map>[]
         : (report['corrections'] as List).cast<Map>();
@@ -303,8 +304,8 @@ class _TranslationReviewPageState extends State<TranslationReviewPage> {
                       ),
                       Text(
                         t(
-                          '人工已核对 ${_manuallyReviewed.length} 块；复核失败项中仍待处理 $_remaining 块。',
-                          'Human-reviewed: ${_manuallyReviewed.length}; unresolved model failures: $_remaining.',
+                          '人工已核对 ${_manuallyReviewed.length} 块；复核失败项中仍待处理 $remaining 块。',
+                          'Human-reviewed: ${_manuallyReviewed.length}; unresolved model failures: $remaining.',
                         ),
                       ),
                       if ((report['rendering'] as Map)['completeSnapshot'] ==

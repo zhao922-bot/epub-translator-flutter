@@ -314,6 +314,9 @@ class AppTheme {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
       tooltipTheme: TooltipThemeData(
+        textStyle: TextStyle(
+          color: isDark ? scheme.onSurface : scheme.onInverseSurface,
+        ),
         decoration: BoxDecoration(
           color: isDark
               ? scheme.surfaceContainerHighest

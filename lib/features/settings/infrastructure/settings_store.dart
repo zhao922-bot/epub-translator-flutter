@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:crypto/crypto.dart';
@@ -38,6 +39,14 @@ abstract class SettingsSecretStore {
   Future<String?> readProxyAuthentication();
   Future<void> writeProxyAuthentication(String value);
   Future<void> deleteProxyAuthentication();
+}
+
+/// Immutable credential objects. Only a committed JSON reference activates one.
+/// Legacy backends remain available for compatibility and existing embedders.
+abstract interface class VersionedSettingsSecretStore {
+  Future<String?> readCredential(String name);
+  Future<void> writeCredential(String name, String value);
+  Future<void> deleteCredential(String name);
 }
 
 enum SettingsSecretSlot { legacy, deepSeek, custom, proxy }
@@ -99,13 +108,25 @@ class _InflightCredentialOp {
   final Future<void> settled;
 }
 
-class NativeSettingsSecretStore implements SettingsSecretStore {
+class NativeSettingsSecretStore
+    implements SettingsSecretStore, VersionedSettingsSecretStore {
   const NativeSettingsSecretStore();
 
   static const String _apiKeyName = 'api_key';
   static const String _deepSeekApiKeyName = 'deepseek_api_key';
   static const String _customApiKeyName = 'custom_api_key';
   static const _secureStorage = FlutterSecureStorage();
+  @override
+  // Versioned keys need independent native records. A shared encrypted map
+  // could still lose a newer key when another process finishes an old write.
+  Future<String?> readCredential(String name) => PlatformUtils.readSecret(name);
+  @override
+  Future<void> writeCredential(String name, String value) =>
+      PlatformUtils.writeSecret(name, value);
+  @override
+  Future<void> deleteCredential(String name) =>
+      PlatformUtils.deleteSecret(name);
+
   static const _proxyAuthenticationName = 'http_proxy_authentication';
 
   @override
@@ -265,6 +286,86 @@ class SettingsStore {
   Object? _configLoadError;
   Object? get configLoadError => _configLoadError;
   Map<String, String> _credentialBindings = {};
+  Map<String, String> _credentialVersions = {};
+  Map<String, String> _committedCredentialVersions = {};
+  bool _metadataLoaded = false;
+
+  static String _versionedName(SettingsSecretSlot slot, String version) =>
+      'epub_translator_credential_${slot.name}_$version';
+
+  Future<String?> _readCommittedSecret(
+    SettingsSecretSlot slot,
+    Future<String?> Function() legacyRead,
+  ) {
+    final version = _credentialVersions[slot.name];
+    if (version == null) return legacyRead();
+    final store = _secretStore;
+    if (store is! VersionedSettingsSecretStore ||
+        !RegExp(r'^[a-f0-9]{32}$').hasMatch(version)) {
+      throw StateError('The committed credential version cannot be read.');
+    }
+    return (store as VersionedSettingsSecretStore).readCredential(
+      _versionedName(slot, version),
+    );
+  }
+
+  void _discardCredentialVersion(
+    SettingsSecretSlot slot,
+    String version,
+    VersionedSettingsSecretStore store,
+  ) {
+    unawaited(
+      Future<void>.sync(
+        () => store.deleteCredential(_versionedName(slot, version)),
+      ).timeout(_secretOpTimeout).catchError((Object _) {
+        AppLogger.warn(
+          'Unused credential version could not be removed.',
+          tag: 'settings',
+        );
+      }),
+    );
+  }
+
+  Future<bool> _saveCredentialVersion(
+    SettingsSecretSlot slot,
+    String value,
+  ) async {
+    final store = _secretStore as VersionedSettingsSecretStore;
+    final generation = _credentialGeneration;
+    final random = Random.secure();
+    final version = List.generate(
+      16,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+    final operation = store.writeCredential(
+      _versionedName(slot, version),
+      value,
+    );
+    try {
+      await operation.timeout(_secretOpTimeout);
+      if (generation != _credentialGeneration) {
+        _discardCredentialVersion(slot, version, store);
+        return false;
+      }
+      _credentialVersions[slot.name] = version;
+      _secretSnapshot?[slot] = value;
+      _secretReadStatuses[slot] = value.isEmpty
+          ? _SecretReadStatus.missing
+          : _SecretReadStatus.value;
+      _pendingPlaintextKeys.remove(slot);
+      _rotatedSlots.remove(slot);
+      return true;
+    } catch (_) {
+      // A timed-out backend can finish much later. It owns only this unique
+      // object, so neither its write nor this cleanup can touch another commit.
+      unawaited(
+        operation
+            .then((_) => _discardCredentialVersion(slot, version, store))
+            .catchError((Object _) {}),
+      );
+      rethrow;
+    }
+  }
 
   /// Whether the legacy (pre-schema) credential migration has finished.
   ///
@@ -499,20 +600,39 @@ class SettingsStore {
   /// later [save] calls can tell "missing" from "unreadable". Marks the store
   /// as loaded.
   Future<List<_SecretReadResult>> _readAllSecrets() async {
+    if (!_metadataLoaded) await _loadConfigFromFile();
     // Read the secret slots concurrently: on Windows each read spawns a
     // PowerShell process, so sequential reads would add seconds to startup.
     // _readSecret already swallows per-slot failures, so Future.wait is safe.
     final List<_SecretReadResult> storedKeys =
         await Future.wait(<Future<_SecretReadResult>>[
-          _readSecret(SettingsSecretSlot.legacy, _secretStore.readApiKey),
+          _readSecret(
+            SettingsSecretSlot.legacy,
+            () => _readCommittedSecret(
+              SettingsSecretSlot.legacy,
+              _secretStore.readApiKey,
+            ),
+          ),
           _readSecret(
             SettingsSecretSlot.deepSeek,
-            _secretStore.readDeepSeekApiKey,
+            () => _readCommittedSecret(
+              SettingsSecretSlot.deepSeek,
+              _secretStore.readDeepSeekApiKey,
+            ),
           ),
-          _readSecret(SettingsSecretSlot.custom, _secretStore.readCustomApiKey),
+          _readSecret(
+            SettingsSecretSlot.custom,
+            () => _readCommittedSecret(
+              SettingsSecretSlot.custom,
+              _secretStore.readCustomApiKey,
+            ),
+          ),
           _readSecret(
             SettingsSecretSlot.proxy,
-            _secretStore.readProxyAuthentication,
+            () => _readCommittedSecret(
+              SettingsSecretSlot.proxy,
+              _secretStore.readProxyAuthentication,
+            ),
           ),
         ]);
     _didLoad = true;
@@ -520,6 +640,9 @@ class SettingsStore {
   }
 
   Future<TranslationConfig> _loadConfigFromFile() async {
+    _metadataLoaded = true;
+    _credentialVersions = {};
+    _committedCredentialVersions = {};
     didCorruptReset = false;
     lastCorruptBackupPath = null;
     // P1-#4: reset per load; only a successfully parsed file establishes a
@@ -587,6 +710,18 @@ class SettingsStore {
       throw const FormatException('settings.json is not a JSON object');
     }
     _settingsSnapshot = raw;
+    final versions = decoded['credentialVersions'];
+    if (versions != null &&
+        (versions is! Map ||
+            versions.entries.any(
+              (e) => e.key is! String || e.value is! String,
+            ))) {
+      throw const FormatException('Invalid credential version references.');
+    }
+    _credentialVersions = versions == null
+        ? {}
+        : Map<String, String>.from(versions as Map);
+    _committedCredentialVersions = Map.of(_credentialVersions);
     final bindings = decoded['credentialBindings'];
     _credentialBindings = bindings is Map
         ? {
@@ -784,6 +919,7 @@ class SettingsStore {
         'Custom API key could not be read; confirm the key before changing its endpoint.',
       );
     }
+    final oldVersions = Map<String, String>.of(_credentialVersions);
     final oldSnapshot = Map<SettingsSecretSlot, String>.of(baseline);
     final oldStatuses = Map<SettingsSecretSlot, _SecretReadStatus>.of(
       _secretReadStatuses,
@@ -869,7 +1005,26 @@ class SettingsStore {
         // A failed transaction must be reloaded before another UI edit can
         // publish an in-memory key snapshot that never committed to JSON.
         _configLoadError = writeError;
-        if (previous != null) {
+        final versionStore = _secretStore;
+        if (versionStore is VersionedSettingsSecretStore) {
+          for (final slot in SettingsSecretSlot.values) {
+            final abandoned = _credentialVersions[slot.name];
+            if (abandoned != null && abandoned != oldVersions[slot.name]) {
+              _discardCredentialVersion(
+                slot,
+                abandoned,
+                versionStore as VersionedSettingsSecretStore,
+              );
+            }
+          }
+          _secretSnapshot = oldSnapshot;
+          _secretReadStatuses
+            ..clear()
+            ..addAll(oldStatuses);
+          _pendingPlaintextKeys
+            ..clear()
+            ..addAll(oldPending);
+        } else if (previous != null) {
           final restorable = slotsToSave
               .where(
                 (slot) => oldStatuses[slot] != _SecretReadStatus.readFailure,
@@ -897,6 +1052,7 @@ class SettingsStore {
             );
           }
         }
+        _credentialVersions = oldVersions;
         rethrow;
       }
       _loadedConfig = safeConfig;
@@ -1110,6 +1266,8 @@ class SettingsStore {
           // still holds the only copy of the key.
           if (_legacyMigrationComplete) 'credentialSchemaVersion': 2,
           'credentialBindings': bindings,
+          if (_credentialVersions.isNotEmpty)
+            'credentialVersions': _credentialVersions,
           'settingsRevision': _settingsRevision + 1,
           // Only retain an existing legacy value while migration is pending.
           // Its original endpoint binding must survive unrelated saves.
@@ -1123,6 +1281,23 @@ class SettingsStore {
         },
       );
       await (settingsJsonWriter ?? writeFileAtomically)(file, encoded);
+      final obsoleteVersions = Map<String, String>.of(
+        _committedCredentialVersions,
+      );
+      _committedCredentialVersions = Map.of(_credentialVersions);
+      final versionStore = _secretStore;
+      if (versionStore is VersionedSettingsSecretStore) {
+        for (final slot in SettingsSecretSlot.values) {
+          final old = obsoleteVersions[slot.name];
+          if (old != null && old != _credentialVersions[slot.name]) {
+            _discardCredentialVersion(
+              slot,
+              old,
+              versionStore as VersionedSettingsSecretStore,
+            );
+          }
+        }
+      }
       _settingsSnapshot = encoded;
       _credentialBindings = bindings;
       // Only retire the legacy fallback once the migration really finished;
@@ -1153,7 +1328,11 @@ class SettingsStore {
       return false;
     }
     final String trimmed = value.trim();
+    if (_secretStore is VersionedSettingsSecretStore) {
+      return _saveCredentialVersion(slot, trimmed);
+    }
     final int opGeneration = _credentialGeneration;
+    final previousValue = _secretSnapshot?[slot];
     final Future<void> backendOp = trimmed.isEmpty ? delete() : write(trimmed);
     final Completer<void> settled = Completer<void>();
     _inflightCredentialOps[slot] = _InflightCredentialOp(
@@ -1173,6 +1352,7 @@ class SettingsStore {
       backendOp: backendOp,
       settled: settled.future,
       writtenValue: trimmed,
+      previousValue: previousValue,
     );
     try {
       // Bound the backend call; a hung write must not wedge the settings
@@ -1206,10 +1386,9 @@ class SettingsStore {
   }
 
   /// Watches a credential backend operation for late completion (P1-#4).
-  /// When the operation was issued under [opGeneration] but a newer save
-  /// has since started, its landing value is outdated — re-assert the
-  /// current snapshot value so the stale write cannot silently overwrite
-  /// the newer one. Best effort and never throws.
+  /// A timed-out operation may finish without a newer save. In either case
+  /// reconcile against the committed binding under the settings file lock.
+  /// Best effort and never throws.
   void _watchCredentialOp(
     SettingsSecretSlot slot,
     int opGeneration, {
@@ -1218,6 +1397,7 @@ class SettingsStore {
     required Future<void> backendOp,
     Future<void>? settled,
     String? writtenValue,
+    String? previousValue,
   }) {
     unawaited(
       backendOp
@@ -1232,8 +1412,17 @@ class SettingsStore {
                 AppLogger.warn(
                   'Credential version mismatch after late completion for '
                   '${_slotLabel(slot)}: in-memory and backend secrets differ; '
-                  'save settings again to reconcile.',
+                  'restoring the committed credential.',
                   tag: 'settings',
+                );
+                // A timeout is not a commit, even if no later save started.
+                // Use the same file-locked, version-checked compensation as
+                // stale generations so another instance's commit stays safe.
+                _reassertCredentialSlot(
+                  slot,
+                  write: write,
+                  delete: delete,
+                  previousValue: previousValue,
                 );
               }
               return;
@@ -1249,7 +1438,12 @@ class SettingsStore {
                 // Best effort; re-assert anyway.
               }
             }
-            _reassertCredentialSlot(slot, write: write, delete: delete);
+            _reassertCredentialSlot(
+              slot,
+              write: write,
+              delete: delete,
+              previousValue: previousValue,
+            );
           })
           .catchError((Object _) {
             // A failed backend operation changes nothing; nothing to repair.
@@ -1266,6 +1460,7 @@ class SettingsStore {
     SettingsSecretSlot slot, {
     required Future<void> Function(String value) write,
     required Future<void> Function() delete,
+    String? previousValue,
   }) {
     unawaited(
       (() async {
@@ -1284,7 +1479,26 @@ class SettingsStore {
             }
             final Map<SettingsSecretSlot, String>? snapshot = _secretSnapshot;
             if (snapshot == null) return;
-            final String value = snapshot[slot] ?? '';
+            String value = snapshot[slot] ?? '';
+            if (slot == SettingsSecretSlot.deepSeek ||
+                slot == SettingsSecretSlot.custom) {
+              final binding = _credentialBindings[slot.name];
+              if (binding != null && binding != _keyFingerprint(value)) {
+                // A reload can observe the uncommitted late value and clear
+                // the in-memory key before this repair acquires the lock.
+                // Only use the saved value if it still matches durable JSON;
+                // an unknown key must never be replaced with an empty one.
+                if (previousValue == null ||
+                    binding != _keyFingerprint(previousValue)) {
+                  AppLogger.warn(
+                    'Credential re-assert skipped: no matching committed value.',
+                    tag: 'settings',
+                  );
+                  return;
+                }
+                value = previousValue;
+              }
+            }
             final int opGeneration = _credentialGeneration;
             final Future<void> backendOp = value.isEmpty
                 ? delete()
@@ -1297,6 +1511,10 @@ class SettingsStore {
               backendOp: backendOp,
             );
             await backendOp.timeout(_secretOpTimeout);
+            // Keep any reload's read-failure snapshot until a fresh load:
+            // its caller still holds the empty config it observed. Publishing
+            // the restored key only here would make a later ordinary save of
+            // that config look like an intentional credential deletion.
           });
         } catch (error) {
           AppLogger.error(

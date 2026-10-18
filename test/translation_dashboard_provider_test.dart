@@ -64,13 +64,33 @@ void main() {
     );
 
     loadCompleter.complete(
-      TranslationConfig.defaults().copyWith(targetLanguage: 'Japanese'),
+      TranslationConfig.defaults().copyWith(
+        targetLanguage: 'Japanese',
+        retryIncompleteReviews: true,
+      ),
     );
     await Future<void>.delayed(Duration.zero);
 
     expect(
       container.read(translationDashboardProvider).config.targetLanguage,
       'Japanese',
+    );
+    expect(
+      container
+          .read(translationDashboardProvider)
+          .config
+          .retryIncompleteReviews,
+      isTrue,
+    );
+    await container
+        .read(settingsProvider.notifier)
+        .setRetryIncompleteReviews(false);
+    expect(
+      container
+          .read(translationDashboardProvider)
+          .config
+          .retryIncompleteReviews,
+      isFalse,
     );
   });
 }

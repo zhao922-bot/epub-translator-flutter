@@ -1469,13 +1469,21 @@ class TranslationApiClient {
     if (value.isEmpty) {
       return null;
     }
-    final int? seconds = int.tryParse(value);
+    final BigInt? seconds = BigInt.tryParse(value);
     if (seconds != null) {
       // A negative value is malformed (RFC 9110 delay-seconds is
       // non-negative); treat it like an unparseable value so the caller
       // falls back to exponential backoff instead of hammering the server
       // with a zero-delay retry.
-      return seconds < 0 ? null : Duration(seconds: seconds);
+      if (seconds.isNegative) return null;
+      // Preserve ordinary server delays, but reject unrepresentable durations
+      // before the VM's microsecond multiplication can wrap.
+      final largestSeconds = BigInt.from(
+        0x7fffffffffffffff ~/ Duration.microsecondsPerSecond,
+      );
+      return seconds > largestSeconds
+          ? _maxServerCooldown + const Duration(seconds: 1)
+          : Duration(seconds: seconds.toInt());
     }
     // RFC 9110 allows an HTTP-date as well as delay-seconds; Dart's
     // DateTime.tryParse only understands an ISO-8601 subset, so parse the

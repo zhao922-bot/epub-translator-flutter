@@ -19,6 +19,11 @@ const Duration _staleTempAge = Duration(minutes: 30);
 /// one process.
 int _tempCounter = 0;
 
+/// Room for `.tmp.<microseconds>_<pid>_<counter>`, including the full
+/// decimal width of the VM's integer fields. Output filename/path budgets
+/// must include this after the longest report suffix, not just EPUB spares.
+const int atomicWriteSuffixBudget = 64;
+
 /// Returns the sibling temp path used for an atomic write to [file]. Public
 /// so the uniqueness guarantee is directly testable; the `.tmp.` infix keeps
 /// the cleanup logic recognizing these files.

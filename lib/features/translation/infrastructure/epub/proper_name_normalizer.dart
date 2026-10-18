@@ -4,6 +4,165 @@ import 'epub_html_extractor.dart';
 import 'epub_dom.dart';
 import 'xhtml_html_compatibility.dart';
 
+typedef _NameOccurrence = ({int start, int end});
+
+/// Visible text offsets for forward name glosses. Formatting markup is
+/// transparent, while block and non-prose boundaries remain opaque. Keeping
+/// offsets lets removal preserve the exact original tags and owned anchors.
+class _NameGlossIndex {
+  _NameGlossIndex(String html, String masked) {
+    final out = StringBuffer();
+    final decodedEntities = <String, String>{};
+    void text(int start, int end) {
+      for (var i = start; i < end; i++) {
+        // XML entities are visible characters, not markup. Keep both raw
+        // boundaries so encoded letters and parentheses can be spliced safely.
+        final entity = masked[i] == '&'
+            ? _entity.matchAsPrefix(masked, i)
+            : null;
+        if (entity != null && entity.end <= end) {
+          final raw = entity.group(0)!;
+          final decoded = decodedEntities.putIfAbsent(
+            raw,
+            () => XhtmlHtmlCompatibility.parseFragment(raw).text ?? raw,
+          );
+          if (decoded != raw) {
+            out.write(decoded);
+            for (var j = 0; j < decoded.length; j++) {
+              offsets.add(i);
+              ends.add(entity.end);
+            }
+            i = entity.end - 1;
+            continue;
+          }
+        }
+        out.write(masked[i]);
+        offsets.add(i);
+        ends.add(i + 1);
+      }
+    }
+
+    var cursor = 0;
+    for (final token in epubMarkupTokens.allMatches(html)) {
+      text(cursor, token.start);
+      final tag = token.group(2)?.toLowerCase().split(':').last;
+      if (!_inlineTags.contains(tag)) {
+        out.write('\uE002');
+        offsets.add(token.start);
+        ends.add(token.end);
+      }
+      cursor = token.end;
+    }
+    text(cursor, html.length);
+    visible = out.toString();
+  }
+
+  static const _inlineTags = {
+    'a',
+    'abbr',
+    'b',
+    'bdi',
+    'bdo',
+    'big',
+    'cite',
+    'del',
+    'dfn',
+    'em',
+    'font',
+    'i',
+    'ins',
+    'mark',
+    'q',
+    's',
+    'small',
+    'span',
+    'strike',
+    'strong',
+    'sub',
+    'sup',
+    'time',
+    'tt',
+    'u',
+    'var',
+  };
+  final offsets = <int>[];
+  final ends = <int>[];
+  late final String visible;
+  static final _space = RegExp(r'\s');
+  static final _entity = RegExp(
+    r'&(?:#[xX][0-9a-fA-F]{1,8}|#[0-9]{1,10}|[A-Za-z][A-Za-z0-9]{1,31});',
+  );
+
+  int _position(int originalOffset) {
+    var low = 0, high = offsets.length;
+    while (low < high) {
+      final middle = (low + high) ~/ 2;
+      if (offsets[middle] < originalOffset) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    return low;
+  }
+
+  bool isNameRange(_NameOccurrence match) {
+    // Entity spellings and markup must not create artificial word boundaries.
+    final first = _position(match.start), last = _position(match.end) - 1;
+    return first < offsets.length &&
+        last >= first &&
+        offsets[first] == match.start &&
+        ends[last] == match.end &&
+        ProperNameNormalizer._hasNameWordBoundary(visible, (
+          start: first,
+          end: last + 1,
+        ));
+  }
+
+  ({
+    int start,
+    int end,
+    int contentStart,
+    int contentEnd,
+    int prefixEnd,
+    bool halfWidth,
+  })?
+  range(_NameOccurrence match) {
+    var start = _position(match.start), end = _position(match.end);
+    while (start > 0 && _space.hasMatch(visible[start - 1])) {
+      start--;
+    }
+    while (end < visible.length && _space.hasMatch(visible[end])) {
+      end++;
+    }
+    if (start == 0 || end == visible.length) return null;
+    final opening = visible[start - 1], closing = visible[end];
+    if (!((opening == '（' && closing == '）') ||
+        (opening == '(' && closing == ')'))) {
+      return null;
+    }
+    return (
+      start: offsets[start - 1],
+      end: ends[end],
+      contentStart: ends[start - 1],
+      contentEnd: offsets[end],
+      prefixEnd: start - 1,
+      halfWidth: opening == '(',
+    );
+  }
+
+  bool hasTargetBefore(int end, String target) {
+    // Bound by visible characters, so a long inline attribute cannot cut
+    // the Chinese name in half. The headroom allows whitespace in the name.
+    final window = target.length * 12 + 64;
+    final start = end > window ? end - window : 0;
+    final text = visible.substring(start, end);
+    return ProperNameNormalizer._glossComparisonKey(
+      text,
+    ).endsWith(ProperNameNormalizer._glossComparisonKey(target));
+  }
+}
+
 /// Deterministic post-processing layer that converts every configuration-
 /// locked proper name to the canonical display form across the whole book.
 ///
@@ -76,7 +235,13 @@ class ProperNameNormalizer {
       return html;
     }
     final prose = _maskNonProse(html);
-    if (!_containsCjk(prose)) {
+    // Numeric entities can encode all target-script text in a valid XHTML
+    // fragment. Decode visible prose only; attributes/non-prose stay opaque.
+    if (!_containsCjk(prose) &&
+        (!prose.contains('&') ||
+            !_containsCjk(
+              _NameGlossIndex(html, _maskHtmlMarkup(html)).visible,
+            ))) {
       return html;
     }
 
@@ -127,6 +292,7 @@ class ProperNameNormalizer {
     if (!pattern.hasMatch(masked)) {
       return html;
     }
+    final identifierSpans = _identifierSentinelSpans(masked);
     final StringBuffer output = StringBuffer();
     int cursor = 0;
     bool changed = false;
@@ -134,6 +300,10 @@ class ProperNameNormalizer {
     while (searchFrom < masked.length) {
       final match = pattern.allMatches(masked, searchFrom).firstOrNull;
       if (match == null) break;
+      if (_inSpans(identifierSpans, match.start, match.end)) {
+        searchFrom = match.end;
+        continue;
+      }
       final replacement = buildReplacement(html, masked, match);
       if (retryRejectedSuffix &&
           replacement == html.substring(match.start, match.end)) {
@@ -213,6 +383,11 @@ class ProperNameNormalizer {
         match.group(1)!,
         match.start,
       ).trim();
+      // Replacing a formatted head would drop its tags (possibly only one
+      // side of a wrapper). The offset-based pass below preserves all markup.
+      if (epubMarkupTokens.hasMatch(head)) {
+        return original.substring(match.start, match.end);
+      }
       // Strict: only the locked translation (after normalization) folds.
       // Anything else — an unrelated phrase, a truncation — is left alone.
       if (_glossComparisonKey(
@@ -247,18 +422,45 @@ class ProperNameNormalizer {
     // length-preserving, so match offsets stay valid for splicing the
     // original HTML back together.
     final String masked = _maskHtmlMarkup(html);
-    if (!english.hasMatch(masked)) {
-      return html;
-    }
     // Identifier spans (URLs, emails, footnote anchors, …) wrapped in
     // `\uE000…\uE001` are off-limits: the sentinel characters read as word
     // boundaries, so the boundary check alone cannot protect them — without
     // this skip a locked `Li` would rewrite `https://example.com/li`.
     final List<(int, int)> identifierSpans = _identifierSentinelSpans(masked);
+    final glosses = _NameGlossIndex(html, masked);
+    final occurrences = <int, _NameOccurrence>{
+      for (final match in english.allMatches(masked))
+        if (glosses.isNameRange((start: match.start, end: match.end)))
+          match.start: (start: match.start, end: match.end),
+    };
+    // A forward gloss may split even one word across nonempty formatting
+    // elements. Match its visible text, then map back to the original markup.
+    // Only bracketed glosses use this path; bare-name rewrites still require
+    // the existing mask so they cannot flatten arbitrary formatted prose.
+    for (final match in english.allMatches(glosses.visible)) {
+      if (!_hasNameWordBoundary(glosses.visible, (
+        start: match.start,
+        end: match.end,
+      ))) {
+        continue;
+      }
+      final occurrence = (
+        start: glosses.offsets[match.start],
+        end: glosses.ends[match.end - 1],
+      );
+      final range = glosses.range(occurrence);
+      if (range != null &&
+          (!range.halfWidth ||
+              glosses.hasTargetBefore(range.prefixEnd, mapping.target))) {
+        occurrences[occurrence.start] = occurrence;
+      }
+    }
+    final ordered = occurrences.values.toList()
+      ..sort((a, b) => a.start.compareTo(b.start));
 
     final StringBuffer output = StringBuffer();
     int cursor = 0;
-    for (final Match match in english.allMatches(masked)) {
+    for (final match in ordered) {
       if (_inSpans(identifierSpans, match.start, match.end)) {
         continue;
       }
@@ -267,7 +469,7 @@ class ProperNameNormalizer {
       if (!_hasNameWordBoundary(masked, match)) {
         continue;
       }
-      final String raw = match.group(0)!;
+      final String raw = masked.substring(match.start, match.end);
       // Transparent empty inline nodes can own IDs, names or page markers.
       // Keep them immediately before the canonical name: links still land
       // at the name, and its Chinese/English display text stays contiguous.
@@ -278,13 +480,29 @@ class ProperNameNormalizer {
                 html.substring(match.start + run.start, match.start + run.end),
           )
           .join();
-      // A bare English name that sits inside an existing `中文（English）`
-      // gloss (between an opening paren and its closing paren) is already
-      // canonical and must not be re-glossed.
-      if (_isCanonicalGlossInnerName(masked, match)) {
-        if (state?.countedNames.contains(mapping.source) == false) {
-          state?.countedNames.add(mapping.source);
+      // Recognize forward glosses through inline formatting without flattening
+      // their markup. A half-width pair is a gloss only after the locked target.
+      final range = glosses.range(match);
+      final hasTarget =
+          range != null &&
+          glosses.hasTargetBefore(range.prefixEnd, mapping.target);
+      if (range != null && (!range.halfWidth || hasTarget)) {
+        if (state?.countedNames.contains(mapping.source) == true && hasTarget) {
+          output.write(html.substring(cursor, range.start));
+          for (final token in epubMarkupTokens.allMatches(html, range.start)) {
+            if (token.start >= range.end) break;
+            output.write(token.group(0));
+          }
+          cursor = range.end;
+        } else if (range.halfWidth) {
+          output
+            ..write(html.substring(cursor, range.start))
+            ..write('（')
+            ..write(html.substring(range.contentStart, range.contentEnd))
+            ..write('）');
+          cursor = range.end;
         }
+        state?.countedNames.add(mapping.source);
         continue;
       }
       // A bare name immediately followed by a full-width parenthetical
@@ -385,6 +603,9 @@ class ProperNameNormalizer {
       final next = index + 1 < tokens.length ? tokens[index + 1] : null;
       final isEmptyPair =
           match.group(2) != null &&
+          _NameGlossIndex._inlineTags.contains(
+            match.group(2)!.toLowerCase().split(':').last,
+          ) &&
           match.group(1) != '/' &&
           !match.group(0)!.endsWith('/>') &&
           next != null &&
@@ -392,10 +613,17 @@ class ProperNameNormalizer {
           next.group(2) == match.group(2) &&
           html.substring(end, next.start).trim().isEmpty;
       if (isEmptyPair) {
+        // Keep visible whitespace between the tags. Hiding it would join
+        // distinct words, or remove a real boundary next to a bare name.
+        out
+          ..write('\uE003' * (match.end - match.start))
+          ..write(html.substring(match.end, next.start))
+          ..write('\uE003' * (next.end - next.start));
         end = next.end;
         index++;
+      } else {
+        out.write('\uE002' * (end - match.start));
       }
-      out.write((isEmptyPair ? '\uE003' : '\uE002') * (end - match.start));
       cursor = end;
     }
     out.write(html.substring(cursor));
@@ -462,7 +690,7 @@ class ProperNameNormalizer {
   /// the opaque mask (`\uE002`) and the identifier sentinels all count as
   /// boundaries; the empty-tag mask (`\uE003`) is transparent and looked
   /// through, so `Li<span></span>mited` is seen as the glued word it is.
-  static bool _hasNameWordBoundary(String masked, Match match) {
+  static bool _hasNameWordBoundary(String masked, _NameOccurrence match) {
     bool isWordChar(String char) => RegExp(r'[A-Za-z0-9_]').hasMatch(char);
     int start = match.start;
     while (start > 0 && masked[start - 1] == '\uE003') {
@@ -545,24 +773,6 @@ class ProperNameNormalizer {
     return cleaned;
   }
 
-  /// Whether [match] spans an English name that is embedded inside an
-  /// already-canonical `中文（English）` gloss — a full-width paren pair that
-  /// is the shape we emit. A half-width `(English)` pair is NOT canonical: it
-  /// must be folded to full-width so the whole book converges on one shape.
-  ///
-  /// Both parens must be present: an unmatched `）` (or `（`) is ordinary
-  /// prose punctuation, not a gloss, and the name next to it still needs
-  /// its first-occurrence annotation.
-  static bool _isCanonicalGlossInnerName(String html, Match match) {
-    final bool precededByOpen = RegExp(
-      r'[（]\s*$',
-    ).hasMatch(html.substring(0, match.start));
-    final bool followedByClose = RegExp(
-      r'^\s*[）]',
-    ).hasMatch(html.substring(match.end));
-    return precededByOpen && followedByClose;
-  }
-
   /// Whether [match] is immediately followed by a parenthetical containing
   /// CJK — the shape of a model-provided `English（中文）` gloss or appositive
   /// that the strict reverse-gloss rule left untouched.
@@ -573,7 +783,7 @@ class ProperNameNormalizer {
   /// nesting level is allowed (`（亚当（字幼常））`), and half-width parens
   /// count too — but only with CJK inside, so `(the economist)` is not
   /// mistaken for a gloss.
-  static bool _isFollowedByGlossParen(String html, Match match) {
+  static bool _isFollowedByGlossParen(String html, _NameOccurrence match) {
     // NB: `^` anchors to the start of the *string*, not to `match.end`, so
     // slice first like the sibling helpers do.
     final Match? paren = RegExp(
@@ -592,47 +802,67 @@ class ProperNameNormalizer {
   /// would also pollute the book-wide first-occurrence state). An exact
   /// variant (`亚当斯密` for locked `亚当·斯密`) is unified to the locked target.
   ///
-  /// Runs on the markup-masked text: attribute values such as
-  /// `title="Adam Smith（亚当）"` are metadata and are never canonicalized.
+  /// Matches visible text, then splices by original offsets. Source/target
+  /// formatting and entities are preserved without rewriting attributes.
   static String _canonicalizeReverseGlosses(
     String html,
     ProperNameMap mapping,
   ) {
-    final String source = RegExp.escape(mapping.source);
+    final masked = _maskHtmlMarkup(html);
+    final index = _NameGlossIndex(html, masked);
+    final identifiers = _identifierSentinelSpans(masked);
+    final source = _tolerantNamePattern(mapping.source).pattern;
     final String pattern =
-        r'(\b'
+        r'('
         '$source'
         r')\s*[（(]\s*'
-        r'([^()（）]{1,40}?[\u3400-\u9FFF][^()（）]{0,24}?)\s*[)）]';
+        r'([^()（）]{0,40}?[\u3400-\u9FFF][^()（）]{0,24}?)\s*[)）]';
     final RegExp reverse = RegExp(pattern, caseSensitive: false);
-    return _rewriteOnMaskedText(html, reverse, (
-      String original,
-      String masked,
-      Match match,
-    ) {
-      final String name = _unmaskSlice(original, match.group(1)!, match.start);
-      // Group 2 follows `name` + `\\s*[（(]\\s*`; locate it in the masked
-      // copy so its offsets map 1:1 back onto the original HTML.
-      final int afterName = match.start + match.group(1)!.length;
-      final Match? separator = RegExp(
-        r'\s*[（(]\s*',
-      ).matchAsPrefix(masked, afterName);
-      final int group2Start = separator?.end ?? afterName;
-      final String translated = _unmaskSlice(
-        original,
-        match.group(2)!,
-        group2Start,
-      ).trim();
-      if (_glossComparisonKey(
-            XhtmlHtmlCompatibility.parseFragment(translated).text ?? '',
-          ) !=
-          _glossComparisonKey(mapping.target)) {
-        // Strict: anything that is not the locked translation — an appositive,
-        // a truncation — is left untouched rather than disguised as a gloss.
-        return original.substring(match.start, match.end);
+    String markup(int start, int end) => epubMarkupTokens
+        .allMatches(html, start)
+        .takeWhile((token) => token.start < end)
+        .map((token) => token.group(0)!)
+        .join();
+    final output = StringBuffer();
+    var cursor = 0;
+    for (final match in reverse.allMatches(index.visible)) {
+      final sourceEnd = match.start + match.group(1)!.length;
+      final start = index.offsets[match.start];
+      final end = index.ends[match.end - 1];
+      if (!_hasNameWordBoundary(index.visible, (
+            start: match.start,
+            end: sourceEnd,
+          )) ||
+          _inSpans(identifiers, start, end) ||
+          _glossComparisonKey(match.group(2)!) !=
+              _glossComparisonKey(mapping.target)) {
+        continue;
       }
-      return '${_text(mapping.target)}（$name）';
-    });
+      final separator = RegExp(
+        r'\s*[（(]\s*',
+      ).matchAsPrefix(index.visible, sourceEnd)!;
+      final targetStart = index.offsets[separator.end];
+      final targetEnd = index.ends[separator.end + match.group(2)!.length - 1];
+      final translated = html.substring(targetStart, targetEnd).trim();
+      final target = epubMarkupTokens.hasMatch(translated)
+          ? translated
+          : _text(mapping.target);
+      final name = _text(
+        _cleanLooseHtmlTokens(match.group(1)!, mapping.source),
+      );
+      // Remove only the old name and parentheses. Keep every tag in order,
+      // including wrappers crossing the source, target, or either parenthesis.
+      output
+        ..write(html.substring(cursor, start))
+        ..write(markup(start, targetStart))
+        ..write(target)
+        ..write(markup(targetEnd, end))
+        ..write('（$name）');
+      cursor = end;
+    }
+    if (cursor == 0) return html;
+    output.write(html.substring(cursor));
+    return output.toString();
   }
 
   /// Guesses the bracket style already used by the surrounding block so the
@@ -669,8 +899,16 @@ class ProperNameNormalizer {
     // Protect footnote-back link anchors: <a ...>II</a> etc. Those are pure
     // anchor text and must not be treated as a name occurrence.
     String out = html.replaceAllMapped(
-      RegExp(r'<a\b[^>]*>[^<]{0,12}</a>', caseSensitive: false),
-      (Match match) => '\uE000${_protect(match.group(0)!)}\uE001',
+      RegExp(r'<a\b[^>]*>([^<]*)</a>', caseSensitive: false),
+      (Match match) {
+        final raw = match.group(1)!;
+        if (raw.length > 12 && !raw.contains('&')) return match.group(0)!;
+        // Entity spelling length must not turn a short link into prose.
+        final text = XhtmlHtmlCompatibility.parseFragment(raw).text ?? '';
+        return text.trim().isEmpty || text.length > 12
+            ? match.group(0)!
+            : '\uE000${_protect(match.group(0)!)}\uE001';
+      },
     );
     // Protect inline work titles in 《》 already carrying the original Latin
     // gloss, e.g. 《国富论》（The Wealth of Nations） — but NOT when the

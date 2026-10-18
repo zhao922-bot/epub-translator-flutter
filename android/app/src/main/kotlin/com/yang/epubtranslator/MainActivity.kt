@@ -1251,9 +1251,9 @@ class MainActivity : FlutterActivity() {
                     file.absolutePath !in activeShareTargets &&
                     now - file.lastModified() >= SHARE_STAGING_CAP_GRACE_MS
                 ) {
-                    if (file.delete()) {
-                        grants = dropShareGrant(grants, file.absolutePath)
-                    }
+                    // Keep its ledger entry until the orphan revoke pass below
+                    // succeeds. Failed revokes must remain retryable.
+                    file.delete()
                 }
             }
             val liveFiles = stagingDir.listFiles()?.filter { it.isFile } ?: return@synchronized

@@ -67,6 +67,78 @@ class _RuneCursor {
   }
 }
 
+/// Index the parenthesis boundaries once per text. An unclosed gloss must
+/// not rescan the suffix for every occurrence of every retained phrase.
+class _ParenthesizedTermGlossIndex {
+  _ParenthesizedTermGlossIndex(this.text) : cursor = _RuneCursor(text) {
+    final runes = cursor.runes;
+    final length = runes.length;
+    afterToken = List<bool>.filled(length + 1, false);
+    beforeToken = List<bool>.filled(length + 1, false);
+    closesAfterToken = List<bool>.filled(length + 1, false);
+    final cjkCount = List<int>.filled(length + 1, 0);
+    final openAfterCjk = List<bool>.filled(length, false);
+    int previousNonSpace = -1;
+    int previousNonFiller = -1;
+    for (int i = 0; i < length; i++) {
+      final rune = runes[i];
+      cjkCount[i + 1] =
+          cjkCount[i] + (TranslationQuality._isCjkRune(rune) ? 1 : 0);
+      beforeToken[i] =
+          previousNonFiller >= 0 && openAfterCjk[previousNonFiller];
+      if (_isOpen(rune)) {
+        openAfterCjk[i] =
+            previousNonSpace >= 0 &&
+            TranslationQuality._isCjkRune(runes[previousNonSpace]);
+      }
+      if (!TranslationQuality._isGlossSpaceRune(rune)) previousNonSpace = i;
+      if (!TranslationQuality._isGlossFillerRune(rune)) previousNonFiller = i;
+    }
+    int nextClose = length;
+    int nextNonSpace = length;
+    int nextNonFiller = length;
+    for (int i = length - 1; i >= 0; i--) {
+      final rune = runes[i];
+      if (_isClose(rune)) nextClose = i;
+      if (!TranslationQuality._isGlossSpaceRune(rune)) nextNonSpace = i;
+      if (!TranslationQuality._isGlossFillerRune(rune)) nextNonFiller = i;
+      closesAfterToken[i] =
+          nextNonFiller < length && _isClose(runes[nextNonFiller]);
+      afterToken[i] =
+          nextNonSpace < length &&
+          _isOpen(runes[nextNonSpace]) &&
+          nextClose < length &&
+          cjkCount[nextClose] > cjkCount[nextNonSpace + 1];
+    }
+  }
+
+  final String text;
+  final _RuneCursor cursor;
+  late final List<bool> afterToken;
+  late final List<bool> beforeToken;
+  late final List<bool> closesAfterToken;
+  final _results = <String, bool>{};
+
+  static bool _isOpen(int rune) => rune == 0x28 || rune == 0xFF08;
+  static bool _isClose(int rune) => rune == 0x29 || rune == 0xFF09;
+
+  bool contains(String token) => _results.putIfAbsent(token, () {
+    if (token.isEmpty) return false;
+    final tokenLength = token.runes.length;
+    int from = 0;
+    while (true) {
+      final occurrence = text.indexOf(token, from);
+      if (occurrence < 0) return false;
+      final start = cursor.runeIndexAt(occurrence);
+      final end = start + tokenLength;
+      if (afterToken[end] || (beforeToken[start] && closesAfterToken[end])) {
+        return true;
+      }
+      from = occurrence + 1;
+    }
+  });
+}
+
 // One traversal per semantic block. Candidate-specific context must stay
 // distinct: a book title and an instruction can occupy the same paragraph.
 class _WorkTitleBlockContext {
@@ -495,6 +567,42 @@ class TranslationQuality {
     );
   }
 
+  /// Only the diagnostic copies are canonicalized; EPUB output keeps its
+  /// qualified names. An explicit foreign namespace must never gain an XHTML
+  /// work-title exemption just because its local name happens to be i/cite.
+  static void _normalizeDiagnosticXhtmlNames(Document document) {
+    final replacements = <Element>[];
+    for (final element in epubElements(document)) {
+      final name = element.localName ?? '';
+      final colon = name.indexOf(':');
+      if (colon < 0) continue;
+      if (element.namespaceUri != null &&
+          element.namespaceUri != 'http://www.w3.org/1999/xhtml') {
+        continue;
+      }
+      final prefix = name.substring(0, colon);
+      String? binding;
+      for (
+        Element? current = element;
+        current != null;
+        current = current.parent
+      ) {
+        binding = current.attributes['xmlns:$prefix'];
+        if (binding != null) break;
+      }
+      // Detached XHTML fragments can omit their inherited declaration.
+      if (binding == null || binding == 'http://www.w3.org/1999/xhtml') {
+        replacements.add(element);
+      }
+    }
+    for (final element in replacements.reversed) {
+      final replacement = Element.tag(epubLocalName(element))
+        ..attributes.addAll(element.attributes);
+      replacement.nodes.addAll(element.nodes.toList());
+      element.replaceWith(replacement);
+    }
+  }
+
   static TranslationResidualFinding? _findSuspiciousDocumentResidual({
     required Document sourceDocument,
     required Document translatedDocument,
@@ -503,6 +611,8 @@ class TranslationQuality {
     required bool allowBibliographicRetention,
     required String lockedGlossary,
   }) {
+    _normalizeDiagnosticXhtmlNames(sourceDocument);
+    _normalizeDiagnosticXhtmlNames(translatedDocument);
     if (!_clearMatchingExplainedInlinePhrases(
       sourceDocument,
       translatedDocument,
@@ -1260,90 +1370,7 @@ class TranslationQuality {
   /// a deliberate first-occurrence gloss rather than bare untranslated text,
   /// so it should be allowed to stay next to Chinese.
   static bool _isParenthesizedTermGloss(String text, String token) {
-    if (token.isEmpty) {
-      return false;
-    }
-    // 性能-#51: linear rune scans. The old direction-2 regex
-    // `token\s*[（(][^）)]*<CJK>[^）)]*[）)]` backtracked quadratically on
-    // long unclosed parenthesized runs (measured 233ms at n=1600 for a
-    // single hasMatch — the two [^）)]* split the same run around each CJK
-    // char); direction-1 shared the shape around the token, and hasMatch
-    // retried at every position. indexOf finds occurrences natively and
-    // each is checked with one bounded walk.
-    final _RuneCursor cursor = _RuneCursor(text);
-    final int tokenRuneLength = token.runes.length;
-    int from = 0;
-    while (true) {
-      final int occurrence = text.indexOf(token, from);
-      if (occurrence < 0) {
-        return false;
-      }
-      final int start = cursor.runeIndexAt(occurrence);
-      final int end = start + tokenRuneLength;
-      if (_glossParensAfterToken(cursor, end) ||
-          _glossParensBeforeToken(cursor, start, end)) {
-        return true;
-      }
-      from = occurrence + 1;
-    }
-  }
-
-  /// Direction 2 of [_isParenthesizedTermGloss]: [tokenEnd] is followed by
-  /// optional whitespace and an open paren whose content (up to the close
-  /// paren) holds at least one CJK char. Each rune is visited once.
-  static bool _glossParensAfterToken(_RuneCursor cursor, int tokenEnd) {
-    final List<int> runes = cursor.runes;
-    int i = tokenEnd;
-    while (i < runes.length && _isGlossSpaceRune(runes[i])) {
-      i++;
-    }
-    if (i >= runes.length ||
-        (runes[i] != _glossOpenAscii && runes[i] != _glossOpenFull)) {
-      return false;
-    }
-    i++;
-    bool seenCjk = false;
-    while (i < runes.length &&
-        runes[i] != _glossCloseAscii &&
-        runes[i] != _glossCloseFull) {
-      if (_isCjkRune(runes[i])) {
-        seenCjk = true;
-      }
-      i++;
-    }
-    return seenCjk && i < runes.length;
-  }
-
-  /// Direction 1 of [_isParenthesizedTermGloss]: an open paren preceded
-  /// (through whitespace) by CJK sits immediately before the token, with
-  /// only gloss filler between the paren and the token, and filler plus a
-  /// close paren after the token.
-  static bool _glossParensBeforeToken(
-    _RuneCursor cursor,
-    int tokenStart,
-    int tokenEnd,
-  ) {
-    final List<int> runes = cursor.runes;
-    int i = tokenStart - 1;
-    while (i >= 0 && _isGlossFillerRune(runes[i])) {
-      i--;
-    }
-    if (i < 0 || (runes[i] != _glossOpenAscii && runes[i] != _glossOpenFull)) {
-      return false;
-    }
-    i--;
-    while (i >= 0 && _isGlossSpaceRune(runes[i])) {
-      i--;
-    }
-    if (i < 0 || !_isCjkRune(runes[i])) {
-      return false;
-    }
-    int j = tokenEnd;
-    while (j < runes.length && _isGlossFillerRune(runes[j])) {
-      j++;
-    }
-    return j < runes.length &&
-        (runes[j] == _glossCloseAscii || runes[j] == _glossCloseFull);
+    return _ParenthesizedTermGlossIndex(text).contains(token);
   }
 
   static bool _isCjkTargetLanguage(String targetLanguage) {
@@ -2952,6 +2979,7 @@ class TranslationQuality {
       return !isStandaloneLowercaseTerm;
     }
 
+    late final glosses = _ParenthesizedTermGlossIndex(strippedTranslated);
     for (final List<String> run in _englishRunsSeparatedByTargetScript(
       strippedTranslated,
     )) {
@@ -2978,7 +3006,7 @@ class TranslationQuality {
       // so it is not title-like, but it still sits inside the parenthesized
       // gloss and must not be treated as untranslated prose.
       final String runText = run.join(' ');
-      if (_isParenthesizedTermGloss(strippedTranslated, runText)) {
+      if (glosses.contains(runText)) {
         continue;
       }
       final bool allLowercase = run.every(

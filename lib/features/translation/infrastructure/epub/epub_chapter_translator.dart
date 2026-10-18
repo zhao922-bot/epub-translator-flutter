@@ -827,7 +827,11 @@ class EpubChapterTranslator {
     run.watchCancellation();
     Dio? dio;
     try {
-      await validateInspectedSource(chapters);
+      await validateInspectedSource(
+        chapters,
+        cancelToken: cancelToken,
+        throwIfCancelled: run.throwIfCancelled,
+      );
       run.throwIfCancelled();
       dio = _apiClient.buildDio(config);
       final profile = await _invocation(run)._memory.generateStyleProfile(
@@ -1089,7 +1093,12 @@ class EpubChapterTranslator {
       }
       await validateOutputDirectory(outputDirectory, config.uiLanguage);
       if (totalBlocks == 0) {
-        await validateInspectedSource(chapters, inputPath: inputPath);
+        await validateInspectedSource(
+          chapters,
+          inputPath: inputPath,
+          cancelToken: cancelToken,
+          throwIfCancelled: _run.throwIfCancelled,
+        );
         return await _repackZeroBlockSelection(
           jobId: jobId,
           inputPath: inputPath,
@@ -2593,12 +2602,10 @@ class EpubChapterTranslator {
                 ..add(_apiClient.metricsFor(dio))
                 ..add(_run.styleMetrics))
               .toJson();
-      final TranslationJob terminalJob = currentJob.copyWith(
+      TranslationJob terminalJob = currentJob.copyWith(
         apiUsage: apiUsage,
         elapsedMilliseconds: translationStopwatch.elapsedMilliseconds,
-        qualityReportPath: config.semanticQualityCheck
-            ? "$outputFilePath.quality.json"
-            : null,
+        qualityReportPath: null,
         reviewSuggestionCount: _run.semanticCorrections.length,
         consistencyWarningCount: _run.consistencyFindings.length,
         unreviewedBlockCount: _run.semanticUnreviewed.length,
@@ -2635,9 +2642,7 @@ class EpubChapterTranslator {
         job: terminalJob,
         chapters: updatedChapters,
         apiUsage: apiUsage,
-        qualityReportPath: config.semanticQualityCheck
-            ? '$outputFilePath.quality.json'
-            : null,
+        qualityReportPath: null,
       );
       emit(
         terminalJob,
@@ -2677,12 +2682,6 @@ class EpubChapterTranslator {
             : 'API totals: ${jsonEncode(usage)} (style, memory, body, review, title and retries).',
       );
       if (config.semanticQualityCheck) {
-        emit(
-          terminalJob,
-          s.isChinese
-              ? '语义复核：${_run.semanticRequests} 次请求，${_run.semanticCorrections.length} 条待确认建议，${_run.semanticUnreviewed.length} 个文本块未完成复核。报告：$outputFilePath.quality.json'
-              : 'Semantic review: ${_run.semanticRequests} requests, ${_run.semanticCorrections.length} suggestions awaiting approval, ${_run.semanticUnreviewed.length} unreviewed blocks. Report: $outputFilePath.quality.json',
-        );
         try {
           await writeFileAtomically(
             File('$outputFilePath.quality.json'),
@@ -2727,7 +2726,28 @@ class EpubChapterTranslator {
               'apiUsage': usage,
             }),
           );
+          terminalJob = terminalJob.copyWith(
+            qualityReportPath: '$outputFilePath.quality.json',
+          );
+          committedResult = TranslationRunResult(
+            job: terminalJob,
+            chapters: updatedChapters,
+            apiUsage: apiUsage,
+            qualityReportPath: '$outputFilePath.quality.json',
+          );
+          emit(
+            terminalJob,
+            s.isChinese
+                ? '语义复核：${_run.semanticRequests} 次请求，${_run.semanticCorrections.length} 条待确认建议，${_run.semanticUnreviewed.length} 个文本块未完成复核。报告：$outputFilePath.quality.json'
+                : 'Semantic review: ${_run.semanticRequests} requests, ${_run.semanticCorrections.length} suggestions awaiting approval, ${_run.semanticUnreviewed.length} unreviewed blocks. Report: $outputFilePath.quality.json',
+          );
         } catch (error) {
+          emit(
+            terminalJob,
+            s.isChinese
+                ? '译本已保存，但复核报告无法写入；本次复核报告不可用。'
+                : 'The EPUB was saved, but the review report could not be written and is unavailable for this run.',
+          );
           AppLogger.warn(
             'Quality report write failed (${error.runtimeType}).',
             tag: 'translate',
@@ -2784,7 +2804,7 @@ class EpubChapterTranslator {
           s.runLogFinalCheckpointFailed('${error.runtimeType}', outputFilePath),
         );
       }
-      return committedResult;
+      return committedResult!;
     } catch (error) {
       final TranslationRunResult? done = committedResult;
       if (done != null) {
@@ -4642,22 +4662,32 @@ class EpubChapterTranslator {
     final String baseName = path.basenameWithoutExtension(inputPath);
     String candidate = path.join(
       outputDirectory,
-      outputFileNameForTest(baseName, safeSuffix),
+      outputFileName(baseName, safeSuffix),
     );
     // Never overwrite the source EPUB even if sanitization collapses the name.
     if (_sameFilesystemPath(candidate, inputPath)) {
       candidate = path.join(
         outputDirectory,
-        outputFileNameForTest(baseName, '${safeSuffix}_out'),
+        outputFileName(baseName, '${safeSuffix}_out'),
       );
     }
     return candidate;
   }
 
-  /// Reserve room for the repack temporary suffix. Windows counts UTF-16
-  /// units; POSIX filesystems count UTF-8 bytes per component.
+  /// Reports append at most `.diagnostics.json` and then the shared atomic
+  /// write suffix. This also covers EPUB temp/backup/recovery suffixes.
+  static const int outputPathSuffixBudget = 17 + atomicWriteSuffixBudget;
+
   @visibleForTesting
   static String outputFileNameForTest(
+    String baseName,
+    String suffix, {
+    bool? windows,
+  }) => outputFileName(baseName, suffix, windows: windows);
+
+  /// Keep every derived artifact writable. Windows counts UTF-16 units;
+  /// POSIX filesystems count UTF-8 bytes per filename component.
+  static String outputFileName(
     String baseName,
     String suffix, {
     bool? windows,
@@ -4679,7 +4709,7 @@ class EpubChapterTranslator {
       return result.toString();
     }
 
-    const int limit = 255 - 26; // .recovery. + 16-digit microsecond timestamp
+    const int limit = 255 - outputPathSuffixBudget;
     final String name = '$baseName$suffix.epub';
     if (size(name) <= limit) return name;
     final String hash = sha256
@@ -4737,20 +4767,15 @@ class EpubChapterTranslator {
     }
   }
 
-  /// Longest write-path form the app ever produces for [outputFilePath]:
-  /// `<output>.recovery.<16 digits>` kept by the lock-conflict recovery path
-  /// (+26), which also covers the shorter `.tmp.<16 digits>` (+21) repack
-  /// form and the `.bak.<16 digits>` (+21) backup form. All three suffixes
-  /// use [DateTime.microsecondsSinceEpoch] (16 digits). Dart's
-  /// [String.length] counts UTF-16 code units, which is what Windows
-  /// MAX_PATH (260) counts.
+  /// Include reports and their atomic temporary names, as well as EPUB
+  /// recovery files. [String.length] counts Windows UTF-16 code units.
   ///
   /// Visible for testing.
   @visibleForTesting
   static bool outputPathExceedsWindowsMaxPath(String outputFilePath) {
     // MAX_PATH (260) counts the terminating NUL, so 259 is the longest
     // usable path; a final path of exactly 260 already overflows.
-    return outputFilePath.length + 26 >= 260;
+    return outputFilePath.length + outputPathSuffixBudget >= 260;
   }
 
   /// Throws [WindowsLongPathException] when the longest write path the
@@ -4761,15 +4786,12 @@ class EpubChapterTranslator {
   ///
   /// [longPathsEnabledReader] is a test seam for the (slow, PowerShell-based)
   /// registry read.
-  ///
-  /// Visible for testing.
-  @visibleForTesting
   static Future<void> throwIfOutputPathTooLongForWindows(
     String outputFilePath, {
     Future<bool?> Function()? longPathsEnabledReader,
   }) async {
     final String fileName = path.windows.basename(outputFilePath);
-    if (fileName.length + 26 > 255) {
+    if (fileName.length + outputPathSuffixBudget > 255) {
       throw FileSystemException(
         'Output filename plus temporary suffix exceeds 255 UTF-16 code units.',
         outputFilePath,

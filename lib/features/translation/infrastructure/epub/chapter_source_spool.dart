@@ -178,6 +178,7 @@ class ChapterSourceSpool {
       final archive = await EpubIsolateWorker.loadInspectionSnapshot(
         identity.inputPath,
         selectEntries: _selectChapter(chapterPath),
+        isCancelled: isCancelled,
       );
       throwIfCancelled();
       checkEpubSourceHash(archive.fingerprint, identity.sha256);

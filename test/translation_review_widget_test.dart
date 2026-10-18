@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_run_details.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/pages/translation_review_page.dart';
+import 'support/review_baseline_fixture.dart';
 
 void main() {
   testWidgets(
@@ -16,7 +17,7 @@ void main() {
         jsonEncode({
           'version': 2,
           'outputPath': '${dir.path}/book.epub',
-          'rendering': {},
+          'rendering': writeReviewBaselineFixture('${dir.path}/book.epub'),
           'corrections': [
             {
               'chapter': 'story.xhtml',

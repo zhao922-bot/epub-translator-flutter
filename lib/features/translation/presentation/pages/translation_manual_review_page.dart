@@ -31,11 +31,42 @@ class _TranslationManualReviewPageState
   late final _edits = Map<String, String>.of(widget.edits);
   late final _reviewed = Set<String>.of(widget.reviewed);
   String _query = '';
+  final _searchIndex =
+      <String, ({String source, String markup, String id, String text})>{};
   String t(String zh, String en) => widget.isChinese ? zh : en;
+
+  String _currentMarkup(Map<String, String> block) =>
+      _edits[block['key']] ?? block['proposedHtml'] ?? block['beforeHtml']!;
+
+  String _searchText(Map<String, String> block) {
+    final key = block['key']!;
+    final source = block['sourceHtml']!;
+    final markup = _currentMarkup(block);
+    final id = block['id']!;
+    final cached = _searchIndex[key];
+    if (cached != null &&
+        cached.source == source &&
+        cached.markup == markup &&
+        cached.id == id) {
+      return cached.text;
+    }
+    final text =
+        '$id ${TranslationConsistencyChecker.text(source)} '
+                '${TranslationConsistencyChecker.text(markup)}'
+            .toLowerCase();
+    _searchIndex[key] = (source: source, markup: markup, id: id, text: text);
+    return text;
+  }
+
+  @override
+  void didUpdateWidget(covariant TranslationManualReviewPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.blocks, widget.blocks)) _searchIndex.clear();
+  }
 
   Future<void> _edit(Map<String, String> block) async {
     final key = block['key']!;
-    final markup = _edits[key] ?? block['proposedHtml'] ?? block['beforeHtml']!;
+    final markup = _currentMarkup(block);
     final initial = TranslationReviewStore.editableText(markup);
     if (initial == null) {
       await _replace(block, markup);
@@ -166,13 +197,7 @@ class _TranslationManualReviewPageState
   @override
   Widget build(BuildContext context) {
     final matches = widget.blocks
-        .where(
-          (b) =>
-              _query.isEmpty ||
-              ('${b['id']} ${b['sourceHtml']} ${_edits[b['key']] ?? b['beforeHtml']}')
-                  .toLowerCase()
-                  .contains(_query),
-        )
+        .where((b) => _query.isEmpty || _searchText(b).contains(_query))
         .toList();
     return Scaffold(
       appBar: AppBar(
@@ -229,10 +254,7 @@ class _TranslationManualReviewPageState
                 final source = TranslationConsistencyChecker.text(
                   block['sourceHtml']!,
                 );
-                final markup =
-                    _edits[key] ??
-                    block['proposedHtml'] ??
-                    block['beforeHtml']!;
+                final markup = _currentMarkup(block);
                 return Card(
                   margin: const EdgeInsets.symmetric(
                     horizontal: 16,

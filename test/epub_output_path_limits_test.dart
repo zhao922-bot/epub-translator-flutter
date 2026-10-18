@@ -40,29 +40,35 @@ void main() {
         // FileSystemEntity.type internally constructs a Directory too. That
         // query is permitted; only actual subdirectory creation is denied.
         fseGetType: (path, followLinks) async => path == temp.path
-            ? FileSystemEntityType.directory : FileSystemEntityType.notFound,
+            ? FileSystemEntityType.directory
+            : FileSystemEntityType.notFound,
       );
       expect(temp.listSync(), isEmpty);
     },
   );
 
   group('output filename component limit', () {
-    test('reserves the recovery suffix at the exact UTF-16 boundary', () {
-      final name = EpubChapterTranslator.outputFileNameForTest(
-        'a' * 224,
-        '',
-        windows: true,
-      );
-      expect(name.length + 26, 255);
-      expect(name, '${'a' * 224}.epub');
-      final shortened = EpubChapterTranslator.outputFileNameForTest(
-        'a' * 225,
-        '',
-        windows: true,
-      );
-      expect(shortened.length + 26, lessThanOrEqualTo(255));
-      expect(shortened, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
-    });
+    test(
+      'reserves all report and temporary suffixes at the UTF-16 boundary',
+      () {
+        const budget = EpubChapterTranslator.outputPathSuffixBudget;
+        const titleLength = 255 - budget - 5;
+        final name = EpubChapterTranslator.outputFileNameForTest(
+          'a' * titleLength,
+          '',
+          windows: true,
+        );
+        expect(name.length + budget, 255);
+        expect(name, '${'a' * titleLength}.epub');
+        final shortened = EpubChapterTranslator.outputFileNameForTest(
+          'a' * (titleLength + 1),
+          '',
+          windows: true,
+        );
+        expect(shortened.length + budget, lessThanOrEqualTo(255));
+        expect(shortened, matches(RegExp(r'_[0-9a-f]{12}\.epub$')));
+      },
+    );
 
     test(
       'shortens astral titles safely with a stable collision-resistant hash',
@@ -200,9 +206,10 @@ void main() {
     },
   );
   group('outputPathExceedsWindowsMaxPath', () {
-    test('boundary: 233 chars fits (233 + 26 == 259, the longest usable)', () {
-      final String path = "C:\\${'a' * 230}";
-      expect(path.length, 233);
+    test('all derived write paths fit at the exact MAX_PATH boundary', () {
+      const length = 259 - EpubChapterTranslator.outputPathSuffixBudget;
+      final String path = "C:\\${'a' * (length - 3)}";
+      expect(path.length, length);
       expect(
         EpubChapterTranslator.outputPathExceedsWindowsMaxPath(path),
         isFalse,
@@ -210,10 +217,11 @@ void main() {
     });
 
     test(
-      'boundary: 234 chars exceeds (234 + 26 == 260, NUL no longer fits)',
+      'derived write path at 260 leaves no room for the terminating NUL',
       () {
-        final String path = "C:\\${'a' * 231}";
-        expect(path.length, 234);
+        const length = 260 - EpubChapterTranslator.outputPathSuffixBudget;
+        final String path = "C:\\${'a' * (length - 3)}";
+        expect(path.length, length);
         expect(
           EpubChapterTranslator.outputPathExceedsWindowsMaxPath(path),
           isTrue,

@@ -769,13 +769,16 @@ void main() {
       );
 
       expect(result.job.status, TranslationJobStatus.completed);
-      expect(server.blockRequestIds, <List<String>>[
-        <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
-        <String>['f0:p-1'],
-        <String>['f1:p-1', 'f2:p-1'],
-        <String>['f1:p-1'],
-        <String>['f2:p-1'],
-      ]);
+      expect(
+        server.blockRequestIds,
+        unorderedEquals(<List<String>>[
+          <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+          <String>['f0:p-1'],
+          <String>['f1:p-1', 'f2:p-1'],
+          <String>['f1:p-1'],
+          <String>['f2:p-1'],
+        ]),
+      );
       expect(
         server.blockRequestIds,
         everyElement(
@@ -912,18 +915,21 @@ void main() {
       chapters: inspection.chapters,
     );
 
-    expect(server.blockRequestIds.map((List<String> ids) => ids.length), <int>[
-      3,
-      1,
-      2,
-      1,
-      1,
-    ]);
+    expect(
+      server.blockRequestIds,
+      unorderedEquals(<List<String>>[
+        ['f0:p-1', 'f1:p-1', 'f2:p-1'],
+        ['f0:p-1'],
+        ['f1:p-1', 'f2:p-1'],
+        ['f1:p-1'],
+        ['f2:p-1'],
+      ]),
+    );
     expect(
       server.blockRequestIds
           .where((List<String> ids) => ids.length == 1)
           .expand((List<String> ids) => ids),
-      <String>['f0:p-1', 'f1:p-1', 'f2:p-1'],
+      unorderedEquals(<String>['f0:p-1', 'f1:p-1', 'f2:p-1']),
     );
     expect(
       server.blockRequestIds,

@@ -249,12 +249,27 @@ class SettingsTextFieldState extends State<SettingsTextField> {
 
   @override
   void dispose() {
-    // Flush any pending debounced commit before tearing down: leaving the
-    // page within the debounce window must not silently drop the last typed
-    // characters. _flushCommit is safe here — mounted is still true during
-    // dispose, and it only forwards to widget.onChanged (memory + persist),
-    // the same path blur uses.
-    _flushCommit();
+    _commitTimer?.cancel();
+    final text = _controller.text;
+    final commit = widget.onCommit;
+    final changed = widget.onChanged;
+    if (widget.enabled &&
+        (text != _lastCommitted || _pendingCommit != null) &&
+        text != _pendingText) {
+      // Use captured values; this State and its field are gone by the time
+      // the callback runs. The controller owns persistence and error notices.
+      scheduleMicrotask(() async {
+        try {
+          if (commit != null) {
+            await commit(text);
+          } else {
+            await changed(text);
+          }
+        } catch (_) {
+          // Match the debounced commit's error handling.
+        }
+      });
+    }
     _focusNode.removeListener(_onFocusChanged);
     _focusNode.dispose();
     _controller.dispose();

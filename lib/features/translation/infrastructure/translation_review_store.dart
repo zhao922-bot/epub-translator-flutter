@@ -79,7 +79,10 @@ class TranslationReviewStore {
         return result;
       });
 
-  Future<Map<String, dynamic>> load(String reportPath) => Isolate.run(() async {
+  Future<Map<String, dynamic>> load(
+    String reportPath, {
+    String? expectedOutputPath,
+  }) => Isolate.run(() async {
     final file = File(reportPath);
     if (await file.length() > 64 * 1024 * 1024) {
       throw const FormatException('Review report exceeds the size limit.');
@@ -91,6 +94,18 @@ class TranslationReviewStore {
         decoded['corrections'] is! List ||
         decoded['rendering'] is! Map) {
       throw const FormatException('Unsupported review report.');
+    }
+    final reasons = decoded['unreviewedReasons'];
+    if (reasons != null &&
+        (reasons is! Map ||
+            reasons.entries.any(
+              (e) => e.key is! String || e.value is! String,
+            ))) {
+      throw const FormatException('Invalid review coverage reasons.');
+    }
+    if (decoded['lastExportBilingual'] != null &&
+        decoded['lastExportBilingual'] is! bool) {
+      throw const FormatException('Invalid reviewed output format.');
     }
     final seen = <String>{};
     for (final item in decoded['corrections'] as List) {
@@ -145,8 +160,135 @@ class TranslationReviewStore {
         (last is! String || path.extension(last).toLowerCase() != '.epub')) {
       throw const FormatException('Invalid reviewed output path.');
     }
+    if (expectedOutputPath != null) {
+      String identity(String p) => Platform.isWindows
+          ? path.normalize(path.absolute(p)).toLowerCase()
+          : path.normalize(path.absolute(p));
+      if (identity(decoded['outputPath'] as String) !=
+          identity(expectedOutputPath)) {
+        throw const FormatException('Review output identity changed.');
+      }
+      final rendering = decoded['rendering'] as Map;
+      // Partial/legacy reports also carry baseline hashes. Their format flag
+      // only controls whole-book conversion; it must not bypass identity checks.
+      final snapshots = _validatedSnapshots(decoded, rendering);
+      final baseline = await EpubIsolateWorker.loadInspectionSnapshot(
+        expectedOutputPath,
+        selectEntries: (_, _) => snapshots.keys.toSet(),
+      );
+      for (final entry in snapshots.entries) {
+        final bytes = baseline.files[entry.key];
+        if (bytes == null ||
+            sha256.convert(bytes).toString() !=
+                (entry.value as Map)['baseHtmlSha256']) {
+          throw const FormatException(
+            'The review report belongs to an older EPUB.',
+          );
+        }
+      }
+    }
     return decoded;
   });
+
+  /// Every displayed/exported suggestion must belong to a hashed chapter.
+  /// A partial report may omit unrelated chapters, but never its own evidence.
+  static Map<String, dynamic> _validatedSnapshots(Map report, Map rendering) {
+    bool strings(Object? value) =>
+        value is List && value.every((v) => v is String);
+    if (rendering['targetLanguage'] is! String ||
+        rendering['lockedGlossary'] is! String ||
+        rendering['bilingual'] is! bool ||
+        (rendering['completeSnapshot'] != null &&
+            rendering['completeSnapshot'] is! bool) ||
+        (rendering['residualQualityCheck'] != null &&
+            rendering['residualQualityCheck'] is! bool)) {
+      throw const FormatException('Invalid review rendering settings.');
+    }
+    final chapters = rendering['chapters'];
+    if (chapters is! Map || chapters.isEmpty) {
+      throw const FormatException('Review baseline snapshots are missing.');
+    }
+    for (final entry in chapters.entries) {
+      final snapshot = entry.value;
+      if (entry.key is! String ||
+          snapshot is! Map ||
+          snapshot['originalHtml'] is! String ||
+          snapshot['translations'] is! Map ||
+          (snapshot['translations'] as Map).entries.any(
+            (e) => e.key is! String || e.value is! String,
+          ) ||
+          !strings(snapshot['countedNames']) ||
+          !strings(snapshot['degraded']) ||
+          (snapshot['includeInTranslation'] != null &&
+              snapshot['includeInTranslation'] is! bool) ||
+          snapshot['baseHtmlSha256'] is! String ||
+          !RegExp(
+            r'^[a-f0-9]{64}$',
+          ).hasMatch(snapshot['baseHtmlSha256'] as String)) {
+        throw const FormatException('Invalid review baseline snapshot.');
+      }
+    }
+    final sourceBlocks = <String, Map<String, String>>{};
+    Map<String, String> blocksFor(String chapterPath) =>
+        sourceBlocks.putIfAbsent(
+          chapterPath,
+          () => {
+            for (final block
+                in const EpubHtmlExtractor()
+                    .inspectChapterBytes(
+                      chapterPath: chapterPath,
+                      bytes: utf8.encode(
+                        chapters[chapterPath]['originalHtml'] as String,
+                      ),
+                    )
+                    .blocks)
+              block.id: block.sourceHtml,
+          },
+        );
+    // Manual review and export also consume drafts with no model suggestion.
+    // An unknown ID would be silently skipped and could restore source text.
+    for (final entry in chapters.entries) {
+      final translations = (entry.value as Map)['translations'] as Map;
+      if (translations.isEmpty) continue;
+      final blocks = blocksFor(entry.key as String);
+      if (translations.keys.any((id) => !blocks.containsKey(id))) {
+        throw const FormatException('Review draft has no baseline block.');
+      }
+    }
+    for (final item in (report['corrections'] as List).cast<Map>()) {
+      if (!chapters.containsKey(item['chapter'])) {
+        throw const FormatException(
+          'Review suggestion has no baseline chapter.',
+        );
+      }
+      final chapterPath = item['chapter'] as String;
+      final snapshot = chapters[chapterPath] as Map;
+      final blocks = blocksFor(chapterPath);
+      // Chapter hashes alone do not establish that a suggestion's block
+      // exists. Otherwise export could silently ignore it yet mark it accepted.
+      if (blocks[item['id']] != item['sourceHtml'] ||
+          (snapshot['translations'] as Map)[item['id']] != item['beforeHtml']) {
+        throw const FormatException(
+          'Suggestion does not match the baseline block.',
+        );
+      }
+    }
+    return Map<String, dynamic>.from(chapters);
+  }
+
+  /// Normalize review identities once, then perform constant-time lookups.
+  static List<String> unresolvedBlockIds(
+    Map report,
+    Set<String> manuallyReviewed,
+  ) {
+    final reviewed = manuallyReviewed
+        .map((key) => key.replaceAll('\u0000', ':'))
+        .toSet();
+    return [
+      for (final id in (report['unreviewed'] as List? ?? []).cast<String>())
+        if (!reviewed.contains(id)) id,
+    ];
+  }
 
   Future<String> export({
     required String reportPath,
@@ -179,7 +321,9 @@ class TranslationReviewStore {
     if (editedSuggestions.keys.any((key) => !keys.contains(key))) {
       throw const FormatException('Unknown edited suggestion.');
     }
-    final snapshots = Map<String, dynamic>.from(rendering['chapters'] as Map);
+    final snapshots = await Isolate.run(
+      () => _validatedSnapshots(report, rendering),
+    );
     final paths = snapshots.keys.toSet();
     final baseline = await EpubIsolateWorker.loadInspectionSnapshot(
       baseOutputPath,
@@ -208,8 +352,16 @@ class TranslationReviewStore {
       ),
     );
     final stamp = DateTime.now().microsecondsSinceEpoch;
-    final output =
-        '${path.withoutExtension(baseOutputPath)}_reviewed_$stamp.epub';
+    final output = path.join(
+      path.dirname(baseOutputPath),
+      EpubChapterTranslator.outputFileName(
+        path.basenameWithoutExtension(baseOutputPath),
+        '_reviewed_$stamp',
+      ),
+    );
+    if (Platform.isWindows) {
+      await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(output);
+    }
     await EpubIsolateWorker.writeTranslatedEpub(
       inputPath: baseOutputPath,
       outputFilePath: output,
@@ -226,11 +378,10 @@ class TranslationReviewStore {
     report['lastExportPath'] = output;
     report['manualEdits'] = manualEdits;
     report['manuallyReviewed'] = manuallyReviewed.toList()..sort();
-    report['unresolvedAfterManualReview'] = [
-      for (final id in (report['unreviewed'] as List? ?? []))
-        if (!manuallyReviewed.any((key) => key.replaceAll('\u0000', ':') == id))
-          id,
-    ];
+    report['unresolvedAfterManualReview'] = unresolvedBlockIds(
+      report,
+      manuallyReviewed,
+    );
     report['lastExportBilingual'] = outputBilingual;
     report['lastExportAt'] = DateTime.now().toIso8601String();
     try {

@@ -6,25 +6,16 @@ import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-/// B-01 regression: the Windows pre-run path budget must reserve the
-/// longest suffix the app actually writes — `.recovery.<16 digits>` (+26,
-/// from the lock-conflict recovery path) — not the old +22 estimate.
-///
-/// The old comment claimed the longest form was `.tmp.<16>` (+22) and
-/// `.bak.<13>` (+18), but every suffix uses
-/// [DateTime.microsecondsSinceEpoch] (16 digits):
-/// - `.tmp.` + 16 digits = 21
-/// - `.bak.` + 16 digits = 21
-/// - `.recovery.` + 16 digits = 26  (the true longest)
-///
-/// A 234–237-char output path passed the old precheck (234 + 22 < 260) yet
-/// the commit would then write a 260–263-char `.recovery.*` path — failing
-/// at ~98% after every API call was already billed.
+/// The pre-run path budget covers both EPUB recovery files and the longer
+/// quality/diagnostic report atomic-write names. The former +26 budget
+/// covered the recovery path but missed these derived artifacts.
 void main() {
-  group('B-01 recovery-suffix budget (+26)', () {
-    test('233-char path still fits (233 + 26 == 259)', () {
-      final String path = "C:\\${'a' * 230}";
-      expect(path.length, 233);
+  const budget = EpubChapterTranslator.outputPathSuffixBudget;
+  group('B-01 all-artifact suffix budget', () {
+    test('longest usable path leaves room for every artifact', () {
+      const length = 259 - budget;
+      final String path = "C:\\${'a' * (length - 3)}";
+      expect(path.length, length);
       expect(
         EpubChapterTranslator.outputPathExceedsWindowsMaxPath(path),
         isFalse,
@@ -42,49 +33,50 @@ void main() {
       });
     }
 
-    test('throwIf* path check throws only when the long-path policy is off',
-        () async {
-      // 234-char path with a 229-char filename: only the whole-path rule
-      // fires (the component rule passes at exactly 229 + 26 == 255).
-      final String path = "C:\\d\\${'a' * 224}.epub";
-      expect(path.length, 234);
-      await expectLater(
-        EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+    test(
+      'throwIf* path check throws only when the long-path policy is off',
+      () async {
+        // The component fits exactly; only the whole-path rule fires.
+        final String path = "C:\\d\\${'a' * (255 - budget - 5)}.epub";
+        expect(path.length + budget, 260);
+        await expectLater(
+          EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+            path,
+            longPathsEnabledReader: () async => false,
+          ),
+          throwsA(isA<WindowsLongPathException>()),
+        );
+        // Policy on / unknown: the precheck stays silent.
+        await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
           path,
-          longPathsEnabledReader: () async => false,
-        ),
-        throwsA(isA<WindowsLongPathException>()),
-      );
-      // Policy on / unknown: the precheck stays silent.
-      await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
-        path,
-        longPathsEnabledReader: () async => true,
-      );
-      await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
-        path,
-        longPathsEnabledReader: () async => null,
-      );
-    });
-
-    test('filename component check reserves +26 (229 ok, 230 throws)', () async {
-      // 224 a's + '.epub' = 229 chars: 229 + 26 == 255, fits exactly.
-      // Short directory keeps the whole-path check (232 + 26 < 260) out.
-      final String ok = "C:\\${'a' * 224}.epub";
-      await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
-        ok,
-        longPathsEnabledReader: () async => false,
-      );
-      // 225 a's + '.epub' = 230 chars: 230 + 26 == 256 > 255, throws even
-      // when the long-path policy is on (component limit is independent).
-      final String tooLong = "C:\\${'a' * 225}.epub";
-      await expectLater(
-        EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
-          tooLong,
           longPathsEnabledReader: () async => true,
-        ),
-        throwsA(isA<FileSystemException>()),
-      );
-    });
+        );
+        await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+          path,
+          longPathsEnabledReader: () async => null,
+        );
+      },
+    );
+
+    test(
+      'filename component check covers report and atomic-write suffixes',
+      () async {
+        final String ok = "C:\\${'a' * (255 - budget - 5)}.epub";
+        await EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+          ok,
+          longPathsEnabledReader: () async => false,
+        );
+        // Component limits apply independently of the system long-path policy.
+        final String tooLong = "C:\\${'a' * (256 - budget - 5)}.epub";
+        await expectLater(
+          EpubChapterTranslator.throwIfOutputPathTooLongForWindows(
+            tooLong,
+            longPathsEnabledReader: () async => true,
+          ),
+          throwsA(isA<FileSystemException>()),
+        );
+      },
+    );
 
     test('documented suffix arithmetic matches the worker', () {
       // Mirrors epub_isolate_worker.dart: every temp/backup/recovery name

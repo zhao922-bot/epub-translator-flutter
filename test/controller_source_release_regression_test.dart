@@ -65,7 +65,7 @@ class _ReleasingRepository implements TranslationRepository {
     required TranslationConfig config,
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
-}) async {
+  }) async {
     final TranslationJob job = _inspectedJob(inputPath, outputDirectory);
     onProgress?.call(job, 'Inspection complete.');
     return InspectionResult(job: job, chapters: chapters());
@@ -141,9 +141,7 @@ void main() {
       final temp = await Directory.systemTemp.createTemp('source_release_');
       addTearDown(() => temp.delete(recursive: true));
       final repository = _ReleasingRepository();
-      final controller = TranslationDashboardController(
-        repository: repository,
-      );
+      final controller = TranslationDashboardController(repository: repository);
       addTearDown(controller.debugDispose);
       repository.readState = () => controller.state;
       controller.syncSettings(
@@ -197,16 +195,17 @@ void main() {
       final temp = await Directory.systemTemp.createTemp('source_release_');
       addTearDown(() => temp.delete(recursive: true));
       final repository = _ReleasingRepository();
-      final controller = TranslationDashboardController(
-        repository: repository,
-      );
+      final controller = TranslationDashboardController(repository: repository);
       addTearDown(controller.debugDispose);
+      repository.readState = () => controller.state;
       controller.syncSettings(
         TranslationConfig.defaults().copyWith(styleProfileEnabled: false),
       );
       controller.setInputPath('${temp.path}/book.epub');
       await controller.startInspection();
       await controller.startTranslation();
+      expect(controller.state.job?.status, TranslationJobStatus.completed);
+      expect(controller.state.job?.errorMessage, isNull);
       final int before = controller.state.inspectedChapters.length;
       final String bodyBefore = controller.state.inspectedChapters.single.body;
 
@@ -232,9 +231,7 @@ void main() {
       final temp = await Directory.systemTemp.createTemp('source_release_');
       addTearDown(() => temp.delete(recursive: true));
       final repository = _ReleasingRepository();
-      final controller = TranslationDashboardController(
-        repository: repository,
-      );
+      final controller = TranslationDashboardController(repository: repository);
       addTearDown(controller.debugDispose);
       repository.readState = () => controller.state;
       controller.syncSettings(

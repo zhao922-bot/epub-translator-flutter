@@ -1,6 +1,9 @@
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:dio/dio.dart';
+
+import 'cancellable_fingerprint.dart';
 
 import '../../domain/models/inspected_chapter.dart';
 
@@ -37,11 +40,18 @@ void checkEpubSourceHash(String actual, String? expected) {
 Future<void> validateInspectedSource(
   Iterable<InspectedChapter> chapters, {
   String? inputPath,
+  CancelToken? cancelToken,
+  void Function()? throwIfCancelled,
 }) async {
   final identity = sourceIdentityForChapters(chapters);
   if (identity == null) return;
-  final digest = await sha256
-      .bind(File(inputPath ?? identity.inputPath).openRead())
-      .first;
+  final bytes = File(inputPath ?? identity.inputPath).openRead();
+  final digest = cancelToken == null && throwIfCancelled == null
+      ? await sha256.bind(bytes).first
+      : await cancellableFingerprint(
+          bytes,
+          cancelToken: cancelToken ?? CancelToken(),
+          throwIfCancelled: throwIfCancelled,
+        );
   checkEpubSourceHash(digest.toString(), identity.sha256);
 }

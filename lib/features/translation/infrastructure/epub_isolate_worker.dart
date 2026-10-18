@@ -184,8 +184,8 @@ List<String> recoveryBudgetDeletions(
 /// A commit failed, but the complete translated payload remains recoverable.
 ///
 /// The fully-translated temp file is deliberately NOT deleted: the user can
-/// close the locking program and retry the translation (block cache makes the
-/// retry fast with no extra API cost), or rename [tempFilePath] manually.
+/// close the locking program and retry the translation (available block cache
+/// reduces repeated work), or rename [tempFilePath] manually.
 /// [message] is already localized by the caller via [EpubIsolateWorker.commitTempFile]'s
 /// `lockedMessage` callback.
 class OutputFileRecoveryException extends FileSystemException {
@@ -452,15 +452,73 @@ class EpubIsolateWorker {
     // Test-only: shrinks the cross-entry actual-inflated-bytes cap (P1-#2)
     // so the cumulative enforcement is exercisable without a 512 MiB bomb.
     int? totalInflatedLimitOverrideForTest,
-  }) {
+  }) async {
+    final cancelled = isCancelled ?? () => false;
+    // Keep native file ownership outside the killable CPU worker. Killing a
+    // synchronous read skips its finally block and can retain a Windows handle.
+    final source = await _readInspectionBytes(inputPath, cancelled);
+    if (cancelled()) throw const TranslationCancelledException();
+    final transferable = TransferableTypedData.fromList([source]);
     return prepareWithProgress(
       operation: _inspectionOperation(
         inputPath,
+        transferable,
         selectEntries,
         totalInflatedLimitOverrideForTest,
       ),
-      isCancelled: isCancelled ?? () => false,
+      isCancelled: cancelled,
     );
+  }
+
+  static Future<Uint8List> _readInspectionBytes(
+    String inputPath,
+    bool Function() isCancelled,
+  ) async {
+    void checkCancellation() {
+      if (isCancelled()) throw const TranslationCancelledException();
+    }
+
+    checkCancellation();
+    try {
+      final handle = await File(inputPath).open();
+      try {
+        Uint8List buffer = Uint8List(64 * 1024);
+        int length = 0;
+        while (true) {
+          checkCancellation();
+          final chunk = await handle.read(64 * 1024);
+          checkCancellation();
+          if (chunk.isEmpty) break;
+          final actualLength = length + chunk.length;
+          if (actualLength > _kMaxEpubCompressedBytes) {
+            throw EpubDecompressionLimitException(
+              inputPath: inputPath,
+              compressedBytes: actualLength,
+              uncompressedBytes: -1,
+              limitBytes: _kMaxEpubCompressedBytes,
+            );
+          }
+          if (actualLength > buffer.length) {
+            var capacity = buffer.length * 2;
+            if (capacity < actualLength) capacity = actualLength;
+            if (capacity > _kMaxEpubCompressedBytes) {
+              capacity = _kMaxEpubCompressedBytes;
+            }
+            final grown = Uint8List(capacity);
+            grown.setRange(0, length, buffer);
+            buffer = grown;
+          }
+          buffer.setRange(length, actualLength, chunk);
+          length = actualLength;
+        }
+        return Uint8List.view(buffer.buffer, 0, length);
+      } finally {
+        await handle.close();
+      }
+    } on FileSystemException catch (error) {
+      if (isFileLockError(error)) throw InputFileLockedException(inputPath);
+      rethrow;
+    }
   }
 
   // Build sendable closures in scopes containing only worker data, never UI
@@ -470,6 +528,7 @@ class EpubIsolateWorker {
   )
   _inspectionOperation(
     String inputPath,
+    TransferableTypedData source,
     Set<String> Function(Map<String, List<int>>, String) selectEntries,
     // Test-only: shrinks the cross-entry actual-inflated-bytes cap (P1-#2)
     // so the cumulative enforcement is exercisable without a 512 MiB bomb.
@@ -479,7 +538,7 @@ class EpubIsolateWorker {
     int? totalInflatedLimitOverride,
   ) {
     return (_) {
-      final bytes = _readSourceBytesGuarded(inputPath);
+      final bytes = source.materialize().asUint8List();
       final archive = _decodeArchiveWithLimits(inputPath, bytes).archive;
       final files = <String, Uint8List>{};
       int totalInflatedBytes = 0;
@@ -1257,9 +1316,9 @@ class EpubIsolateWorker {
       if (isFileLockError(error)) {
         // The output file is locked (Windows sharing violation): keep the
         // translated temp file and report a localized message. The user
-        // closes the locking program and retries — the block cache makes
-        // the retry fast with no extra API cost — or renames the temp file
-        // manually.
+        // closes the locking program and retries with available cached blocks,
+        // or renames the complete temp file manually. Uncached steps may
+        // still make API requests.
         final recoveryFile = await preserveRecoveryTempForTest(
           tempFile,
           finalFile,
@@ -1858,18 +1917,33 @@ class EpubIsolateWorker {
     checkSymlinkEntrySizesForTest(inputPath, bytes);
     final ZipDecoder decoder = ZipDecoder();
     final Archive archive = decoder.decodeBytes(bytes);
+    final Set<String> seen = <String>{};
+    final Set<String> duplicates = <String>{};
+    for (final ZipFileHeader header in decoder.directory.fileHeaders) {
+      final file = header.file;
+      final name = file?.filename;
+      if (file == null || name == null || name.isEmpty) continue;
+      if (!seen.add(name)) {
+        duplicates.add(name);
+        // archive 4.0.9 merges metadata onto the FIRST payload. Rebuild the
+        // duplicate entry from its final raw header so read and repack both
+        // honor the promised last-wins content and a matching CRC.
+        final entry = name.endsWith('/') || name.endsWith('\\')
+            ? ArchiveFile.directory(name)
+            : ArchiveFile.file(name, file.uncompressedSize, file);
+        entry
+          ..compression = file.compressionMethod
+          ..mode = header.externalFileAttributes >> 16
+          ..crc32 = file.crc32
+          ..lastModTime = file.lastModFileDate << 16 | file.lastModFileTime;
+        archive.add(entry);
+      }
+    }
     checkArchiveLimitsForTest(
       inputPath: inputPath,
       archive: archive,
       compressedBytes: bytes.length,
     );
-    final Set<String> seen = <String>{};
-    final Set<String> duplicates = <String>{};
-    for (final ZipFileHeader header in decoder.directory.fileHeaders) {
-      final String? name = header.file?.filename;
-      if (name == null || name.isEmpty) continue;
-      if (!seen.add(name)) duplicates.add(name);
-    }
     return (archive: archive, duplicateNames: duplicates);
   }
 

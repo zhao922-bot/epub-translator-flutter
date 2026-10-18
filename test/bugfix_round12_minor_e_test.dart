@@ -5,6 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as path;
+import 'support/raw_zip_fixture.dart';
 
 /// Regression tests for the isolate-worker minor fixes (round 12, batch E):
 /// 1. `.tmp.*` orphan reclamation on commit (previously only `.bak.*` was
@@ -147,25 +148,28 @@ void main() {
     });
 
     Future<File> writeDupEpub() async {
-      final Archive archive = Archive();
-      final List<int> mimetype = 'application/epub+zip'.codeUnits;
-      archive.add(
-        ArchiveFile.noCompress('mimetype', mimetype.length, mimetype),
-      );
-      archive.add(
-        ArchiveFile.bytes(
+      final builder = RawZipFixtureBuilder()
+        ..add('mimetype', 'application/epub+zip'.codeUnits)
+        ..add(
           'OEBPS/chapter.xhtml',
           '<html><body><p>FIRST</p></body></html>'.codeUnits,
-        ),
-      );
-      archive.add(
-        ArchiveFile.bytes(
+        )
+        ..add(
           'OEBPS/chapter.xhtml',
           '<html><body><p>SECOND</p></body></html>'.codeUnits,
+        );
+      final bytes = builder.build();
+      final decoder = ZipDecoder()..decodeBytes(bytes);
+      expect(
+        decoder.directory.fileHeaders.where(
+          (h) => h.file?.filename == 'OEBPS/chapter.xhtml',
         ),
+        hasLength(2),
+        reason:
+            'The raw input must retain both different payloads before production runs.',
       );
-      final File file = File(path.join(tempDir.path, 'dup.epub'));
-      await file.writeAsBytes(ZipEncoder().encodeBytes(archive), flush: true);
+      final file = File(path.join(tempDir.path, 'dup.epub'));
+      await file.writeAsBytes(bytes, flush: true);
       return file;
     }
 
@@ -190,8 +194,17 @@ void main() {
                   '<html><body><p>translated</p></body></html>',
             },
           );
-      final Archive repacked = ZipDecoder().decodeBytes(
+      final outputDecoder = ZipDecoder();
+      final Archive repacked = outputDecoder.decodeBytes(
         await File(tempPath).readAsBytes(),
+      );
+      expect(
+        outputDecoder.directory.fileHeaders.where(
+          (h) => h.file?.filename == 'OEBPS/chapter.xhtml',
+        ),
+        hasLength(1),
+        reason:
+            'Count raw output headers; Archive iteration itself hides duplicates.',
       );
       final List<ArchiveFile> copies = repacked
           .where((ArchiveFile f) => f.name == 'OEBPS/chapter.xhtml')

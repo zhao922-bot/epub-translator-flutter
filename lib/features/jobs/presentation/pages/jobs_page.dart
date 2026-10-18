@@ -90,7 +90,14 @@ class JobsPage extends ConsumerWidget {
                   key: ValueKey(job.id),
                   job: job,
                   strings: strings,
-                  onOpen: () => controller.openJobOutput(job.id),
+                  onOpen: () async {
+                    final error = await controller.openJobOutput(job.id);
+                    if (error != null && context.mounted) {
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(SnackBar(content: Text(error)));
+                    }
+                  },
                   onRetry: () => controller.retryJob(job.id),
                 );
               },

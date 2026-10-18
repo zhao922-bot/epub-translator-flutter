@@ -289,9 +289,13 @@ class TranslationConfig {
     final String trimmed = value.trim();
     if (trimmed.isEmpty) return;
     final Uri? uri = Uri.tryParse(trimmed);
-    // An unparseable URL fails later at request time; nothing
-    // credential-like can be reliably identified in it here.
-    if (uri == null) return;
+    // A malformed URL cannot be inspected reliably for embedded credentials.
+    // Keep it as an unsaved UI draft rather than persisting sensitive text.
+    if (uri == null) {
+      throw const FormatException(
+        'API URL is invalid. Check the address and port.',
+      );
+    }
     if (uri.userInfo.isNotEmpty) {
       throw const FormatException(
         'API URLs must not embed userinfo credentials; '

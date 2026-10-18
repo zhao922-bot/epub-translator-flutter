@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as path;
 
@@ -93,9 +95,9 @@ class _TranslationInputsState extends State<TranslationInputs> {
     _commitOutputDirectory();
   }
 
-  /// Commits the pending path edits. [force] bypasses the focus check and is
-  /// used from [dispose] so uncommitted keystrokes are never silently dropped
-  /// when the widget goes away. Only fires when the text is genuine user
+  /// Commits pending path edits. [force] bypasses the focus check on submit.
+  /// Disposal captures the same draft checks and schedules a deferred commit.
+  /// Only fires when the text is genuine user
   /// typing (differs from the last synced external value): an external value
   /// that arrived while the field was focused must not be reverted by the
   /// blur commit of an untouched field.
@@ -164,11 +166,22 @@ class _TranslationInputsState extends State<TranslationInputs> {
 
   @override
   void dispose() {
-    // Flush uncommitted keystrokes: navigating away with a focused field
-    // never triggers blur, so without this the last typed path would be
-    // silently dropped.
-    _commitInputPath(force: true);
-    _commitOutputDirectory(force: true);
+    // Capture drafts before releasing the fields. Provider updates must run
+    // after the widget tree has finished unmounting.
+    final input = _inputPathController.text;
+    final output = _outputDirectoryController.text;
+    final onInput = widget.onInputChanged;
+    final onOutput = widget.onOutputChanged;
+    if (widget.enabled &&
+        input != _syncedInputPath &&
+        input != widget.inputPath) {
+      scheduleMicrotask(() => onInput(input));
+    }
+    if (widget.enabled &&
+        output != _syncedOutputDirectory &&
+        output != widget.outputDirectory) {
+      scheduleMicrotask(() => onOutput(output));
+    }
     _inputPathFocusNode
       ..removeListener(_commitInputPathOnBlur)
       ..dispose();

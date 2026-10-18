@@ -757,75 +757,86 @@ void main() {
     );
   });
 
-  test('C-P2-11 late secret write mismatch warns', () async {
-    final root = await Directory.systemTemp.createTemp('round14-c11-');
-    addTearDown(() => root.delete(recursive: true));
-    final secrets = _SecretStore();
-    final settings = SettingsStore(
-      settingsFileProvider: () async => File('${root.path}/settings.json'),
-      secretStore: secrets,
-    );
-    final config = await settings.load();
-    final gate = secrets.writeGate = Completer<void>();
-    final timeoutReady = Completer<void Function()>();
-    final warnings = <String>[];
-    final warned = Completer<void>();
-    void capture(OutputEvent event) {
-      if (event.level != Level.warning) return;
-      warnings.addAll(event.lines);
-      if (event.lines.any(
-            (line) => line.contains(
-              'Credential version mismatch after late completion',
-            ),
-          ) &&
-          !warned.isCompleted) {
-        warned.complete();
+  test(
+    'C-P2-11 late secret write mismatch warns and restores the empty slot',
+    () async {
+      final root = await Directory.systemTemp.createTemp('round14-c11-');
+      addTearDown(() => root.delete(recursive: true));
+      final secrets = _SecretStore();
+      final settings = SettingsStore(
+        settingsFileProvider: () async => File('${root.path}/settings.json'),
+        secretStore: secrets,
+      );
+      final config = await settings.load();
+      final gate = secrets.writeGate = Completer<void>();
+      final timeoutReady = Completer<void Function()>();
+      final warnings = <String>[];
+      final warned = Completer<void>();
+      void capture(OutputEvent event) {
+        if (event.level != Level.warning) return;
+        warnings.addAll(event.lines);
+        if (event.lines.any(
+              (line) => line.contains(
+                'Credential version mismatch after late completion',
+              ),
+            ) &&
+            !warned.isCompleted) {
+          warned.complete();
+        }
       }
-    }
 
-    Logger.addOutputListener(capture);
-    addTearDown(() => Logger.removeOutputListener(capture));
-    final saving = runZoned(
-      () => settings.save(config.copyWith(customApiKey: 'late-private-key')),
-      zoneSpecification: ZoneSpecification(
-        createTimer: (self, parent, zone, duration, callback) {
-          final timer = parent.createTimer(zone, duration, callback);
-          if (duration == const Duration(seconds: 30) &&
-              !timeoutReady.isCompleted) {
-            timeoutReady.complete(() {
-              timer.cancel();
-              zone.run(callback);
-            });
-          }
-          return timer;
-        },
-      ),
-    );
-    final failed = expectLater(
-      saving,
-      throwsA(
-        isA<SettingsSecretSaveException>().having(
-          (error) => error.failures[SettingsSecretSlot.custom],
-          'custom timeout',
-          isA<TimeoutException>(),
+      Logger.addOutputListener(capture);
+      addTearDown(() => Logger.removeOutputListener(capture));
+      final saving = runZoned(
+        () => settings.save(config.copyWith(customApiKey: 'late-private-key')),
+        zoneSpecification: ZoneSpecification(
+          createTimer: (self, parent, zone, duration, callback) {
+            final timer = parent.createTimer(zone, duration, callback);
+            if (duration == const Duration(seconds: 30) &&
+                !timeoutReady.isCompleted) {
+              timeoutReady.complete(() {
+                timer.cancel();
+                zone.run(callback);
+              });
+            }
+            return timer;
+          },
         ),
-      ),
-    );
-    try {
-      (await timeoutReady.future)();
-      await failed;
+      );
+      final failed = expectLater(
+        saving,
+        throwsA(
+          isA<SettingsSecretSaveException>().having(
+            (error) => error.failures[SettingsSecretSlot.custom],
+            'custom timeout',
+            isA<TimeoutException>(),
+          ),
+        ),
+      );
+      try {
+        (await timeoutReady.future)();
+        await failed;
+        expect(secrets.values[SettingsSecretSlot.custom], isNull);
+        expect(warnings, isEmpty);
+      } finally {
+        gate.complete();
+      }
+      await warned.future;
+      final repaired = Stopwatch()..start();
+      while (secrets.values[SettingsSecretSlot.custom] != null &&
+          repaired.elapsed < const Duration(seconds: 3)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
       expect(secrets.values[SettingsSecretSlot.custom], isNull);
-      expect(warnings, isEmpty);
-    } finally {
-      gate.complete();
-    }
-    await warned.future;
-    expect(secrets.values[SettingsSecretSlot.custom], 'late-private-key');
-    expect(warnings.join('\n'), contains('custom key'));
-    expect(warnings.join('\n'), contains('save settings again to reconcile'));
-    expect(warnings.join('\n'), isNot(contains('late-private-key')));
-    expect(settings.lastPersistedSecretSlots, isEmpty);
-  });
+      expect(warnings.join('\n'), contains('custom key'));
+      expect(
+        warnings.join('\n'),
+        contains('restoring the committed credential'),
+      );
+      expect(warnings.join('\n'), isNot(contains('late-private-key')));
+      expect(settings.lastPersistedSecretSlots, isEmpty);
+    },
+  );
 
   test(
     'C-P2-12 partial secret failure updates lastPersistedSecretSlots',
