@@ -284,6 +284,9 @@ void main() {
       expect(secondRun.job.completedBlocks, 128);
       expect(secondRun.job.status, TranslationJobStatus.completed);
     },
+    // The cold run persists 64 chapters before checking cache-only reuse.
+    // Allow for shared CI disk contention; request/count assertions stay strict.
+    timeout: const Timeout(Duration(minutes: 2)),
   );
 
   test(
