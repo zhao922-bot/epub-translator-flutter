@@ -83,6 +83,63 @@ class TranslationConsistencyChecker {
         ),
       );
     }
+    if (chinese) {
+      // Occurrence counts and temporal ordinals are not interchangeable.
+      // This is a review signal, not permission to rewrite an ambiguous date.
+      const ordinals = [
+        'first',
+        'second',
+        'third',
+        'fourth',
+        'fifth',
+        'sixth',
+        'seventh',
+        'eighth',
+        'ninth',
+        'tenth',
+      ];
+      final sourceOrdinals = <String, int>{};
+      for (final match in RegExp(
+        r'\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(?:time|day|morning|evening|night|week|month|year|occasion)\b',
+        caseSensitive: false,
+      ).allMatches(source)) {
+        final value = '${ordinals.indexOf(match[1]!.toLowerCase()) + 1}';
+        sourceOrdinals.update(value, (n) => n + 1, ifAbsent: () => 1);
+      }
+      final targetOrdinals = <String, int>{};
+      for (final match in RegExp(
+        r'第([零〇一二两兩三四五六七八九十百0-9]+)',
+      ).allMatches(target)) {
+        for (final value in numbers(match[1]!, chinese: true)) {
+          targetOrdinals.update(value, (n) => n + 1, ifAbsent: () => 1);
+        }
+      }
+      if (sourceOrdinals.entries.any(
+        (e) => (targetOrdinals[e.key] ?? 0) < e.value,
+      )) {
+        add(
+          'ordinal',
+          t(
+            '请核对事件次数与日期先后，原文序数可能遗漏或重复。',
+            'Check occurrence counts and chronological ordinals for omissions or duplicates.',
+          ),
+        );
+      }
+    }
+    final letters = RegExp(
+      r'\b[B-HJ-Z]\b',
+    ).allMatches(source).map((m) => m[0]!).toSet();
+    if (letters.any(
+      (letter) => !RegExp('(?<![A-Za-z])$letter(?![A-Za-z])').hasMatch(target),
+    )) {
+      add(
+        'literalLetter',
+        t(
+          '原文独立字母或姓名首字母可能被替换，请核对其书写形式。',
+          'Check whether a standalone written letter or initial was replaced.',
+        ),
+      );
+    }
     final lockedTerms = {
       for (final term in ProperNameNormalizer.parseGlossary(
         config.lockedGlossary,
@@ -145,6 +202,11 @@ class TranslationConsistencyChecker {
     ).hasMatch(source)) {
       score += 2;
     }
+    if (RegExp(
+      r'\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b|\b(?:Mr|Mrs|Miss|Sir|Dr)\.?\s+[A-Z]|\b[B-HJ-Z]\b|\b(?:go|goes|went|gone|come|came|walked|travelled|traveled)\s+(?:up|down|over)\b',
+    ).hasMatch(source)) {
+      score += 3;
+    }
     return score;
   }
 
@@ -193,6 +255,46 @@ class TranslationConsistencyChecker {
       }
     }
     return result;
+  }
+
+  /// Conservative application gate, separate from source-omission warnings.
+  /// A new numeric claim needs source support; ambiguous unit conversions or
+  /// idioms remain proposals. Existing draft numbers do not become new risks.
+  static Set<String> introducedNumbers({
+    required String sourceHtml,
+    required String beforeHtml,
+    required String afterHtml,
+  }) {
+    Set<String> values(String markup) {
+      var value = text(markup);
+      const ordinals = [
+        'first',
+        'second',
+        'third',
+        'fourth',
+        'fifth',
+        'sixth',
+        'seventh',
+        'eighth',
+        'ninth',
+        'tenth',
+      ];
+      value = value.replaceAllMapped(
+        RegExp(
+          r'\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b',
+          caseSensitive: false,
+        ),
+        (m) => '${ordinals.indexOf(m[0]!.toLowerCase()) + 1}',
+      );
+      return {
+        ...numbers(value, chinese: false),
+        ...numbers(value, chinese: true),
+      };
+    }
+
+    return values(
+      afterHtml,
+    ).difference({...values(sourceHtml), ...values(beforeHtml)});
   }
 
   static Iterable<num> _englishNumbers(String text) sync* {

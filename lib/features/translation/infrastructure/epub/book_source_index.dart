@@ -7,6 +7,8 @@ class BookSourceIndex {
     final counts = <String, int>{};
     final names = <String, int>{};
     final nameContextCounts = <String, int>{};
+    final titledNames = <String>{};
+    final nameEvidence = <String, String>{};
     final sentenceStart = RegExp(r'''(?:[.!?]["'”’)]*\s*|^["'“‘(\s]*)$''');
     const common = {
       'The',
@@ -75,7 +77,7 @@ class BookSourceIndex {
         final text = block.sourceText.replaceAll(RegExp(r'\s+'), ' ');
         final seenNames = <String>{};
         final contextualNames = <String>{};
-        for (final match in RegExp(r"\b[A-Z][a-z]{3,}\b").allMatches(text)) {
+        for (final match in RegExp(r"\b[A-Z][a-z]{2,}\b").allMatches(text)) {
           final name = match[0]!;
           if (common.contains(name) ||
               (!names.containsKey(name) && names.length >= 1024)) {
@@ -83,6 +85,13 @@ class BookSourceIndex {
           }
           if (seenNames.add(name)) {
             names.update(name, (n) => n + 1, ifAbsent: () => 1);
+            nameEvidence.putIfAbsent(
+              name,
+              () => text.substring(
+                (match.start - 100).clamp(0, text.length),
+                (match.end + 180).clamp(0, text.length),
+              ),
+            );
           }
           // Sentence-opening capitals alone are weak name evidence. Repeated
           // names inside sentences and possessives should survive the limit
@@ -90,7 +99,16 @@ class BookSourceIndex {
           final possessive =
               text.startsWith("'s", match.end) ||
               text.startsWith('’s', match.end);
-          if ((possessive ||
+          final prefix = text.substring(
+            (match.start - 80).clamp(0, match.start),
+            match.start,
+          );
+          final titled = RegExp(
+            r'\b(?:Mr|Mrs|Ms|Miss|Dr|Sir|Lady|Lord|Professor|Captain|Reverend)\.?\s+$',
+          ).hasMatch(prefix);
+          if (titled) titledNames.add(name);
+          if ((titled ||
+                  possessive ||
                   !sentenceStart.hasMatch(
                     text.substring(
                       (match.start - 80).clamp(0, match.start),
@@ -152,6 +170,12 @@ class BookSourceIndex {
       });
     final rankedNames = names.entries.where((e) => e.value >= 3).toList()
       ..sort((a, b) {
+        // A title is strong person-name evidence. Its period must not demote
+        // the following surname as an ordinary sentence-opening capital.
+        final person = (titledNames.contains(b.key) ? 1 : 0).compareTo(
+          titledNames.contains(a.key) ? 1 : 0,
+        );
+        if (person != 0) return person;
         final context = (nameContextCounts[b.key] ?? 0).compareTo(
           nameContextCounts[a.key] ?? 0,
         );
@@ -170,7 +194,11 @@ class BookSourceIndex {
       ],
       'recurringNames': [
         for (final e in rankedNames.take(32))
-          {'source': e.key, 'occurrences': e.value},
+          {
+            'source': e.key,
+            'occurrences': e.value,
+            'evidence': nameEvidence[e.key]!,
+          },
       ],
       'relationshipEvidence': relations,
     };

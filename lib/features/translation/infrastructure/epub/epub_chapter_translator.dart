@@ -222,7 +222,7 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion = 'v19-book-terms-context';
+  static const String qualityCacheSchemaVersion = 'v24-source-evidence';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
@@ -1620,6 +1620,35 @@ class EpubChapterTranslator {
             }
           }
         } catch (error) {
+          throwIfCancelled();
+          if (config.autoApplyVerifiedCorrections) {
+            try {
+              final recovered = await _memory.completeEntityMemory(
+                dio: dio,
+                config: config,
+                memory: _BookMemory.empty,
+                cancelToken: cancelToken,
+              );
+              bookMemory = userStyleProfile == null
+                  ? recovered
+                  : recovered.copyWith(
+                      styleProfile: userStyleProfile,
+                      styleProfileConfirmed: true,
+                    );
+              await persistBookMemory();
+              if (recovered.glossary.isNotEmpty) {
+                emit(
+                  currentJob,
+                  config.uiLanguage == UiLanguage.chinese
+                      ? '书籍摘要生成失败，已通过独立请求恢复专名表。'
+                      : 'Book summary failed; recovered the entity glossary separately.',
+                );
+                return;
+              }
+            } catch (_) {
+              throwIfCancelled();
+            }
+          }
           if (userStyleProfile != null) {
             bookMemory = _BookMemory.empty.copyWith(
               styleProfile: userStyleProfile,
@@ -2558,6 +2587,14 @@ class EpubChapterTranslator {
         }
       }
       final reviewSnapshots = <String, Object?>{};
+      final sourceLanguages = config.semanticQualityCheck
+          ? await EpubIsolateWorker.readBookLanguages(
+              inputPath,
+              expectedSourceFingerprint: sourceIdentityForChapters(
+                chapters,
+              )?.sha256,
+            )
+          : null;
       await _repacker.writeTranslatedEpub(
         reviewSnapshots: reviewSnapshots,
         reviewChapterPaths: config.semanticQualityCheck
@@ -2701,6 +2738,7 @@ class EpubChapterTranslator {
                 'completeSnapshot': true,
                 'bilingual': config.bilingual,
                 'targetLanguage': config.targetLanguage,
+                'sourceLanguages': sourceLanguages,
                 'lockedGlossary': config.lockedGlossary,
                 'residualQualityCheck': config.residualQualityCheck,
                 'chapters': reviewSnapshots,
@@ -2714,6 +2752,12 @@ class EpubChapterTranslator {
               'requests': _run.semanticRequests,
               'requestLimit': config.maxSemanticReviewRequests,
               'corrections': _run.semanticCorrections,
+              'automaticCorrections': _run.automaticCorrections.values.toList(),
+              'autoApplyVerifiedCorrections':
+                  config.autoApplyVerifiedCorrections,
+              'missingEntityTerms': config.autoApplyVerifiedCorrections
+                  ? _memory.missingEntityTerms(bookMemory ?? _BookMemory.empty)
+                  : const <String>[],
               'auditSampleBlocks': _run.semanticAuditSamples.length,
               'draftReusedBlocks': _run.reusedDraftBlocks.length,
               'unreviewedReasons': {
@@ -4913,6 +4957,7 @@ class EpubChapterTranslator {
                 config.maxSemanticReviewTokens,
                 config.semanticReviewScope.name,
                 "semantic-suggestions-v2",
+                config.autoApplyVerifiedCorrections,
               ],
               config.styleProfileEnabled,
               _styleProfileCacheValue(confirmedStyleProfile),
@@ -4954,6 +4999,7 @@ class EpubChapterTranslator {
               ],
               if (config.semanticQualityCheck) ...[
                 'semantic-suggestions-v2',
+                config.autoApplyVerifiedCorrections,
                 config.semanticReviewScope.name,
               ],
               config.styleProfileEnabled,

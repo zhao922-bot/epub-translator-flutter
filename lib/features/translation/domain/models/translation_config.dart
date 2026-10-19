@@ -40,6 +40,7 @@ class TranslationConfig {
     this.reasoningEffort = ModelReasoningEffort.automatic,
     this.maxOutputTokens = 8192,
     this.semanticQualityCheck = false,
+    this.autoApplyVerifiedCorrections = false,
     this.retryIncompleteReviews = false,
     this.maxSemanticReviewRequests = 8,
     this.semanticReviewScope = SemanticReviewScope.risksOnly,
@@ -90,6 +91,9 @@ class TranslationConfig {
   final ModelReasoningEffort reasoningEffort;
   final int maxOutputTokens;
   final bool semanticQualityCheck;
+
+  /// Apply only evidence-backed suggestions approved by a separate verifier.
+  final bool autoApplyVerifiedCorrections;
   final bool retryIncompleteReviews;
   final int maxSemanticReviewRequests;
   final SemanticReviewScope semanticReviewScope;
@@ -192,6 +196,7 @@ class TranslationConfig {
     ModelReasoningEffort? reasoningEffort,
     int? maxOutputTokens,
     bool? semanticQualityCheck,
+    bool? autoApplyVerifiedCorrections,
     bool? retryIncompleteReviews,
     int? maxSemanticReviewRequests,
     SemanticReviewScope? semanticReviewScope,
@@ -227,6 +232,8 @@ class TranslationConfig {
       reasoningEffort: reasoningEffort ?? this.reasoningEffort,
       maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
       semanticQualityCheck: semanticQualityCheck ?? this.semanticQualityCheck,
+      autoApplyVerifiedCorrections:
+          autoApplyVerifiedCorrections ?? this.autoApplyVerifiedCorrections,
       retryIncompleteReviews:
           retryIncompleteReviews ?? this.retryIncompleteReviews,
       maxSemanticReviewRequests:
@@ -268,6 +275,7 @@ class TranslationConfig {
       'reasoningEffort': reasoningEffort.name,
       'maxOutputTokens': maxOutputTokens,
       'semanticQualityCheck': semanticQualityCheck,
+      'autoApplyVerifiedCorrections': autoApplyVerifiedCorrections,
       'retryIncompleteReviews': retryIncompleteReviews,
       'maxSemanticReviewRequests': maxSemanticReviewRequests,
       'semanticReviewScope': semanticReviewScope.name,
@@ -401,6 +409,8 @@ class TranslationConfig {
         max: 32768,
       ),
       semanticQualityCheck: json['semanticQualityCheck'] == true,
+      autoApplyVerifiedCorrections:
+          json['autoApplyVerifiedCorrections'] == true,
       retryIncompleteReviews: json['retryIncompleteReviews'] == true,
       semanticReviewScope: SemanticReviewScope.values.firstWhere(
         (v) => v.name == json['semanticReviewScope'],

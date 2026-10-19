@@ -148,6 +148,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
           c.styleProfileEnabled,
           c.reasoningEffort,
           c.semanticQualityCheck,
+          c.autoApplyVerifiedCorrections,
           c.retryIncompleteReviews,
           c.semanticReviewScope,
           c.lockedGlossary,
@@ -556,13 +557,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                       ),
                       subtitle: Text(
                         strings.isChinese
-                            ? '先检查数字、币种与术语，再请求模型复核；修改建议需在结果页确认。额外请求会产生 API 费用。'
-                            : 'Check numbers, currencies and terms, then request model review. Approve suggestions on the results page. Additional API calls incur costs.',
+                            ? '检查事实、数字、币种与术语，再请求模型复核。默认仅提出建议；可在下方开启自动修正。额外请求会产生 API 费用。'
+                            : 'Check facts, numbers, currencies and terms, then request model review. Suggestions only by default; automatic correction can be enabled below. Additional API calls incur costs.',
                       ),
                       value: config.semanticQualityCheck,
                       onChanged: isRunActive
                           ? null
                           : controller.setSemanticQualityCheck,
+                    ),
+                    SwitchListTile.adaptive(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        strings.isChinese
+                            ? '自动应用已验证的修正'
+                            : 'Automatically apply verified corrections',
+                      ),
+                      subtitle: Text(
+                        strings.isChinese
+                            ? '仅应用有原文证据、通过结构检查且经另一独立请求复核确认的修正；保留修改记录，其余留为建议。需要开启语义复核，会增加 API 请求。'
+                            : 'Apply only source-supported, structurally valid corrections approved by a separate model review. Retain an audit trail and leave other proposals as suggestions. Requires semantic review and additional API calls.',
+                      ),
+                      value: config.autoApplyVerifiedCorrections,
+                      onChanged: isRunActive || !config.semanticQualityCheck
+                          ? null
+                          : controller.setAutoApplyVerifiedCorrections,
                     ),
                     SwitchListTile.adaptive(
                       contentPadding: EdgeInsets.zero,

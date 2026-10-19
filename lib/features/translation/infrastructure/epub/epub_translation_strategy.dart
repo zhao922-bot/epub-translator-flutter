@@ -2336,7 +2336,15 @@ class _EpubTranslationStrategy {
     return ' Translate meaning, not words: render idioms, metaphors, and '
         'figurative expressions by their intended meaning in natural, '
         'idiomatic target-language phrasing. Never translate them word for '
-        'word or calque source-language metaphors literally.';
+        'word or calque source-language metaphors literally. '
+        'Before returning, compare each clause with the source for factual fidelity: '
+        'preserve literal alphabet letters and initials when they represent a written label or abbreviation, not their phonetic spelling. '
+        'Distinguish an occurrence count from a day or sequence ordinal; keep each ordinal and its event in the original order. '
+        'Do not invent an extra physical action, observation, intention, geographic direction, or a stronger result to make prose vivid. '
+        'Resolve occupations, official titles and ambiguous word senses from the person and situation established in the source context, not just the most common dictionary sense. '
+        'A discourse or motion particle is not automatically a compass direction; require explicit geographic evidence. '
+        'Preserve ambiguity where context is insufficient. Reuse established translations for every recurring named entity, including secondary characters and shortened forms. '
+        'Perform this fidelity check silently; return only the requested translation format.';
   }
 }
 

@@ -16,15 +16,15 @@
 
 ## 下载与升级
 
-当前版本：**1.7.2+55**。安装包与 SHA-256 校验文件见 [1.7.2 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.7.2)。
+当前版本：**1.7.3+56**。安装包与 SHA-256 校验文件见 [1.7.3 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.7.3)。
 
 | 平台 | 下载 | 使用方式 |
 | --- | --- | --- |
-| Windows 10 / 11 x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.2/folioferry-v1.7.2-windows-x64-setup.exe) | 为当前用户安装，可从开始菜单启动 |
-| Windows 便携版 | [ZIP 压缩包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.2/folioferry-v1.7.2-windows-x64.zip) | 完整解压后运行 `FolioFerry.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [APK 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.2/folioferry-v1.7.2-android.apk) | 中文系统显示“页渡”，其他系统显示“FolioFerry” |
+| Windows 10 / 11 x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.3/folioferry-v1.7.3-windows-x64-setup.exe) | 为当前用户安装，可从开始菜单启动 |
+| Windows 便携版 | [ZIP 压缩包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.3/folioferry-v1.7.3-windows-x64.zip) | 完整解压后运行 `FolioFerry.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [APK 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.3/folioferry-v1.7.3-android.apk) | 中文系统显示“页渡”，其他系统显示“FolioFerry” |
 
-- **Android 升级**：沿用 v1.6.31–v1.6.36 的应用标识与发布签名，可覆盖安装这些版本，无需为更名卸载软件。更早的签名不同版本需先备份设置与数据。
+- **Android 升级**：沿用 v1.6.31 至 v1.7.2 的应用标识与发布签名，可覆盖安装这些版本，无需为更名卸载软件。更早的签名不同版本需先备份设置与数据。
 - **Windows 升级**：安装包沿用原应用标识，已有安装会继续使用原安装目录；设置、密钥、任务记录和缓存继续从原数据位置读取。
 - Windows 安装包目前未进行商业代码签名。若系统提示未知发布者，请核对下载来源及发布页提供的 SHA-256。
 
@@ -46,7 +46,7 @@
 | 书籍风格档案 | 从开篇内容分析文体与语气，由你确认或修改后用于后续翻译 |
 | 结构与残留检查 | 检查异常回复、疑似漏译和结构问题，重试失败块并记录原因 |
 | 缓存与续传 | 复用有效译文，中断后继续；支持在有效缓存基础上切换单语与双语导出 |
-| 译文语义复核 | 可选检查数字、术语及语义风险，提供有原文依据的修改建议 |
+| 译文语义复核 | 检查数字、术语及语义风险；可选择自动应用经过独立验证的修正 |
 | 人工校对 | 搜索原文、译文或段落编号，确认、修改并导出独立校对版 |
 | EPUB 导出 | 尽量保留目录、章节顺序、图片、链接、脚注、代码、公式与原排版 |
 | 用量记录 | 展示请求次数、接口返回的输入/输出 token、耗时和缓存命中情况 |
@@ -63,10 +63,12 @@ Android 翻译期间使用前台服务显示进度。系统省电、后台时限
 
 “译文语义复核”默认关闭。开启后，可优先检查风险段落或检查全部段落，并设置额外请求次数与 token 预算。
 
-- 模型提出的修改建议需要原文依据，并经过结构校验；不会自动覆盖已导出的译本。
+- 默认仅保留建议。需要自动修正时，再开启“自动应用已验证的修正”：候选须通过原文证据、HTML 与一致性检查，并由同一配置模型的另一独立请求验证，才会写入本次译文和缓存。
+- 自动修正保留原文、修改前后内容和验证理由。未通过验证或预算不足的建议仍保留，不会被强制应用；独立验证会增加 API 请求。
+- 预算不足时可使用“重试上次未通过的复核”；未命中可复用草稿缓存的段落可能重新翻译，并产生额外用量。
 - 在“运行概览”或“任务历史”打开检查结果，逐条选择建议，再导出新的复核版 EPUB。
 - 也可搜索任意已翻译段落进行人工校对。复杂行内排版采用精确文字替换，以保留链接、强调和脚注。
-- 原译本与翻译缓存保留；取消选择后可重新导出。基准译本变化时，旧建议不会被直接套用。
+- 人工选择建议和校对导出时，原译本与翻译缓存保留；取消选择后可重新导出。基准译本变化时，旧建议不会被直接套用。
 - 译本旁的 `.epub.quality.json` 包含复核记录及重新导出所需内容，请与译本一起保存。
 
 ## 模型、费用与数据
@@ -104,7 +106,7 @@ Windows 需要 Visual Studio 的“使用 C++ 的桌面开发”组件。打包�
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 
 # Windows EXE 安装包：需 Inno Setup 6.3+，先完成上述打包
-ISCC /DAppVersion=1.7.2 tool\windows_installer.iss
+ISCC /DAppVersion=1.7.3 tool\windows_installer.iss
 
 # Android：需 Android SDK 与 JDK（发布使用 JDK 21）
 # 将 android/key.properties.example 复制为 android/key.properties，填写本机签名配置
@@ -147,7 +149,7 @@ GitHub CI 执行静态分析、完整测试，并使用 EPUBCheck 5.4.0 验证�
 
 ## English
 
-**FolioFerry** is an AI-powered EPUB translator for Windows and Android. Connect your own compatible API, select chapters, review the book's style, and export a translated or bilingual EPUB. Valid translations can be reused through caching and resume support. Optional review suggestions and manual corrections are applied only when you select and export them.
+**FolioFerry** is an AI-powered EPUB translator for Windows and Android. Connect your own compatible API, select chapters, review the book's style, and export a translated or bilingual EPUB. Valid translations can be reused through caching and resume support. Optional semantic review can retain suggestions or, when explicitly enabled, automatically apply source-supported corrections after a separate verification request to the configured model. Manual review and export remain available. Verification and retries can incur additional API usage.
 
 Version 1.7 introduces the **FolioFerry / 页渡** name and the book-and-ferry icon. Existing application identities and data locations are retained for upgrade compatibility. See [Releases](https://github.com/zhao922-bot/epub-translator-flutter/releases/latest) for downloads.
 

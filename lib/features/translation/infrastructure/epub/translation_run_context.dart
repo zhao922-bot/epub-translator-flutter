@@ -29,6 +29,7 @@ class TranslationRunContext {
   int semanticRequests = 0;
   final ReviewEvidenceIndex semanticEvidence = ReviewEvidenceIndex();
   Map<String, Object> sourceHints = const {};
+  List<String> missingEntityTerms = [];
   int semanticReservedTokens = 0;
   final Set<String> semanticReviewed = {};
   final Set<String> semanticSkipped = {};
@@ -40,6 +41,7 @@ class TranslationRunContext {
   final Map<String, Map<String, String>> semanticTerms = {};
   final Set<String> semanticSingleRetries = {};
   final List<Map<String, Object?>> semanticCorrections = [];
+  final Map<String, Map<String, Object?>> automaticCorrections = {};
 
   bool isUnreviewed(String chapterPath, String id) =>
       semanticUnreviewed.contains(

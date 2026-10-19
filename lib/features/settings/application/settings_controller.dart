@@ -227,6 +227,10 @@ Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
   if (before.semanticQualityCheck != after.semanticQualityCheck) {
     changed.add('semanticQualityCheck');
   }
+  if (before.autoApplyVerifiedCorrections !=
+      after.autoApplyVerifiedCorrections) {
+    changed.add('autoApplyVerifiedCorrections');
+  }
   if (before.maxSemanticReviewRequests != after.maxSemanticReviewRequests) {
     changed.add('maxSemanticReviewRequests');
   }
@@ -1191,6 +1195,8 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       _update((config) => config.copyWith(retryIncompleteReviews: value));
   Future<void> setSemanticQualityCheck(bool value) =>
       _update((config) => config.copyWith(semanticQualityCheck: value));
+  Future<void> setAutoApplyVerifiedCorrections(bool value) =>
+      _update((config) => config.copyWith(autoApplyVerifiedCorrections: value));
   Future<void> setSemanticReviewScope(SemanticReviewScope value) =>
       _update((config) => config.copyWith(semanticReviewScope: value));
   Future<void> setMaxSemanticReviewTokens(double value) => _update(

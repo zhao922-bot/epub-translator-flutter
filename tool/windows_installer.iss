@@ -1,7 +1,7 @@
 ﻿; Run after tool/package_windows.ps1 has bundled the VC++ runtime:
-; ISCC /DAppVersion=1.7.2 tool/windows_installer.iss
+; ISCC /DAppVersion=1.7.3 tool/windows_installer.iss
 #ifndef AppVersion
-  #error AppVersion is required (for example /DAppVersion=1.7.2).
+  #error AppVersion is required (for example /DAppVersion=1.7.3).
 #endif
 #define AppName "页渡 · FolioFerry"
 #define AppExe "FolioFerry.exe"

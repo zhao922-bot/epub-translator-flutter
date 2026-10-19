@@ -22,11 +22,15 @@ class Fixture {
   late TranslationConfig config;
   final requests = <Map<String, dynamic>>[];
   bool truncateStyle = false, malformedReview = false;
+  bool malformedInitialMemory = false;
+  bool malformedEntityMemory = false;
+  List<Map<String, String>> entityTerms = const [];
   int styleCalls = 0;
   String reviewCategory = 'emotion', reviewConfidence = 'high';
   String? reviewQuoteOverride;
   bool omitUsage = false, reviewUnchanged = false;
   List<dynamic> Function(List<Map<String, Object?>>)? reviewItemsOverride;
+  List<dynamic> Function(List<Map<String, Object?>>)? verificationItemsOverride;
 
   Future<void> init({
     int blocks = 2,
@@ -68,15 +72,21 @@ class Fixture {
           });
         }
       } else if (payload is Map && payload['kind'] == 'initialBookMemory') {
-        content = jsonEncode({
-          'bookSummary': 'A couple exchanges gifts.',
-          'styleGuide': ['Preserve emotion.'],
-          'glossary': [
-            {'source': 'Della', 'target': '德拉'},
-            {'source': 'Dell', 'target': '德拉'},
-          ],
-          'recentChapters': [],
-        });
+        content = malformedInitialMemory
+            ? 'invalid-memory'
+            : jsonEncode({
+                'bookSummary': 'A couple exchanges gifts.',
+                'styleGuide': ['Preserve emotion.'],
+                'glossary': [
+                  {'source': 'Della', 'target': '德拉'},
+                  {'source': 'Dell', 'target': '德拉'},
+                ],
+                'recentChapters': [],
+              });
+      } else if (payload is Map && payload['kind'] == 'entityGlossary') {
+        content = malformedEntityMemory
+            ? 'invalid-entity-memory'
+            : jsonEncode({'glossary': entityTerms});
       } else if (payload is Map && payload['kind'] == 'semanticReview') {
         final items = <Map<String, Object?>>[
           for (final item in payload['blocks'] as List)
@@ -93,6 +103,20 @@ class Fixture {
         ];
         content = jsonEncode({
           'blocks': reviewItemsOverride?.call(items) ?? items,
+        });
+      } else if (payload is Map && payload['kind'] == 'semanticVerification') {
+        final items = <Map<String, Object?>>[
+          for (final item in payload['blocks'] as List)
+            {
+              'id': item['id'],
+              'approve': true,
+              'confidence': 'high',
+              'sourceQuotes': ['alas'],
+              'reason': 'The source explicitly expresses distress.',
+            },
+        ];
+        content = jsonEncode({
+          'blocks': verificationItemsOverride?.call(items) ?? items,
         });
       } else if (payload is Map && payload['kind'] == 'chapterMemory') {
         content = jsonEncode({

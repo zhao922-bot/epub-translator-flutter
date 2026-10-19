@@ -1436,7 +1436,11 @@ body.epub-translator-cjk [data-translation="true"] {
     }
   }
 
-  String? _languageTagForTarget(String targetLanguage) {
+  String? _languageTagForTarget(String targetLanguage) =>
+      languageTagForTarget(targetLanguage);
+
+  /// Shared by direct and review exports so language declarations agree.
+  static String? languageTagForTarget(String targetLanguage) {
     final String normalized = targetLanguage.trim().toLowerCase();
     if (normalized.isEmpty) {
       return null;

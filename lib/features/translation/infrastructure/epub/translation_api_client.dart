@@ -660,6 +660,7 @@ class TranslationApiClient {
       final budget = request['max_tokens'] as int;
       if (!truncated ||
           kind == 'semanticReview' ||
+          kind == 'semanticVerification' ||
           attempt == 1 ||
           budget >= cap) {
         return response;

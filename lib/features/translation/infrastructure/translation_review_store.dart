@@ -108,6 +108,27 @@ class TranslationReviewStore {
       throw const FormatException('Invalid reviewed output format.');
     }
     final seen = <String>{};
+    final automatic = decoded['automaticCorrections'];
+    if (automatic != null) {
+      final automaticKeys = <String>{};
+      if (automatic is! List ||
+          automatic.any(
+            (item) =>
+                item is! Map ||
+                [
+                  'chapter',
+                  'id',
+                  'sourceHtml',
+                  'beforeHtml',
+                  'afterHtml',
+                  'verificationReason',
+                ].any((key) => item[key] is! String) ||
+                item['verified'] != true ||
+                !automaticKeys.add(suggestionKey(item)),
+          )) {
+        throw const FormatException('Invalid automatic correction history.');
+      }
+    }
     for (final item in decoded['corrections'] as List) {
       if (item is! Map ||
           [
@@ -204,6 +225,13 @@ class TranslationReviewStore {
             rendering['residualQualityCheck'] is! bool)) {
       throw const FormatException('Invalid review rendering settings.');
     }
+    if (rendering.containsKey('sourceLanguages') &&
+        (!strings(rendering['sourceLanguages']) ||
+            (rendering['sourceLanguages'] as List).any(
+              (v) => (v as String).trim().isEmpty,
+            ))) {
+      throw const FormatException('Invalid review source languages.');
+    }
     final chapters = rendering['chapters'];
     if (chapters is! Map || chapters.isEmpty) {
       throw const FormatException('Review baseline snapshots are missing.');
@@ -270,6 +298,18 @@ class TranslationReviewStore {
           (snapshot['translations'] as Map)[item['id']] != item['beforeHtml']) {
         throw const FormatException(
           'Suggestion does not match the baseline block.',
+        );
+      }
+    }
+    for (final item
+        in (report['automaticCorrections'] as List? ?? []).cast<Map>()) {
+      final chapterPath = item['chapter'] as String;
+      if (!chapters.containsKey(chapterPath) ||
+          blocksFor(chapterPath)[item['id']] != item['sourceHtml'] ||
+          (chapters[chapterPath]['translations'] as Map)[item['id']] !=
+              item['afterHtml']) {
+        throw const FormatException(
+          'Automatic correction does not match the baseline block.',
         );
       }
     }
@@ -351,6 +391,42 @@ class TranslationReviewStore {
         manuallyReviewed: manuallyReviewed,
       ),
     );
+    final targetTag = EpubRepacker.languageTagForTarget(
+      rendering['targetLanguage'] as String,
+    );
+    List<String>? sourceLanguages;
+    if (outputBilingual && targetTag != null) {
+      if (rendering.containsKey('sourceLanguages')) {
+        sourceLanguages = (rendering['sourceLanguages'] as List).cast<String>();
+      } else if (rendering['bilingual'] != true) {
+        // Version-2 reports predating sourceLanguages retain source XHTML.
+        // Use document-level declarations only: an inline foreign quotation
+        // must not become a source book language. Never guess from prose.
+        final seen = <String>{};
+        sourceLanguages = [];
+        for (final snapshot in snapshots.values.cast<Map>()) {
+          final document = html.parse(snapshot['originalHtml'] as String);
+          final root = document.documentElement;
+          final body = document.body;
+          final language =
+              root?.attributes['xml:lang'] ??
+              root?.attributes['lang'] ??
+              body?.attributes['xml:lang'] ??
+              body?.attributes['lang'];
+          if (language != null &&
+              language.trim().isNotEmpty &&
+              seen.add(language.trim().toLowerCase())) {
+            sourceLanguages.add(language.trim());
+          }
+        }
+        if (sourceLanguages.isEmpty) {
+          throw const FormatException(
+            'This legacy report has no source language metadata. '
+            'Translate the original EPUB again to enable bilingual conversion.',
+          );
+        }
+      }
+    }
     final stamp = DateTime.now().microsecondsSinceEpoch;
     final output = path.join(
       path.dirname(baseOutputPath),
@@ -367,6 +443,8 @@ class TranslationReviewStore {
       outputFilePath: output,
       translatedHtmlByPath: prepared.html,
       navigationLabelsByPath: prepared.labels,
+      navigationLanguageTag: targetTag,
+      sourceLanguageTags: sourceLanguages,
       bilingual: outputBilingual,
       expectedSourceFingerprint: baseline.fingerprint,
     );

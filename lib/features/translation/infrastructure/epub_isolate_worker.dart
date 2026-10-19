@@ -720,6 +720,57 @@ class EpubIsolateWorker {
     }
   }
 
+  /// Read only package language declarations; XHTML quotations are not book
+  /// languages. Keep the original order for subsequent review conversions.
+  static List<String> bookLanguages(Map<String, List<int>> files) {
+    final containerBytes = files['META-INF/container.xml'];
+    if (containerBytes == null) return [];
+    final container = xml.XmlDocument.parse(
+      decodeEpubText(
+        bytes: containerBytes,
+        filePath: 'META-INF/container.xml',
+        strict: true,
+      ),
+    );
+    final opfPath = container.descendants
+        .whereType<xml.XmlElement>()
+        .where((e) => e.name.local == 'rootfile')
+        .firstOrNull
+        ?.getAttribute('full-path');
+    final bytes = files[opfPath];
+    if (bytes == null || opfPath == null) return [];
+    final opf = xml.XmlDocument.parse(
+      decodeEpubText(bytes: bytes, filePath: opfPath, strict: true),
+    );
+    final metadata = opf.rootElement.childElements
+        .where(
+          (e) =>
+              e.name.local == 'metadata' &&
+              (e.namespaceUri == 'http://www.idpf.org/2007/opf' ||
+                  e.namespaceUri == null),
+        )
+        .firstOrNull;
+    return (metadata?.childElements ?? const <xml.XmlElement>[])
+        .where(
+          (e) =>
+              e.name.local == 'language' &&
+              e.namespaceUri == 'http://purl.org/dc/elements/1.1/',
+        )
+        .map((e) => e.innerText.trim())
+        .where((value) => value.isNotEmpty)
+        .toList();
+  }
+
+  static Future<List<String>> readBookLanguages(
+    String inputPath, {
+    String? expectedSourceFingerprint,
+  }) => Isolate.run(() {
+    final decoded = _decodeEpubArchive(inputPath, expectedSourceFingerprint);
+    return bookLanguages(
+      _LazyArchiveView(decoded.archive, inputPath: inputPath),
+    );
+  });
+
   /// Repacks an EPUB, replacing selected XHTML payloads, on a background isolate.
   ///
   /// Writes to a same-directory temp file first, then commits to [outputFilePath]
@@ -747,6 +798,7 @@ class EpubIsolateWorker {
     required Map<String, String> translatedHtmlByPath,
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
+    List<String>? sourceLanguageTags,
     bool bilingual = false,
     bool Function()? shouldCommit,
     bool Function()? isCancelled,
@@ -771,6 +823,7 @@ class EpubIsolateWorker {
           bilingual,
           expectedSourceFingerprint,
           translatedTitle,
+          sourceLanguageTags,
         ),
         isCancelled: () =>
             (isCancelled?.call() ?? false) ||
@@ -817,6 +870,7 @@ class EpubIsolateWorker {
     bool bilingual,
     String? fingerprint,
     String? title,
+    List<String>? sourceLanguages,
   ) =>
       (_) => _writeTranslatedEpubToTempSync(
         inputPath: inputPath,
@@ -827,6 +881,7 @@ class EpubIsolateWorker {
         bilingual: bilingual,
         expectedSourceFingerprint: fingerprint,
         translatedTitle: title,
+        sourceLanguageTags: sourceLanguages,
         ownedTempPath: tempPath,
       );
 
@@ -861,6 +916,7 @@ class EpubIsolateWorker {
     bool bilingual = false,
     Map<String, String> renderedHtmlByPath = const <String, String>{},
     String? translatedTitle,
+    List<String>? sourceLanguageTags,
   }) {
     // Unknown language only prevents language annotations, not already-paid
     // title/label translations. Preserve existing language metadata verbatim.
@@ -905,8 +961,25 @@ class EpubIsolateWorker {
                   element.name.local == 'language' &&
                   element.namespaceUri == 'http://purl.org/dc/elements/1.1/',
             )
-            .toList(growable: false);
+            .toList();
     if (languageTag != null) {
+      if (bilingual && sourceLanguageTags != null) {
+        // A monolingual baseline has overwritten the source declarations.
+        // Restore their values before applying the usual bilingual policy.
+        // Reuse nodes where possible to retain IDs and metadata attributes.
+        for (var i = 0; i < sourceLanguageTags.length; i++) {
+          if (i < languages.length) {
+            languages[i].innerText = sourceLanguageTags[i];
+          } else if (metadata != null) {
+            final element = _dcLanguageElement(opf, sourceLanguageTags[i]);
+            metadata.children.add(element);
+            languages.add(element);
+          }
+        }
+        for (var i = sourceLanguageTags.length; i < languages.length; i++) {
+          languages[i].innerText = languageTag;
+        }
+      }
       if (bilingual && languages.isNotEmpty) {
         final seen = <String>{};
         for (final language in languages) {
@@ -927,6 +1000,23 @@ class EpubIsolateWorker {
       } else {
         for (final xml.XmlElement language in languages) {
           language.innerText = languageTag;
+        }
+        // A bilingual baseline has an extra target declaration. Retain one
+        // target entry when converting back, as a direct monolingual export
+        // does. Preserve metadata refinements attached to removed IDs.
+        final first = languages.first;
+        for (final duplicate in languages.skip(1)) {
+          final id = duplicate.getAttribute('id');
+          if (id != null) {
+            final retainedId = first.getAttribute('id') ?? id;
+            first.setAttribute('id', retainedId);
+            for (final element in opf.descendants.whereType<xml.XmlElement>()) {
+              if (element.getAttribute('refines') == '#$id') {
+                element.setAttribute('refines', '#$retainedId');
+              }
+            }
+          }
+          duplicate.parent?.children.remove(duplicate);
         }
       }
     }
@@ -2178,6 +2268,7 @@ class EpubIsolateWorker {
     required Map<String, String> translatedHtmlByPath,
     Map<String, String> navigationLabelsByPath = const <String, String>{},
     String? navigationLanguageTag,
+    List<String>? sourceLanguageTags,
     bool bilingual = false,
     String? expectedSourceFingerprint,
     String? translatedTitle,
@@ -2217,6 +2308,7 @@ class EpubIsolateWorker {
         archiveFiles: archiveView,
         labelsByPath: navigationLabelsByPath,
         languageTag: navigationLanguageTag,
+        sourceLanguageTags: sourceLanguageTags,
         bilingual: bilingual,
         renderedHtmlByPath: translatedHtmlByPath,
         translatedTitle: translatedTitle,

@@ -296,6 +296,34 @@ class _TranslationReviewPageState extends State<TranslationReviewPage> {
                         ),
                       ),
                       const SizedBox(height: 12),
+                      if ((report['automaticCorrections'] as List?)
+                              ?.isNotEmpty ??
+                          false)
+                        ExpansionTile(
+                          title: Text(
+                            t(
+                              '已自动修正 ${(report['automaticCorrections'] as List).length} 段（独立请求复核通过）',
+                              '${(report['automaticCorrections'] as List).length} automatically corrected blocks (separately verified)',
+                            ),
+                          ),
+                          children: [
+                            for (final correction
+                                in (report['automaticCorrections'] as List)
+                                    .take(200)
+                                    .whereType<Map>())
+                              ListTile(
+                                title: Text(
+                                  '${correction['chapter']} · ${correction['id']}',
+                                ),
+                                subtitle: SelectableText(
+                                  '${t('原文', 'Source')}: ${html.parseFragment(correction['sourceHtml'] as String).text}\n'
+                                  '${t('自动修正前', 'Before automatic correction')}: ${html.parseFragment(correction['beforeHtml'] as String).text}\n'
+                                  '${t('自动修正后', 'After automatic correction')}: ${html.parseFragment(correction['afterHtml'] as String).text}\n'
+                                  '${t('复核依据', 'Verification')}: ${correction['verificationReason']}',
+                                ),
+                              ),
+                          ],
+                        ),
                       Text(
                         t(
                           '已复核 ${report['reviewedBlocks'] ?? 0} 块；低风险跳过 ${report['skippedLowRiskBlocks'] ?? 0} 块；未完成 ${(report['unreviewed'] as List?)?.length ?? 0} 块。',

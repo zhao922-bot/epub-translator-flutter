@@ -79,6 +79,59 @@ void main() {
     );
   });
 
+  test('outer quote delimiters do not change verbatim evidence requirements', () {
+    const source =
+        'She said, "the younger children will return on Thursday, and we can rest."';
+    const excerpt = 'the younger children will return on Thursday';
+    for (final pair in [
+      ['"', '"'],
+      ["'", "'"],
+      ['“', '”'],
+      ['‘', '’'],
+      ['「', '」'],
+      ['『', '』'],
+    ]) {
+      expect(
+        ReviewEvidenceValidator.supports(
+          '${pair[0]}$excerpt${pair[1]}',
+          source,
+        ),
+        isTrue,
+      );
+      expect(
+        ReviewEvidenceValidator.supports(
+          '${pair[0]}${excerpt.replaceFirst('younger', 'older')}${pair[1]}',
+          source,
+        ),
+        isFalse,
+      );
+    }
+    for (final fabricated in [
+      '"$excerpt”',
+      '"the younger children will return on Friday"',
+      '"the younger children; will return on Thursday"',
+      '" "',
+      '""',
+      '“the younger children will return ... she bought seven tickets”',
+    ]) {
+      expect(ReviewEvidenceValidator.supports(fabricated, source), isFalse);
+    }
+    expect(
+      ReviewEvidenceValidator.supports(
+        '“the younger children ... and we can rest.”',
+        source,
+      ),
+      isTrue,
+    );
+    expect(
+      ReviewEvidenceValidator.supports(
+        '“and we can rest. ... the younger children”',
+        source,
+      ),
+      isFalse,
+    );
+  });
+
   test('omitted quote fragments must all exist in source order', () {
     const source =
         'The bell rang for tea. After a long passage, they ate dinner. There are only six lines.';
