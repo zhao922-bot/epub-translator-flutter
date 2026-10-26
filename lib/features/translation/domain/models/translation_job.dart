@@ -413,6 +413,7 @@ Map<String, Object> _readUsage(Object? value) {
     'completionTokens',
     'elapsedMs',
     'usageReportedRequests',
+    'reasoningTokens',
   ];
   const kinds = [
     'styleProfile',
@@ -420,6 +421,11 @@ Map<String, Object> _readUsage(Object? value) {
     'chapterMemory',
     'translation',
     'semanticReview',
+    'semanticVerification',
+    'semanticSourceAnalysis',
+    'semanticDraftAnalysis',
+    'semanticReviewRepair',
+    'semanticEquivalence',
     'bookTitle',
     'probe',
   ];
@@ -430,11 +436,24 @@ Map<String, Object> _readUsage(Object? value) {
       'byKind',
       'elapsedMsByKind',
       'promptTokensByKind',
+      'finishReasons',
       'completionTokensByKind',
     ])
       if (value[key] is Map)
         key: <String, int>{
-          for (final kind in kinds)
+          for (final kind
+              in key == 'finishReasons'
+                  ? const [
+                      'omitted',
+                      'stop',
+                      'eos_token',
+                      'length',
+                      'content_filter',
+                      'tool_calls',
+                      'function_call',
+                      'unsupported',
+                    ]
+                  : kinds)
             if ((value[key] as Map).containsKey(kind))
               kind: _readNonNegativeInt((value[key] as Map)[kind]),
         },

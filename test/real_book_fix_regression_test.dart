@@ -30,7 +30,13 @@ class Fixture {
   String? reviewQuoteOverride;
   bool omitUsage = false, reviewUnchanged = false;
   List<dynamic> Function(List<Map<String, Object?>>)? reviewItemsOverride;
+  List<dynamic> Function(List<Map<String, Object?>>)?
+  sourceAnalysisItemsOverride;
   List<dynamic> Function(List<Map<String, Object?>>)? verificationItemsOverride;
+  List<dynamic> Function(List<Map<String, Object?>>)?
+  draftAnalysisItemsOverride;
+  List<dynamic> Function(List<Map<String, Object?>>)? repairItemsOverride;
+  List<dynamic> Function(List<Map<String, Object?>>)? equivalenceItemsOverride;
 
   Future<void> init({
     int blocks = 2,
@@ -87,22 +93,90 @@ class Fixture {
         content = malformedEntityMemory
             ? 'invalid-entity-memory'
             : jsonEncode({'glossary': entityTerms});
-      } else if (payload is Map && payload['kind'] == 'semanticReview') {
+      } else if (payload is Map &&
+          payload['kind'] == 'semanticSourceAnalysis') {
+        final items = <Map<String, Object?>>[
+          for (final block in payload['blocks'] as List)
+            {
+              'id': block['id'],
+              'units': [
+                for (final u in block['units'] as List)
+                  {
+                    'id': u['id'],
+                    'meaning': u['source'],
+                    for (final key
+                        in (u['focus'] as String)
+                            .split(',')
+                            .where((s) => s.isNotEmpty))
+                      key: key == 'sense'
+                          ? 'The source establishes the contextual sense of ${u['senseTerms'] ?? 'the expression'}.'
+                          : 'The source explicitly establishes the $key meaning.',
+                    if ((u['focus'] as String).contains('reference'))
+                      'referenceNumber': 'singular',
+                  },
+              ],
+            },
+        ];
+        content = jsonEncode({
+          'blocks': sourceAnalysisItemsOverride?.call(items) ?? items,
+        });
+      } else if (payload is Map && payload['kind'] == 'semanticDraftAnalysis') {
+        final items = <Map<String, Object?>>[
+          for (final b in payload['blocks'] as List)
+            {
+              'id': b['id'],
+              'meaning': 'She cried from happiness and continued to rejoice.',
+            },
+        ];
+        content = jsonEncode({
+          'blocks': draftAnalysisItemsOverride?.call(items) ?? items,
+        });
+      } else if (payload is Map &&
+          (payload['kind'] == 'semanticReview' ||
+              payload['kind'] == 'semanticReviewRepair')) {
         final items = <Map<String, Object?>>[
           for (final item in payload['blocks'] as List)
             {
               'id': malformedReview ? 'unknown' : item['id'],
               'html': reviewUnchanged
-                  ? item['draftHtml']
+                  ? item['draftHtml'] ?? '<p>${item['draftText']}</p>'
                   : '<p>她先欢喜，接着却伤心地哭喊起来。</p>',
               'category': reviewCategory,
               'confidence': reviewConfidence,
               'sourceQuote': reviewQuoteOverride ?? 'alas',
               'issues': ['The emotional contrast was reversed.'],
+              if (item['sourceAnalysis'] is List)
+                'coverage': [
+                  for (final u in item['sourceAnalysis'] as List)
+                    {
+                      'id': u['id'],
+                      'verdict': reviewUnchanged ? 'equivalent' : 'mismatch',
+                      'targetQuote': item['draftText'],
+                      'backMeaning': 'The draft conveys the stated emotion.',
+                      'referenceNumber': 'singular',
+                      'referenceQuote': '她',
+                      'reason': 'Compare the source emotion with the draft.',
+                    },
+                ],
             },
         ];
         content = jsonEncode({
-          'blocks': reviewItemsOverride?.call(items) ?? items,
+          'blocks': payload['kind'] == 'semanticReviewRepair'
+              ? repairItemsOverride?.call(items) ?? items
+              : reviewItemsOverride?.call(items) ?? items,
+        });
+      } else if (payload is Map && payload['kind'] == 'semanticEquivalence') {
+        final items = <Map<String, Object?>>[
+          for (final b in payload['blocks'] as List)
+            {
+              'id': b['id'],
+              'sourceImpliesDraft': true,
+              'draftImpliesSource': true,
+              'reason': 'Both readings express the same proposition.',
+            },
+        ];
+        content = jsonEncode({
+          'blocks': equivalenceItemsOverride?.call(items) ?? items,
         });
       } else if (payload is Map && payload['kind'] == 'semanticVerification') {
         final items = <Map<String, Object?>>[

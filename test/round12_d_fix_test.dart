@@ -57,7 +57,7 @@ void main() {
         '{"a":1}<think>one</think> \n<think mode="r">two</think>\t\r\n':
             '{"a":1}',
         'data<THINK TYPE="x">tail</THINK>  \n': 'data',
-      'data<think type="literal </think>">tail</think>': 'data',
+        'data<think type="literal </think>">tail</think>': 'data',
         'data<think>outer <think>inner</think>': 'data',
         'Ordinary text': 'Ordinary text',
         '{"t":"literal <think>inside</think>"}':
@@ -262,7 +262,7 @@ void main() {
   test('P3-01 navigation labels retain baseline text order and hierarchy', () {
     final chapters = [_navigationChapter('one'), _navigationChapter('two')];
     final repacker = EpubRepacker();
-    // 固化优化前的输出，逐项验证数量、文本和插入顺序。
+    // Only consecutive opening headings form the chapter label; later sections keep their own anchors.
     expect(
       repacker
           .debugNavigationLabels(chapters)
@@ -270,7 +270,7 @@ void main() {
           .map((entry) => [entry.key, entry.value])
           .toList(),
       [
-        ['OPS/one.xhtml', '1. Chapitre un'],
+        ['OPS/one.xhtml', '1'],
         ['OPS/one.xhtml#one-h1', '1'],
         ['OPS/one.xhtml#one-inline', '1'],
         ['OPS/one.xhtml#part-one', '1'],
@@ -280,7 +280,7 @@ void main() {
         ['OPS/one.xhtml#one-h4', 'Sous-section un'],
         ['OPS/one.xhtml#one-h5', 'Détail un'],
         ['OPS/one.xhtml#one-h6', 'Note un'],
-        ['OPS/two.xhtml', 'Deuxième chapitre: Section deux'],
+        ['OPS/two.xhtml', 'Deuxième chapitre'],
         ['OPS/two.xhtml#two-h1', 'Deuxième chapitre'],
         ['OPS/two.xhtml#two-inline', 'Deuxième chapitre'],
         ['OPS/two.xhtml#part-two', 'Deuxième chapitre'],
@@ -319,14 +319,14 @@ void main() {
           )
           .toList(),
       [
-        ['one-chapter', 0, '1. Chapitre un', 'one.xhtml'],
+        ['one-chapter', 0, '1', 'one.xhtml'],
         ['one-h1', 1, '1', 'one.xhtml#one-h1'],
         ['one-h2', 2, 'Chapitre un', 'one.xhtml#one-h2'],
         ['one-h3', 3, 'Section un', 'one.xhtml#one-h3'],
         ['one-h4', 4, 'Sous-section un', 'one.xhtml#one-h4'],
         ['one-h5', 5, 'Détail un', 'one.xhtml#one-h5'],
         ['one-h6', 6, 'Note un', 'one.xhtml#one-h6'],
-        ['two-chapter', 0, 'Deuxième chapitre: Section deux', 'two.xhtml'],
+        ['two-chapter', 0, 'Deuxième chapitre', 'two.xhtml'],
         ['two-h1', 1, 'Deuxième chapitre', 'two.xhtml#two-h1'],
         ['two-h2', 2, 'Section deux', 'two.xhtml#two-h2'],
         ['two-h3', 3, 'Partie deux', 'two.xhtml#two-h3'],

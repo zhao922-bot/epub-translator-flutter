@@ -43,6 +43,7 @@ import 'translation_artifact_cache.dart';
 import 'translation_consistency_checker.dart';
 import 'review_text_patch.dart';
 import 'review_evidence_validator.dart';
+import 'semantic_source_analysis.dart';
 import 'cancellable_fingerprint.dart';
 import 'translation_batch_planner.dart';
 import 'translation_progress_persistence.dart';
@@ -52,6 +53,7 @@ import 'translation_work_queue.dart';
 part 'epub_book_memory.dart';
 part 'epub_translation_strategy.dart';
 part 'epub_semantic_reviewer.dart';
+part 'epub_semantic_grounding.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
 ///
@@ -222,7 +224,7 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion = 'v24-source-evidence';
+  static const String qualityCacheSchemaVersion = 'v30-verified-partial-corrections';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
@@ -2597,9 +2599,11 @@ class EpubChapterTranslator {
           : null;
       await _repacker.writeTranslatedEpub(
         reviewSnapshots: reviewSnapshots,
-        reviewChapterPaths: config.semanticQualityCheck
-            ? selectedChapters.map((c) => c.path).toSet()
-            : const {},
+        reviewChapterPaths: {
+          if (config.semanticQualityCheck)
+            ...selectedChapters.map((c) => c.path),
+          ..._degradedBlocks.map((key) => key.split('\u0000').first),
+        },
         inputPath: inputPath,
         outputFilePath: outputFilePath,
         config: config,
@@ -2620,6 +2624,18 @@ class EpubChapterTranslator {
         },
       );
       repackStopwatch.stop();
+      for (final detail in degradedDetails) {
+        final scoped = _degradedBlocks.firstWhere(
+          (key) => key.replaceAll('\u0000', ':') == detail['block'],
+        );
+        final parts = scoped.split('\u0000');
+        final snapshot = reviewSnapshots[parts.first];
+        final states = snapshot is Map ? snapshot['finalDegradedBlocks'] : null;
+        detail['processingFallback'] = detail['fallback']!;
+        detail['finalContentState'] = states is Map
+            ? states[parts.last]?.toString() ?? 'unknown'
+            : 'unknown';
+      }
 
       final bool allBlocksDegraded =
           totalBlocks > 0 && degradedBlockCount >= totalBlocks;
@@ -2703,7 +2719,7 @@ class EpubChapterTranslator {
             diagnostics,
             const JsonEncoder.withIndent(
               '  ',
-            ).convert({'version': 1, 'degradedBlocks': degradedDetails}),
+            ).convert({'version': 2, 'degradedBlocks': degradedDetails}),
           );
         }
       } catch (error) {
@@ -2753,6 +2769,7 @@ class EpubChapterTranslator {
               'requestLimit': config.maxSemanticReviewRequests,
               'corrections': _run.semanticCorrections,
               'automaticCorrections': _run.automaticCorrections.values.toList(),
+              'meaningAssessments': _run.meaningAssessments.values.toList(),
               'autoApplyVerifiedCorrections':
                   config.autoApplyVerifiedCorrections,
               'missingEntityTerms': config.autoApplyVerifiedCorrections
@@ -2763,6 +2780,11 @@ class EpubChapterTranslator {
               'unreviewedReasons': {
                 for (final e in _run.semanticUnreviewedReasons.entries)
                   e.key.replaceAll('\u0000', ':'): e.value,
+              },
+              'unreviewedDetails': {
+                for (final e in _run.semanticFailureDetails.entries)
+                  if (_run.semanticUnreviewed.contains(e.key))
+                    e.key.replaceAll('\u0000', ':'): e.value,
               },
               'unreviewed': _run.semanticUnreviewed
                   .map((id) => id.replaceAll('\u0000', ':'))
@@ -4557,6 +4579,11 @@ class EpubChapterTranslator {
       'chapterMemory': '章节记忆',
       'translation': '正文',
       'semanticReview': '语义复核',
+      'semanticSourceAnalysis': '原文释义',
+      'semanticDraftAnalysis': '独立译文释义',
+      'semanticEquivalence': '含义等价核对',
+      'semanticReviewRepair': '有限审校修复',
+      'semanticVerification': '修正验证',
       'bookTitle': '书名',
       'probe': '连接测试',
     };

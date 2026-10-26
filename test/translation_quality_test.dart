@@ -2466,10 +2466,6 @@ void main() {
               name: 'email address',
               translatedHtml: '<p>联系support@example.com获取帮助。</p>',
             ),
-            (
-              name: 'spaced lowercase word',
-              translatedHtml: '<p>讨论 cyberspace 概念。</p>',
-            ),
           ]) {
         test('allows ${example.name}', () {
           final TranslationResidualFinding? finding =
@@ -2482,6 +2478,15 @@ void main() {
           expect(finding, isNull);
         });
       }
+
+      test('flags an unglossed spaced lowercase word', () {
+        final finding = TranslationQuality.findSuspiciousHtmlResidual(
+          sourceHtml: '<p>They discussed the concept of cyberspace.</p>',
+          translatedHtml: '<p>讨论 cyberspace 概念。</p>',
+          targetLanguage: 'Chinese',
+        );
+        expect(finding?.token, 'cyberspace');
+      });
 
       test('does not apply the adjacency rule to non-CJK targets', () {
         final TranslationResidualFinding?

@@ -139,20 +139,32 @@ void main() {
           ),
         ),
       );
-      await tester.runAsync(() async {
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      });
-      final watch = Stopwatch()..start();
-      await tester.pump();
-      watch.stop();
-      timings[count] = watch.elapsedMilliseconds;
+      // File parsing runs asynchronously. Wait for readiness, measuring every
+      // UI frame, instead of assuming disk/worker completion within 500 ms.
+      final ready = find.text(
+        'Human-reviewed: $count; unresolved model failures: 0.',
+      );
+      var slowestFrameMs = 0;
+      for (var attempt = 0; attempt < 50; attempt++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)),
+        );
+        final watch = Stopwatch()..start();
+        await tester.pump();
+        watch.stop();
+        if (watch.elapsedMilliseconds > slowestFrameMs) {
+          slowestFrameMs = watch.elapsedMilliseconds;
+        }
+        if (ready.evaluate().isNotEmpty) break;
+      }
+      timings[count] = slowestFrameMs;
       expect(
         find.text('Human-reviewed: $count; unresolved model failures: 0.'),
         findsOneWidget,
       );
       expect(tester.takeException(), isNull);
       debugPrint(
-        'AUDIT review UI count=$count reportBytes=${report.lengthSync()} firstLoadedBuildMs=${watch.elapsedMilliseconds}',
+        'AUDIT review UI count=$count reportBytes=${report.lengthSync()} slowestBuildMs=$slowestFrameMs',
       );
       await tester.pumpWidget(const SizedBox.shrink());
     }

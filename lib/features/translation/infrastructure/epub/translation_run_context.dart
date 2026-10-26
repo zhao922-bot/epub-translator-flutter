@@ -38,10 +38,12 @@ class TranslationRunContext {
   final Set<String> semanticAuditSamples = {};
   final Set<String> reusedDraftBlocks = {};
   final Map<String, String> semanticUnreviewedReasons = {};
+  final Map<String, String> semanticFailureDetails = {};
   final Map<String, Map<String, String>> semanticTerms = {};
   final Set<String> semanticSingleRetries = {};
   final List<Map<String, Object?>> semanticCorrections = [];
   final Map<String, Map<String, Object?>> automaticCorrections = {};
+  final Map<String, Map<String, Object?>> meaningAssessments = {};
 
   bool isUnreviewed(String chapterPath, String id) =>
       semanticUnreviewed.contains(

@@ -613,6 +613,9 @@ class TranslationQuality {
   }) {
     _normalizeDiagnosticXhtmlNames(sourceDocument);
     _normalizeDiagnosticXhtmlNames(translatedDocument);
+    _unwrapReaderTextSpans(sourceDocument);
+    _unwrapReaderTextSpans(translatedDocument);
+    _clearMatchingPublicationMetadata(sourceDocument, translatedDocument);
     if (!_clearMatchingExplainedInlinePhrases(
       sourceDocument,
       translatedDocument,
@@ -677,6 +680,7 @@ class TranslationQuality {
         kind: TranslationResidualKind.longSourceText,
       );
     }
+    _clearMatchingPlainAttributions(sourceDocument, translatedDocument);
     final List<Element> sourceCandidates = _outermostWorkTitleCandidates(
       sourceDocument,
     );
@@ -838,6 +842,7 @@ class TranslationQuality {
         translatedDocument.body?.text ?? translatedDocument.text ?? '',
       ),
       targetLanguage: targetLanguage,
+      sourceText: sourceDocument.body?.text ?? sourceDocument.text ?? '',
     );
     if (adjacentLowercaseWord != null) {
       return TranslationResidualFinding(
@@ -1093,12 +1098,178 @@ class TranslationQuality {
     };
     return paragraph.classes
         .map((String token) => token.toLowerCase())
-        .any(recognizedClasses.contains);
+        .any(
+          (token) =>
+              recognizedClasses.contains(token) ||
+              RegExp(r'(?:^|[-_])signature$').hasMatch(token),
+        );
+  }
+
+  // Reader-generated text runs carry positions, not linguistic boundaries.
+  // Normalize diagnostic clones only; rendered markup/IDs remain untouched.
+  static void _unwrapReaderTextSpans(Document document) {
+    final spans = document.querySelectorAll('span.koboSpan');
+    if (spans.isEmpty) return;
+    for (final element in spans.reversed) {
+      if (element.attributes.keys.any(
+            (key) => !const {
+              'id',
+              'class',
+              'lang',
+              'xml:lang',
+              'xmlns',
+            }.contains(key.toString()),
+          ) ||
+          !element.classes.contains('koboSpan') ||
+          element.classes.any((c) => c != 'koboSpan') ||
+          element.namespaceUri != null &&
+              element.namespaceUri != 'http://www.w3.org/1999/xhtml') {
+        continue;
+      }
+      final parent = element.parentNode;
+      if (parent == null) continue;
+      final at = parent.nodes.indexOf(element);
+      parent.nodes.insertAll(at, element.nodes.toList());
+      element.remove();
+    }
+    // Adjacent text nodes left by unwrapping must not remain artificial
+    // sentence boundaries in the per-node source/target comparison.
+    void merge(Node node) {
+      for (final child in node.nodes.toList()) {
+        merge(child);
+      }
+      for (var i = node.nodes.length - 1; i > 0; i--) {
+        final left = node.nodes[i - 1], right = node.nodes[i];
+        if (left is Text && right is Text) {
+          left.data += right.data;
+          right.remove();
+        }
+      }
+    }
+
+    merge(document);
+  }
+
+  static void _clearMatchingPlainAttributions(
+    Document source,
+    Document target,
+  ) {
+    final sources = source.querySelectorAll('p');
+    final targets = target.querySelectorAll('p');
+    if (sources.length != targets.length) return;
+    for (var i = 0; i < sources.length; i++) {
+      final a = sources[i], b = targets[i];
+      final name = _normalizeText(a.text);
+      if (name != _normalizeText(b.text) ||
+          _canonicalRetainedPersonName(name) == null ||
+          a.children.isNotEmpty ||
+          b.children.isNotEmpty ||
+          _elementStructurePath(a) != _elementStructurePath(b)) {
+        continue;
+      }
+      bool attribution(Element p) {
+        // Publishing-system signature classes are explicit attributions.
+        // Keep the older ambiguous `sig` class behind the extractor's
+        // contextual author-signature classification.
+        if (p.classes.any(
+          (c) => RegExp(r'^.+[-_]signature$', caseSensitive: false).hasMatch(c),
+        )) {
+          return true;
+        }
+        final parent = p.parent;
+        if (parent?.localName != 'blockquote') return false;
+        final paragraphs = parent!.children
+            .where((e) => e.localName == 'p' && e.text.trim().isNotEmpty)
+            .toList();
+        return paragraphs.length >= 2 &&
+            identical(paragraphs.last, p) &&
+            (_hasEpigraphAttributionSemantics(p) ||
+                p.classes.any(
+                  (c) => RegExp(
+                    r'(?:^|[-_])epigraph[-_](?:source|author)$',
+                    caseSensitive: false,
+                  ).hasMatch(c),
+                ));
+      }
+
+      if (attribution(a) && attribution(b)) {
+        a.text = '';
+        b.text = '';
+      }
+    }
+  }
+
+  static void _clearMatchingPublicationMetadata(
+    Document source,
+    Document target,
+  ) {
+    final sources = source.querySelectorAll('p');
+    final targets = target.querySelectorAll('p');
+    if (sources.length != targets.length) return;
+    final classification = RegExp(
+      r'\b(?:LCC\s+[A-Z]{1,3}\d[\w./-]*(?:\s+[A-Z]\d[\w./-]*)?(?:\s+\d{4})?|DDC\s+\d[\d/.\-]*(?:[—-]dc\d+(?:/[a-z]{2,3}/\d{8})?)?)\b',
+    );
+    for (var i = 0; i < sources.length; i++) {
+      final a = sources[i], b = targets[i];
+      if (_elementStructurePath(a) != _elementStructurePath(b)) continue;
+      final raw = _normalizeText(a.text), translated = _normalizeText(b.text);
+      if (raw == translated &&
+          raw.length <= 160 &&
+          RegExp(
+            r'^[A-Za-z][A-Za-z0-9]*_(?:[A-Za-z0-9.]+_)+[A-Za-z0-9.]+$',
+          ).hasMatch(raw) &&
+          RegExp(r'\d').hasMatch(raw)) {
+        a.text = '';
+        b.text = '';
+        continue;
+      }
+      final metadata = a.classes.any(
+        (c) => RegExp(
+          r'copyright|bibliograph|metadata',
+          caseSensitive: false,
+        ).hasMatch(c),
+      );
+      if (!metadata) continue;
+      final title = RegExp(
+        r'^Title:\s*(.{1,300})\s*/\s*([^/]+?)\.?$',
+      ).firstMatch(raw);
+      if (title != null &&
+          _canonicalRetainedPersonName(title[2]!.trim()) != null) {
+        final colon = translated.indexOf(RegExp(r'[:：]'));
+        if (colon > 0 &&
+            RegExp(
+              r'[\u3400-\u9fff]',
+            ).hasMatch(translated.substring(0, colon)) &&
+            translated.substring(colon + 1).trim() ==
+                raw.substring(raw.indexOf(':') + 1).trim()) {
+          a.text = '';
+          b.text = '';
+          continue;
+        }
+      }
+      if (raw.startsWith('Classification:')) {
+        for (final match in classification.allMatches(raw)) {
+          final code = match[0]!;
+          if (!translated.contains(code)) continue;
+          for (final p in [a, b]) {
+            void clear(Node node) {
+              if (node is Text) node.data = node.data.replaceAll(code, ' ');
+              for (final child in node.nodes) {
+                clear(child);
+              }
+            }
+
+            clear(p);
+          }
+        }
+      }
+    }
   }
 
   static String? _findCjkAdjacentLowercaseWord(
     String text, {
     required String targetLanguage,
+    required String sourceText,
   }) {
     if (!_isCjkTargetLanguage(targetLanguage)) {
       return null;
@@ -1109,6 +1280,9 @@ class TranslationQuality {
     // itself — not to other bare tokens sharing the paragraph (or the same
     // parentheses) — and no per-token whole-text scan is needed.
     final Set<int> glossedTokenStarts = _glossedTermTokenStarts(strippedText);
+    final sourceWords = RegExp(
+      r"[A-Za-z0-9'’\-]+",
+    ).allMatches(sourceText).map((m) => m[0]!.toLowerCase()).toSet();
     for (final RegExpMatch match in RegExp(
       r"[A-Za-z0-9'’\-]+",
     ).allMatches(strippedText)) {
@@ -1121,8 +1295,32 @@ class TranslationQuality {
           token != token.toLowerCase()) {
         continue;
       }
-      final int? precedingRune = _runeBefore(strippedText, match.start);
-      final int? followingRune = _runeAt(strippedText, match.end);
+      var before = match.start, after = match.end;
+      while (before > 0 &&
+          _isGlossSpaceRune(strippedText.codeUnitAt(before - 1))) {
+        before--;
+      }
+      while (after < strippedText.length &&
+          _isGlossSpaceRune(strippedText.codeUnitAt(after))) {
+        after++;
+      }
+      final int? precedingRune = _runeBefore(strippedText, before);
+      final int? followingRune = _runeAt(strippedText, after);
+      // Whitespace alone does not make the boundary word of a retained
+      // multi-word technical phrase a stray English word.
+      final spaced = before != match.start || after != match.end;
+      final directBefore = _runeBefore(strippedText, match.start);
+      final directAfter = _runeAt(strippedText, match.end);
+      final directCjk =
+          (directBefore != null && _isCjkRune(directBefore)) ||
+          (directAfter != null && _isCjkRune(directAfter));
+      if (!directCjk && !sourceWords.contains(token)) continue;
+      if (spaced &&
+          !directCjk &&
+          ((precedingRune != null && _isLatinLetterRune(precedingRune)) ||
+              (followingRune != null && _isLatinLetterRune(followingRune)))) {
+        continue;
+      }
       if ((precedingRune != null && _isCjkRune(precedingRune)) ||
           (followingRune != null && _isCjkRune(followingRune))) {
         if (glossedTokenStarts.contains(match.start)) {
@@ -2990,7 +3188,9 @@ class TranslationQuality {
       if (_canonicalRetainedPersonName(run.join(' ')) != null) {
         continue;
       }
-      if (_looksLikeEnglishTitleOrName(run)) {
+      if (_looksLikeEnglishTitleOrName(run) &&
+          !_looksLikeSentenceOrInstruction(run.join(' ')) &&
+          !_isCommonInstructionPhrase(run.join(' '))) {
         continue;
       }
       // Legal case names such as `Roe v. Wade` (or the embedded form

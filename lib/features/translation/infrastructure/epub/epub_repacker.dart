@@ -262,6 +262,65 @@ body.epub-translator-cjk [data-translation="true"] {
     // inside the isolate from the same decoded archive, so the whole book is
     // never loaded into the main isolate just to read three small XML files.
     _validateXmlReplacements(translatedHtmlByPath);
+    // Compare the actual rendered nodes after navigation synchronization,
+    // keeping the earlier fallback event separate from the exported content.
+    for (final chapter in chapters) {
+      final snapshot = review[chapter.path];
+      final rendered = translatedHtmlByPath[chapter.path];
+      if (snapshot is! Map<String, Object?> || rendered == null) continue;
+      final degraded = chapter.blocks
+          .where(
+            (b) => degradedBlockIds.contains(
+              degradedKeyForBlock(chapterPath: chapter.path, blockId: b.id),
+            ),
+          )
+          .toList();
+      if (degraded.isEmpty) continue;
+      final originals = _extractor.extractTranslatableTextElements(
+        XhtmlHtmlCompatibility.parseDocument(chapter.originalHtml),
+      );
+      final document = XhtmlHtmlCompatibility.parseDocument(rendered);
+      final preceding = <dom.Element?>[];
+      void walk(dom.Node node) {
+        final siblings = node.nodes;
+        for (var i = 0; i < siblings.length; i++) {
+          final child = siblings[i];
+          if (child is dom.Comment && child.data?.trim() == 'UNTRANSLATED') {
+            var j = i - 1;
+            while (j >= 0 &&
+                siblings[j] is dom.Text &&
+                (siblings[j] as dom.Text).data.trim().isEmpty) {
+              j--;
+            }
+            preceding.add(
+              j >= 0 && siblings[j] is dom.Element
+                  ? siblings[j] as dom.Element
+                  : null,
+            );
+          } else {
+            walk(child);
+          }
+        }
+      }
+
+      walk(document);
+      String normalized(String text) =>
+          text.replaceAll(RegExp(r'\s+'), ' ').trim();
+      snapshot['finalDegradedBlocks'] = {
+        for (var i = 0; i < degraded.length; i++)
+          degraded[i].id:
+              preceding.length != degraded.length ||
+                  preceding[i] == null ||
+                  chapter.blocks.indexOf(degraded[i]) >= originals.length
+              ? 'unknown'
+              : normalized(preceding[i]!.text) ==
+                    normalized(
+                      originals[chapter.blocks.indexOf(degraded[i])].text,
+                    )
+              ? 'sourceRetained'
+              : 'modifiedNeedsReview',
+      };
+    }
     for (final e in review.entries) {
       (e.value as Map<String, Object?>)['baseHtmlSha256'] = sha256
           .convert(
@@ -1380,7 +1439,18 @@ body.epub-translator-cjk [data-translation="true"] {
   }
 
   String? _navigationLabelForChapter(InspectedChapter chapter) {
-    final List<String> headings = chapter.blocks
+    // Only the opening contiguous heading group describes this chapter.
+    // A subtitle may be a third heading; a later subsection does not belong
+    // in the chapter label merely because it is the second h1/h2/h3.
+    final opening = <ExtractedBlock>[];
+    for (final block in chapter.blocks) {
+      if (!RegExp(r'^h[1-3]$').hasMatch(block.tagName)) {
+        if (opening.isNotEmpty) break;
+        continue;
+      }
+      opening.add(block);
+    }
+    final List<String> headings = opening
         .where(
           (ExtractedBlock block) =>
               block.translatedHtml?.trim().isNotEmpty == true &&
@@ -1397,7 +1467,6 @@ body.epub-translator-cjk [data-translation="true"] {
         )
         .where((String value) => value.isNotEmpty)
         .toSet()
-        .take(2)
         .toList(growable: false);
     if (headings.isEmpty) {
       return null;
@@ -1405,10 +1474,20 @@ body.epub-translator-cjk [data-translation="true"] {
     if (headings.length == 1) {
       return headings.first;
     }
-    if (RegExp(r'^\d{1,3}$').hasMatch(headings.first)) {
-      return '${headings.first}. ${headings[1]}';
+    var label = headings.first;
+    for (var i = 1; i < headings.length; i++) {
+      final subtitle = headings[i];
+      if (RegExp(r'^[（(].*[）)]$').hasMatch(subtitle)) {
+        label += subtitle;
+      } else {
+        final separator =
+            i == 1 && RegExp(r'^\d{1,3}$').hasMatch(headings.first)
+            ? '. '
+            : ': ';
+        label += '$separator$subtitle';
+      }
     }
-    return '${headings.first}: ${headings[1]}';
+    return label;
   }
 
   void _validateXmlReplacements(

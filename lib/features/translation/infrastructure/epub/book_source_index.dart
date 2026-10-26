@@ -168,21 +168,30 @@ class BookSourceIndex {
         final cmp = b.value.compareTo(a.value);
         return cmp != 0 ? cmp : a.key.compareTo(b.key);
       });
-    final rankedNames = names.entries.where((e) => e.value >= 3).toList()
-      ..sort((a, b) {
-        // A title is strong person-name evidence. Its period must not demote
-        // the following surname as an ordinary sentence-opening capital.
-        final person = (titledNames.contains(b.key) ? 1 : 0).compareTo(
-          titledNames.contains(a.key) ? 1 : 0,
-        );
-        if (person != 0) return person;
-        final context = (nameContextCounts[b.key] ?? 0).compareTo(
-          nameContextCounts[a.key] ?? 0,
-        );
-        if (context != 0) return context;
-        final frequency = b.value.compareTo(a.value);
-        return frequency != 0 ? frequency : a.key.compareTo(b.key);
-      });
+    // Two separate paragraphs suffice when both contain contextual name
+    // evidence. Mere sentence-opening capitals still need three occurrences.
+    final rankedNames =
+        names.entries
+            .where(
+              (e) =>
+                  e.value >= 3 ||
+                  (e.value >= 2 && (nameContextCounts[e.key] ?? 0) >= 2),
+            )
+            .toList()
+          ..sort((a, b) {
+            // A title is strong person-name evidence. Its period must not demote
+            // the following surname as an ordinary sentence-opening capital.
+            final person = (titledNames.contains(b.key) ? 1 : 0).compareTo(
+              titledNames.contains(a.key) ? 1 : 0,
+            );
+            if (person != 0) return person;
+            final context = (nameContextCounts[b.key] ?? 0).compareTo(
+              nameContextCounts[a.key] ?? 0,
+            );
+            if (context != 0) return context;
+            final frequency = b.value.compareTo(a.value);
+            return frequency != 0 ? frequency : a.key.compareTo(b.key);
+          });
     return {
       'recurringTerms': [
         for (final e in ranked.take(24))

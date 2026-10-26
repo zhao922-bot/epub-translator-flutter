@@ -17,14 +17,25 @@ import 'cancellation_listener.dart';
 /// Thrown when a translation, style, or memory reply cannot be parsed as JSON
 /// (the message content is missing or is not a JSON object).
 ///
-/// Unlike a well-formed reply that fails validation (wrong block ids, a
-/// failed residual-quality gate, an empty block), an unparseable reply is —
-/// at temperature 0.2 — almost always deterministic for the same prompt, so
-/// the batch-level retry policy skips re-sending the whole batch and goes
-/// straight to the cheaper per-block fallback instead of billing
-/// [TranslationConfig.maxRetries] identical full-batch requests.
+/// Transport recovery is bounded in [postChatCompletions]. The batch policy
+/// then splits a failed batch instead of repeating identical paid requests.
+enum TranslationResponseFailure {
+  envelope,
+  missingChoices,
+  incomplete,
+  blocked,
+  unsupportedFinish,
+  missingMessage,
+  invalidContent,
+  emptyContent,
+}
+
 class TranslationParseException extends FormatException {
-  const TranslationParseException(super.message);
+  const TranslationParseException(
+    super.message, {
+    this.failure = TranslationResponseFailure.invalidContent,
+  });
+  final TranslationResponseFailure failure;
 }
 
 class MissingApiConfigurationException extends FormatException {
@@ -53,11 +64,15 @@ class TranslationApiMetrics {
       elapsedMs = 0;
   int usageReportedRequests = 0;
   final Map<String, int> byKind = {};
+  final Map<String, int> finishReasons = {};
+  int reasoningTokens = 0;
   final Map<String, int> elapsedMsByKind = {},
       promptTokensByKind = {},
       completionTokensByKind = {};
   Map<String, Object> toJson() => {
     'requests': requests,
+    'finishReasons': Map<String, int>.from(finishReasons),
+    'reasoningTokens': reasoningTokens,
     'errors': errors,
     'promptTokens': promptTokens,
     'completionTokens': completionTokens,
@@ -69,8 +84,10 @@ class TranslationApiMetrics {
     'completionTokensByKind': Map<String, int>.from(completionTokensByKind),
   };
   void add(TranslationApiMetrics other) {
+    reasoningTokens += other.reasoningTokens;
     usageReportedRequests += other.usageReportedRequests;
     for (final pair in [
+      (finishReasons, other.finishReasons),
       (elapsedMsByKind, other.elapsedMsByKind),
       (promptTokensByKind, other.promptTokensByKind),
       (completionTokensByKind, other.completionTokensByKind),
@@ -184,6 +201,7 @@ class TranslationApiClient {
         baseUrl: normalizedBaseUrl(config.apiBaseUrl),
         extra: <String, dynamic>{
           'reasoningEffort': config.effectiveReasoningEffort,
+          'automaticThinkingDisabled': config.automaticThinkingDisabled,
           'reasoningModel':
               config.isGlm53 || config.effectiveReasoningEffort != null,
           'maxOutputTokens': config.maxOutputTokens.clamp(512, 32768),
@@ -211,8 +229,16 @@ class TranslationApiClient {
       );
       metrics.elapsedMs += watch.elapsedMilliseconds;
       if (failed) metrics.errors++;
+      final choices = data is Map ? data['choices'] : null;
+      if (choices is List && choices.isNotEmpty && choices.first is Map) {
+        final reason = _safeFinishReason(choices.first['finish_reason']);
+        metrics.finishReasons.update(reason, (v) => v + 1, ifAbsent: () => 1);
+      }
       final usage = data is Map ? data['usage'] : null;
       if (usage is Map) {
+        final details = usage['completion_tokens_details'];
+        final reasoning = details is Map ? details['reasoning_tokens'] : null;
+        if (reasoning is int) metrics.reasoningTokens += max(0, reasoning);
         if (usage['prompt_tokens'] is int &&
             usage['completion_tokens'] is int) {
           metrics.usageReportedRequests++;
@@ -617,6 +643,10 @@ class TranslationApiClient {
       32768,
     );
     final reasoning = dio.options.extra['reasoningEffort'] as String?;
+    if (dio.options.extra['automaticThinkingDisabled'] == true &&
+        !request.containsKey('thinking')) {
+      request['thinking'] = {'type': 'disabled'};
+    }
     if (reasoning != null) request['reasoning_effort'] = reasoning;
     final requested = request['max_tokens'] as int? ?? 900;
     request['max_tokens'] =
@@ -660,12 +690,34 @@ class TranslationApiClient {
       final budget = request['max_tokens'] as int;
       if (!truncated ||
           kind == 'semanticReview' ||
+          kind == 'semanticSourceAnalysis' ||
+          kind == 'semanticDraftAnalysis' ||
+          kind == 'semanticReviewRepair' ||
+          kind == 'semanticEquivalence' ||
           kind == 'semanticVerification' ||
           attempt == 1 ||
           budget >= cap) {
         return response;
       }
-      request['max_tokens'] = min(cap, budget * 2);
+      // Reasoning-only truncation needs room for visible output, not just a
+      // second tiny allocation. Keep one retry and the user's hard ceiling.
+      final message = choices.first['message'];
+      final content = message is Map ? message['content'] : null;
+      final usage = body is Map ? body['usage'] : null;
+      final details = usage is Map ? usage['completion_tokens_details'] : null;
+      final reasoningTokens = details is Map
+          ? details['reasoning_tokens']
+          : null;
+      final reasoningOnly =
+          (content == null || content == '') &&
+          ((message is Map &&
+                  message['reasoning_content'] is String &&
+                  (message['reasoning_content'] as String).isNotEmpty) ||
+              (reasoningTokens is int && reasoningTokens > 0));
+      request['max_tokens'] = min(
+        cap,
+        max(budget * 2, reasoningOnly ? 4096 : 0),
+      );
     }
   }
 
@@ -753,6 +805,7 @@ class TranslationApiClient {
       throw TranslationParseException(
         'Translation API response is not a JSON object '
         '(${responseData.runtimeType}).',
+        failure: TranslationResponseFailure.envelope,
       );
     }
     // Validate the choices envelope structurally before indexing: `[]?[0]`
@@ -765,6 +818,7 @@ class TranslationApiClient {
       throw TranslationParseException(
         'Translation API response has no usable choices '
         '(${rawChoices.runtimeType}).',
+        failure: TranslationResponseFailure.missingChoices,
       );
     }
     final dynamic firstChoice = rawChoices.first;
@@ -772,6 +826,7 @@ class TranslationApiClient {
       throw TranslationParseException(
         'Translation API response choice is not a JSON object '
         '(${firstChoice.runtimeType}).',
+        failure: TranslationResponseFailure.envelope,
       );
     }
     // A complete JSON/HTML envelope can still contain incomplete prose.
@@ -779,17 +834,24 @@ class TranslationApiClient {
     // validates, caches, or displays the content. Older compatible gateways
     // sometimes omit this field; retain their existing behavior.
     final dynamic finishReason = firstChoice['finish_reason'];
-    if (finishReason != null && finishReason != 'stop') {
+    if (finishReason != null &&
+        finishReason != 'stop' &&
+        finishReason != 'eos_token') {
       throw TranslationParseException(
-        'Translation API response did not finish normally '
-        '(finish_reason=$finishReason). '
+        'finish_reason=${_safeFinishReason(finishReason)}: Translation API response did not finish normally. '
         '${finishReason == 'length' ? 'Increase the output token limit or reduce reasoning effort in settings.' : ''}',
+        failure: finishReason == 'length'
+            ? TranslationResponseFailure.incomplete
+            : finishReason == 'content_filter'
+            ? TranslationResponseFailure.blocked
+            : TranslationResponseFailure.unsupportedFinish,
       );
     }
     final dynamic rawMessage = firstChoice['message'];
     if (rawMessage is! Map<String, dynamic>) {
       throw const TranslationParseException(
         'Translation API response message is not a JSON object.',
+        failure: TranslationResponseFailure.missingMessage,
       );
     }
     final dynamic rawContent = rawMessage['content'];
@@ -814,10 +876,22 @@ class TranslationApiClient {
     if (requireNonEmpty && visibleContent.isEmpty) {
       throw const TranslationParseException(
         'Translation API response has no visible message content.',
+        failure: TranslationResponseFailure.emptyContent,
       );
     }
     return visibleContent;
   }
+
+  static String _safeFinishReason(dynamic reason) => switch (reason) {
+    null => 'omitted',
+    'stop' ||
+    'eos_token' ||
+    'length' ||
+    'content_filter' ||
+    'tool_calls' ||
+    'function_call' => reason as String,
+    _ => 'unsupported',
+  };
 
   /// A trailing reasoning block needs a complete closing tag at the end.
   static bool _endsWithThinkClose(String content) {
@@ -1250,6 +1324,7 @@ class TranslationApiClient {
         ? error.response?.statusCode
         : null;
     if (statusCode == 400 ||
+        statusCode == 402 ||
         statusCode == 401 ||
         statusCode == 404 ||
         statusCode == 407) {
@@ -1278,6 +1353,10 @@ class TranslationApiClient {
         return 'HTTP 400 from $host. The provider rejected the request itself (often a context limit or content filter); it will not succeed by retrying. Try a smaller chunk size or check the request content.';
       case 401:
         return strings.httpAuthError(host);
+      case 402:
+        return config.uiLanguage == UiLanguage.chinese
+            ? 'HTTP 402：$host 账户余额或可用额度不足。请检查计费额度后重试；已完成内容保留在缓存中。'
+            : 'HTTP 402 from $host: insufficient balance or available credit. Check billing before retrying; completed work remains cached.';
       case 403:
         return strings.httpForbiddenError(host, config.model);
       case 404:

@@ -780,7 +780,12 @@ class _EpubTranslationStrategy {
           '${EpubChapterTranslator._truncateUtf16(detail, 240)}';
     }
     if (error is TranslationParseException) {
-      return 'Invalid translation response format';
+      final detail = SensitiveText.redact(
+        error.message,
+        configuredApiKey: config.apiKey,
+      ).replaceAll(RegExp(r'\s+'), ' ').trim();
+      return 'Invalid translation response format [${error.failure.name}]: '
+          '${EpubChapterTranslator._truncateUtf16(detail, 240)}';
     }
     if (TranslationApiClient.isRequestTimeout(error)) {
       return 'Request timed out (${(error as DioException).type.name})';
@@ -2344,6 +2349,13 @@ class _EpubTranslationStrategy {
         'Resolve occupations, official titles and ambiguous word senses from the person and situation established in the source context, not just the most common dictionary sense. '
         'A discourse or motion particle is not automatically a compass direction; require explicit geographic evidence. '
         'Preserve ambiguity where context is insufficient. Reuse established translations for every recurring named entity, including secondary characters and shortened forms. '
+        'If the source explicitly names a person, preserve that name rather than replacing it with an anonymous pronoun. '
+        'Track each pronoun to its referent, preserving singular/plural and who is absent, present or acting. '
+        'Preserve the scope of every negation, comparison, qualifier and evaluative clause; nested negatives must not reverse the claim. '
+        'An attempt, movement toward a goal or participation is not a successful outcome unless the source states success; check the next sentence before asserting a result. '
+        'Interpret domain roles and rule-following expressions in their surrounding situation. '
+        'Read consecutive text nodes as one sentence before translating. Allocate each meaning once across inline tags; do not duplicate an adverb, time abbreviation or punctuation already rendered in a neighboring node. '
+        'Keep the markup and emphasis, and do not leave ordinary source-language words between translated words. '
         'Perform this fidelity check silently; return only the requested translation format.';
   }
 }

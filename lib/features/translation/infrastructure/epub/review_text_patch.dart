@@ -4,11 +4,7 @@ import 'package:html/parser.dart' as html;
 /// Apply small, unambiguous text edits without allowing model-generated markup.
 /// Attributes, inline formatting and protected content are never edited.
 class ReviewTextPatch {
-  static String apply(String draft, List edits) {
-    if (edits.isEmpty || edits.length > 24) {
-      throw const FormatException('Invalid review edit count.');
-    }
-    final document = html.parseFragment(draft);
+  static List<dom.Text> _editableNodes(dom.Node document) {
     final nodes = <dom.Text>[];
     void visit(dom.Node node) {
       if (node is dom.Element &&
@@ -32,6 +28,26 @@ class ReviewTextPatch {
     }
 
     visit(document);
+    return nodes;
+  }
+
+  /// Stable request-local node IDs permit repeated words without returning
+  /// model-authored HTML. They never address attributes or protected content.
+  static List<Map<String, String>> segments(String draft) {
+    final nodes = _editableNodes(html.parseFragment(draft));
+    return [
+      for (var i = 0; i < nodes.length; i++)
+        if (nodes[i].data.trim().isNotEmpty)
+          {'node': 'n$i', 'text': nodes[i].data},
+    ];
+  }
+
+  static String apply(String draft, List edits) {
+    if (edits.isEmpty || edits.length > 24) {
+      throw const FormatException('Invalid review edit count.');
+    }
+    final document = html.parseFragment(draft);
+    final nodes = _editableNodes(document);
     final changes = <dom.Text, List<({int start, int end, String value})>>{};
     for (final edit in edits) {
       if (edit is! Map ||
@@ -41,8 +57,20 @@ class ReviewTextPatch {
         throw const FormatException('Invalid review edit.');
       }
       final before = edit['before'] as String;
+      Iterable<dom.Text> scope = nodes;
+      if (edit.containsKey('node')) {
+        final id = edit['node'];
+        if (id is! String || !RegExp(r'^n(?:0|[1-9][0-9]*)$').hasMatch(id)) {
+          throw const FormatException('Invalid review node.');
+        }
+        final index = int.tryParse(id.substring(1));
+        if (index == null || index >= nodes.length) {
+          throw const FormatException('Missing review node.');
+        }
+        scope = [nodes[index]];
+      }
       final matches = <({dom.Text node, int at})>[];
-      for (final node in nodes) {
+      for (final node in scope) {
         for (
           var at = node.data.indexOf(before);
           at >= 0;

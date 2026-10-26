@@ -527,8 +527,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage>
                     ),
                     Text(
                       strings.isChinese
-                          ? '自动为已适配模型选择较低强度；手动选项需要接口支持。'
-                          : 'Automatic uses low effort for supported models; manual options require API support.',
+                          ? '自动为已验证接口选择较低强度或关闭推理；手动选项需要接口支持。'
+                          : 'Automatic uses low effort or disables thinking for verified APIs; manual options require API support.',
                     ),
                     _SettingsSlider(
                       select: (c) => c.maxOutputTokens.toDouble(),

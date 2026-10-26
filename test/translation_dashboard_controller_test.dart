@@ -225,6 +225,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
   }
 
   int translateCount = 0;
+  TranslationConfig? lastTranslationConfig;
 
   @override
   Future<TranslationRunResult> translateChapters({
@@ -238,6 +239,7 @@ class _SuccessfulInspectionRepository implements TranslationRepository {
     void Function(String chapterPath)? onChapterSourcesReleased,
   }) async {
     translateCount += 1;
+    lastTranslationConfig = config;
     lastConfirmedStyleProfile = confirmedStyleProfile;
     final String outputPath =
         '$outputDirectory\\${inputPath.split(RegExp(r'[\\/]')).last.replaceAll('.epub', '')}_translated.epub';
@@ -809,6 +811,41 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 }
 
 void main() {
+  test(
+    'verified correction settings reach the real translation handoff',
+    () async {
+      final repository = _SuccessfulInspectionRepository(blockCount: 1);
+      final controller = TranslationDashboardController(
+        repository: repository,
+        historyStore: _MemoryJobHistoryStore(),
+      );
+      addTearDown(controller.dispose);
+      final enabled = TranslationConfig.defaults().copyWith(
+        styleProfileEnabled: false,
+        semanticQualityCheck: true,
+        autoApplyVerifiedCorrections: true,
+        retryIncompleteReviews: true,
+        semanticReviewScope: SemanticReviewScope.all,
+        maxSemanticReviewRequests: 24,
+        maxSemanticReviewTokens: 200000,
+      );
+      controller.syncSettings(enabled);
+      controller.setInputPath('book.epub');
+      await controller.startInspection();
+      await controller.startTranslation();
+      final actual = repository.lastTranslationConfig!;
+      expect(actual.semanticQualityCheck, isTrue);
+      expect(actual.autoApplyVerifiedCorrections, isTrue);
+      expect(actual.retryIncompleteReviews, isTrue);
+      expect(actual.semanticReviewScope, SemanticReviewScope.all);
+      expect(actual.maxSemanticReviewRequests, 24);
+      expect(actual.maxSemanticReviewTokens, 200000);
+      controller.syncSettings(
+        enabled.copyWith(autoApplyVerifiedCorrections: false),
+      );
+      expect(controller.state.config.autoApplyVerifiedCorrections, isFalse);
+    },
+  );
   test(
     'P1-6 queued restart inference stays local before another instance starts it',
     () async {

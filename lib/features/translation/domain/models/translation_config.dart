@@ -113,6 +113,14 @@ class TranslationConfig {
       ? (isGlm53 ? 'low' : null)
       : reasoningEffort.name;
 
+  /// Verified provider/model capability, not a general OpenAI-compatible flag.
+  /// This alias otherwise spends its entire small translation/memory budget on
+  /// hidden reasoning. Explicit user effort choices retain provider behavior.
+  bool get automaticThinkingDisabled =>
+      reasoningEffort == ModelReasoningEffort.automatic &&
+      Uri.tryParse(apiBaseUrl.trim())?.host.toLowerCase() == 'api.edgefn.net' &&
+      model.trim().toLowerCase() == 'deepseek-v4-flash-0731';
+
   /// Persistence separates the proxy endpoint from its entire authentication
   /// component. Keep the combined URL in memory for the existing UI/client.
   /// Split textually so even a malformed URL cannot leak credentials to JSON.

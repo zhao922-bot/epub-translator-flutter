@@ -832,6 +832,7 @@ class TranslationDashboardController
       reasoningEffort: settingsConfig.reasoningEffort,
       maxOutputTokens: settingsConfig.maxOutputTokens,
       semanticQualityCheck: settingsConfig.semanticQualityCheck,
+      autoApplyVerifiedCorrections: settingsConfig.autoApplyVerifiedCorrections,
       semanticReviewScope: settingsConfig.semanticReviewScope,
       maxSemanticReviewTokens: settingsConfig.maxSemanticReviewTokens,
       maxSemanticReviewRequests: settingsConfig.maxSemanticReviewRequests,

@@ -87,7 +87,7 @@ void main() {
       final f = fixture.Fixture();
       await f.init();
       addTearDown(f.dispose);
-    final cache = _Cache(Directory('${f.dir.path}/guard-cache'));
+      final cache = _Cache(Directory('${f.dir.path}/guard-cache'));
       final api = _Api();
       final config = f.config.copyWith(
         semanticQualityCheck: false,
@@ -121,7 +121,7 @@ void main() {
       final first = await run();
       expect(first.job.status, TranslationJobStatus.completedWithWarnings);
       expect(first.job.degradedBlockCount, 1);
-    final output = first.job.outputPath;
+      final output = first.job.outputPath;
       final report =
           jsonDecode(await File('$output.diagnostics.json').readAsString())
               as Map;
@@ -129,6 +129,9 @@ void main() {
       final record = (report['degradedBlocks'] as List).single as Map;
       expect(record['block'], 'story.xhtml:p-2');
       expect(record['fallback'], 'source');
+      expect(report['version'], 2);
+      expect(record['processingFallback'], 'source');
+      expect(record['finalContentState'], 'sourceRetained');
       expect(record['reason'], contains('Non-translation'));
       expect(
         logs.any((l) => l.contains('Non-translation') && l.contains('保留原文')),

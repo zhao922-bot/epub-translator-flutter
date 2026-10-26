@@ -11,6 +11,26 @@ import 'real_book_fix_regression_test.dart' as fixture;
 import 'translation_quality_optimization_test.dart' as helpers;
 
 void main() {
+  test(
+    'two contextual mentions cover excerpt names without counting starters',
+    () {
+      final chapter = const EpubHtmlExtractor().inspectChapterBytes(
+        chapterPath: 'short.xhtml',
+        bytes: utf8.encode(
+          '<html><body>'
+          '<p>Wonderful things happened to Rowan in the village.</p>'
+          '<p>Wonderful news reached Rowan from a friend.</p>'
+          '</body></html>',
+        ),
+      );
+      final names = (BookSourceIndex.build([chapter])['recurringNames'] as List)
+          .cast<Map>()
+          .map((e) => e['source'])
+          .toSet();
+      expect(names, contains('Rowan'));
+      expect(names, isNot(contains('Wonderful')));
+    },
+  );
   test('titled secondary names survive a crowded source index', () {
     final words = [
       for (var i = 0; i < 40; i++)
@@ -416,6 +436,18 @@ void main() {
           jsonDecode(File(result.qualityReportPath!).readAsStringSync()) as Map;
       expect(report['automaticCorrections'], isEmpty);
       expect(report['corrections'], hasLength(2));
+      final expectedFailure = switch (outcome) {
+        'reject' => 'rejectedOrUncertain',
+        'uncertain' => 'lowConfidence',
+        'fabricatedEvidence' => 'unsupportedEvidence',
+        _ => 'missingOrDuplicateDecision',
+      };
+      expect(
+        (report['corrections'] as List).every(
+          (s) => s['verificationFailure'] == expectedFailure,
+        ),
+        isTrue,
+      );
       expect(helpers.story(result.job.outputPath), contains('喜极而泣'));
       final warm = await helpers.run(
         f,
@@ -426,7 +458,9 @@ void main() {
       expect(warm.apiUsage['requests'], 0);
       expect(
         (restored['corrections'] as List).every(
-          (s) => s['autoApplication'] == 'notVerified',
+          (s) =>
+              s['autoApplication'] == 'notVerified' &&
+              s['verificationFailure'] == expectedFailure,
         ),
         isTrue,
       );
@@ -436,7 +470,7 @@ void main() {
     'verification shares the review budget; exhaustion leaves proposals intact',
     () async {
       final f = fixture.Fixture();
-      await f.init(reviewLimit: 1);
+      await f.init(reviewLimit: 3);
       addTearDown(f.dispose);
       final r = await helpers.run(
         f,
@@ -444,8 +478,9 @@ void main() {
       );
       final report =
           jsonDecode(File(r.qualityReportPath!).readAsStringSync()) as Map;
-      expect(report['requests'], 1);
+      expect(report['requests'], 3);
       expect(report['automaticCorrections'], isEmpty);
+      expect(report['corrections'], hasLength(2));
       expect(
         (report['corrections'] as List).every(
           (s) => s['autoApplication'] == 'verificationBudgetLimit',

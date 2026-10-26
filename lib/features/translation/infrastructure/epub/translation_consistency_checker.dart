@@ -37,6 +37,28 @@ class TranslationConsistencyChecker {
       r'chinese|中文|汉语|漢語|^zh',
       caseSensitive: false,
     ).hasMatch(config.targetLanguage);
+    // Signals only: the reviewer must distinguish accidental duplication
+    // from deliberate repetition using the complete source sentence.
+    if (chinese &&
+        RegExp(r'([\u4e00-\u9fff]{2,6})\1').hasMatch(target) &&
+        !RegExp(r'\b(\w+)\s+\1\b', caseSensitive: false).hasMatch(source)) {
+      add(
+        'repetition',
+        t(
+          '译文可能出现相邻重复短语，请结合完整原句确认。',
+          'Check an adjacent repeated phrase against the full source sentence.',
+        ),
+      );
+    }
+    if (RegExp(r'([。！？；])\s*\1').hasMatch(target)) {
+      add(
+        'punctuation',
+        t(
+          '请核对跨标签的重复标点。',
+          'Check duplicate sentence punctuation across inline tags.',
+        ),
+      );
+    }
     if (chinese) {
       if (RegExp(
             r'\bdollars?\b|\bUSD\b|\$',
@@ -191,6 +213,18 @@ class TranslationConsistencyChecker {
     final source = text(sourceHtml);
     var score = findings.length * 10;
     if (RegExp(
+      r'\b(he|him|his|she|her|they|them|their|tried|trying|attempted|sought|aimed|managed|manager|coach|senator|observer)\b',
+      caseSensitive: false,
+    ).hasMatch(source)) {
+      score += 2;
+    }
+    if (RegExp(
+      r'<(?:span|i|em|b|strong)\b',
+      caseSensitive: false,
+    ).hasMatch(sourceHtml)) {
+      score += 1;
+    }
+    if (RegExp(
       r'\b(not|never|neither|without|unless|alas|but|however|yet|instead|nickname|called)\b|\b\w+n[’\x27]t\b',
       caseSensitive: false,
     ).hasMatch(source)) {
@@ -238,7 +272,15 @@ class TranslationConsistencyChecker {
       final value = num.tryParse(
         match[0]!.replaceAll(',', '').replaceAll('−', '-'),
       );
-      if (value != null && value.isFinite) result.add(normalized(value));
+      if (value != null && value.isFinite) {
+        final tail = text.substring(match.end);
+        final multiplier = !chinese
+            ? _englishDurationMultiplier(tail)
+            : RegExp(r'^\s*(?:个|個)?世[纪紀]').hasMatch(tail)
+            ? 100
+            : 1;
+        result.add(normalized(value * multiplier));
+      }
     }
     if (!chinese) result.addAll(_englishNumbers(text).map(normalized));
     if (chinese) {
@@ -348,12 +390,23 @@ class TranslationConsistencyChecker {
         }
       }
       final tail = text.substring(match.end);
-      final centuries = RegExp(
-        r'^\s+centur(?:y|ies)\b',
-        caseSensitive: false,
-      ).hasMatch(tail);
-      yield (total + section) * (centuries ? 100 : 1);
+      yield (total + section) * _englishDurationMultiplier(tail);
     }
+  }
+
+  static int _englishDurationMultiplier(String tail) {
+    if (RegExp(
+      r'^\s+decades?\b(?![-‑–])',
+      caseSensitive: false,
+    ).hasMatch(tail)) {
+      return 10;
+    }
+    return RegExp(
+          r'^\s+centur(?:y|ies)\b(?![-‑–])',
+          caseSensitive: false,
+        ).hasMatch(tail)
+        ? 100
+        : 1;
   }
 
   static num? _chineseNumber(String text) {
