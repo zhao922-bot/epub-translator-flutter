@@ -476,21 +476,24 @@ void main() {
             );
             XmlDocument.parse(markup);
             final doc = hp.parse(markup);
+            final translatedMarker = epub3
+                ? '[data-translation]'
+                : '.epub-translator-translation';
             expect(
-              doc.querySelector('p:not([data-translation]) a')!.text,
+              doc.querySelector('p:not($translatedMarker) a')!.text,
               bilingual && selectedToc ? 'First chapter' : '第一章',
               reason: markup,
             );
             if (bilingual && selectedToc) {
-              expect(doc.querySelector('p[data-translation] a')!.text, '第一章');
+              expect(doc.querySelector('p$translatedMarker a')!.text, '第一章');
               expect(
                 doc
-                    .querySelector('p:not([data-translation]) a')!
+                    .querySelector('p:not($translatedMarker) a')!
                     .attributes['lang'],
                 isNot('zh-CN'),
               );
             } else {
-              expect(doc.querySelector('p[data-translation] a'), isNull);
+              expect(doc.querySelector('p$translatedMarker a'), isNull);
             }
           },
         );

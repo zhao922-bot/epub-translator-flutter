@@ -29,6 +29,8 @@ class Fixture {
   String reviewCategory = 'emotion', reviewConfidence = 'high';
   String? reviewQuoteOverride;
   bool omitUsage = false, reviewUnchanged = false;
+  final Map<String, int> failureStatusByKind = {};
+  final Set<String> truncatedKinds = {};
   List<dynamic> Function(List<Map<String, Object?>>)? reviewItemsOverride;
   List<dynamic> Function(List<Map<String, Object?>>)?
   sourceAnalysisItemsOverride;
@@ -59,6 +61,20 @@ class Fixture {
         payload = jsonDecode(user);
       } on FormatException {
         payload = null;
+      }
+      final failureStatus = payload is Map
+          ? failureStatusByKind[payload['kind']]
+          : null;
+      if (failureStatus != null) {
+        request.response.statusCode = failureStatus;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({
+            'error': {'message': 'Fixture request failed'},
+          }),
+        );
+        await request.response.close();
+        return;
       }
       var finish = 'stop';
       String content;
@@ -212,6 +228,9 @@ class Fixture {
         throw StateError('Unexpected test request shape');
       }
       request.response.headers.contentType = ContentType.json;
+      if (payload is Map && truncatedKinds.contains(payload['kind'])) {
+        finish = 'length';
+      }
       request.response.write(
         jsonEncode({
           'choices': [

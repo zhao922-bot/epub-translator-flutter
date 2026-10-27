@@ -805,6 +805,7 @@ class EpubIsolateWorker {
     String Function(String outputPath, String tempPath)? lockedMessage,
     String? expectedSourceFingerprint,
     String? translatedTitle,
+    Map<String, String>? outputHtmlHashes,
   }) async {
     // Reserve a unique path in the parent before spawning. A killed worker
     // cannot report its path or run finally; parent ownership enables cleanup.
@@ -812,7 +813,7 @@ class EpubIsolateWorker {
         '$outputFilePath.tmp.${DateTime.now().microsecondsSinceEpoch}';
     final File tempFile = File(tempPath);
     try {
-      await prepareWithProgress(
+      final hashes = await prepareWithProgress(
         operation: _exportOperation(
           inputPath,
           outputFilePath,
@@ -824,6 +825,7 @@ class EpubIsolateWorker {
           expectedSourceFingerprint,
           translatedTitle,
           sourceLanguageTags,
+          outputHtmlHashes != null,
         ),
         isCancelled: () =>
             (isCancelled?.call() ?? false) ||
@@ -837,13 +839,15 @@ class EpubIsolateWorker {
         await _deleteQuietly(tempFile);
         return false;
       }
-      return await commitTempFile(
+      final committed = await commitTempFile(
         tempFile,
         File(outputFilePath),
         shouldCommit: () =>
             !(isCancelled?.call() ?? false) && (shouldCommit?.call() ?? true),
         lockedMessage: lockedMessage,
       );
+      if (committed) outputHtmlHashes?.addAll(hashes);
+      return committed;
     } catch (error) {
       // A failed commit keeps its temp file by design (see
       // OutputFileRecoveryException): deleting it here would destroy the
@@ -860,7 +864,7 @@ class EpubIsolateWorker {
     }
   }
 
-  static String Function(void Function(int, int)) _exportOperation(
+  static Map<String, String> Function(void Function(int, int)) _exportOperation(
     String inputPath,
     String outputFilePath,
     String tempPath,
@@ -871,19 +875,24 @@ class EpubIsolateWorker {
     String? fingerprint,
     String? title,
     List<String>? sourceLanguages,
-  ) =>
-      (_) => _writeTranslatedEpubToTempSync(
-        inputPath: inputPath,
-        outputFilePath: outputFilePath,
-        translatedHtmlByPath: html,
-        navigationLabelsByPath: labels,
-        navigationLanguageTag: language,
-        bilingual: bilingual,
-        expectedSourceFingerprint: fingerprint,
-        translatedTitle: title,
-        sourceLanguageTags: sourceLanguages,
-        ownedTempPath: tempPath,
-      );
+    bool collectHashes,
+  ) => (_) {
+    final hashes = <String, String>{};
+    _writeTranslatedEpubToTempSync(
+      inputPath: inputPath,
+      outputFilePath: outputFilePath,
+      translatedHtmlByPath: html,
+      navigationLabelsByPath: labels,
+      navigationLanguageTag: language,
+      bilingual: bilingual,
+      expectedSourceFingerprint: fingerprint,
+      translatedTitle: title,
+      sourceLanguageTags: sourceLanguages,
+      ownedTempPath: tempPath,
+      outputHtmlHashes: collectHashes ? hashes : null,
+    );
+    return hashes;
+  };
 
   /// Test seam: write only the temp payload without committing.
   static Future<String> writeTranslatedEpubToTempForTest({
@@ -1048,6 +1057,30 @@ class EpubIsolateWorker {
     final Map<String, String> replacements = <String, String>{
       opfPath: opf.toXmlString(),
     };
+    if (opf.rootElement.getAttribute('version') == '2.0') {
+      // XHTML 1.1 in EPUB 2 does not allow HTML5 data-* attributes. Keep the
+      // generated bilingual marker as a class, after TOC synchronization, so
+      // styles and later review exports still identify translated blocks.
+      for (final entry in renderedHtmlByPath.entries) {
+        if (!entry.value.contains('data-translation=')) continue;
+        final document = xml.XmlDocument.parse(entry.value);
+        var changed = false;
+        for (final element
+            in document.descendants.whereType<xml.XmlElement>()) {
+          if (element.getAttribute('data-translation') != 'true') continue;
+          element.removeAttribute('data-translation');
+          final classes =
+              (element.getAttribute('class') ?? '')
+                  .split(RegExp(r'\s+'))
+                  .where((c) => c.isNotEmpty)
+                  .toSet()
+                ..add('epub-translator-translation');
+          element.setAttribute('class', classes.join(' '));
+          changed = true;
+        }
+        if (changed) replacements[entry.key] = document.toXmlString();
+      }
+    }
     for (final item in opf.descendants.whereType<xml.XmlElement>().where(
       (element) =>
           _isOpfManifestChild(element, 'item') &&
@@ -2273,6 +2306,7 @@ class EpubIsolateWorker {
     String? expectedSourceFingerprint,
     String? translatedTitle,
     String? ownedTempPath,
+    Map<String, String>? outputHtmlHashes,
   }) {
     // Keep source payloads compressed and share their ArchiveFile objects.
     // Only navigation metadata is inflated; output goes straight to disk.
@@ -2396,6 +2430,11 @@ class EpubIsolateWorker {
       final String? replacement = replacements[sourceFile.name];
       if (replacement != null) {
         final List<int> utf8Bytes = utf8.encode(replacement);
+        if (outputHtmlHashes != null) {
+          outputHtmlHashes[sourceFile.name] = sha256
+              .convert(utf8Bytes)
+              .toString();
+        }
         repacked.add(
           ArchiveFile.bytes(sourceFile.name, utf8Bytes)
             ..compression = sourceFile.compression

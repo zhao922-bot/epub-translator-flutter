@@ -625,6 +625,24 @@ class TranslationApiClient {
     }
   }
 
+  /// The reservation and transport must agree on the final response allowance.
+  static int effectiveOutputTokens({
+    required int requested,
+    required int maximum,
+    required bool reasoningModel,
+  }) => (reasoningModel ? max(4096, requested) : requested).clamp(
+    1,
+    maximum.clamp(512, 32768),
+  );
+
+  static int outputTokensFor(TranslationConfig config, int requested) =>
+      effectiveOutputTokens(
+        requested: requested,
+        maximum: config.maxOutputTokens,
+        reasoningModel:
+            config.isGlm53 || config.effectiveReasoningEffort != null,
+      );
+
   Future<Response<dynamic>> postChatCompletions({
     required Dio dio,
     required Map<String, dynamic> data,
@@ -649,11 +667,11 @@ class TranslationApiClient {
     }
     if (reasoning != null) request['reasoning_effort'] = reasoning;
     final requested = request['max_tokens'] as int? ?? 900;
-    request['max_tokens'] =
-        (dio.options.extra['reasoningModel'] == true
-                ? max(4096, requested)
-                : requested)
-            .clamp(1, cap);
+    request['max_tokens'] = effectiveOutputTokens(
+      requested: requested,
+      maximum: cap,
+      reasoningModel: dio.options.extra['reasoningModel'] == true,
+    );
     // A length-truncated answer cannot be cached as complete. Retry at most
     // once with a genuinely larger budget, never repeat an identical paid call.
     var kind = 'translation';

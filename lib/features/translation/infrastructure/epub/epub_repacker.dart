@@ -98,7 +98,8 @@ body.epub-translator-cjk .epub-translator-anchor-marker {
  * readers can tell translation apart from source without overriding the
  * book's own typography. 双语模式：译文段落跟在原文后，用细竖线做低调区分，
  * 不覆盖书籍原有排版。 */
-body.epub-translator-cjk [data-translation="true"] {
+body.epub-translator-cjk [data-translation="true"],
+body.epub-translator-cjk .epub-translator-translation {
   border-left: 0.18em solid #8a8a8a;
   padding-left: 0.6em;
   margin-top: 0.5em;
@@ -167,6 +168,7 @@ body.epub-translator-cjk [data-translation="true"] {
     );
     throwIfCancelled();
     reviewSnapshots?.addAll(prepared.review);
+    final outputHashes = reviewSnapshots == null ? null : <String, String>{};
     final bool committed;
     try {
       committed = await EpubIsolateWorker.writeTranslatedEpub(
@@ -178,6 +180,7 @@ body.epub-translator-cjk [data-translation="true"] {
         bilingual: config.bilingual,
         expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
         translatedTitle: translatedTitle,
+        outputHtmlHashes: outputHashes,
         shouldCommit: () =>
             !(cancelToken?.isCancelled == true ||
                 (isCancelled?.call() ?? false)),
@@ -196,6 +199,15 @@ body.epub-translator-cjk [data-translation="true"] {
     }
     if (!committed) {
       throw const TranslationCancelledException();
+    }
+    // Packaging may normalize EPUB2 bilingual markers or navigation. Bind
+    // review snapshots to those final bytes, without rereading the archive.
+    for (final entry
+        in outputHashes?.entries ?? const <MapEntry<String, String>>[]) {
+      final snapshot = reviewSnapshots?[entry.key];
+      if (snapshot is Map<String, Object?>) {
+        snapshot['baseHtmlSha256'] = entry.value;
+      }
     }
     // Cancellation after commit must not report visible output as aborted.
   }
@@ -541,7 +553,12 @@ body.epub-translator-cjk [data-translation="true"] {
       if (node is dom.Element &&
           EpubHtmlExtractor.tagLocalName(node) == sourceTag) {
         final dom.Element translation = dom.Element.tag(
-          _qualifiedTagName(source, sourceTag == 'summary' ? 'span' : 'div'),
+          // EPUB 2 captions accept inline content only. A span is also valid
+          // in EPUB 3 and retains the same translation language/style marks.
+          _qualifiedTagName(
+            source,
+            sourceTag == 'summary' || sourceTag == 'caption' ? 'span' : 'div',
+          ),
         );
         translation.attributes.addAll(node.attributes);
         translation.attributes.remove('value');
@@ -1298,8 +1315,6 @@ body.epub-translator-cjk [data-translation="true"] {
     for (final chapter in chapters) {
       if (!chapter.includeInTranslation) continue;
       final chapterPath = path.posix.normalize(chapter.path);
-      final chapterLabel = _navigationLabelForChapter(chapter);
-      if (chapterLabel != null) labels[chapterPath] = chapterLabel;
       // Translation releases sourceHtml after caching. Recreate the same
       // extraction boundaries from the retained chapter document for export.
       // Block fragments lose document context: keep actual source elements
@@ -1318,6 +1333,16 @@ body.epub-translator-cjk [data-translation="true"] {
         elementsById['${epubLocalName(sourceElements[k])}-${k + 1}'] =
             sourceElements[k];
       }
+      final opening = _openingHeadingGroup(chapter, elementsById);
+      final openingId = opening.isEmpty ? null : opening.first.id;
+      final chapterLabel = _navigationLabelForHeadingGroup(opening);
+      if (chapterLabel != null) labels[chapterPath] = chapterLabel;
+      // Adjacent h1/h2 headings can also name independent sections. A
+      // fragment gets the combined title only with an actual subtitle signal.
+      final firstHeading = elementsById[openingId];
+      final hasSubtitle = opening
+          .skip(1)
+          .any((b) => _isSubtitleHeading(b, elementsById[b.id], firstHeading));
       for (final block in chapter.blocks) {
         if (block.translatedHtml?.trim().isNotEmpty != true) continue;
         final sourceElement = elementsById[block.id];
@@ -1344,10 +1369,17 @@ body.epub-translator-cjk [data-translation="true"] {
         // Only pair structurally matching headings; preserve unknown labels.
         if (headings.length != translatedHeadings.length) continue;
         for (var i = 0; i < headings.length; i++) {
-          final label = translatedHeadings[i].text
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim();
+          var label = navigationLabelText(translatedHeadings[i]);
           if (label.isEmpty) continue;
+          // The first heading's IDs, preceding anchors and ancestor IDs all
+          // address the opening title group. Later/subtitle anchors still
+          // address their own heading rather than the whole chapter title.
+          if (block.id == openingId &&
+              i == 0 &&
+              hasSubtitle &&
+              chapterLabel != null) {
+            label = chapterLabel;
+          }
           final dom.Element heading = headings[i];
           for (final element in [
             heading,
@@ -1430,40 +1462,103 @@ body.epub-translator-cjk [data-translation="true"] {
     return index < headings.length ? headings[index] : null;
   }
 
-  bool _isHeadingElement(dom.Element element) {
-    final String tag = epubLocalName(element);
+  bool _isHeadingElement(dom.Element element) =>
+      _isHeadingTag(epubLocalName(element));
+
+  bool _isHeadingTag(String tag) {
     return tag.length == 2 &&
         tag.codeUnitAt(0) == 0x68 && // 'h'
         tag.codeUnitAt(1) >= 0x31 && // '1'
         tag.codeUnitAt(1) <= 0x36; // '6'
   }
 
-  String? _navigationLabelForChapter(InspectedChapter chapter) {
+  bool _isSubtitleHeading(
+    ExtractedBlock block,
+    dom.Element? element,
+    dom.Element? firstHeading,
+  ) {
+    final text = element == null
+        ? navigationLabelText(
+            XhtmlHtmlCompatibility.parseFragment(block.sourceHtml),
+          )
+        : navigationLabelText(element);
+    final roles = (element?.attributes['role'] ?? '').split(RegExp(r'\s+'));
+    final classes = element?.classes ?? <String>{};
+    final parent = element?.parent;
+    return RegExp(r'^[（(].*[）)]$', dotAll: true).hasMatch(text) ||
+        (element != null &&
+            EpubSemantics.typesOf(element).contains('subtitle')) ||
+        roles.contains('doc-subtitle') ||
+        classes.any(
+          (c) => RegExp(
+            r'(^|[-_])sub[-_]?title($|[-_])',
+            caseSensitive: false,
+          ).hasMatch(c),
+        ) ||
+        (parent != null &&
+            identical(parent, firstHeading?.parent) &&
+            epubLocalName(parent) == 'hgroup');
+  }
+
+  List<ExtractedBlock> _openingHeadingGroup(
+    InspectedChapter chapter,
+    Map<String, dom.Element> elementsById,
+  ) {
     // Only the opening contiguous heading group describes this chapter.
     // A subtitle may be a third heading; a later subsection does not belong
-    // in the chapter label merely because it is the second h1/h2/h3.
+    // in the chapter label merely because it is the next heading.
     final opening = <ExtractedBlock>[];
+    var foundSubtitle = false;
+    dom.Element? containerOf(dom.Element? element) {
+      var parent = element?.parent;
+      while (parent != null) {
+        if (const {
+          'section',
+          'article',
+          'hgroup',
+        }.contains(epubLocalName(parent))) {
+          return parent;
+        }
+        parent = parent.parent;
+      }
+      return null;
+    }
+
     for (final block in chapter.blocks) {
-      if (!RegExp(r'^h[1-3]$').hasMatch(block.tagName)) {
+      if (!_isHeadingTag(block.tagName)) {
         if (opening.isNotEmpty) break;
         continue;
       }
+      if (opening.isNotEmpty) {
+        final firstElement = elementsById[opening.first.id];
+        final element = elementsById[block.id];
+        if (firstElement != null &&
+            element != null &&
+            !identical(containerOf(firstElement), containerOf(element))) {
+          break;
+        }
+        final subtitle = _isSubtitleHeading(block, element, firstElement);
+        // A subtitle does not make every following heading part of the title.
+        // This boundary also applies when no body paragraph separates sections.
+        if (foundSubtitle && !subtitle) break;
+        foundSubtitle = foundSubtitle || subtitle;
+      }
       opening.add(block);
     }
+    return opening;
+  }
+
+  String? _navigationLabelForHeadingGroup(List<ExtractedBlock> opening) {
     final List<String> headings = opening
         .where(
           (ExtractedBlock block) =>
               block.translatedHtml?.trim().isNotEmpty == true &&
-              RegExp(r'^h[1-3]$').hasMatch(block.tagName),
+              _isHeadingTag(block.tagName),
         )
         .map(
-          (ExtractedBlock block) =>
-              (XhtmlHtmlCompatibility.parseFragment(
-                        block.translatedHtml!,
-                      ).text ??
-                      '')
-                  .replaceAll(RegExp(r'\s+'), ' ')
-                  .trim(),
+          (ExtractedBlock block) => navigationLabelText(
+            XhtmlHtmlCompatibility.parseFragment(block.translatedHtml!),
+          ),
         )
         .where((String value) => value.isNotEmpty)
         .toSet()

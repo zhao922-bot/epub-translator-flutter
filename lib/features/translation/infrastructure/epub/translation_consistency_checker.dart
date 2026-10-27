@@ -1,9 +1,14 @@
 import 'dart:math' as math;
 
-import 'package:html/parser.dart' as html;
+import 'package:html/dom.dart' as dom;
 
 import '../../domain/models/translation_config.dart';
+import 'epub_dom.dart';
+import 'epub_plain_text.dart';
 import 'proper_name_normalizer.dart';
+import 'review_text_patch.dart';
+import 'semantic_risk_signals.dart';
+import 'xhtml_html_compatibility.dart';
 
 /// Cheap, deterministic signals, never automatic edits. Ambiguous amounts,
 /// nicknames and negations need context; a signal is not proof of an error.
@@ -11,13 +16,35 @@ class TranslationConsistencyChecker {
   const TranslationConsistencyChecker();
 
   static String text(String markup) {
-    final fragment = html.parseFragment(markup);
-    for (final node in fragment.querySelectorAll(
-      'script,style,code,pre,sup,math,svg,[translate="no"]',
-    )) {
-      node.remove();
+    return _reviewText(XhtmlHtmlCompatibility.parseFragment(markup));
+  }
+
+  static String _reviewText(dom.Node root) =>
+      epubPlainText(root, skipElement: ReviewTextPatch.isProtectedElement);
+
+  static bool _hasEditableFormatting(dom.Node root) {
+    final stack = <Iterator<dom.Node>>[root.nodes.iterator];
+    while (stack.isNotEmpty) {
+      if (!stack.last.moveNext()) {
+        stack.removeLast();
+        continue;
+      }
+      final node = stack.last.current;
+      if (node is dom.Element) {
+        if (ReviewTextPatch.isProtectedElement(node)) continue;
+        if (const {
+          'span',
+          'i',
+          'em',
+          'b',
+          'strong',
+        }.contains(epubLocalName(node))) {
+          return true;
+        }
+      }
+      if (node.nodes.isNotEmpty) stack.add(node.nodes.iterator);
     }
-    return (fragment.text ?? '').replaceAll(RegExp(r'\s+'), ' ').trim();
+    return false;
   }
 
   List<Map<String, String>> check({
@@ -210,24 +237,25 @@ class TranslationConsistencyChecker {
   /// Include contextual risks even when a deterministic mismatch was not found.
   /// These select a review, but are not displayed as confirmed defects.
   int riskScore(String sourceHtml, List<Map<String, String>> findings) {
-    final source = text(sourceHtml);
+    final fragment = XhtmlHtmlCompatibility.parseFragment(sourceHtml);
+    final source = _reviewText(fragment);
     var score = findings.length * 10;
-    if (RegExp(
-      r'\b(he|him|his|she|her|they|them|their|tried|trying|attempted|sought|aimed|managed|manager|coach|senator|observer)\b',
-      caseSensitive: false,
-    ).hasMatch(source)) {
+    final focus = SemanticRiskSignals.focus(source);
+    if (focus.any(const {'reference', 'outcome', 'sense'}.contains) ||
+        RegExp(
+          r'\b(sought|aimed|managed)\b',
+          caseSensitive: false,
+        ).hasMatch(source)) {
       score += 2;
     }
-    if (RegExp(
-      r'<(?:span|i|em|b|strong)\b',
-      caseSensitive: false,
-    ).hasMatch(sourceHtml)) {
+    if (_hasEditableFormatting(fragment)) {
       score += 1;
     }
-    if (RegExp(
-      r'\b(not|never|neither|without|unless|alas|but|however|yet|instead|nickname|called)\b|\b\w+n[’\x27]t\b',
-      caseSensitive: false,
-    ).hasMatch(source)) {
+    if (focus.contains('scope') ||
+        RegExp(
+          r'\b(neither|unless|alas|but|however|yet|instead|nickname|called)\b',
+          caseSensitive: false,
+        ).hasMatch(source)) {
       score += 3;
     }
     if (RegExp(
@@ -244,7 +272,13 @@ class TranslationConsistencyChecker {
     return score;
   }
 
-  static Set<String> numbers(String text, {required bool chinese}) {
+  /// Soft preservation checks retain possible numbers even without a unit.
+  /// Only the automatic-application gate requires explicit quantity syntax.
+  static Set<String> numbers(
+    String text, {
+    required bool chinese,
+    bool requireQuantitySyntax = false,
+  }) {
     text = text.replaceAll(RegExp(r'\s+'), ' ');
     if (!chinese) {
       text = text.replaceAll(
@@ -287,6 +321,7 @@ class TranslationConsistencyChecker {
       for (final match in RegExp(
         r'[负負]?[零〇一二两兩三四五六七八九十百千万萬亿億]+(?:[点點][零〇一二三四五六七八九]+)?',
       ).allMatches(text)) {
+        if (requireQuantitySyntax && !_isChineseQuantity(text, match)) continue;
         final value = _chineseNumber(match[0]!);
         if (value != null && value.isFinite) {
           final centuries = RegExp(
@@ -299,9 +334,56 @@ class TranslationConsistencyChecker {
     return result;
   }
 
+  static final _hanBefore = RegExp(r'\p{Script=Han}$', unicode: true);
+  static final _hanAfter = RegExp(r'^\p{Script=Han}', unicode: true);
+  static final _quantityPrefix = RegExp(
+    r'(?:第|分之|编号|編號|序号|序號|图|圖|表|卷|章|共|合计|合計|总计|總計|等于|等於|为|為|是|[=＝:：])\s*$',
+  );
+  static final _quantitySuffix = RegExp(
+    r'^\s*(?:美元|美金|欧元|歐元|英镑|英鎊|人民币|人民幣|港元|加元|澳元|日元|新元|'
+    r'元|圆|圓|块|塊|美分|欧分|歐分|便士|厘米|毫米|公里|千米|米|公斤|千克|克|磅|升|'
+    r'小时|小時|分钟|分鐘|秒|刻|年|月|日|天|周|週|星期|世纪|世紀|岁|歲|'
+    r'个|個|位|名|人|只|隻|条|條|本|册|冊|页|頁|章|卷|节|節|段|行|句|字|'
+    r'件|份|张|張|幅|封|所|间|間|辆|輛|艘|架|台|臺|座|颗|顆|粒|枚|支|枝|杯|瓶|箱|包|双|雙|对|對|组|組|'
+    r'次|遍|回|倍|成|折|度|号|號|%|％)',
+  );
+
+  /// Han numeral characters also form ordinary vocabulary. Only explicit
+  /// quantity syntax is a deterministic numeric claim; ambiguous lexical
+  /// uses still go through the independent semantic verifier. No replacement
+  /// text or book-specific vocabulary is encoded here.
+  static bool _isChineseQuantity(String text, RegExpMatch match) {
+    final token = match[0]!;
+    final unsigned = token.replaceFirst(RegExp(r'^[负負]'), '');
+    // Large units need a coefficient in a compound numeral (bare units are
+    // valid). This avoids interpreting arbitrary unit/digit word fragments.
+    if (unsigned.length > 1 && RegExp(r'^[百千万萬亿億]').hasMatch(unsigned)) {
+      return false;
+    }
+    if (token != unsigned ||
+        unsigned.contains(RegExp('[点點]')) ||
+        RegExp(r'^[零〇一二三四五六七八九]{3,}$').hasMatch(unsigned)) {
+      return true;
+    }
+    final before = text.substring(0, match.start);
+    final after = text.substring(match.end);
+    if (!_hanBefore.hasMatch(before) && !_hanAfter.hasMatch(after)) return true;
+    if (_quantitySuffix.hasMatch(after) ||
+        before.endsWith('第') ||
+        (!_hanAfter.hasMatch(after) && _quantityPrefix.hasMatch(before))) {
+      return true;
+    }
+    // 分 and 点 are ambiguous as bare prefixes of a following word. A unit
+    // ending, fractional construction or explicit unit extension is numeric.
+    return RegExp(
+      r'^\s*(?:分(?:之|钟|鐘|钱|錢|制)|[分点點](?=$|[\s，。；、！？:：,.;!?）)的]))',
+    ).hasMatch(after);
+  }
+
   /// Conservative application gate, separate from source-omission warnings.
-  /// A new numeric claim needs source support; ambiguous unit conversions or
-  /// idioms remain proposals. Existing draft numbers do not become new risks.
+  /// A new numeric claim needs source support. Ambiguous lexical uses of
+  /// numeral characters are assessed by the mandatory semantic verifier.
+  /// Existing draft numbers do not become new risks.
   static Set<String> introducedNumbers({
     required String sourceHtml,
     required String beforeHtml,
@@ -330,7 +412,7 @@ class TranslationConsistencyChecker {
       );
       return {
         ...numbers(value, chinese: false),
-        ...numbers(value, chinese: true),
+        ...numbers(value, chinese: true, requireQuantitySyntax: true),
       };
     }
 
@@ -453,7 +535,7 @@ class TranslationConsistencyChecker {
           if (unit < 10000) {
             section += (digit == 0 ? 1 : digit) * unit;
           } else {
-            total += (section + digit) * unit;
+            total += (section + digit == 0 ? 1 : section + digit) * unit;
             section = 0;
           }
           digit = 0;

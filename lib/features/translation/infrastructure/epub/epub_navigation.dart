@@ -5,6 +5,7 @@ import 'xhtml_html_compatibility.dart';
 import 'epub_semantics.dart';
 import 'epub_html_extractor.dart';
 import 'epub_dom.dart';
+import 'epub_plain_text.dart';
 
 bool isEpubTocElement(dom.Element element) {
   for (final attribute in element.attributes.entries) {
@@ -28,6 +29,39 @@ bool isEpubTocElement(dom.Element element) {
   return false;
 }
 
+// Use the same text boundary when reading a heading and replacing a TOC label.
+// Otherwise protected markers copied into the label would be duplicated beside
+// the original marker that replacement correctly preserves.
+bool _skipNavigationElement(dom.Element node) {
+  final types = EpubSemantics.typesOf(node);
+  final roles = (node.attributes['role'] ?? '').split(RegExp(r'\s+'));
+  return EpubHtmlExtractor.nonTextAncestors.contains(epubLocalName(node)) ||
+      node.classes.any(
+        const {'pagenum', 'footnote_ref', 'footnote_num'}.contains,
+      ) ||
+      types.any(const {'pagebreak', 'noteref', 'backlink'}.contains) ||
+      roles.any(
+        const {'doc-pagebreak', 'doc-noteref', 'doc-backlink'}.contains,
+      );
+}
+
+List<dom.Text> _navigationTextNodes(dom.Node root) {
+  final textNodes = <dom.Text>[];
+  void collect(dom.Node node) {
+    if (node is dom.Text) textNodes.add(node);
+    if (node is dom.Element && _skipNavigationElement(node)) return;
+    for (final child in node.nodes) {
+      collect(child);
+    }
+  }
+
+  collect(root);
+  return textNodes;
+}
+
+String navigationLabelText(dom.Node node) =>
+    epubPlainText(node, skipElement: _skipNavigationElement);
+
 /// Both legacy HTML and EPUB 3 TOCs share the same label protection and
 /// language rules. Page markers and note references remain source-owned.
 bool replaceNavigationAnchorLabel(
@@ -35,26 +69,9 @@ bool replaceNavigationAnchorLabel(
   String label, {
   String? languageTag,
 }) {
-  final textNodes = <dom.Text>[];
-  void collect(dom.Node node) {
-    if (node is dom.Text && node.data.trim().isNotEmpty) textNodes.add(node);
-    if (node is! dom.Element) return;
-    final types = EpubSemantics.typesOf(node);
-    final roles = (node.attributes['role'] ?? '').split(RegExp(r'\s+'));
-    if (EpubHtmlExtractor.nonTextAncestors.contains(epubLocalName(node)) ||
-        node.classes.contains('pagenum') ||
-        types.any(const {'pagebreak', 'noteref', 'backlink'}.contains) ||
-        roles.any(
-          const {'doc-pagebreak', 'doc-noteref', 'doc-backlink'}.contains,
-        )) {
-      return;
-    }
-    for (final child in node.nodes) {
-      collect(child);
-    }
-  }
-
-  collect(anchor);
+  final textNodes = _navigationTextNodes(
+    anchor,
+  ).where((text) => text.data.trim().isNotEmpty).toList();
   if (textNodes.isEmpty) return false;
   final labelNode = textNodes.first;
   labelNode.text = label;
@@ -132,7 +149,10 @@ String serializeEpubNavigation(dom.Document document, String originalMarkup) {
 bool isTranslatedNavigationAnchor(dom.Element anchor) {
   dom.Element? current = anchor;
   while (current != null) {
-    if (current.attributes['data-translation'] == 'true') return true;
+    if (current.attributes['data-translation'] == 'true' ||
+        current.classes.contains('epub-translator-translation')) {
+      return true;
+    }
     current = current.parent;
   }
   return false;

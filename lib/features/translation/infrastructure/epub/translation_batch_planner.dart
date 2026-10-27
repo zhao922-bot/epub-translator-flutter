@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import '../../../../shared/logging/app_logger.dart';
+import '../../../../shared/text/unicode_prefix.dart';
 import '../../domain/models/inspected_chapter.dart';
 
 /// Plans block batches and neighboring read-only context for API calls.
@@ -284,14 +285,19 @@ class TranslationBatchPlanner {
   }) {
     final List<ExtractedBlock> immutableBlocks =
         List<ExtractedBlock>.unmodifiable(blocks);
+    final chapterIndex =
+        indexById ??
+        {for (var i = 0; i < chapterBlocks.length; i++) chapterBlocks[i].id: i};
     return TranslationBlockBatch(
       immutableBlocks,
+      sourceOrder: chapterBlocks,
+      sourceIndexById: chapterIndex,
       context: buildContext(
         chapterTitle: chapterTitle,
         batchBlocks: immutableBlocks,
         chapterBlocks: chapterBlocks,
         bookMemory: bookMemory,
-        indexById: indexById,
+        indexById: chapterIndex,
       ),
     );
   }
@@ -380,10 +386,30 @@ class TranslationBlockBatch {
   const TranslationBlockBatch(
     this.blocks, {
     this.context = const TranslationBatchContext(),
+    this.sourceOrder = const [],
+    this.sourceIndexById = const {},
   });
 
   final List<ExtractedBlock> blocks;
   final TranslationBatchContext context;
+
+  // Keep the original chapter order even when a retry contains sparse blocks.
+  // These are shared references, not copies of the entire chapter per batch.
+  final List<ExtractedBlock> sourceOrder;
+  final Map<String, int> sourceIndexById;
+
+  Map<String, String> sourceNeighbours(ExtractedBlock block) {
+    final order = sourceOrder.isEmpty ? blocks : sourceOrder;
+    final at =
+        sourceIndexById[block.id] ??
+        order.indexWhere((candidate) => candidate.id == block.id);
+    if (at < 0 || at >= order.length || order[at].id != block.id) return {};
+    String clip(String value) => unicodeSafePrefix(value, 480);
+    return {
+      if (at > 0) 'before': clip(order[at - 1].sourceText),
+      if (at + 1 < order.length) 'after': clip(order[at + 1].sourceText),
+    };
+  }
 
   Map<String, Object?> toPlanForTest() {
     return <String, Object?>{

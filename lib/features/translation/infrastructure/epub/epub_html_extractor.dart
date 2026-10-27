@@ -4,6 +4,7 @@ import 'package:path/path.dart' as path;
 import '../../domain/models/inspected_chapter.dart';
 import 'epub_text_decoder.dart';
 import 'epub_dom.dart';
+import 'epub_plain_text.dart';
 import 'epub_semantics.dart';
 import 'xhtml_html_compatibility.dart';
 
@@ -583,40 +584,7 @@ class EpubHtmlExtractor {
     // Structural boundaries separate words even without source whitespace.
     // span/a are translatable but inline: spacing those would corrupt split
     // words such as foo<b>bar</b>baz. Extra block spaces normalize below.
-    const Set<String> blockTags = <String>{
-      'p',
-      'h1',
-      'h2',
-      'h3',
-      'h4',
-      'h5',
-      'h6',
-      'li',
-      'td',
-      'th',
-      'blockquote',
-      'dt',
-      'dd',
-      'figcaption',
-      'caption',
-      'summary',
-      'div',
-      'section',
-      'article',
-      'header',
-      'footer',
-      'nav',
-      'main',
-      'aside',
-      'figure',
-      'table',
-      'tr',
-      'ul',
-      'ol',
-      'dl',
-      'pre',
-      'hr',
-    };
+    const blockTags = epubTextBoundaryTags;
     final StringBuffer buffer = StringBuffer();
     void visit(dom.Node node, int nodeDepth) {
       // P2-#23: stop descending past the depth cap instead of overflowing

@@ -16,15 +16,15 @@
 
 ## 下载与升级
 
-当前版本：**1.7.4+57**。安装包与 SHA-256 校验文件见 [1.7.4 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.7.4)。
+当前版本：**1.7.5+58**。安装包与 SHA-256 校验文件见 [1.7.5 发布页](https://github.com/zhao922-bot/epub-translator-flutter/releases/tag/v1.7.5)。
 
 | 平台 | 下载 | 使用方式 |
 | --- | --- | --- |
-| Windows 10 / 11 x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.4/folioferry-v1.7.4-windows-x64-setup.exe) | 为当前用户安装，可从开始菜单启动 |
-| Windows 便携版 | [ZIP 压缩包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.4/folioferry-v1.7.4-windows-x64.zip) | 完整解压后运行 `FolioFerry.exe`，保留同目录 DLL 与 `data` 文件夹 |
-| Android | [APK 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.4/folioferry-v1.7.4-android.apk) | 中文系统显示“页渡”，其他系统显示“FolioFerry” |
+| Windows 10 / 11 x64 | [EXE 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.5/folioferry-v1.7.5-windows-x64-setup.exe) | 为当前用户安装，可从开始菜单启动 |
+| Windows 便携版 | [ZIP 压缩包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.5/folioferry-v1.7.5-windows-x64.zip) | 完整解压后运行 `FolioFerry.exe`，保留同目录 DLL 与 `data` 文件夹 |
+| Android | [APK 安装包](https://github.com/zhao922-bot/epub-translator-flutter/releases/download/v1.7.5/folioferry-v1.7.5-android.apk) | 中文系统显示“页渡”，其他系统显示“FolioFerry” |
 
-- **Android 升级**：沿用 v1.6.31 至 v1.7.2 的应用标识与发布签名，可覆盖安装这些版本，无需为更名卸载软件。更早的签名不同版本需先备份设置与数据。
+- **Android 升级**：沿用 v1.6.31 至 v1.7.5 的应用标识与发布签名，可覆盖安装这些版本，无需为更名卸载软件。更早的签名不同版本需先备份设置与数据。
 - **Windows 升级**：安装包沿用原应用标识，已有安装会继续使用原安装目录；设置、密钥、任务记录和缓存继续从原数据位置读取。
 - Windows 安装包目前未进行商业代码签名。若系统提示未知发布者，请核对下载来源及发布页提供的 SHA-256。
 
@@ -106,7 +106,7 @@ Windows 需要 Visual Studio 的“使用 C++ 的桌面开发”组件。打包�
 powershell -ExecutionPolicy Bypass -File tool\package_windows.ps1
 
 # Windows EXE 安装包：需 Inno Setup 6.3+，先完成上述打包
-ISCC /DAppVersion=1.7.4 tool\windows_installer.iss
+ISCC /DAppVersion=1.7.5 tool\windows_installer.iss
 
 # Android：需 Android SDK 与 JDK（发布使用 JDK 21）
 # 将 android/key.properties.example 复制为 android/key.properties，填写本机签名配置

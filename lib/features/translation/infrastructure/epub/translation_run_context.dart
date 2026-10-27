@@ -44,6 +44,8 @@ class TranslationRunContext {
   final List<Map<String, Object?>> semanticCorrections = [];
   final Map<String, Map<String, Object?>> automaticCorrections = {};
   final Map<String, Map<String, Object?>> meaningAssessments = {};
+  // Preserve a validated partial review while an explicit retry is in flight.
+  final Map<String, Map<String, Object?>> semanticRetryEntries = {};
 
   bool isUnreviewed(String chapterPath, String id) =>
       semanticUnreviewed.contains(

@@ -43,6 +43,7 @@ class _EpubSemanticReviewer {
         batch: TranslationBlockBatch(
           group.value.map((r) => r.block).toList(),
           context: batch.context,
+          sourceOrder: group.value.first.chapter.blocks,
         ),
         translations: local,
         chapterPath: group.key,
@@ -128,12 +129,23 @@ class _EpubSemanticReviewer {
   String _scopeKey(String chapter, String id) =>
       EpubRepacker.degradedKeyForBlock(chapterPath: chapter, blockId: id);
 
+  String _safeReason(TranslationConfig config, String reason) =>
+      unicodeSafePrefix(
+        SensitiveText.redact(reason, configuredApiKey: config.apiKey),
+        1200,
+      );
+
+  Map<String, Object?>? _automaticForDraft(String key, String draft) {
+    final audit = owner._run.automaticCorrections[key];
+    return audit?['afterHtml'] == draft ? audit : null;
+  }
+
   String _reviewKey(
     TranslationConfig config,
     String chapter,
     ExtractedBlock block,
     String draft,
-  ) => TranslationArtifactCache.key(config, 'semantic-suggestions-v11', [
+  ) => TranslationArtifactCache.key(config, 'semantic-suggestions-v13', [
     owner._run.cacheSourceIdentity,
     chapter,
     block.id,
@@ -162,6 +174,19 @@ class _EpubSemanticReviewer {
       );
     }
     if (persist) {
+      final previous = owner._run.semanticRetryEntries[key];
+      if (previous != null) {
+        // An unsuccessful supplement must not erase a verified local edit or
+        // its original assessment. The next explicit retry still sees partial
+        // coverage; an ordinary warm run retains the last failure honestly.
+        await owner._artifactCache
+            .write(_reviewKey(config, chapter, block, draft), {
+              ...previous,
+              'retryFailureReason': reason,
+              'retryFailureDetail': ?owner._run.semanticFailureDetails[key],
+            });
+        return;
+      }
       await owner._artifactCache
           .write(_reviewKey(config, chapter, block, draft), {
             'status': 'needsAttention',
@@ -182,12 +207,35 @@ class _EpubSemanticReviewer {
     ExtractedBlock block,
     String draft, {
     bool allowSkip = true,
+    bool resumeVerification = false,
     Map<String, String> knownTerms = const {},
   }) async {
     final key = _scopeKey(chapter, block.id);
     final entry = await owner._artifactCache.read(
       _reviewKey(config, chapter, block, draft),
     );
+    // Old cache entries can predate verification-reason redaction. Migrate
+    // both accepted and pending records before they enter a report again.
+    var sanitized = false;
+    for (final field in ['automaticCorrection', 'suggestion']) {
+      final record = entry?[field];
+      if (record is Map && record['verificationReason'] is String) {
+        final reason = _safeReason(
+          config,
+          record['verificationReason'] as String,
+        );
+        if (reason != record['verificationReason']) {
+          entry![field] = {...record, 'verificationReason': reason};
+          sanitized = true;
+        }
+      }
+    }
+    if (sanitized) {
+      await owner._artifactCache.write(
+        _reviewKey(config, chapter, block, draft),
+        entry!,
+      );
+    }
     final terms = <String, String>{};
     if (entry?['knownTerms'] is Map) {
       for (final e in (entry!['knownTerms'] as Map).entries.take(128)) {
@@ -284,9 +332,14 @@ class _EpubSemanticReviewer {
           !config.autoApplyVerifiedCorrections) {
         return false;
       }
-      owner._run.automaticCorrections[key] = Map<String, Object?>.from(
-        automatic,
-      );
+      owner._run.automaticCorrections[key] = {
+        ...Map<String, Object?>.from(automatic),
+        if (automatic['verificationReason'] is String)
+          'verificationReason': _safeReason(
+            config,
+            automatic['verificationReason'] as String,
+          ),
+      };
     }
     if (suggestion != null) {
       if (suggestion is! Map ||
@@ -310,7 +363,7 @@ class _EpubSemanticReviewer {
     }
     if (config.autoApplyVerifiedCorrections) {
       final assessment = entry['assessment'];
-      final assessedDraft = automatic is Map ? automatic['beforeHtml'] : draft;
+      final assessedDraft = assessment is Map ? assessment['draftHtml'] : null;
       try {
         if (assessment is! Map ||
             assessment['chapter'] != chapter ||
@@ -318,7 +371,9 @@ class _EpubSemanticReviewer {
             assessment['sourceHtml'] != block.sourceHtml ||
             assessment['draftAnalysis'] is! String ||
             (assessment['draftAnalysis'] as String).trim().isEmpty ||
-            assessment['draftHtml'] != assessedDraft ||
+            (assessedDraft != draft &&
+                (automatic is! Map ||
+                    assessedDraft != automatic['beforeHtml'])) ||
             assessedDraft is! String) {
           throw const FormatException('Missing bound meaning assessment.');
         }
@@ -338,11 +393,11 @@ class _EpubSemanticReviewer {
             assessment['coverage'],
             plan,
             assessedDraft,
-            unchanged: suggestion == null && automatic == null,
+            unchanged: suggestion == null && assessedDraft == draft,
           );
         }
         if (suggestion == null &&
-            automatic == null &&
+            assessedDraft == draft &&
             !_equivalenceEstablished(assessment['independentEquivalence'])) {
           throw const FormatException(
             'Missing independent equivalence decision.',
@@ -364,16 +419,82 @@ class _EpubSemanticReviewer {
         !owner._run.semanticCorrections.any(
           (s) => s['chapter'] == chapter && s['id'] == block.id,
         )) {
-      owner._run.semanticCorrections.add(Map<String, Object?>.from(suggestion));
+      owner._run.semanticCorrections.add({
+        ...Map<String, Object?>.from(suggestion),
+        // A cancellation may leave the proposal saved before verification.
+        // Restoring it must not silently spend requests without an explicit retry.
+        if (config.autoApplyVerifiedCorrections &&
+            suggestion['autoApplication'] == null)
+          'autoApplication': 'verificationPending',
+      });
     }
     final restoredAssessment = entry['assessment'];
-    _setCoverageState(
-      key,
-      complete:
-          restoredAssessment is! Map ||
-          restoredAssessment['coverageComplete'] != false,
-    );
+    final complete =
+        restoredAssessment is! Map ||
+        restoredAssessment['coverageComplete'] != false;
+    _setCoverageState(key, complete: complete);
+    if (!complete) {
+      if (entry['retryFailureReason'] is String) {
+        owner._run.semanticUnreviewedReasons[key] =
+            entry['retryFailureReason'] as String;
+      }
+      if (entry['retryFailureDetail'] is String) {
+        owner._run.semanticFailureDetails[key] = _safeReason(
+          config,
+          entry['retryFailureDetail'] as String,
+        );
+      }
+      if (config.retryIncompleteReviews) {
+        owner._run.semanticRetryEntries[key] = {
+          ...entry,
+          'automaticCorrection': ?_automaticForDraft(key, draft),
+        };
+        return false;
+      }
+    }
+    if (config.autoApplyVerifiedCorrections &&
+        suggestion is Map &&
+        _pendingVerificationReason(suggestion) != null) {
+      _setVerificationState(key, suggestion);
+      // Cache scanning must schedule the block, while the review stage can
+      // reuse its bound assessment and proceed straight to verification.
+      if (complete && config.retryIncompleteReviews) return resumeVerification;
+    }
     return true;
+  }
+
+  String? _pendingVerificationReason(Map suggestion) {
+    return switch (suggestion['autoApplication']) {
+      null || 'verificationPending' => 'invalidResponse',
+      'verificationBudgetLimit' => 'budgetLimit',
+      'verificationFailed' =>
+        suggestion['verificationFailureReason'] == 'requestFailed' ||
+                suggestion['verificationFailure'] == 'DioException'
+            ? 'requestFailed'
+            : 'invalidResponse',
+      'notVerified'
+          when const {
+            'missingOrDuplicateDecision',
+            'invalidDecision',
+            'missingReason',
+            'unsupportedEvidence',
+          }.contains(suggestion['verificationFailure']) =>
+        'invalidResponse',
+      _ => null,
+    };
+  }
+
+  void _setVerificationState(String key, Map suggestion) {
+    final complete =
+        owner._run.meaningAssessments[key]?['coverageComplete'] != false;
+    if (!complete) return;
+    _setCoverageState(key, complete: true);
+    final reason = _pendingVerificationReason(suggestion);
+    if (reason != null) {
+      owner._run.semanticReviewed.remove(key);
+      owner._run.semanticUnreviewed.add(key);
+      owner._run.semanticUnreviewedReasons[key] = reason;
+    }
   }
 
   void _setCoverageState(String key, {required bool complete}) {
@@ -435,6 +556,7 @@ class _EpubSemanticReviewer {
         block,
         draft,
         allowSkip: false,
+        resumeVerification: true,
         knownTerms: knownTerms,
       )) {
         continue;
@@ -442,6 +564,7 @@ class _EpubSemanticReviewer {
       final score = _checker.riskScore(block.sourceHtml, findings);
       if (config.semanticReviewScope == SemanticReviewScope.risksOnly &&
           score == 0 &&
+          !owner._run.semanticRetryEntries.containsKey(key) &&
           !owner._run.semanticAuditSamples.contains(key)) {
         owner._run.semanticSkipped.add(key);
         continue;
@@ -481,7 +604,9 @@ class _EpubSemanticReviewer {
           dio: dio,
           config: config,
           blocks: blocks,
-          sourceOrder: batch.blocks,
+          adjacentSource: {
+            for (final block in blocks) block.id: batch.sourceNeighbours(block),
+          },
           chapterPath: chapterPath,
           batchContext: batch.context,
           cancelToken: cancelToken,
@@ -589,10 +714,7 @@ class _EpubSemanticReviewer {
                   if (config.autoApplyVerifiedCorrections) ...{
                     'sourceAnalysis': sourcePlans[block.id],
                     'draftAnalysis': draftMeanings[block.id],
-                    'adjacentSource': _EpubSemanticGrounding.neighbours(
-                      block,
-                      batch.blocks,
-                    ),
+                    'adjacentSource': batch.sourceNeighbours(block),
                     'draftText': TranslationConsistencyChecker.text(
                       translations[block.id]!,
                     ),
@@ -626,12 +748,9 @@ class _EpubSemanticReviewer {
       // UTF-8 bytes plus framing is intentionally conservative. Reserve the
       // full response allowance, never refund missing provider usage. This is
       // a local estimated budget, not a provider billing guarantee.
-      final reservation =
-          utf8.encode(jsonEncode(messages)).length + 256 + outputTokens;
-      if (owner._run.semanticRequests >=
-              config.maxSemanticReviewRequests.clamp(1, 64) ||
-          owner._run.semanticReservedTokens + reservation >
-              config.maxSemanticReviewTokens.clamp(4000, 1024000)) {
+      if (!_EpubSemanticGrounding(
+        owner,
+      ).reserve(config, messages, outputTokens)) {
         for (final block in blocks) {
           await _recordIncomplete(
             config,
@@ -644,8 +763,6 @@ class _EpubSemanticReviewer {
         }
         continue;
       }
-      owner._run.semanticRequests++;
-      owner._run.semanticReservedTokens += reservation;
       try {
         final response = await owner._postChatCompletions(
           dio: dio,
@@ -663,8 +780,9 @@ class _EpubSemanticReviewer {
         if (items is! List) {
           throw const FormatException('Incomplete semantic review.');
         }
+        var stageFailures = <String, String>{};
         if (config.autoApplyVerifiedCorrections) {
-          items = await _repairCoverage(
+          final repaired = await _repairCoverage(
             dio: dio,
             config: config,
             blocks: blocks,
@@ -676,6 +794,8 @@ class _EpubSemanticReviewer {
             outputTokens: outputTokens,
             cancelToken: cancelToken,
           );
+          items = repaired.items;
+          stageFailures = repaired.failures;
         }
         final byId = <String, List<Map>>{};
         for (final item in items) {
@@ -692,12 +812,25 @@ class _EpubSemanticReviewer {
           // without stripping or accepting invented markup in the quotation.
           ...batch.blocks.map((b) => b.sourceHtml),
           ...batch.blocks.map((b) => b.sourceText),
+          ...blocks.expand((b) => batch.sourceNeighbours(b).values),
           ...evidence,
           ...batch.context.before.map((s) => s.text),
           ...batch.context.after.map((s) => s.text),
         ].join('\n');
         for (final block in blocks) {
           final id = block.id;
+          final stageFailure = stageFailures[id];
+          if (stageFailure != null) {
+            await _recordIncomplete(
+              config,
+              chapterPath,
+              block,
+              translations[id]!,
+              stageFailure,
+              persist: stageFailure != 'budgetLimit',
+            );
+            continue;
+          }
           final matches = byId[id];
           final item = matches?.length == 1 ? matches!.single : null;
           // A malformed/missing/duplicate item invalidates only its own block.
@@ -836,9 +969,13 @@ class _EpubSemanticReviewer {
                     assessment['coverageFailure'] as String;
               }
             }
+            owner._run.semanticCorrections.removeWhere(
+              (s) => s['chapter'] == chapterPath && s['id'] == id,
+            );
             if (suggestion != null) {
               owner._run.semanticCorrections.add(suggestion);
             }
+            owner._run.semanticRetryEntries.remove(key);
             _setCoverageState(
               key,
               complete: assessment?['coverageComplete'] != false,
@@ -852,6 +989,10 @@ class _EpubSemanticReviewer {
                 'knownTerms': owner._run.semanticTerms[key] ?? {},
                 'checksVersion': 2,
                 'assessment': ?assessment,
+                'automaticCorrection': ?_automaticForDraft(
+                  key,
+                  translations[id]!,
+                ),
               },
             );
           } on FormatException catch (error) {
@@ -906,6 +1047,7 @@ class _EpubSemanticReviewer {
       )) {
         final block = batch.blocks.firstWhere((b) => b.id == s['id']);
         final key = _scopeKey(chapterPath, block.id);
+        if (owner._run.semanticRetryEntries.containsKey(key)) continue;
         await owner._artifactCache.write(
           _reviewKey(config, chapterPath, block, s['beforeHtml'] as String),
           {
@@ -915,6 +1057,10 @@ class _EpubSemanticReviewer {
             'knownTerms': owner._run.semanticTerms[key] ?? {},
             'checksVersion': 2,
             'assessment': ?owner._run.meaningAssessments[key],
+            'automaticCorrection': ?_automaticForDraft(
+              key,
+              s['beforeHtml'] as String,
+            ),
           },
         );
       }
@@ -924,7 +1070,7 @@ class _EpubSemanticReviewer {
   /// One bounded repair for contradictory/malformed coverage. Healthy peers
   /// never get re-requested. A repaired proposal still passes all normal patch,
   /// evidence and independent-verification gates below.
-  Future<List> _repairCoverage({
+  Future<({List items, Map<String, String> failures})> _repairCoverage({
     required Dio dio,
     required TranslationConfig config,
     required List<ExtractedBlock> blocks,
@@ -937,6 +1083,7 @@ class _EpubSemanticReviewer {
     CancelToken? cancelToken,
   }) async {
     final invalid = <String, String>{};
+    final failures = <String, String>{};
     final unchanged = <ExtractedBlock>[];
     var decisions = <String, Map>{};
     for (final b in blocks) {
@@ -987,6 +1134,7 @@ class _EpubSemanticReviewer {
                   [
                     ...batch.blocks.map((b) => b.sourceText),
                     ...batch.blocks.map((b) => b.sourceHtml),
+                    ...blocks.expand((b) => batch.sourceNeighbours(b).values),
                     ...batch.context.before.map((b) => b.text),
                     ...batch.context.after.map((b) => b.text),
                   ].join('\n'),
@@ -1006,7 +1154,7 @@ class _EpubSemanticReviewer {
       }
     }
     if (unchanged.isNotEmpty) {
-      decisions = await _checkEquivalence(
+      final checked = await _checkEquivalence(
         dio: dio,
         config: config,
         blocks: unchanged,
@@ -1014,7 +1162,13 @@ class _EpubSemanticReviewer {
         draftMeanings: draftMeanings,
         cancelToken: cancelToken,
       );
+      decisions = checked.decisions;
       for (final b in unchanged) {
+        if (checked.failure == 'budgetLimit' ||
+            checked.failure == 'requestFailed') {
+          failures[b.id] = checked.failure;
+          continue;
+        }
         final decision = decisions[b.id];
         if (!_equivalenceEstablished(decision)) {
           invalid[b.id] = decision?['reason'] is String
@@ -1030,7 +1184,7 @@ class _EpubSemanticReviewer {
             item,
       ];
     }
-    if (invalid.isEmpty) return items;
+    if (invalid.isEmpty) return (items: items, failures: failures);
     // An unconfirmed unchanged verdict must not become reviewed when a repair
     // cannot run or fails. Preserve paid drafts, but retain an honest warning.
     final rejected = [
@@ -1040,6 +1194,10 @@ class _EpubSemanticReviewer {
         else
           item,
     ];
+    ({List items, Map<String, String> failures}) reject(String reason) => (
+      items: rejected,
+      failures: {...failures, for (final id in invalid.keys) id: reason},
+    );
     final messages = <Map<String, Object?>>[
       {
         'role': 'system',
@@ -1066,10 +1224,7 @@ class _EpubSemanticReviewer {
                 'failure': invalid[b.id],
                 'sourceAnalysis': sourcePlans[b.id],
                 'draftAnalysis': draftMeanings[b.id],
-                'adjacentSource': _EpubSemanticGrounding.neighbours(
-                  b,
-                  batch.blocks,
-                ),
+                'adjacentSource': batch.sourceNeighbours(b),
                 'draftText': TranslationConsistencyChecker.text(
                   translations[b.id]!,
                 ),
@@ -1082,7 +1237,7 @@ class _EpubSemanticReviewer {
     if (!_EpubSemanticGrounding(
       owner,
     ).reserve(config, messages, outputTokens)) {
-      return rejected;
+      return reject('budgetLimit');
     }
     try {
       final response = await owner._postChatCompletions(
@@ -1098,33 +1253,38 @@ class _EpubSemanticReviewer {
       final repaired = owner._apiClient.decodeBatchJsonPayload(
         response.data,
       )['blocks'];
-      if (repaired is! List) return rejected;
-      return [
-        ...items.where((r) => r is! Map || !invalid.containsKey(r['id'])),
-        ...repaired
-            .whereType<Map>()
-            .where((r) => invalid.containsKey(r['id']))
-            .map((r) {
-              // A repair cannot overrule the independent gate by repeating
-              // unchanged:true. It must provide a supported candidate correction.
-              if (r['unchanged'] == true ||
-                  r['html'] == translations[r['id']]) {
-                return {...r, 'coverage': <Object?>[]};
-              }
-              return {
-                ...r,
-                if (decisions.containsKey(r['id']))
-                  'independentEquivalence': decisions[r['id']],
-              };
-            }),
-      ];
+      if (repaired is! List) return reject('invalidResponse');
+      return (
+        items: [
+          ...items.where((r) => r is! Map || !invalid.containsKey(r['id'])),
+          ...repaired
+              .whereType<Map>()
+              .where((r) => invalid.containsKey(r['id']))
+              .map((r) {
+                // A repair cannot overrule the independent gate by repeating
+                // unchanged:true. It must provide a supported candidate correction.
+                if (r['unchanged'] == true ||
+                    r['html'] == translations[r['id']]) {
+                  return {...r, 'coverage': <Object?>[]};
+                }
+                return {
+                  ...r,
+                  if (decisions.containsKey(r['id']))
+                    'independentEquivalence': decisions[r['id']],
+                };
+              }),
+        ],
+        failures: failures,
+      );
     } catch (error) {
       if (error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }
       owner._run.throwIfCancelled();
-      return rejected;
+      return reject(
+        error is DioException ? 'requestFailed' : 'invalidResponse',
+      );
     }
   }
 
@@ -1138,7 +1298,7 @@ class _EpubSemanticReviewer {
   /// Assess logical meaning without the original review verdict or the target
   /// wording that caused anchoring. A rejection only requests repair; it is
   /// never permission to alter text. The bilingual verifier remains required.
-  Future<Map<String, Map>> _checkEquivalence({
+  Future<({Map<String, Map> decisions, String failure})> _checkEquivalence({
     required Dio dio,
     required TranslationConfig config,
     required List<ExtractedBlock> blocks,
@@ -1177,7 +1337,7 @@ class _EpubSemanticReviewer {
       config.maxOutputTokens.clamp(256, 2048),
     );
     if (!_EpubSemanticGrounding(owner).reserve(config, messages, output)) {
-      return {};
+      return (decisions: <String, Map>{}, failure: 'budgetLimit');
     }
     try {
       final response = await owner._postChatCompletions(
@@ -1193,19 +1353,27 @@ class _EpubSemanticReviewer {
       final rows = owner._apiClient.decodeBatchJsonPayload(
         response.data,
       )['blocks'];
-      if (rows is! List) return {};
-      return {
-        for (final b in blocks)
-          if (rows.whereType<Map>().where((r) => r['id'] == b.id).length == 1)
-            b.id: rows.whereType<Map>().singleWhere((r) => r['id'] == b.id),
-      };
+      if (rows is! List) {
+        return (decisions: <String, Map>{}, failure: 'invalidResponse');
+      }
+      return (
+        decisions: {
+          for (final b in blocks)
+            if (rows.whereType<Map>().where((r) => r['id'] == b.id).length == 1)
+              b.id: rows.whereType<Map>().singleWhere((r) => r['id'] == b.id),
+        },
+        failure: '',
+      );
     } catch (error) {
       if (error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }
       owner._run.throwIfCancelled();
-      return {};
+      return (
+        decisions: <String, Map>{},
+        failure: error is DioException ? 'requestFailed' : 'invalidResponse',
+      );
     }
   }
 
@@ -1227,6 +1395,12 @@ class _EpubSemanticReviewer {
           (s) =>
               s['chapter'] == chapterPath &&
               blocks.containsKey(s['id']) &&
+              (s['autoApplication'] == null ||
+                  (config.retryIncompleteReviews &&
+                      _pendingVerificationReason(s) != null)) &&
+              !owner._run.semanticRetryEntries.containsKey(
+                _scopeKey(chapterPath, s['id'] as String),
+              ) &&
               s['beforeHtml'] == translations[s['id']],
         )
         .toList();
@@ -1261,6 +1435,7 @@ class _EpubSemanticReviewer {
             (v) => !beforeSignals.contains('${v['code']}\u0000${v['detail']}'),
           )) {
         s['autoApplication'] = 'newConsistencyRisk';
+        _setVerificationState(key, s);
       } else {
         eligible.add(s);
       }
@@ -1270,6 +1445,10 @@ class _EpubSemanticReviewer {
       eligible.map((s) => blocks[s['id']]!.sourceText).join('\n'),
       excludeSources: eligible.map((s) => blocks[s['id']]!.sourceText),
     );
+    final adjacentSource = {
+      for (final s in eligible)
+        s['id'] as String: batch.sourceNeighbours(blocks[s['id']]!),
+    };
     final messages = [
       {
         'role': 'system',
@@ -1279,6 +1458,7 @@ class _EpubSemanticReviewer {
             'Approve only a clear factual or meaning error fixed by the candidate, supported by the actual source and context. '
             'Check BOTH the original draft and the candidate against the source; do not assume the proposer is right. '
             'Reject stylistic preferences, speculative details, altered numbers, omitted meaning, or changes of valid idiom. '
+            'Distinguish actual quantities from numeral characters used in ordinary words or idioms; judge ambiguous expressions by their meaning in context. '
             'Preserve initials, event counts and chronological order; resolve word senses and titles from context. '
             'Do not infer geographic directions or extra actions/results. Preserve valid wording where ambiguous. '
             'A canonical name from the source-derived glossary may support identity consistency, but does not justify changing unrelated meaning. '
@@ -1297,6 +1477,7 @@ class _EpubSemanticReviewer {
               {
                 'id': s['id'],
                 'sourceHtml': s['sourceHtml'],
+                'adjacentSource': adjacentSource[s['id']],
                 'draftHtml': s['beforeHtml'],
                 'candidateHtml': s['afterHtml'],
               },
@@ -1305,19 +1486,15 @@ class _EpubSemanticReviewer {
       },
     ];
     final outputTokens = config.maxOutputTokens.clamp(1024, 8192);
-    final reservation =
-        utf8.encode(jsonEncode(messages)).length + 256 + outputTokens;
-    if (owner._run.semanticRequests >=
-            config.maxSemanticReviewRequests.clamp(1, 64) ||
-        owner._run.semanticReservedTokens + reservation >
-            config.maxSemanticReviewTokens.clamp(4000, 1024000)) {
+    if (!_EpubSemanticGrounding(
+      owner,
+    ).reserve(config, messages, outputTokens)) {
       for (final s in eligible) {
         s['autoApplication'] = 'verificationBudgetLimit';
+        _setVerificationState(_scopeKey(chapterPath, s['id'] as String), s);
       }
       return;
     }
-    owner._run.semanticRequests++;
-    owner._run.semanticReservedTokens += reservation;
     try {
       final response = await owner._postChatCompletions(
         dio: dio,
@@ -1335,8 +1512,13 @@ class _EpubSemanticReviewer {
         throw const FormatException('Invalid correction verification.');
       }
       final evidence = [
-        ...batch.blocks.map((b) => b.sourceText),
-        ...batch.blocks.map((b) => b.sourceHtml),
+        // Accept source quotes only from material actually sent to the verifier.
+        // An unchanged peer elsewhere in the batch is not implicit evidence.
+        ...eligible.map((s) => s['sourceHtml'] as String),
+        ...eligible.map(
+          (s) => TranslationConsistencyChecker.text(s['sourceHtml'] as String),
+        ),
+        ...adjacentSource.values.expand((neighbours) => neighbours.values),
         ...related,
         ...batch.context.before.map((s) => s.text),
         ...batch.context.after.map((s) => s.text),
@@ -1349,16 +1531,22 @@ class _EpubSemanticReviewer {
             .toList();
         final decision = matches.length == 1 ? matches.single : null;
         if (decision?['reason'] is String) {
-          s['verificationReason'] = unicodeSafePrefix(
-            SensitiveText.redact(
-              decision!['reason'] as String,
-              configuredApiKey: config.apiKey,
-            ),
-            1200,
+          s['verificationReason'] = _safeReason(
+            config,
+            decision!['reason'] as String,
           );
         }
         final verificationFailure = decision == null
             ? 'missingOrDuplicateDecision'
+            : decision['approve'] is! bool ||
+                  (decision['approve'] == true &&
+                      !const {
+                        'high',
+                        'medium',
+                        'low',
+                        'uncertain',
+                      }.contains(decision['confidence']))
+            ? 'invalidDecision'
             : decision['approve'] != true
             ? 'rejectedOrUncertain'
             : decision['confidence'] != 'high'
@@ -1383,6 +1571,7 @@ class _EpubSemanticReviewer {
             )) {
           s['autoApplication'] = 'notVerified';
           s['verificationFailure'] = verificationFailure;
+          _setVerificationState(_scopeKey(chapterPath, id), s);
           continue;
         }
         final block = blocks[id]!;
@@ -1392,16 +1581,17 @@ class _EpubSemanticReviewer {
           translatedHtml: s['afterHtml'] as String,
         );
         final key = _scopeKey(chapterPath, id);
-        final audit = <String, Object?>{
-          ...s,
-          'verified': true,
-          'autoApplication': 'applied',
-          'verificationEvidence': decision['sourceQuotes'],
-          'verificationReason': (decision['reason'] as String).substring(
-            0,
-            min(1200, (decision['reason'] as String).length),
-          ),
-        }..remove('accepted');
+        final audit =
+            <String, Object?>{
+                ...s,
+                'verified': true,
+                'autoApplication': 'applied',
+                'verificationEvidence': decision['sourceQuotes'],
+                'verificationReason': s['verificationReason'],
+              }
+              ..remove('accepted')
+              ..remove('verificationFailure')
+              ..remove('verificationFailureReason');
         final findings = _checker.check(
           sourceHtml: block.sourceHtml,
           translatedHtml: corrected,
@@ -1426,6 +1616,7 @@ class _EpubSemanticReviewer {
         translations[id] = corrected;
         owner._run.automaticCorrections[key] = audit;
         owner._run.semanticCorrections.remove(s);
+        _setVerificationState(key, audit);
         if (findings.isEmpty) {
           owner._run.consistencyFindings.remove(key);
         } else {
@@ -1442,6 +1633,10 @@ class _EpubSemanticReviewer {
         if (owner._run.semanticCorrections.contains(s)) {
           s['autoApplication'] = 'verificationFailed';
           s['verificationFailure'] = error.runtimeType.toString();
+          s['verificationFailureReason'] = error is DioException
+              ? 'requestFailed'
+              : 'invalidResponse';
+          _setVerificationState(_scopeKey(chapterPath, s['id'] as String), s);
         }
       }
       AppLogger.warn(

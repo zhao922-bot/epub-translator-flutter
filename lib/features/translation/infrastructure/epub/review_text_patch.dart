@@ -1,40 +1,57 @@
 import 'package:html/dom.dart' as dom;
-import 'package:html/parser.dart' as html;
+import 'epub_dom.dart';
+import 'xhtml_html_compatibility.dart';
 
 /// Apply small, unambiguous text edits without allowing model-generated markup.
 /// Attributes, inline formatting and protected content are never edited.
 class ReviewTextPatch {
+  /// Shared by review text extraction, risk selection and editable segments.
+  /// Qualified XHTML names must have the same protection as ordinary names.
+  static bool isProtectedElement(dom.Element node) =>
+      const {
+        'script',
+        'style',
+        'code',
+        'pre',
+        'var',
+        'kbd',
+        'samp',
+        'sup',
+        'svg',
+        'math',
+      }.contains(epubLocalName(node)) ||
+      node.attributes['translate']?.toLowerCase() == 'no' ||
+      node.classes.contains('notranslate');
+
+  static dom.DocumentFragment _parse(String draft) {
+    validateEpubMarkupDepth(draft);
+    final fragment = XhtmlHtmlCompatibility.parseFragment(draft);
+    validateEpubDomDepth(fragment);
+    return fragment;
+  }
+
   static List<dom.Text> _editableNodes(dom.Node document) {
     final nodes = <dom.Text>[];
-    void visit(dom.Node node) {
-      if (node is dom.Element &&
-          (const {
-                'script',
-                'style',
-                'code',
-                'pre',
-                'sup',
-                'svg',
-                'math',
-              }.contains(node.localName) ||
-              node.attributes['translate']?.toLowerCase() == 'no' ||
-              node.classes.contains('notranslate'))) {
-        return;
+    final stack = <Iterator<dom.Node>>[
+      [document].iterator,
+    ];
+    while (stack.isNotEmpty) {
+      if (!stack.last.moveNext()) {
+        stack.removeLast();
+        continue;
       }
+      final node = stack.last.current;
+      if (node is dom.Element && isProtectedElement(node)) continue;
       if (node is dom.Text) nodes.add(node);
-      for (final child in node.nodes) {
-        visit(child);
-      }
+      if (node.nodes.isNotEmpty) stack.add(node.nodes.iterator);
     }
-
-    visit(document);
     return nodes;
   }
 
   /// Stable request-local node IDs permit repeated words without returning
   /// model-authored HTML. They never address attributes or protected content.
   static List<Map<String, String>> segments(String draft) {
-    final nodes = _editableNodes(html.parseFragment(draft));
+    final nodes = _editableNodes(_parse(draft));
     return [
       for (var i = 0; i < nodes.length; i++)
         if (nodes[i].data.trim().isNotEmpty)
@@ -46,7 +63,7 @@ class ReviewTextPatch {
     if (edits.isEmpty || edits.length > 24) {
       throw const FormatException('Invalid review edit count.');
     }
-    final document = html.parseFragment(draft);
+    final document = _parse(draft);
     final nodes = _editableNodes(document);
     final changes = <dom.Text, List<({int start, int end, String value})>>{};
     for (final edit in edits) {

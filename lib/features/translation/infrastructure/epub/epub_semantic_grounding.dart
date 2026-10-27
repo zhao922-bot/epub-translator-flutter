@@ -6,19 +6,6 @@ class _EpubSemanticGrounding {
   _EpubSemanticGrounding(this.owner);
   final EpubChapterTranslator owner;
 
-  static Map<String, String> neighbours(
-    ExtractedBlock block,
-    List<ExtractedBlock> sourceOrder,
-  ) {
-    final at = sourceOrder.indexWhere((b) => b.id == block.id);
-    String clip(String s) => unicodeSafePrefix(s, 480);
-    return {
-      if (at > 0) 'before': clip(sourceOrder[at - 1].sourceText),
-      if (at >= 0 && at + 1 < sourceOrder.length)
-        'after': clip(sourceOrder[at + 1].sourceText),
-    };
-  }
-
   static Map<String, Object?> context(TranslationBatchContext value) {
     String clip(String s) => unicodeSafePrefix(s, 900);
     final glossary = value.bookMemory?['glossary'];
@@ -42,7 +29,9 @@ class _EpubSemanticGrounding {
     int outputTokens,
   ) {
     final amount =
-        utf8.encode(jsonEncode(messages)).length + 256 + outputTokens;
+        utf8.encode(jsonEncode(messages)).length +
+        256 +
+        TranslationApiClient.outputTokensFor(config, outputTokens);
     if (owner._run.semanticRequests >=
             config.maxSemanticReviewRequests.clamp(1, 64) ||
         owner._run.semanticReservedTokens + amount >
@@ -59,7 +48,7 @@ class _EpubSemanticGrounding {
     required Dio dio,
     required TranslationConfig config,
     required List<ExtractedBlock> blocks,
-    required List<ExtractedBlock> sourceOrder,
+    required Map<String, Map<String, String>> adjacentSource,
     required String chapterPath,
     required TranslationBatchContext batchContext,
     CancelToken? cancelToken,
@@ -77,7 +66,7 @@ class _EpubSemanticGrounding {
             block.id,
             units,
             scopedContext,
-            neighbours(block, sourceOrder),
+            adjacentSource[block.id],
           ]);
       keys[block.id] = key;
       final cached = await owner._artifactCache.read(key);
@@ -132,7 +121,7 @@ class _EpubSemanticGrounding {
               {
                 'id': b.id,
                 'units': SemanticSourceAnalysis.units(b.sourceHtml),
-                'adjacentSource': neighbours(b, sourceOrder),
+                'adjacentSource': adjacentSource[b.id],
               },
           ],
         }),

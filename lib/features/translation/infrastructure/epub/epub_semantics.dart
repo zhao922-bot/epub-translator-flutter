@@ -72,9 +72,12 @@ class EpubSemantics {
         }
         if (!name.endsWith(':type')) continue;
         final prefix = name.substring(0, name.length - 5);
-        if (_binding(element, prefix) == namespace &&
+        final binding = _binding(element, prefix);
+        // A foreign binding must survive detachment too: dropping a rebound
+        // conventional epub prefix would activate the legacy fallback above.
+        if (binding != null &&
             !element.attributes.containsKey('xmlns:$prefix')) {
-          inherited['xmlns:$prefix'] = namespace;
+          inherited['xmlns:$prefix'] = binding;
         }
       }
     }

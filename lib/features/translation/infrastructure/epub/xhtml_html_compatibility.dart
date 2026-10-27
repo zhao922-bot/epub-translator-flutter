@@ -181,8 +181,9 @@ class XhtmlHtmlCompatibility {
       }
 
       final String qualifiedName = source.substring(nameStart, nameEnd);
-      final String localName = qualifiedName.split(':').last.toLowerCase();
-      if (!_htmlVoidTags.contains(localName)) {
+      // HTML recognizes only unprefixed void names. A self-closing x:br or
+      // x:img must be closed explicitly or it swallows subsequent siblings.
+      if (!_htmlVoidTags.contains(qualifiedName.toLowerCase())) {
         output
           ..write(source.substring(copyFrom, cursor))
           ..write(source.substring(cursor, slash))
@@ -332,8 +333,10 @@ class XhtmlHtmlCompatibility {
       }
 
       final String qualifiedName = xmlEntitySafe.substring(nameStart, nameEnd);
-      final String localName = qualifiedName.split(':').last.toLowerCase();
-      if (!_htmlVoidTags.contains(localName)) {
+      // Prefixed elements are serialized by the HTML DOM with explicit end
+      // tags, including x:br. Preserve that valid XML pair; self-closing only
+      // its start tag would leave an unmatched end tag in the exported EPUB.
+      if (!_htmlVoidTags.contains(qualifiedName.toLowerCase())) {
         cursor = tagEnd + 1;
         continue;
       }
