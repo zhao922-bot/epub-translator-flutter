@@ -87,7 +87,7 @@ class _EpubBookMemory {
       'targetLanguage': config.targetLanguage,
       'styleProfileEnabled': config.styleProfileEnabled,
       'chapters': sourceChapters,
-      ...owner._run.sourceHints,
+      ...BookSourceIndex.promptHints(owner._run.sourceHints),
     };
     final includeProfile = config.styleProfileEnabled && includeStyleProfile;
     final String styleProfilePrompt = includeProfile
@@ -98,7 +98,7 @@ class _EpubBookMemory {
       config: config,
       payload: payload,
       systemPrompt:
-          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${includeProfile ? ', styleProfile' : ''}. Keep bookSummary under 80 words. styleGuide is at most 4 short rules. glossary is an array of at most 32 objects with source and target. Include repeated single-word surnames and brands from recurringNames as separate aliases, even when their longer names also appear. Keep each alias translation consistent with the full name. Prioritize recurringTerms (brands, places, character names and aliases) and choose one canonical target for each repeated entity. Each source must be an actual contiguous name, not slash-separated alternatives. Use relationshipEvidence to record family age/order in styleGuide; do not infer older/younger relatives from an unqualified English word. Do not invent medical diagnoses or choose a plant/object meaning unsupported by context. Preserve currency units, numbers, negation and emotional contrasts. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
+          'Create a compact translation memory for an EPUB before chapter translation begins. Return strict JSON only with keys: bookSummary, styleGuide, glossary, recentChapters${includeProfile ? ', styleProfile' : ''}. Keep bookSummary under 80 words. styleGuide is at most 4 short rules. glossary is an array of at most 32 objects with source and target. Include repeated single-word surnames and brands from recurringNames as separate aliases, even when their longer names also appear. Keep each alias translation consistent with the full name. Prioritize recurringTerms (brands, places, character names and aliases) and choose one canonical target for each repeated entity. Each source must be an actual contiguous name, not slash-separated alternatives. Use relationshipEvidence to record family age/order in styleGuide; do not infer older/younger relatives from an unqualified English word. An unqualified cousin has no established side or age order: choose one neutral target and never alternate between 堂/表 or 兄/弟/姐/妹 without explicit evidence. Do not invent medical diagnoses or choose a plant/object meaning unsupported by context. Preserve currency units, numbers, negation and emotional contrasts. recentChapters should be empty for the initial memory. Write target terms and notes for ${config.targetLanguage}.$styleProfilePrompt',
       cancelToken: cancelToken,
       cacheScope: [
         for (final c in chapters)

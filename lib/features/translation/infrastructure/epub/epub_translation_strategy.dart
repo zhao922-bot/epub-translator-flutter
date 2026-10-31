@@ -2349,12 +2349,14 @@ class _EpubTranslationStrategy {
         'Resolve occupations, official titles and ambiguous word senses from the person and situation established in the source context, not just the most common dictionary sense. '
         'A discourse or motion particle is not automatically a compass direction; require explicit geographic evidence. '
         'Preserve ambiguity where context is insufficient. Reuse established translations for every recurring named entity, including secondary characters and shortened forms. '
+        'For an unqualified kinship term such as cousin, preserve the source’s unspecified side and age order; in Chinese use one neutral form such as 表亲 with the established name, and do not alternate to 堂兄、表哥 or 表姐 without explicit source evidence. '
         'If the source explicitly names a person, preserve that name rather than replacing it with an anonymous pronoun. '
         'Track each pronoun to its referent, preserving singular/plural and who is absent, present or acting. '
         'Preserve the scope of every negation, comparison, qualifier and evaluative clause; nested negatives must not reverse the claim. '
         'An attempt, movement toward a goal or participation is not a successful outcome unless the source states success; check the next sentence before asserting a result. '
         'Interpret domain roles and rule-following expressions in their surrounding situation. '
         'Read consecutive text nodes as one sentence before translating. Allocate each meaning once across inline tags; do not duplicate an adverb, time abbreviation or punctuation already rendered in a neighboring node. '
+        'When target syntax differs from English, reorder clauses rather than copying English order. Convert abstract-noun comparisons, long relative clauses and prepositional metaphors into natural target-language clauses without changing facts, modality or emphasis. '
         'Keep the markup and emphasis, and do not leave ordinary source-language words between translated words. '
         'Perform this fidelity check silently; return only the requested translation format.';
   }

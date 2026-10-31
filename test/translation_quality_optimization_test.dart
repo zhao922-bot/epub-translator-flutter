@@ -103,6 +103,35 @@ void main() {
         greaterThan(0),
       );
       expect(checker.riskScore('<p>The sky was blue.</p>', []), 0);
+      expect(
+        checker.riskScore(
+          '<p>The quiet house stood beside a winding road surrounded by '
+          'green trees and fragrant flowers beneath the bright summer sky.</p>',
+          [],
+        ),
+        0,
+      );
+      expect(
+        checker.riskScore(
+          '<p>But the effort is getting to be greater than the relief.</p>',
+          [],
+        ),
+        greaterThan(0),
+      );
+      expect(
+        checker.riskScore(
+          '<p>They ran off in great waves of optic horror, like seaweeds.</p>',
+          [],
+        ),
+        greaterThan(0),
+      );
+      expect(
+        checker.riskScore(
+          '<p>He acts this way, sleeping under this paper for three months.</p>',
+          [],
+        ),
+        greaterThan(0),
+      );
     },
   );
 

@@ -37,6 +37,7 @@ import 'footnote_batch_planner.dart';
 import 'protected_anchor_text_slots.dart';
 import 'epub_semantics.dart';
 import 'book_source_index.dart';
+import 'book_consistency_repair.dart';
 import 'epub_xml_characters.dart';
 import 'translation_api_client.dart';
 import 'translation_artifact_cache.dart';
@@ -224,7 +225,8 @@ class EpubChapterTranslator {
   static const String _cacheSchemaVersion = 'v17-structure-repair';
 
   // Quality rules version input/job/block identities as well as checkpoints.
-  static const String qualityCacheSchemaVersion = 'v30-verified-partial-corrections';
+  static const String qualityCacheSchemaVersion =
+      'v30-verified-partial-corrections';
 
   static int htmlBudgetTokensForTest(String html) =>
       _TranslationRequestBudget.estimateTokens(html);
@@ -2500,7 +2502,7 @@ class EpubChapterTranslator {
         s.runLogRepacking,
       );
 
-      final List<InspectedChapter> updatedChapters = chapters
+      List<InspectedChapter> updatedChapters = chapters
           .map(
             (InspectedChapter chapter) =>
                 updatedByPath[chapter.path] ?? chapter,
@@ -2518,6 +2520,25 @@ class EpubChapterTranslator {
               cancelToken.isCancelled || (isCancelled?.call() ?? false),
         );
         updatedChapters[index] = restored;
+      }
+      final relationshipRepair =
+          BookRelationshipConsistency.repairUnqualifiedCousins(
+            chapters: updatedChapters,
+            config: config,
+            glossary: bookMemory?.glossary ?? const <Map<String, String>>[],
+            sourceHints: _run.sourceHints,
+          );
+      updatedChapters = relationshipRepair.chapters;
+      for (final correction in relationshipRepair.corrections) {
+        _run.automaticCorrections['book-consistency\u0000${correction.chapterPath}\u0000${correction.blockId}'] =
+            correction.toJson();
+      }
+      if (relationshipRepair.corrections.isNotEmpty) {
+        AppLogger.warn(
+          'Canonicalized ${relationshipRepair.corrections.length} '
+          'unsupported kinship variants.',
+          tag: 'book-consistency',
+        );
       }
       final int degradedBlockCount = _degradedBlocks.length;
       final degradedDetails = [
@@ -2564,10 +2585,17 @@ class EpubChapterTranslator {
         );
         if (originalTitle != null) {
           try {
+            final translatedBodyTitle =
+                BookTitleConsistency.translatedBodyTitle(
+                  metadataTitle: originalTitle,
+                  chapters: updatedChapters,
+                  sourceHints: _run.sourceHints,
+                );
             translatedTitle = await _translateBookTitle(
               dio: dio,
               config: config,
               originalTitle: originalTitle,
+              translatedBodyTitle: translatedBodyTitle,
               inputFingerprint: inputFingerprint,
               cancelToken: cancelToken,
             );
@@ -4515,13 +4543,19 @@ class EpubChapterTranslator {
     required Dio dio,
     required TranslationConfig config,
     required String originalTitle,
+    String? translatedBodyTitle,
     String inputFingerprint = '',
     CancelToken? cancelToken,
   }) async {
     if (titleAlreadyInTargetLanguage(originalTitle, config.targetLanguage)) {
       return null;
     }
-    final key = TranslationArtifactCache.key(config, 'book-title-v2', [
+    if (translatedBodyTitle != null && translatedBodyTitle.trim().isNotEmpty) {
+      final clean = _cleanBookTitle(translatedBodyTitle, checkHtmlTags: false);
+      validateEpubXmlCharacters(clean);
+      if (clean != originalTitle.trim()) return clean;
+    }
+    final key = TranslationArtifactCache.key(config, 'book-title-v3', [
       inputFingerprint,
       originalTitle,
     ]);

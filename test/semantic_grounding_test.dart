@@ -497,6 +497,65 @@ void main() {
     },
   );
 
+  for (final approve in [true, false]) {
+    test(
+      'fluency correction applies only after independent verification: $approve',
+      () async {
+        final f = fixture.Fixture();
+        await f.init(blocks: 1);
+        addTearDown(f.dispose);
+        f.reviewCategory = 'fluency';
+        f.reviewItemsOverride = (items) => [
+          for (final item in items)
+            {
+              ...item,
+              'html': '<p>她起初因喜悦而尖叫，随后却悲痛地哭喊起来。</p>',
+              'category': 'fluency',
+              'confidence': 'high',
+              'sourceQuote': 'alas',
+              'issues': ['The draft is a source-order calque.'],
+            },
+        ];
+        f.verificationItemsOverride = (items) => [
+          for (final item in items)
+            {
+              ...item,
+              'approve': approve,
+              'confidence': 'high',
+              'sourceQuotes': ['alas'],
+              'reason': approve
+                  ? 'The candidate preserves the source and is more idiomatic.'
+                  : 'The candidate is not clearly more idiomatic.',
+            },
+        ];
+        final r = await helpers.run(
+          f,
+          config: f.config.copyWith(autoApplyVerifiedCorrections: true),
+        );
+        final q =
+            jsonDecode(File(r.qualityReportPath!).readAsStringSync()) as Map;
+        expect(q['automaticCorrections'], hasLength(approve ? 1 : 0));
+        expect(q['corrections'], hasLength(approve ? 0 : 1));
+        final verification = f.requests
+            .map((request) {
+              final content =
+                  (request['messages'] as List).last['content'] as String;
+              return content.startsWith('{') ? jsonDecode(content) : null;
+            })
+            .whereType<Map>()
+            .singleWhere(
+              (payload) => payload['kind'] == 'semanticVerification',
+            );
+        final block = (verification['blocks'] as List).single as Map;
+        expect(block['category'], 'fluency');
+        expect(
+          block['issues'],
+          contains('The draft is a source-order calque.'),
+        );
+      },
+    );
+  }
+
   test(
     'an unsupported unchanged response never becomes a reviewed block',
     () async {

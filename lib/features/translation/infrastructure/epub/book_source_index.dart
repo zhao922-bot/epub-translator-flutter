@@ -3,6 +3,9 @@ import '../../domain/models/inspected_chapter.dart';
 /// Bounded source-only hints from the entire selection, including logical
 /// sections packed into a single XHTML. No additional model request is needed.
 class BookSourceIndex {
+  static const int _maxHeadingEvidence = 512;
+  static const int _maxCousinEvidence = 2048;
+
   static Map<String, Object> build(List<InspectedChapter> chapters) {
     final counts = <String, int>{};
     final names = <String, int>{};
@@ -65,16 +68,65 @@ class BookSourceIndex {
     };
     final evidence = <String, String>{};
     final relations = <String>[];
+    final headingSources = <Map<String, String>>[];
+    final cousinMentions = <Map<String, Object>>[];
     final phrases = RegExp(
       r"\b[A-Z][a-z]{2,}(?:['’]s)?(?:\s+[A-Z][a-z]{2,}(?:['’]s)?){1,4}\b",
     );
     final relationships = RegExp(
-      r'\b(eldest|younger|older|twins|brothers?|sisters?|children)\b',
+      r'\b(eldest|younger|older|twins|brothers?|sisters?|children|'
+      r'cousins?|aunts?|uncles?|nephews?|nieces?|parents?|'
+      r'mothers?|fathers?|grand(?:mother|father|parents?|sons?|daughters?)|'
+      r'relatives?)\b',
+      caseSensitive: false,
+    );
+    final cousinMention = RegExp(
+      r"\b[Cc]ousin\s+([A-Z][\p{L}\p{M}'’\-]+)"
+      r"(?:\s*(?:,|and|&)\s*(?:Cousin\s+)?"
+      r"([A-Z][\p{L}\p{M}'’\-]+))?",
+      caseSensitive: true,
+      unicode: true,
+    );
+    final explicitAge = RegExp(
+      r'\b(?:older|elder|eldest|younger|senior|junior)\b',
       caseSensitive: false,
     );
     for (final chapter in chapters.where((c) => c.includeInTranslation)) {
       for (final block in chapter.blocks) {
         final text = block.sourceText.replaceAll(RegExp(r'\s+'), ' ');
+        final tagName = block.tagName.toLowerCase();
+        if (text.isNotEmpty &&
+            const {'h1', 'h2', 'h3'}.contains(tagName) &&
+            headingSources.length < _maxHeadingEvidence) {
+          headingSources.add({
+            'chapter': chapter.path,
+            'id': block.id,
+            'source': block.sourceText,
+          });
+        }
+        if (cousinMentions.length < _maxCousinEvidence) {
+          final names = <String>[];
+          for (final match in cousinMention.allMatches(text)) {
+            for (var index = 1; index <= 2; index++) {
+              final name = match.group(index)?.trim();
+              if (name != null &&
+                  name.isNotEmpty &&
+                  !names.any(
+                    (value) => value.toLowerCase() == name.toLowerCase(),
+                  )) {
+                names.add(name);
+              }
+            }
+          }
+          if (names.isNotEmpty) {
+            cousinMentions.add({
+              'chapter': chapter.path,
+              'id': block.id,
+              'names': names,
+              'explicitAge': explicitAge.hasMatch(text),
+            });
+          }
+        }
         final seenNames = <String>{};
         final contextualNames = <String>{};
         for (final match in RegExp(r"\b[A-Z][a-z]{2,}\b").allMatches(text)) {
@@ -210,6 +262,22 @@ class BookSourceIndex {
           },
       ],
       'relationshipEvidence': relations,
+      'headingSources': headingSources,
+      'cousinMentions': cousinMentions,
     };
+  }
+
+  /// Internal source evidence stays out of model prompts.
+  static Map<String, Object> promptHints(Map<String, Object> sourceHints) {
+    final result = <String, Object>{};
+    for (final key in const {
+      'recurringTerms',
+      'recurringNames',
+      'relationshipEvidence',
+    }) {
+      final value = sourceHints[key];
+      if (value is List) result[key] = value;
+    }
+    return result;
   }
 }

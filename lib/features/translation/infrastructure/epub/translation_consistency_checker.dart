@@ -251,6 +251,9 @@ class TranslationConsistencyChecker {
     if (_hasEditableFormatting(fragment)) {
       score += 1;
     }
+    if (focus.contains('naturalness')) {
+      score += 1;
+    }
     if (focus.contains('scope') ||
         RegExp(
           r'\b(neither|unless|alas|but|however|yet|instead|nickname|called)\b',
