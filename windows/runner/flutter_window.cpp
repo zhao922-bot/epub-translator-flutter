@@ -58,8 +58,32 @@ bool FlutterWindow::OnCreate() {
           flutter_controller_->engine()->messenger(),
           "epub_translator/window_drop",
           &flutter::StandardMethodCodec::GetInstance());
-  SetChildContent(flutter_controller_->view()->GetNativeWindow());
-  DragAcceptFiles(GetHandle(), TRUE);
+  windows_platform_bridge_ = std::make_unique<WindowsPlatformBridge>(
+      GetHandle(), flutter_controller_->engine()->messenger());
+  HWND child_hwnd = flutter_controller_->view()->GetNativeWindow();
+  SetChildContent(child_hwnd);
+
+  drop_target_ = new WindowDropTarget(
+      [this](const std::wstring& first_path, UINT file_count) {
+        SendDroppedFilePath(first_path, file_count);
+      },
+      [this](bool entered, UINT file_count) {
+        SendDragState(entered, file_count);
+      });
+  if (SUCCEEDED(::RegisterDragDrop(GetHandle(), drop_target_))) {
+    ole_drop_registered_ = true;
+  }
+  if (child_hwnd != nullptr &&
+      SUCCEEDED(::RegisterDragDrop(child_hwnd, drop_target_))) {
+    drop_child_hwnd_ = child_hwnd;
+    ole_child_drop_registered_ = true;
+  }
+  if (!ole_drop_registered_ && !ole_child_drop_registered_) {
+    // Fallback to WM_DROPFILES if OLE drop registration fails.
+    drop_target_->Release();
+    drop_target_ = nullptr;
+    ::DragAcceptFiles(GetHandle(), TRUE);
+  }
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
@@ -74,9 +98,22 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
-  if (GetHandle()) {
+  if (ole_child_drop_registered_ && drop_child_hwnd_ != nullptr) {
+    ::RevokeDragDrop(drop_child_hwnd_);
+    ole_child_drop_registered_ = false;
+    drop_child_hwnd_ = nullptr;
+  }
+  if (ole_drop_registered_ && GetHandle()) {
+    ::RevokeDragDrop(GetHandle());
+    ole_drop_registered_ = false;
+  } else if (GetHandle()) {
     DragAcceptFiles(GetHandle(), FALSE);
   }
+  if (drop_target_ != nullptr) {
+    drop_target_->Release();
+    drop_target_ = nullptr;
+  }
+  windows_platform_bridge_ = nullptr;
   window_drop_channel_ = nullptr;
 
   if (flutter_controller_) {
@@ -144,4 +181,19 @@ void FlutterWindow::SendDroppedFilePath(const std::wstring& file_path,
       flutter::EncodableValue(static_cast<int32_t>(file_count));
   window_drop_channel_->InvokeMethod(
       "fileDropped", std::make_unique<flutter::EncodableValue>(args));
+}
+
+void FlutterWindow::SendDragState(bool entered, UINT file_count) {
+  if (!window_drop_channel_) {
+    return;
+  }
+  if (entered) {
+    flutter::EncodableMap args;
+    args[flutter::EncodableValue("fileCount")] =
+        flutter::EncodableValue(static_cast<int32_t>(file_count));
+    window_drop_channel_->InvokeMethod(
+        "dragEntered", std::make_unique<flutter::EncodableValue>(args));
+  } else {
+    window_drop_channel_->InvokeMethod("dragExited", nullptr);
+  }
 }

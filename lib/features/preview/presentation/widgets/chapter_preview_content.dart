@@ -1,44 +1,46 @@
 import 'package:flutter/material.dart';
+
 import '../../../../shared/localization/app_strings.dart';
 import '../../domain/models/preview_chapter.dart';
+import '../preview_strings.dart';
+import 'chapter_warning_badges.dart';
+import 'preview_passages.dart';
+import 'preview_search_field.dart';
 
-class ChapterPreviewContent extends StatelessWidget {
+class ChapterPreviewContent extends StatefulWidget {
   const ChapterPreviewContent({
     super.key,
     required this.chapter,
     required this.strings,
     required this.parallel,
+    this.onBrowseBlocks,
   });
+
   final PreviewChapter chapter;
   final AppStrings strings;
   final bool parallel;
+  final ValueChanged<String>? onBrowseBlocks;
+
+  @override
+  State<ChapterPreviewContent> createState() => _ChapterPreviewContentState();
+}
+
+class _ChapterPreviewContentState extends State<ChapterPreviewContent> {
+  final _search = TextEditingController();
+  RegExp? _pattern;
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    Widget passage(String title, String body) => Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          title,
-          style: theme.textTheme.labelMedium?.copyWith(
-            color: theme.colorScheme.onSurfaceVariant,
-          ),
-        ),
-        const SizedBox(height: 14),
-        SelectableText(
-          body,
-          style: theme.textTheme.bodyLarge?.copyWith(height: 1.8),
-        ),
-      ],
-    );
-    final original = passage(strings.sourcePreview, chapter.body);
-    final translation = passage(
-      strings.translatedPreview,
-      chapter.translatedBody?.isNotEmpty == true
-          ? chapter.translatedBody!
-          : strings.noTranslationYet,
-    );
+    final chapter = widget.chapter;
+    final strings = widget.strings;
+    final browseBlocks = widget.onBrowseBlocks;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -65,23 +67,37 @@ class ChapterPreviewContent extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 24),
-        const Divider(),
-        const SizedBox(height: 24),
-        if (parallel)
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(child: original),
-              const SizedBox(width: 28),
-              Expanded(child: translation),
-            ],
-          )
-        else ...[
-          original,
-          const SizedBox(height: 28),
-          translation,
+        if (chapter.hasWarnings) ...[
+          const SizedBox(height: 10),
+          ChapterWarningBadges(chapter: chapter, strings: strings),
         ],
+        const SizedBox(height: 20),
+        PreviewSearchField(
+          controller: _search,
+          label: strings.searchExcerpt,
+          clearLabel: strings.clearPreviewSearch,
+          onChanged: (text) =>
+              setState(() => _pattern = previewSearchPattern(text)),
+        ),
+        if (browseBlocks != null)
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: TextButton.icon(
+              onPressed: () => browseBlocks(_search.text),
+              icon: const Icon(Icons.view_agenda_outlined),
+              label: Text(strings.browseChapterBlocks),
+            ),
+          ),
+        const SizedBox(height: 12),
+        const Divider(),
+        const SizedBox(height: 20),
+        PreviewPassages(
+          strings: strings,
+          source: chapter.body,
+          translation: chapter.translatedBody ?? '',
+          parallel: widget.parallel,
+          pattern: _pattern,
+        ),
         const SizedBox(height: 28),
         ExpansionTile(
           title: Text(

@@ -121,6 +121,7 @@ void main() {
       final first = await run();
       expect(first.job.status, TranslationJobStatus.completedWithWarnings);
       expect(first.job.degradedBlockCount, 1);
+      expect(first.chapters.single.degradedBlockCount, 1);
       final output = first.job.outputPath;
       final report =
           jsonDecode(await File('$output.diagnostics.json').readAsString())
@@ -151,6 +152,7 @@ void main() {
       expect(second.job.status, TranslationJobStatus.completed);
       expect(second.job.cachedBlocks, 0);
       expect(second.job.degradedBlockCount, 0);
+      expect(second.chapters.single.degradedBlockCount, 0);
       expect(api.bodyBlocks, 2);
       final refreshed =
           jsonDecode(await File('$output.diagnostics.json').readAsString())

@@ -13,6 +13,7 @@ import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../translation_response_guard.dart';
 import 'cancellation_listener.dart';
+import 'sse_stream_decoder.dart';
 
 /// Thrown when a translation, style, or memory reply cannot be parsed as JSON
 /// (the message content is missing or is not a JSON object).
@@ -202,9 +203,9 @@ class TranslationApiClient {
         extra: <String, dynamic>{
           'reasoningEffort': config.effectiveReasoningEffort,
           'automaticThinkingDisabled': config.automaticThinkingDisabled,
-          'reasoningModel':
-              config.isGlm53 || config.effectiveReasoningEffort != null,
+          'reasoningModel': config.capabilities.needsReasoningHeadroom,
           'maxOutputTokens': config.maxOutputTokens.clamp(512, 32768),
+          'useStreamingApi': config.useStreamingApi,
         },
         headers: <String, String>{
           'Authorization': 'Bearer ${config.apiKey}',
@@ -639,14 +640,25 @@ class TranslationApiClient {
       effectiveOutputTokens(
         requested: requested,
         maximum: config.maxOutputTokens,
-        reasoningModel:
-            config.isGlm53 || config.effectiveReasoningEffort != null,
+        reasoningModel: config.capabilities.needsReasoningHeadroom,
       );
 
   Future<Response<dynamic>> postChatCompletions({
     required Dio dio,
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
+  }) => postChatCompletionsStream(
+    dio: dio,
+    data: data,
+    cancelToken: cancelToken,
+  );
+
+  Future<Response<dynamic>> postChatCompletionsStream({
+    required Dio dio,
+    required Map<String, dynamic> data,
+    CancelToken? cancelToken,
+    bool? stream,
+    void Function(String delta)? onStreamDelta,
   }) async {
     // Dio concatenates baseUrl and a relative path as strings. Construct the
     // absolute endpoint first so a base query/fragment cannot absorb the path.
@@ -691,12 +703,22 @@ class TranslationApiClient {
         /* Normal prose/title requests are not JSON. */
       }
     }
+    final bool wantStream =
+        stream ??
+        (request['stream'] as bool?) ??
+        (kind != 'probe' &&
+            (dio.options.extra['useStreamingApi'] as bool? ?? false));
+    bool streamingActive = wantStream;
     for (var attempt = 0; ; attempt++) {
-      final response = await dio.post<dynamic>(
-        endpoint.toString(),
-        data: request,
+      final response = await _postChatRequestWithStreamFallback(
+        dio: dio,
+        endpoint: endpoint,
+        request: request,
+        kind: kind,
+        streaming: streamingActive,
         cancelToken: cancelToken,
-        options: Options(extra: {'requestKind': kind}),
+        onStreamDelta: onStreamDelta,
+        onStreamUnsupported: () => streamingActive = false,
       );
       final body = response.data;
       final choices = body is Map ? body['choices'] : null;
@@ -737,6 +759,143 @@ class TranslationApiClient {
         max(budget * 2, reasoningOnly ? 4096 : 0),
       );
     }
+  }
+
+  Future<Response<dynamic>> _postChatRequestWithStreamFallback({
+    required Dio dio,
+    required Uri endpoint,
+    required Map<String, dynamic> request,
+    required String kind,
+    required bool streaming,
+    CancelToken? cancelToken,
+    void Function(String delta)? onStreamDelta,
+    void Function()? onStreamUnsupported,
+  }) async {
+    if (!streaming) {
+      request.remove('stream');
+      return dio.post<dynamic>(
+        endpoint.toString(),
+        data: request,
+        cancelToken: cancelToken,
+        options: Options(extra: {'requestKind': kind}),
+      );
+    }
+
+    final Map<String, dynamic> streamedPayload = <String, dynamic>{
+      ...request,
+      'stream': true,
+    };
+    try {
+      final Response<ResponseBody> rawResponse = await dio.post<ResponseBody>(
+        endpoint.toString(),
+        data: streamedPayload,
+        cancelToken: cancelToken,
+        options: Options(
+          extra: {'requestKind': kind},
+          responseType: ResponseType.stream,
+        ),
+      );
+      final ResponseBody? responseBody = rawResponse.data;
+      if (responseBody == null) {
+        return Response<dynamic>(
+          requestOptions: rawResponse.requestOptions,
+          statusCode: rawResponse.statusCode,
+          statusMessage: rawResponse.statusMessage,
+          headers: rawResponse.headers,
+          extra: rawResponse.extra,
+          data: <String, dynamic>{},
+        );
+      }
+      final String? contentType = rawResponse.headers.value(
+        Headers.contentTypeHeader,
+      );
+      final Map<String, dynamic> assembled = await decodeChatCompletionStream(
+        stream: responseBody.stream,
+        contentType: contentType,
+        cancelToken: cancelToken,
+        onContentDelta: onStreamDelta,
+      );
+      return Response<dynamic>(
+        requestOptions: rawResponse.requestOptions,
+        statusCode: rawResponse.statusCode,
+        statusMessage: rawResponse.statusMessage,
+        headers: rawResponse.headers,
+        extra: rawResponse.extra,
+        data: assembled,
+      );
+    } on DioException catch (error) {
+      final Response<dynamic>? decodedErrorResponse =
+          await _materializeErrorBody(error.response);
+      final DioException materialized = decodedErrorResponse == null
+          ? error
+          : DioException(
+              requestOptions: error.requestOptions,
+              response: decodedErrorResponse,
+              type: error.type,
+              error: error.error,
+              message: error.message,
+              stackTrace: error.stackTrace,
+            );
+      if (materialized.response?.statusCode == 400 &&
+          _errorMentionsUnsupportedStream(decodedErrorResponse?.data)) {
+        onStreamUnsupported?.call();
+        request.remove('stream');
+        return dio.post<dynamic>(
+          endpoint.toString(),
+          data: request,
+          cancelToken: cancelToken,
+          options: Options(extra: {'requestKind': kind}),
+        );
+      }
+      throw materialized;
+    }
+  }
+
+  static Future<Response<dynamic>?> _materializeErrorBody(
+    Response<dynamic>? response,
+  ) async {
+    if (response == null) return null;
+    final dynamic body = response.data;
+    if (body is! ResponseBody) return response;
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    try {
+      await for (final Uint8List chunk in body.stream) {
+        builder.add(chunk);
+      }
+    } catch (_) {
+      return response;
+    }
+    final String text = utf8.decode(builder.takeBytes(), allowMalformed: true);
+    dynamic parsed = text;
+    try {
+      parsed = jsonDecode(text);
+    } catch (_) {
+      // Keep plain error text when error body is non-JSON.
+    }
+    return Response<dynamic>(
+      requestOptions: response.requestOptions,
+      statusCode: response.statusCode,
+      statusMessage: response.statusMessage,
+      headers: response.headers,
+      extra: response.extra,
+      data: parsed,
+    );
+  }
+
+  static bool _errorMentionsUnsupportedStream(dynamic body) {
+    final String raw = switch (body) {
+      Map m when m['error'] is Map =>
+        (m['error'] as Map)['message']?.toString() ?? m.toString(),
+      Map m => m['message']?.toString() ?? m.toString(),
+      null => '',
+      _ => body.toString(),
+    };
+    final String message = raw.toLowerCase();
+    return message.contains('stream') &&
+        (message.contains('unsupported') ||
+            message.contains('invalid') ||
+            message.contains('not support') ||
+            message.contains('unexpected'));
   }
 
   Future<T> runRetried<T>({

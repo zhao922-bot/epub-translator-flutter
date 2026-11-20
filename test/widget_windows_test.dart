@@ -18,6 +18,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'helpers/memory_session_path_store.dart';
+
 class _WidgetSettingsStore extends SettingsStore {
   _WidgetSettingsStore(this.loadCompleter);
 
@@ -64,6 +66,7 @@ void main() {
         settingsStoreProvider.overrideWithValue(
           _WidgetSettingsStore(completer),
         ),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(_WidgetJobHistoryStore()),
       ],
       child: const EpubTranslatorApp(),
@@ -173,17 +176,31 @@ void main() {
   ) async {
     await tester.pumpWidget(testApp());
     await tester.pumpAndSettle();
+    await openTranslation(tester);
 
-    const MethodCodec codec = StandardMethodCodec();
-    await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .handlePlatformMessage(
-          'epub_translator/window_drop',
-          codec.encodeMethodCall(
-            const MethodCall('fileDropped', 'C:\\Books\\dragged.epub'),
-          ),
-          (_) {},
-        );
-    await tester.pumpAndSettle();
+    Future<void> sendDropEvent(MethodCall event) async {
+      const MethodCodec codec = StandardMethodCodec();
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+            'epub_translator/window_drop',
+            codec.encodeMethodCall(event),
+            (_) {},
+          );
+      await tester.pumpAndSettle();
+    }
+
+    const enter = MethodCall('dragEntered', {'fileCount': 1});
+    final release = find.text('Release to import EPUB');
+    await sendDropEvent(enter);
+    expect(release, findsOneWidget);
+    await sendDropEvent(const MethodCall('dragExited'));
+    expect(release, findsNothing);
+    await sendDropEvent(enter);
+    expect(release, findsOneWidget);
+    await sendDropEvent(
+      const MethodCall('fileDropped', r'C:\Books\dragged.epub'),
+    );
+    expect(release, findsNothing);
 
     // Primary UI shows basename; full path is under Advanced paths.
     expect(find.text('dragged.epub'), findsWidgets);
@@ -201,6 +218,7 @@ void main() {
       'were ignored', (tester) async {
     await tester.pumpWidget(testApp());
     await tester.pumpAndSettle();
+    await openSettings(tester);
 
     const MethodCodec codec = StandardMethodCodec();
     await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger

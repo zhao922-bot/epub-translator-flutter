@@ -15,6 +15,7 @@ import '../widgets/translation_logs.dart';
 import '../widgets/translation_overview.dart';
 import '../widgets/translation_style_profile_card.dart';
 import '../widgets/translation_workflow_steps.dart';
+import '../workbench_strings.dart';
 
 /// Window drop is handled globally by [AppShell] so imports work on any page.
 ///
@@ -56,8 +57,8 @@ class TranslationDashboardPage extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           _DashboardOverview(),
-          _DashboardInputs(),
           _DashboardWorkflow(),
+          _DashboardInputs(),
           _DashboardStyleProfile(),
           _DashboardLogs(),
         ],
@@ -115,6 +116,11 @@ class _DashboardOverview extends ConsumerWidget {
           onExportPressed: controller.exportTranslatedEpub,
           onSaveToDownloadsPressed: controller.saveTranslatedEpubToDownloads,
           canTranslate: canTranslate,
+          onPreviewWarnings:
+              overview.inspectedChapters.isNotEmpty &&
+                  GoRouter.maybeOf(context) != null
+              ? () => context.go('/preview')
+              : null,
           estimate: overview.estimate,
           canCancel: overview.isRunActive,
           onCancelPressed: controller.requestCancel,
@@ -234,18 +240,25 @@ class _DashboardInputs extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        if (inputs.reviewEnabled)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: Text(
-              strings.isChinese
-                  ? '语义复核最多增加 ${inputs.reviewRequests} 次请求，预估 token 预算 ${inputs.reviewTokens}；达到上限后保留译文并标记未完成的复核。'
-                  : 'Review adds at most ${inputs.reviewRequests} calls with an estimated ${inputs.reviewTokens}-token budget. Remaining reviews are flagged when either limit is reached.',
-            ),
-          ),
         TranslationInputs(
           key: const ValueKey<String>('translation-inputs'),
           actions: primaryActions,
+          reviewBudget: inputs.reviewEnabled
+              ? Tooltip(
+                  message: strings.reviewBudgetDescription,
+                  child: Chip(
+                    avatar: const Icon(Icons.fact_check_outlined, size: 16),
+                    visualDensity: VisualDensity.compact,
+                    shape: const StadiumBorder(),
+                    label: Text(
+                      strings.reviewBudgetSummary(
+                        inputs.reviewRequests,
+                        inputs.reviewTokens,
+                      ),
+                    ),
+                  ),
+                )
+              : null,
           chapterSummary: inputs.inspectedChapters.isNotEmpty
               ? strings.chapterChecklistSummary(
                   selectedChapters.length,
@@ -367,6 +380,7 @@ class _DashboardStyleProfile extends ConsumerWidget {
           canGenerate: hasInspected && !profile.isRunActive,
           onGenerate: controller.generateStyleProfile,
           onConfirm: controller.confirmStyleProfile,
+          onEdit: controller.clearStyleProfileConfirmation,
           onChanged:
               ({
                 String? primaryGenre,

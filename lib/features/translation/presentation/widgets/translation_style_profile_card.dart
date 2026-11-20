@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/section_card.dart';
 import '../../domain/models/translation_style_profile.dart';
+import '../workbench_strings.dart';
 
 class TranslationStyleProfileCard extends StatefulWidget {
   const TranslationStyleProfileCard({
@@ -16,6 +17,7 @@ class TranslationStyleProfileCard extends StatefulWidget {
     required this.canGenerate,
     required this.onGenerate,
     required this.onConfirm,
+    this.onEdit,
     required this.onChanged,
   });
 
@@ -28,6 +30,7 @@ class TranslationStyleProfileCard extends StatefulWidget {
   final bool canGenerate;
   final VoidCallback onGenerate;
   final VoidCallback onConfirm;
+  final VoidCallback? onEdit;
   final void Function({
     String? primaryGenre,
     String? secondaryGenresCsv,
@@ -243,27 +246,10 @@ class _TranslationStyleProfileCardState
     final ThemeData theme = Theme.of(context);
     final ColorScheme scheme = theme.colorScheme;
     final bool hasProfile = !widget.profile.isEmpty;
-    final String badge = widget.confirmed
-        ? widget.strings.styleProfileConfirmedBadge
-        : widget.strings.styleProfilePendingBadge;
-
-    if (widget.confirmed && !_showConfirmedDetails) {
-      return SectionCard(
-        title: widget.strings.styleProfileSectionTitle,
-        trailing: TextButton(
-          onPressed: () => setState(() => _showConfirmedDetails = true),
-          child: Text(widget.strings.showDetails),
-        ),
-        child: Text(
-          [
-            widget.strings.styleProfileConfirmedBadge,
-            widget.profile.primaryGenre,
-            widget.profile.tone,
-          ].where((text) => text.isNotEmpty).join(' · '),
-          style: theme.textTheme.bodySmall,
-        ),
-      );
+    if (widget.confirmed) {
+      return _buildConfirmedProfile(theme);
     }
+
     return SectionCard(
       title: widget.strings.styleProfileSectionTitle,
       icon: Icons.auto_stories_rounded,
@@ -275,7 +261,7 @@ class _TranslationStyleProfileCardState
           borderRadius: BorderRadius.circular(999),
         ),
         child: Text(
-          badge,
+          widget.strings.styleProfilePendingBadge,
           style: theme.textTheme.labelMedium?.copyWith(
             color: scheme.onSurfaceVariant,
             fontWeight: FontWeight.w700,
@@ -285,14 +271,6 @@ class _TranslationStyleProfileCardState
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          if (widget.confirmed)
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(
-                onPressed: () => setState(() => _showConfirmedDetails = false),
-                child: Text(widget.strings.hideDetails),
-              ),
-            ),
           Text(
             widget.strings.styleProfileSectionBody,
             style: theme.textTheme.bodySmall?.copyWith(
@@ -409,6 +387,82 @@ class _TranslationStyleProfileCardState
                     widget.onChanged(confidence: next.first);
                   },
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConfirmedProfile(ThemeData theme) {
+    final strings = widget.strings;
+    final profile = widget.profile;
+    final String confidence = switch (profile.confidence) {
+      TranslationStyleConfidence.high => strings.styleConfidenceHigh,
+      TranslationStyleConfidence.medium => strings.styleConfidenceMedium,
+      TranslationStyleConfidence.low => strings.styleConfidenceLow,
+    };
+    final fields = [
+      (strings.styleProfilePrimaryGenre, profile.primaryGenre),
+      (strings.styleProfileSecondaryGenres, profile.secondaryGenres.join(', ')),
+      (strings.styleProfileTone, profile.tone),
+      (strings.styleProfileSentenceStyle, profile.sentenceStyle),
+      (strings.styleProfileConstraints, _lines(profile.translationConstraints)),
+      (strings.styleProfileAvoid, _lines(profile.avoid)),
+      (strings.styleProfileConfidence, confidence),
+    ];
+    return SectionCard(
+      title: strings.styleProfileSectionTitle,
+      trailing: TextButton(
+        onPressed: () =>
+            setState(() => _showConfirmedDetails = !_showConfirmedDetails),
+        child: Text(
+          _showConfirmedDetails ? strings.hideDetails : strings.showDetails,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            [
+              strings.styleProfileConfirmedBadge,
+              profile.primaryGenre,
+              profile.tone,
+            ].where((text) => text.isNotEmpty).join(' · '),
+            style: theme.textTheme.bodySmall,
+          ),
+          if (_showConfirmedDetails) ...[
+            const SizedBox(height: 12),
+            for (final (label, value) in fields)
+              if (value.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(label, style: theme.textTheme.labelLarge),
+                      Text(value, style: theme.textTheme.bodyMedium),
+                    ],
+                  ),
+                ),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (widget.onEdit != null)
+                  FilledButton.tonalIcon(
+                    onPressed: widget.editable ? widget.onEdit : null,
+                    icon: const Icon(Icons.edit_outlined, size: 18),
+                    label: Text(strings.editStyleProfile),
+                  ),
+                TextButton.icon(
+                  onPressed: widget.isGenerating || !widget.canGenerate
+                      ? null
+                      : widget.onGenerate,
+                  icon: const Icon(Icons.auto_awesome_rounded, size: 18),
+                  label: Text(strings.regenerateStyleProfile),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );

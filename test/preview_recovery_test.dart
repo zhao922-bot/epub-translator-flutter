@@ -5,9 +5,35 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:epub_translator_flutter/features/preview/application/preview_provider.dart';
 import 'package:epub_translator_flutter/features/preview/application/preview_recovery.dart';
 import 'package:epub_translator_flutter/features/preview/domain/models/preview_chapter.dart';
+import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
+import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
+
+class _MemorySettingsStore extends SettingsStore {
+  @override
+  Future<TranslationConfig> load() async => TranslationConfig.defaults();
+  @override
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {}
+}
+
+class _MemoryJobHistoryStore extends JobHistoryStore {
+  @override
+  Future<({List<TranslationJob> jobs, int clearedAt})>
+  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
+  @override
+  Future<void> save(
+    List<TranslationJob> jobs, {
+    int clearedAtEpochMs = 0,
+  }) async {}
+}
 
 InspectedChapter legacy({
   String source = 'Original',
@@ -366,6 +392,8 @@ void main() {
       );
       final container = ProviderContainer(
         overrides: [
+          settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+          jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
           translationDashboardProvider.overrideWith((_) => controller),
           previewRecoveryCacheProvider.overrideWithValue(cache),
         ],

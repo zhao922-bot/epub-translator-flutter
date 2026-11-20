@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_run_details.dart';
+import 'package:epub_translator_flutter/app/routes.dart';
+import 'package:epub_translator_flutter/features/translation/presentation/pages/translation_manual_review_page.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/pages/translation_review_page.dart';
 import 'support/review_baseline_fixture.dart';
 
@@ -98,4 +100,104 @@ void main() {
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );
+
+  testWidgets('review routes recover when their extra is missing or invalid', (
+    tester,
+  ) async {
+    appRouter.go(TranslationReviewRouteData.location);
+    await tester.pumpWidget(MaterialApp.router(routerConfig: appRouter));
+    await tester.pumpAndSettle();
+    expect(find.text('Translation review'), findsOneWidget);
+    expect(
+      find.text('Open a review from the translation results or job history.'),
+      findsOneWidget,
+    );
+
+    appRouter.go(ManualReviewRouteData.location, extra: 'invalid');
+    await tester.pumpAndSettle();
+    expect(find.text('Manual review'), findsOneWidget);
+    expect(
+      find.text('Open a review from the translation results or job history.'),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('routed manual review debounces search and returns its choices', (
+    tester,
+  ) async {
+    final dir = Directory.systemTemp.createTempSync('routed-review-widget-');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final output = '${dir.path}/book.epub';
+    final report = File('$output.quality.json');
+    report.writeAsStringSync(
+      jsonEncode({
+        'version': 2,
+        'outputPath': output,
+        'rendering': writeReviewBaselineFixture(output)
+          ..['completeSnapshot'] = true,
+        'unreviewed': ['story.xhtml:p-1'],
+        'corrections': [],
+      }),
+    );
+
+    Future<void> waitFor(Finder target) async {
+      for (
+        var attempt = 0;
+        attempt < 200 && target.evaluate().isEmpty;
+        attempt++
+      ) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 25)),
+        );
+        await tester.pump(const Duration(milliseconds: 25));
+      }
+      expect(target, findsOneWidget);
+    }
+
+    appRouter.go(
+      TranslationReviewRouteData.location,
+      extra: TranslationReviewRouteData(
+        reportPath: report.path,
+        outputPath: output,
+        isChinese: false,
+      ),
+    );
+    await tester.pumpWidget(MaterialApp.router(routerConfig: appRouter));
+    final manualButton = find.text('Review any paragraph');
+    await waitFor(manualButton);
+    await tester.tap(manualButton);
+    final paragraph = find.text('Alas, she cried.');
+    await waitFor(paragraph);
+    await tester.pumpAndSettle();
+    expect(find.byType(TranslationManualReviewPage), findsOneWidget);
+
+    final search = find.byType(TextField);
+    await tester.enterText(search, 'no matching text');
+    await tester.pump(const Duration(milliseconds: 249));
+    expect(paragraph, findsOneWidget);
+    await tester.pump(const Duration(milliseconds: 1));
+    expect(paragraph, findsNothing);
+    expect(find.text('No matching results.'), findsOneWidget);
+
+    await tester.enterText(search, 'ALAS');
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(paragraph, findsOneWidget);
+    await tester.tap(paragraph);
+    await tester.pumpAndSettle();
+    final confirm = find.text('I checked this paragraph against the source');
+    await tester.ensureVisible(confirm);
+    await tester.tap(confirm);
+    await tester.pump();
+    await tester.tap(find.text('Keep choices'));
+    await tester.pumpAndSettle();
+    expect(find.byType(TranslationReviewPage), findsOneWidget);
+    expect(
+      find.text('Human-reviewed: 1; unresolved model failures: 0.'),
+      findsOneWidget,
+    );
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
 }

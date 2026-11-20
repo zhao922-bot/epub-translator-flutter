@@ -20,6 +20,8 @@ class InspectedChapter {
     required this.includeInTranslation,
     this.sourceIdentity,
     this.translatedBody,
+    this.degradedBlockCount = 0,
+    this.reviewWarningBlockCount = 0,
   });
 
   final String path;
@@ -34,6 +36,8 @@ class InspectedChapter {
   final bool recommendedForTranslation;
   final bool includeInTranslation;
   final EpubSourceIdentity? sourceIdentity;
+  final int degradedBlockCount;
+  final int reviewWarningBlockCount;
 
   int get translatedBlockCount => blocks
       .where((ExtractedBlock block) => block.translatedHtml != null)
@@ -50,6 +54,8 @@ class InspectedChapter {
     bool? recommendedForTranslation,
     bool? includeInTranslation,
     EpubSourceIdentity? sourceIdentity,
+    int? degradedBlockCount,
+    int? reviewWarningBlockCount,
   }) {
     return InspectedChapter(
       path: path ?? this.path,
@@ -63,6 +69,9 @@ class InspectedChapter {
           recommendedForTranslation ?? this.recommendedForTranslation,
       includeInTranslation: includeInTranslation ?? this.includeInTranslation,
       sourceIdentity: sourceIdentity ?? this.sourceIdentity,
+      degradedBlockCount: degradedBlockCount ?? this.degradedBlockCount,
+      reviewWarningBlockCount:
+          reviewWarningBlockCount ?? this.reviewWarningBlockCount,
     );
   }
 

@@ -2,34 +2,29 @@ import 'package:epub_translator_flutter/app/theme/app_theme.dart';
 import 'package:epub_translator_flutter/features/jobs/application/jobs_provider.dart';
 import 'package:epub_translator_flutter/features/jobs/domain/models/job_summary.dart';
 import 'package:epub_translator_flutter/features/jobs/presentation/pages/jobs_page.dart';
+import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
+import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
-import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_logs.dart';
 import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-class _MemoryJobHistoryStore extends JobHistoryStore {
+import 'helpers/memory_job_history_store.dart';
+import 'helpers/memory_session_path_store.dart';
+
+class _MemorySettingsStore extends SettingsStore {
   @override
-  Future<({List<TranslationJob> jobs, int clearedAt})>
-  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
+  Future<TranslationConfig> load() async => TranslationConfig.defaults();
 
   @override
   Future<void> save(
-    List<TranslationJob> jobs, {
-    int clearedAtEpochMs = 0,
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
   }) async {}
-
-  @override
-  Future<({bool written, int fileClearedAt})> saveMerged({
-    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
-    required int clearedAtEpochMs,
-  }) async {
-    return (written: true, fileClearedAt: 0);
-  }
 }
 
 void main() {
@@ -114,7 +109,11 @@ void main() {
                 ),
               ],
             ),
-            jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
+            settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+            sessionPathStoreProvider.overrideWithValue(
+              MemorySessionPathStore(),
+            ),
+            jobHistoryStoreProvider.overrideWithValue(MemoryJobHistoryStore()),
           ],
           child: MaterialApp(theme: theme, home: const JobsPage()),
         ),
@@ -162,8 +161,12 @@ void main() {
                     ),
                   ],
                 ),
+                settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+                sessionPathStoreProvider.overrideWithValue(
+                  MemorySessionPathStore(),
+                ),
                 jobHistoryStoreProvider.overrideWithValue(
-                  _MemoryJobHistoryStore(),
+                  MemoryJobHistoryStore(),
                 ),
               ],
               child: MaterialApp(theme: theme, home: const JobsPage()),

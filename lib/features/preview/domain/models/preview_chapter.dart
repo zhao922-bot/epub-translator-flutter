@@ -9,6 +9,9 @@ class PreviewChapter {
     required this.blockCount,
     required this.translatedBlockCount,
     this.translatedBody,
+    this.degradedBlockCount = 0,
+    this.reviewWarningBlockCount = 0,
+    this.hasTruncatedExcerpt = false,
   });
 
   final String title;
@@ -20,4 +23,9 @@ class PreviewChapter {
   final bool includeInTranslation;
   final int blockCount;
   final int translatedBlockCount;
+  final int degradedBlockCount;
+  final int reviewWarningBlockCount;
+  final bool hasTruncatedExcerpt;
+
+  bool get hasWarnings => degradedBlockCount > 0 || reviewWarningBlockCount > 0;
 }

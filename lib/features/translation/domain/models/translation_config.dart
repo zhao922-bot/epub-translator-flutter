@@ -1,4 +1,8 @@
 import '../../../../shared/logging/app_logger.dart';
+import 'model_capability_profile.dart';
+
+export 'model_capability_profile.dart'
+    show ModelCapabilityProfile, ModelReasoningEffort;
 
 enum UiLanguage { english, chinese }
 
@@ -9,8 +13,6 @@ enum ApiProviderSelection { deepseek, custom }
 enum TranslationTuningPreset { stable, balanced, fast }
 
 enum SemanticReviewScope { risksOnly, all }
-
-enum ModelReasoningEffort { automatic, low, high, max }
 
 class TranslationConfig {
   const TranslationConfig({
@@ -45,6 +47,7 @@ class TranslationConfig {
     this.maxSemanticReviewRequests = 8,
     this.semanticReviewScope = SemanticReviewScope.risksOnly,
     this.maxSemanticReviewTokens = 64000,
+    this.useStreamingApi = false,
   });
 
   final String apiBaseUrl;
@@ -101,25 +104,28 @@ class TranslationConfig {
   /// Conservative local reservation, including maximum response tokens.
   final int maxSemanticReviewTokens;
 
+  /// Whether to request OpenAI-compatible Server-Sent Events (`stream: true`)
+  /// when communicating with chat-completions endpoints (falling back cleanly
+  /// to buffered JSON responses when the server returns `application/json`).
+  final bool useStreamingApi;
+
+  /// Resolved capability profile for the active endpoint, model, and effort.
+  ModelCapabilityProfile get capabilities => ModelCapabilityProfile.resolve(
+    apiBaseUrl: apiBaseUrl,
+    model: model,
+    reasoningEffort: reasoningEffort,
+  );
+
   /// Only auto-configure models with verified reasoning-effort support.
   /// Other compatible APIs keep their own defaults unless explicitly opted in.
-  bool get isGlm53 => RegExp(
-    r'(^|/)glm-5\.3(?:-flash)?$',
-    caseSensitive: false,
-  ).hasMatch(model.trim());
+  bool get isGlm53 => capabilities.isGlm53;
 
-  String? get effectiveReasoningEffort =>
-      reasoningEffort == ModelReasoningEffort.automatic
-      ? (isGlm53 ? 'low' : null)
-      : reasoningEffort.name;
+  String? get effectiveReasoningEffort => capabilities.effectiveReasoningEffort;
 
   /// Verified provider/model capability, not a general OpenAI-compatible flag.
   /// This alias otherwise spends its entire small translation/memory budget on
   /// hidden reasoning. Explicit user effort choices retain provider behavior.
-  bool get automaticThinkingDisabled =>
-      reasoningEffort == ModelReasoningEffort.automatic &&
-      Uri.tryParse(apiBaseUrl.trim())?.host.toLowerCase() == 'api.edgefn.net' &&
-      model.trim().toLowerCase() == 'deepseek-v4-flash-0731';
+  bool get automaticThinkingDisabled => capabilities.automaticThinkingDisabled;
 
   /// Persistence separates the proxy endpoint from its entire authentication
   /// component. Keep the combined URL in memory for the existing UI/client.
@@ -209,12 +215,14 @@ class TranslationConfig {
     int? maxSemanticReviewRequests,
     SemanticReviewScope? semanticReviewScope,
     int? maxSemanticReviewTokens,
+    bool? useStreamingApi,
   }) {
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
       semanticReviewScope: semanticReviewScope ?? this.semanticReviewScope,
       maxSemanticReviewTokens:
           maxSemanticReviewTokens ?? this.maxSemanticReviewTokens,
+      useStreamingApi: useStreamingApi ?? this.useStreamingApi,
       apiKey: apiKey ?? this.apiKey,
       model: model ?? this.model,
       apiProviderSelection: apiProviderSelection ?? this.apiProviderSelection,
@@ -288,6 +296,7 @@ class TranslationConfig {
       'maxSemanticReviewRequests': maxSemanticReviewRequests,
       'semanticReviewScope': semanticReviewScope.name,
       'maxSemanticReviewTokens': maxSemanticReviewTokens,
+      'useStreamingApi': useStreamingApi,
     };
   }
 
@@ -497,6 +506,7 @@ class TranslationConfig {
       textScale: textScale,
       lockedGlossary: _readTrimmedString(json['lockedGlossary']),
       httpProxy: _readTrimmedStringAllowEmpty(json['httpProxy']),
+      useStreamingApi: json['useStreamingApi'] == true,
     );
   }
 

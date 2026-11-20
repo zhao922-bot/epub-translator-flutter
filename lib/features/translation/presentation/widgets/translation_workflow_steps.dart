@@ -5,8 +5,7 @@ import '../../domain/models/translation_job.dart';
 
 /// Minimal step strip: connected dots + one short status label.
 ///
-/// Active run [phase] is checked before "has chapters" so re-inspect and
-/// translation never show the wrong idle status.
+/// Active run phases take priority over chapter selection status.
 class TranslationWorkflowSteps extends StatelessWidget {
   const TranslationWorkflowSteps({
     super.key,
@@ -63,7 +62,7 @@ class TranslationWorkflowSteps extends StatelessWidget {
     }
 
     return Semantics(
-      label: label,
+      liveRegion: true,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 2),
         child: Row(
@@ -73,7 +72,7 @@ class TranslationWorkflowSteps extends StatelessWidget {
               children: [
                 for (int index = 1; index <= 4; index++)
                   Container(
-                    width: 22,
+                    width: 18,
                     height: 3,
                     margin: const EdgeInsets.only(right: 5),
                     color: index <= step
@@ -82,7 +81,7 @@ class TranslationWorkflowSteps extends StatelessWidget {
                   ),
               ],
             ),
-            const SizedBox(width: 14),
+            const SizedBox(width: 10),
             Expanded(
               child: Text(
                 label,

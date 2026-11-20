@@ -10,6 +10,7 @@
 #include <string>
 
 #include "win32_window.h"
+#include "windows_platform_bridge.h"
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -34,8 +35,14 @@ class FlutterWindow : public Win32Window {
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
       window_drop_channel_;
+  std::unique_ptr<WindowsPlatformBridge> windows_platform_bridge_;
+  WindowDropTarget* drop_target_ = nullptr;
+  HWND drop_child_hwnd_ = nullptr;
+  bool ole_drop_registered_ = false;
+  bool ole_child_drop_registered_ = false;
 
   void SendDroppedFilePath(const std::wstring& file_path, UINT file_count);
+  void SendDragState(bool entered, UINT file_count);
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

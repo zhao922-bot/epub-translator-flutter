@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import '../../../translation/presentation/pages/translation_review_page.dart';
 import '../../../translation/presentation/widgets/translation_run_details.dart';
+import '../../../translation/presentation/workbench_strings.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../domain/models/job_summary.dart';
 import '../../../translation/domain/models/translation_job.dart';
@@ -12,16 +14,19 @@ class JobRow extends StatelessWidget {
     required this.strings,
     required this.onOpen,
     required this.onRetry,
+    this.onPreviewWarnings,
   });
   final JobSummary job;
   final AppStrings strings;
   final VoidCallback onOpen;
   final VoidCallback onRetry;
+  final VoidCallback? onPreviewWarnings;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final String? reportPath = job.qualityReportPath;
     final color = job.hasWarnings
         ? scheme.tertiary
         : job.status == TranslationJobStatus.failed
@@ -106,11 +111,12 @@ class JobRow extends StatelessWidget {
             color: scheme.onSurfaceVariant,
           ),
         ),
-        if (job.apiUsage.isNotEmpty || job.qualityReportPath != null)
+        if (job.apiUsage.isNotEmpty || (!job.hasWarnings && reportPath != null))
           TranslationRunDetails(
             apiUsage: job.apiUsage,
             outputPath: job.outputPath,
-            reportPath: job.qualityReportPath,
+            reportPath: reportPath,
+            showReviewLink: !job.hasWarnings,
             elapsedMilliseconds: job.elapsedMilliseconds,
             isChinese: strings.isChinese,
             enabled: !job.isActive && !job.retryBlocked,
@@ -120,9 +126,37 @@ class JobRow extends StatelessWidget {
           Text(
             job.degradedBlockCount > 0
                 ? strings.degradedBlocksWarning(job.degradedBlockCount)
-                : strings.partialOutputWarning,
+                : strings.warningReviewSummary,
             style: theme.textTheme.bodySmall?.copyWith(color: scheme.tertiary),
           ),
+          if (onPreviewWarnings != null || reportPath?.isNotEmpty == true)
+            Wrap(
+              spacing: 8,
+              children: [
+                if (onPreviewWarnings != null)
+                  TextButton.icon(
+                    onPressed: onPreviewWarnings,
+                    icon: const Icon(
+                      Icons.chrome_reader_mode_outlined,
+                      size: 17,
+                    ),
+                    label: Text(strings.previewTranslationWarnings),
+                  ),
+                if (reportPath?.isNotEmpty == true)
+                  TextButton.icon(
+                    onPressed: job.isActive || job.retryBlocked
+                        ? null
+                        : () => TranslationReviewPage.open(
+                            context,
+                            reportPath: reportPath!,
+                            outputPath: job.outputPath,
+                            isChinese: strings.isChinese,
+                          ),
+                    icon: const Icon(Icons.fact_check_outlined, size: 17),
+                    label: Text(strings.reviewTranslationWarnings),
+                  ),
+              ],
+            ),
         ],
       ],
     );

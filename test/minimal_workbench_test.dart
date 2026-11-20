@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:epub_translator_flutter/app/app.dart';
+import 'package:epub_translator_flutter/app/routes.dart';
 import 'package:epub_translator_flutter/app/theme/app_theme.dart';
 import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
@@ -14,6 +15,7 @@ import 'package:epub_translator_flutter/shared/platform/native_platform_bridge.d
 import 'package:epub_translator_flutter/shared/widgets/page_scaffold.dart';
 import 'package:epub_translator_flutter/shared/widgets/section_card.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:epub_translator_flutter/features/jobs/application/jobs_provider.dart';
@@ -24,6 +26,8 @@ import 'package:epub_translator_flutter/features/translation/presentation/widget
 import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:epub_translator_flutter/features/translation/presentation/widgets/translation_style_profile_card.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
+
+import 'helpers/memory_session_path_store.dart';
 
 class _MemorySettingsStore extends SettingsStore {
   @override
@@ -75,6 +79,7 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
 Widget _app() => ProviderScope(
   overrides: <Override>[
     settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+    sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
     jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
   ],
   child: const EpubTranslatorApp(),
@@ -128,6 +133,10 @@ void main() {
       );
       await tester.pumpWidget(profile(true));
       expect(find.byType(TextField), findsNothing);
+      await tester.tap(find.text('Show details'));
+      await tester.pumpAndSettle();
+      expect(find.text('Essay'), findsOneWidget);
+      expect(find.byType(TextField), findsNothing);
       await tester.pumpWidget(profile(false));
       expect(find.byType(TextField), findsWidgets);
     },
@@ -135,6 +144,7 @@ void main() {
   Widget jobsApp(int count) => ProviderScope(
     overrides: [
       settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+      sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
       jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
       jobsProvider.overrideWith(
         (ref) => List.generate(
@@ -195,6 +205,7 @@ void main() {
       ProviderScope(
         overrides: [
           settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+          sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
           jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
         ],
         child: MaterialApp(
@@ -313,6 +324,72 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'desktop shortcuts navigate and open the EPUB picker',
+    (tester) async {
+      _viewport(tester, const Size(800, 720));
+      appRouter.go('/');
+      addTearDown(() => appRouter.go('/'));
+      int timesPicked = 0;
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+            translationDashboardProvider.overrideWith(
+              (ref) => TranslationDashboardController(
+                repository: ref.read(translationRepositoryProvider),
+                epubPickerOverride: ({onWindowsNotice}) async {
+                  timesPicked++;
+                  return null;
+                },
+              ),
+            ),
+          ],
+          child: const EpubTranslatorApp(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      Future<void> pressCtrl(LogicalKeyboardKey key) async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(key);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pumpAndSettle();
+      }
+
+      String location() => appRouter.routeInformationProvider.value.uri.path;
+
+      await pressCtrl(LogicalKeyboardKey.digit2);
+      expect(location(), '/jobs');
+      await pressCtrl(LogicalKeyboardKey.digit3);
+      expect(location(), '/preview');
+      await pressCtrl(LogicalKeyboardKey.digit4);
+      expect(location(), '/settings');
+      await pressCtrl(LogicalKeyboardKey.digit1);
+      expect(location(), '/');
+      await pressCtrl(LogicalKeyboardKey.comma);
+      expect(location(), '/settings');
+
+      final apiKey = find.byKey(const ValueKey<String>('settings-api-key'));
+      await tester.ensureVisible(apiKey);
+      await tester.tap(apiKey);
+      await tester.pump();
+      final editable = find.descendant(
+        of: apiKey,
+        matching: find.byType(EditableText),
+      );
+      expect(tester.widget<EditableText>(editable).focusNode.hasFocus, isTrue);
+
+      await pressCtrl(LogicalKeyboardKey.keyO);
+      expect(location(), '/');
+      expect(timesPicked, 1);
+      await pressCtrl(LogicalKeyboardKey.keyO);
+      expect(timesPicked, 2);
+      expect(tester.takeException(), isNull);
+    },
+    variant: const TargetPlatformVariant({TargetPlatform.windows}),
+  );
+
   for (final double width in <double>[390, 800, 1440]) {
     testWidgets('page frame and actions fit $width at 1.3 text scale', (
       tester,
@@ -384,6 +461,7 @@ void main() {
       final ProviderContainer container = ProviderContainer(
         overrides: <Override>[
           settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+          sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
           jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
           settingsResetNoticeProvider.overrideWith(
             (ref) => (id: 7, backupPath: '/tmp/settings.json.bad-1'),

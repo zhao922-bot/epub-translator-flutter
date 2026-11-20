@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../application/jobs_provider.dart';
@@ -60,6 +61,12 @@ class JobsPage extends ConsumerWidget {
     final jobs = ref.watch(jobsProvider);
     final strings = ref.watch(appStringsProvider);
     final controller = ref.read(translationDashboardProvider.notifier);
+    final String? previewJobId = ref.watch(
+      translationDashboardProvider.select(
+        (state) => state.inspectedChapters.isNotEmpty ? state.job?.id : null,
+      ),
+    );
+    final bool canNavigateToPreview = GoRouter.maybeOf(context) != null;
     return PageScaffold(
       title: strings.jobsTitle,
       subtitle: strings.jobsSubtitle,
@@ -99,6 +106,10 @@ class JobsPage extends ConsumerWidget {
                     }
                   },
                   onRetry: () => controller.retryJob(job.id),
+                  onPreviewWarnings:
+                      canNavigateToPreview && job.id == previewJobId
+                      ? () => context.go('/preview')
+                      : null,
                 );
               },
             ),

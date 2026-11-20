@@ -10,6 +10,7 @@ import 'package:path/path.dart' as path;
 import '../../../shared/platform/platform_utils.dart';
 import '../../../shared/io/atomic_file_writer.dart';
 import '../domain/models/job_resume_state.dart';
+import 'cache_scan_worker.dart';
 import 'epub/epub_xml_characters.dart';
 
 final translationCacheStoreProvider = Provider<TranslationCacheStore>(
@@ -92,6 +93,7 @@ class TranslationCacheStore {
   /// backoff — otherwise the backoff flaps and every cycle evicts more
   /// valid cache around the same unreclaimable temps.
   int _lastScanTempBytes = 0;
+  CacheScanStats? _lastScanStats;
   DateTime? _lastPrune;
   bool _maintenancePending = false;
   Future<void> _maintenanceTail = Future<void>.value();
@@ -136,6 +138,9 @@ class TranslationCacheStore {
   /// P2-#24/perf-#42: the mtime baseline for [path], or null when unknown.
   @visibleForTesting
   DateTime? mtimeBaselineForTest(String path) => _mtimes[path];
+
+  @visibleForTesting
+  CacheScanStats? get lastScanStatsForTest => _lastScanStats;
 
   @visibleForTesting
   Future<void> waitForMaintenanceForTest() async {
@@ -511,88 +516,103 @@ class TranslationCacheStore {
     final Map<String, int> changes = <String, int>{};
     _scanChanges = changes;
     try {
-      if (!await root.exists()) return 0;
-      // Sweep every shard, including ones no longer receiving writes. Do not
-      // memoize this maintenance pass: a previously fresh orphan can age out.
-      await cleanStaleAtomicTempFiles(root);
-      await for (final entity in root.list(
-        recursive: true,
-        followLinks: false,
-      )) {
-        if (entity is Directory) {
-          await cleanStaleAtomicTempFiles(entity);
+      final Map<String, CacheIndexEntry> memoryBaselines =
+          <String, CacheIndexEntry>{};
+      for (final MapEntry<String, DateTime> item in _mtimes.entries) {
+        final int? size = _sizes[item.key];
+        final Digest? digest = _contentDigests[item.key];
+        final _RollbackCheck? checked = _rollbackChecked[item.key];
+        if (checked != null && checked.size == size) {
+          memoryBaselines[item.key] = CacheIndexEntry(
+            modifiedUs: checked.modified.microsecondsSinceEpoch,
+            size: checked.size,
+            digestHex: checked.digest.toString(),
+          );
+        } else if (size != null && digest != null) {
+          memoryBaselines[item.key] = CacheIndexEntry(
+            modifiedUs: item.value.microsecondsSinceEpoch,
+            size: size,
+            digestHex: digest.toString(),
+          );
         }
       }
-      final List<_CacheEntry> entries = <_CacheEntry>[];
-      final Map<String, int> scannedSizes = <String, int>{};
-      final Map<String, FileStat> temps = <String, FileStat>{};
-      int deletedBytes = 0;
-      await for (final FileSystemEntity entity in root.list(
-        recursive: true,
-        followLinks: false,
-      )) {
-        if (entity is! File) continue;
-        final String relative = path.relative(entity.path, from: root.path);
-        if (relative == 'jobs' ||
-            relative.startsWith('jobs${path.separator}')) {
-          continue;
-        }
-        final bool isAtomicTemp = path.basename(entity.path).contains('.tmp.');
-        try {
-          final FileStat stat = await entity.stat();
-          if (stat.type != FileSystemEntityType.file) continue;
-          // Fresh temps count toward the cap but cannot be evicted: they may
-          // belong to another live writer. Stale ones were swept above.
-          if (isAtomicTemp) {
-            temps[entity.path] = stat;
-          } else {
-            scannedSizes[entity.path] = stat.size;
-            entries.add(
-              _CacheEntry(
-                file: entity,
-                size: stat.size,
-                modified: stat.modified,
+      final CacheIsolateScanResult snapshot = await scanCacheDirectoryInIsolate(
+        rootPath: root.path,
+        memoryBaselines: memoryBaselines,
+      );
+      _lastScanStats = snapshot.stats;
+      if (!snapshot.exists) return 0;
+
+      final List<_CacheEntry> entries = <_CacheEntry>[
+        for (final ScannedCacheEntry e in snapshot.entries)
+          _CacheEntry(
+            file: File(e.path),
+            size: e.size,
+            modified: DateTime.fromMicrosecondsSinceEpoch(e.modifiedUs),
+          ),
+      ];
+      final Map<String, int> scannedSizes = <String, int>{
+        for (final ScannedCacheEntry e in snapshot.entries) e.path: e.size,
+      };
+      final Map<String, ({int size, DateTime modified})> temps =
+          <String, ({int size, DateTime modified})>{
+            for (final MapEntry<String, ScannedTempEntry> e
+                in snapshot.liveTemps.entries)
+              e.key: (
+                size: e.value.size,
+                modified: DateTime.fromMicrosecondsSinceEpoch(
+                  e.value.modifiedUs,
+                ),
               ),
-            );
-          }
-        } catch (_) {
-          // A file that vanishes mid-scan is simply skipped.
-        }
-      }
+          };
+      final Map<String, Digest> scannedDigests = <String, Digest>{
+        for (final ScannedCacheEntry e in snapshot.entries)
+          if (e.digestHex case final String digest)
+            e.path: digestFromHex(digest),
+      };
+      final Map<String, String> relativeByPath = <String, String>{
+        for (final ScannedCacheEntry e in snapshot.entries)
+          e.path: e.relativePath,
+      };
+      final Map<String, CacheIndexEntry> nextIndex =
+          Map<String, CacheIndexEntry>.of(snapshot.nextIndex);
+      bool indexDirty = snapshot.indexDirty;
+
       await onMaintenanceScan?.call();
-      // Reconcile the temporary paths, not just their original byte sum. A
-      // rename may have promoted a listed temp during this scan, including in
-      // another store/process. Size+mtime identifies that promotion. This
-      // synchronous reconciliation and the overlay below cannot interleave
-      // with this isolate's completed-write accounting.
-      int reconcileTemps() {
+
+      Future<int> reconcileTemps() async {
         int bytes = 0;
-        for (final temp in temps.entries) {
-          final FileStat current = FileStat.statSync(temp.key);
-          if (current.type == FileSystemEntityType.file) {
-            bytes += current.size;
-          } else {
-            final String target = temp.key.substring(
-              0,
-              temp.key.lastIndexOf('.tmp.'),
-            );
-            final FileStat promoted = FileStat.statSync(target);
-            if (promoted.type == FileSystemEntityType.file &&
-                promoted.size == temp.value.size &&
-                promoted.modified == temp.value.modified &&
-                !changes.containsKey(target)) {
-              scannedSizes[target] = promoted.size;
-              _mtimes[target] = promoted.modified;
+        for (final MapEntry<String, ({int size, DateTime modified})> temp
+            in temps.entries) {
+          try {
+            final FileStat current = await File(temp.key).stat();
+            if (current.type == FileSystemEntityType.file) {
+              bytes += current.size;
+              continue;
             }
+            final int marker = temp.key.lastIndexOf('.tmp.');
+            if (marker != -1) {
+              final String target = temp.key.substring(0, marker);
+              final FileStat promoted = await File(target).stat();
+              if (promoted.type == FileSystemEntityType.file &&
+                  promoted.size == temp.value.size &&
+                  promoted.modified == temp.value.modified) {
+                scannedSizes[target] = promoted.size;
+                _mtimes[target] = promoted.modified;
+              }
+            }
+          } catch (_) {
+            // Vanished mid-scan.
           }
         }
         return bytes;
       }
 
-      int tempBytes = reconcileTemps();
-      // Overlay writes completed during listing, including newly created keys.
+      int deletedBytes = 0;
+      int tempBytes = await reconcileTemps();
       scannedSizes.addAll(changes);
       int totalBytes = tempBytes + scannedSizes.values.fold(0, (a, b) => a + b);
+
       if (totalBytes > maxBytes) {
         entries.sort(
           (_CacheEntry a, _CacheEntry b) => a.modified.compareTo(b.modified),
@@ -602,125 +622,109 @@ class TranslationCacheStore {
           if (totalBytes - tempBytes <= targetBytes) break;
           try {
             await _withFileGate(entry.file, () async {
-              // Never delete a replacement written since this scan began.
-              if (changes.containsKey(entry.file.path)) return;
+              if (changes.containsKey(entry.file.path) ||
+                  !scannedDigests.containsKey(entry.file.path)) {
+                return;
+              }
               final FileStat current = await entry.file.stat();
-              if (current.type != FileSystemEntityType.file ||
-                  current.size != entry.size ||
-                  current.modified != entry.modified) {
+              if (current.type != FileSystemEntityType.file) return;
+              if (current.modified != entry.modified ||
+                  current.size != entry.size) {
                 return;
               }
               await entry.file.delete();
-              totalBytes -= entry.size;
               deletedBytes += entry.size;
-              _recordSize(entry.file.path, 0);
+              totalBytes -= entry.size;
+              scannedSizes.remove(entry.file.path);
+              _evictionOrder.remove(entry.file.path);
+              final String? rel = relativeByPath[entry.file.path];
+              if (rel != null && nextIndex.remove(rel) != null) {
+                indexDirty = true;
+              }
             });
           } catch (_) {
-            // Best effort; a locked file is left for the next pass.
+            // Locked file is left for next pass.
           }
         }
       }
-      tempBytes = reconcileTemps();
+
+      tempBytes = await reconcileTemps();
       scannedSizes.addAll(changes);
       scannedSizes.removeWhere((_, size) => size == 0);
-      // Only unchanged contents with a shared backward offset form a clock
-      // event. A lone rollback (or a real rewrite) stays fail-closed. Read
-      // contents only to establish a baseline or reconcile changed mtimes.
-      final Map<Duration, List<_CacheEntry>> rollbacks = {};
-      // P2-#24: keys whose digest could not be read during this scan. Their
-      // mtime baseline must not advance below: that would pair the new
-      // mtime with a stale digest, a permanently wrong baseline that later
-      // scans would never re-hash (the "unchanged" early-continue above).
-      final Set<String> digestReadFailed = <String>{};
+
+      final Set<String> digestFailures = <String>{};
+      final Map<Duration, List<_CacheEntry>> rollbacks =
+          <Duration, List<_CacheEntry>>{};
+
       for (final _CacheEntry entry in entries) {
         final String key = entry.file.path;
         if (!scannedSizes.containsKey(key) || changes.containsKey(key)) {
           continue;
         }
         final DateTime? known = _mtimes[key];
-        if (known == entry.modified && _contentDigests.containsKey(key)) {
+        if (known == entry.modified &&
+            _sizes[key] == entry.size &&
+            _contentDigests.containsKey(key)) {
           continue;
         }
         try {
-          await _withFileGate(entry.file, () async {
-            if (changes.containsKey(key)) return;
-            final _RollbackCheck? checked = _rollbackChecked[key];
-            final Digest digest;
-            if (checked != null &&
-                checked.modified == entry.modified &&
-                checked.size == entry.size) {
-              // P2-#31: (mtime, size) alone cannot prove the content is
-              // unchanged — an external rewrite with the same size and a
-              // preserved mtime would reuse a stale digest and corrupt
-              // rollback detection. Verify by re-hashing and comparing
-              // with the memoized digest; on mismatch the content really
-              // changed, so refresh the memo with the fresh digest.
-              final FileStat current = await entry.file.stat();
-              if (current.type != FileSystemEntityType.file ||
-                  current.size != entry.size ||
-                  current.modified != entry.modified) {
-                return;
+          final Digest? digest = scannedDigests[key];
+          if (digest == null) {
+            digestFailures.add(key);
+            continue;
+          }
+          final FileStat current = await entry.file.stat();
+          if (changes.containsKey(key)) continue;
+          if (current.type != FileSystemEntityType.file ||
+              current.modified != entry.modified ||
+              current.size != entry.size) {
+            digestFailures.add(key);
+            final String? relative = relativeByPath[key];
+            if (relative != null) {
+              final CacheIndexEntry? previous = memoryBaselines[key];
+              if (previous == null) {
+                nextIndex.remove(relative);
+              } else {
+                nextIndex[relative] = previous;
               }
-              final Digest fresh = await sha256
-                  .bind(entry.file.openRead())
-                  .first;
-              final FileStat after = await entry.file.stat();
-              if (after.type != FileSystemEntityType.file ||
-                  after.size != entry.size ||
-                  after.modified != entry.modified) {
-                return;
-              }
-              if (fresh != checked.digest) {
-                _rollbackChecked[key] = _RollbackCheck(
-                  modified: entry.modified,
-                  size: entry.size,
-                  digest: fresh,
-                );
-              }
-              digest = fresh;
-            } else {
-              digest = await sha256.bind(entry.file.openRead()).first;
-              final FileStat current = await entry.file.stat();
-              if (current.type != FileSystemEntityType.file ||
-                  current.size != entry.size ||
-                  current.modified != entry.modified) {
-                return;
-              }
-              // Memoize this (mtime, size, digest): a later scan with an
-              // unchanged file reuses it instead of hashing again.
-              _rollbackChecked[key] = _RollbackCheck(
-                modified: entry.modified,
-                size: entry.size,
-                digest: digest,
-              );
+              indexDirty = true;
             }
-            if (known != null && entry.modified.isBefore(known)) {
-              if (_sizes[key] == entry.size && _contentDigests[key] == digest) {
-                rollbacks
-                    .putIfAbsent(known.difference(entry.modified), () => [])
-                    .add(entry);
-              }
+            continue;
+          }
+          if (known != null && !entry.modified.isAfter(known)) {
+            _rollbackChecked[key] = _RollbackCheck(
+              modified: entry.modified,
+              size: entry.size,
+              digest: digest,
+            );
+            if (_sizes[key] == entry.size && _contentDigests[key] == digest) {
+              rollbacks
+                  .putIfAbsent(known.difference(entry.modified), () => [])
+                  .add(entry);
             } else {
               _contentDigests[key] = digest;
             }
-          });
+          } else {
+            _contentDigests[key] = digest;
+            _rollbackChecked.remove(key);
+          }
         } catch (_) {
-          // Unreadable or concurrently replaced entries cannot prove rollback.
-          digestReadFailed.add(key);
+          digestFailures.add(key);
         }
       }
-      final Set<String> clockRollbackPaths = {
-        for (final cohort in rollbacks.values)
-          if (cohort
-                  .where((entry) => !changes.containsKey(entry.file.path))
-                  .length >=
-              2)
-            for (final entry in cohort) entry.file.path,
-      };
-      // Digest reads yield: overlay writes completed during reconciliation too.
-      tempBytes = reconcileTemps();
-      scannedSizes.addAll(changes);
-      scannedSizes.removeWhere((_, size) => size == 0);
+
+      final Set<String> clockRollbackPaths = <String>{};
+      for (final List<_CacheEntry> cohort in rollbacks.values) {
+        if (cohort
+                .where((entry) => !changes.containsKey(entry.file.path))
+                .length >=
+            2) {
+          for (final _CacheEntry entry in cohort) {
+            clockRollbackPaths.add(entry.file.path);
+          }
+        }
+      }
+
       _sizes
         ..clear()
         ..addAll(scannedSizes);
@@ -729,12 +733,11 @@ class TranslationCacheStore {
       );
       _contentDigests.removeWhere((key, _) => !scannedSizes.containsKey(key));
       _rollbackChecked.removeWhere((key, _) => !scannedSizes.containsKey(key));
+
       for (final _CacheEntry entry in entries) {
         if (!scannedSizes.containsKey(entry.file.path)) continue;
         if (changes.containsKey(entry.file.path)) continue;
-        // P2-#24: a failed digest read leaves the old digest behind; the
-        // mtime baseline must not advance past it.
-        if (digestReadFailed.contains(entry.file.path)) continue;
+        if (digestFailures.contains(entry.file.path)) continue;
         final DateTime? known = _mtimes[entry.file.path];
         if (known == null ||
             entry.modified.isAfter(known) ||
@@ -742,14 +745,34 @@ class TranslationCacheStore {
           _mtimes[entry.file.path] = entry.modified;
         }
       }
+
+      for (final String changedPath in changes.keys) {
+        final int? size = _sizes[changedPath];
+        final DateTime? modified = _mtimes[changedPath];
+        final Digest? digest = _contentDigests[changedPath];
+        if (size == null || modified == null || digest == null || size <= 0) {
+          continue;
+        }
+        final String rel = path
+            .relative(changedPath, from: root.path)
+            .replaceAll("\\", "/");
+        if (rel == cacheIndexFileName ||
+            rel == 'jobs' ||
+            rel.startsWith('jobs/') ||
+            rel.startsWith('..')) {
+          continue;
+        }
+        nextIndex[rel] = CacheIndexEntry(
+          modifiedUs: modified.microsecondsSinceEpoch,
+          size: size,
+          digestHex: digest.toString(),
+        );
+        indexDirty = true;
+      }
+
       _estimatedBytes = tempBytes + _sizes.values.fold(0, (a, b) => a + b);
-      // P2-#32: remember the temp pressure this scan saw, so the light
-      // pass can exclude it from its eviction target and so temp-driven
-      // backoff is not cleared by light-pass evictions.
       _lastScanTempBytes = tempBytes;
-      // Rebuild the lightweight-eviction order from on-disk mtimes (oldest
-      // first) so the backoff-period quota pass evicts approximately LRU
-      // without another full scan.
+
       final List<String> byAge = scannedSizes.keys.toList()
         ..sort(
           (String a, String b) => (_mtimes[a] ?? DateTime(1970)).compareTo(
@@ -759,6 +782,14 @@ class TranslationCacheStore {
       _evictionOrder
         ..clear()
         ..addAll(byAge);
+
+      if (indexDirty) {
+        await persistCacheIndexInIsolate(
+          rootPath: root.path,
+          entries: nextIndex,
+          hadIndexFile: snapshot.hadIndexFile,
+        );
+      }
       return deletedBytes;
     } finally {
       _scanChanges = null;

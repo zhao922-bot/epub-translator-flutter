@@ -3,8 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../../features/translation/application/translation_dashboard_controller.dart';
 import '../../features/settings/application/settings_controller.dart';
+import '../../features/translation/application/translation_dashboard_controller.dart';
 import '../localization/app_strings.dart';
 import '../models/nav_item.dart';
 
@@ -21,6 +21,13 @@ class AppShell extends ConsumerStatefulWidget {
   static const Key brandKey = ValueKey<String>('app-shell-brand');
   static const Key shellKey = ValueKey<String>('app-shell');
 
+  static bool isFileDraggingOf(BuildContext context) =>
+      context
+          .dependOnInheritedWidgetOfExactType<_WindowFileDrag>()
+          ?.notifier
+          ?.value ??
+      false;
+
   @override
   ConsumerState<AppShell> createState() => _AppShellState();
 }
@@ -29,6 +36,16 @@ class _AppShellState extends ConsumerState<AppShell> {
   static const MethodChannel _windowDropChannel = MethodChannel(
     'epub_translator/window_drop',
   );
+  static const _navigationShortcuts = <(LogicalKeyboardKey, int)>[
+    (LogicalKeyboardKey.digit1, 0),
+    (LogicalKeyboardKey.digit2, 1),
+    (LogicalKeyboardKey.digit3, 2),
+    (LogicalKeyboardKey.digit4, 3),
+    (LogicalKeyboardKey.comma, 3),
+  ];
+
+  final ValueNotifier<bool> _fileDragging = ValueNotifier(false);
+  final FocusNode _shortcutFocus = FocusNode(debugLabel: 'Workbench shortcuts');
 
   @override
   void initState() {
@@ -55,12 +72,23 @@ class _AppShellState extends ConsumerState<AppShell> {
   @override
   void dispose() {
     _windowDropChannel.setMethodCallHandler(null);
+    _fileDragging.dispose();
+    _shortcutFocus.dispose();
     super.dispose();
   }
 
   Future<void> _handleWindowDrop(MethodCall call) async {
-    if (call.method != 'fileDropped') {
-      return;
+    switch (call.method) {
+      case 'dragEntered':
+        _fileDragging.value = true;
+        return;
+      case 'dragExited':
+        _fileDragging.value = false;
+        return;
+      case 'fileDropped':
+        _fileDragging.value = false;
+      default:
+        return;
     }
     // Since 1.4.1 the native side sends a map {path, fileCount}; the legacy
     // bare-string payload is still accepted.
@@ -70,8 +98,10 @@ class _AppShellState extends ConsumerState<AppShell> {
     if (args is String) {
       droppedPath = args;
     } else if (args is Map) {
-      droppedPath = args['path'] as String?;
-      fileCount = (args['fileCount'] as num?)?.toInt() ?? 1;
+      final path = args['path'];
+      final count = args['fileCount'];
+      droppedPath = path is String ? path : null;
+      fileCount = count is int ? count : 1;
     } else {
       return;
     }
@@ -104,11 +134,7 @@ class _AppShellState extends ConsumerState<AppShell> {
       );
       return;
     }
-    final String name = droppedPath
-        .replaceAll('\\', '/')
-        .split('/')
-        .where((String part) => part.isNotEmpty)
-        .last;
+    final String name = droppedPath.replaceAll('\\', '/').split('/').last;
     messenger?.showSnackBar(
       SnackBar(
         content: Text(strings.logDroppedEpub(name)),
@@ -134,7 +160,8 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   @override
   Widget build(BuildContext context) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme scheme = theme.colorScheme;
     final strings = ref.watch(appStringsProvider);
 
     // A corrupt/unreadable settings.json resets to defaults at startup with
@@ -179,7 +206,7 @@ class _AppShellState extends ConsumerState<AppShell> {
       onTap: () => context.go(items[index].location),
     );
 
-    return Scaffold(
+    final Widget shell = Scaffold(
       key: AppShell.shellKey,
       body: SafeArea(
         child: LayoutBuilder(
@@ -264,7 +291,49 @@ class _AppShellState extends ConsumerState<AppShell> {
         ),
       ),
     );
+    final Widget dropRegion = _WindowFileDrag(
+      notifier: _fileDragging,
+      child: shell,
+    );
+    return switch (theme.platform) {
+      TargetPlatform.windows ||
+      TargetPlatform.linux ||
+      TargetPlatform.macOS => CallbackShortcuts(
+        bindings: {
+          for (final (key, destination) in _navigationShortcuts)
+            SingleActivator(key, control: true, includeRepeats: false): () =>
+                context.go(items[destination].location),
+          const SingleActivator(
+            LogicalKeyboardKey.keyO,
+            control: true,
+            includeRepeats: false,
+          ): _openEpubFromShortcut,
+        },
+        child: Focus(
+          focusNode: _shortcutFocus,
+          autofocus: true,
+          skipTraversal: true,
+          child: dropRegion,
+        ),
+      ),
+      _ => dropRegion,
+    };
   }
+
+  void _openEpubFromShortcut() {
+    if (ref.read(translationDashboardProvider).isRunActive) {
+      return;
+    }
+    _shortcutFocus.requestFocus();
+    if (widget.currentLocation != '/') {
+      context.go('/');
+    }
+    ref.read(translationDashboardProvider.notifier).pickInputPath();
+  }
+}
+
+class _WindowFileDrag extends InheritedNotifier<ValueNotifier<bool>> {
+  const _WindowFileDrag({required super.notifier, required super.child});
 }
 
 class _SidebarDestination extends StatelessWidget {
@@ -280,7 +349,11 @@ class _SidebarDestination extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final ThemeData theme = Theme.of(context);
+    final ColorScheme scheme = theme.colorScheme;
+    final Color color = selected
+        ? scheme.onPrimaryContainer
+        : scheme.onSurfaceVariant;
     return Semantics(
       selected: selected,
       button: true,
@@ -294,13 +367,29 @@ class _SidebarDestination extends StatelessWidget {
           child: InkWell(
             borderRadius: BorderRadius.circular(8),
             onTap: onTap,
-            child: SizedBox(
-              width: 44,
-              height: 44,
-              child: Icon(
-                item.icon,
-                size: 21,
-                color: selected ? scheme.onSurface : scheme.onSurfaceVariant,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints.tightFor(width: 62),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 9),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(item.icon, size: 20, color: color),
+                    const SizedBox(height: 3),
+                    ExcludeSemantics(
+                      child: Text(
+                        item.label,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: color,
+                          fontWeight: selected
+                              ? FontWeight.w700
+                              : FontWeight.w500,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

@@ -83,9 +83,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     CreateAndAttachConsole();
   }
 
-  // Initialize COM, so that it is available for use in the library and/or
-  // plugins.
-  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  // Initialize OLE (includes apartment-threaded COM + OLE drag-and-drop).
+  const HRESULT ole_hr = ::OleInitialize(nullptr);
 
   flutter::DartProject project(data_path);
 
@@ -97,6 +96,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1280, 720);
   if (!window.Create(L"\u9875\u6e21 \u00b7 FolioFerry", origin, size)) {
+    if (SUCCEEDED(ole_hr)) {
+      ::OleUninitialize();
+    }
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
@@ -107,6 +109,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::DispatchMessage(&msg);
   }
 
-  ::CoUninitialize();
+  if (SUCCEEDED(ole_hr)) {
+    ::OleUninitialize();
+  }
   return EXIT_SUCCESS;
 }

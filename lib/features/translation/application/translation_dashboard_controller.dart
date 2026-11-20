@@ -9,12 +9,12 @@ import 'package:dio/dio.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as path;
 
-import '../../../../shared/localization/app_strings.dart';
-import '../../../../shared/logging/app_logger.dart';
-import '../../../../shared/platform/android_service_bridge.dart';
-import '../../../../shared/platform/native_platform_bridge.dart';
-import '../../../../shared/platform/platform_utils.dart';
-import '../../../../shared/security/sensitive_text.dart';
+import '../../../shared/localization/app_strings.dart';
+import '../../../shared/logging/app_logger.dart';
+import '../../../shared/platform/android_service_bridge.dart';
+import '../../../shared/platform/native_platform_bridge.dart';
+import '../../../shared/platform/platform_utils.dart';
+import '../../../shared/security/sensitive_text.dart';
 import '../../settings/application/settings_controller.dart';
 import '../domain/models/actionable_error.dart';
 import '../domain/models/chapter_selection_preset.dart';
@@ -30,6 +30,10 @@ import '../infrastructure/job_history_store.dart';
 import '../infrastructure/session_path_store.dart';
 import '../infrastructure/translation_cache_store.dart';
 import '../infrastructure/repositories/epub_translation_repository.dart';
+import 'dashboard_error_messages.dart';
+import 'dashboard_estimate_memoizer.dart';
+import 'dashboard_job_history_helper.dart';
+import 'dashboard_progress_coalescer.dart';
 
 final translationRepositoryProvider = Provider<TranslationRepository>(
   (ref) => EpubTranslationRepository(
@@ -260,6 +264,44 @@ class TranslationDashboardController
   // off Windows, where [PlatformUtils.isWindows] is false.
   final Future<void> Function(String path)? windowsPathObserverOverride;
   bool _cancelRequested = false;
+  int _coalescedRunGeneration = 0;
+  String _coalescedRunInputPath = '';
+  late final DashboardProgressCoalescer _progressCoalescer =
+      DashboardProgressCoalescer(onFlush: _applyCoalescedProgress);
+
+  void _applyCoalescedProgress(
+    TranslationJob progressJob,
+    List<String> newLogs,
+    bool isTranslationRun,
+  ) {
+    if (!mounted || _cancelRequested) {
+      return;
+    }
+    if (isTranslationRun) {
+      if (_isStaleTranslationRun(
+        _coalescedRunGeneration,
+        _coalescedRunInputPath,
+      )) {
+        return;
+      }
+      state = state.copyWith(
+        job: progressJob,
+        jobHistory: _jobHistoryWith(progressJob, persist: false),
+        runEstimate: _buildEstimate(job: progressJob),
+        logs: newLogs.isEmpty
+            ? state.logs
+            : <String>[...state.logs, ...newLogs],
+      );
+      _updateTranslationForegroundService(progressJob);
+      _persistProgressHistoryIfDue();
+      return;
+    }
+    state = state.copyWith(
+      job: progressJob,
+      logs: newLogs.isEmpty ? state.logs : <String>[...state.logs, ...newLogs],
+    );
+  }
+
   int _cancellationRevision = 0;
   // P1-#3: translation-run generation for progress callbacks. The previous
   // run's wind-down (terminal emits, checkpoint saves) can outlive the run:
@@ -380,7 +422,7 @@ class TranslationDashboardController
   static List<TranslationJob> mergeHistorySnapshotsForTest(
     List<TranslationJob> memoryJobs,
     List<TranslationJob> fileJobs,
-  ) => _mergeHistorySnapshots(memoryJobs, fileJobs);
+  ) => DashboardJobHistoryHelper.mergeHistorySnapshots(memoryJobs, fileJobs);
   _ResumeProgressHint? _pendingResumeProgressHint;
   String? _activeTranslationHistoryJobId;
   int _activeTranslationRunStartedAt = 0;
@@ -394,6 +436,7 @@ class TranslationDashboardController
     final activeJob = state.job;
     final shouldCancel = state.isRunActive || state.isGeneratingStyleProfile;
     _cancelRequested = true;
+    _progressCoalescer.clear();
     if (shouldCancel && activeJob != null) {
       unawaited(
         Future<void>.sync(() => repository.cancelJob(activeJob.id)).catchError((
@@ -619,10 +662,7 @@ class TranslationDashboardController
 
   void setInputPath(String value) {
     if (!mounted) return;
-    if (state.isRunActive) {
-      state = state.copyWith(logs: <String>[...state.logs, _s.logInputLocked]);
-      return;
-    }
+    if (_logIfRunActive(_s.logInputLocked)) return;
     // NOTE: no extension validation here — this receives intermediate values
     // while the user is still typing (see 'rapid manual edits coalesce queued
     // session writes'); rejecting them would break incremental entry and
@@ -633,6 +673,7 @@ class TranslationDashboardController
     // P2-02: invalidate the finishing run and stop its service here, since
     // its stale finally will no longer stop the foreground service.
     ++_translationRunGeneration;
+    _progressCoalescer.clear();
     // Release the old context before publishing the new input; a stale
     // result must not later clear history or timing owned by a newer run.
     _clearActiveTranslationHistory();
@@ -647,9 +688,7 @@ class TranslationDashboardController
     // the identity-memoization key still strongly owns every originalHtml.
     // Drop all static estimate inputs/results now, even if no new inspection
     // follows, so a manual input change can release the entire source text.
-    _estimateStaticChaptersKey = null;
-    _estimateStaticChunkSizeKey = -1;
-    _estimateStaticCache = null;
+    _estimateMemoizer.reset();
     state = state.copyWith(
       inputPath: value,
       job: null,
@@ -709,6 +748,7 @@ class TranslationDashboardController
     // pick can bump the input revision while a run is still active. Stop
     // its service here because the stale finally will skip cleanup.
     ++_translationRunGeneration;
+    _progressCoalescer.clear();
     _clearActiveTranslationHistory();
     _translationStopwatch?.stop();
     _translationStopwatch = null;
@@ -722,9 +762,7 @@ class TranslationDashboardController
     _styleFieldsEditedDuringGeneration.clear();
     // Pick/drop must release the same strong chapter-list reference as manual
     // entry; waiting for the next estimate retains the previous whole book.
-    _estimateStaticChaptersKey = null;
-    _estimateStaticChunkSizeKey = -1;
-    _estimateStaticCache = null;
+    _estimateMemoizer.reset();
     state = state.copyWith(
       inputPath: normalizedPath,
       outputDirectory: outputDirectory,
@@ -1200,7 +1238,8 @@ class TranslationDashboardController
         : state.outputDirectory;
     // P2-02: a new inspection (including same-book reinspection or retry)
     // invalidates the finishing run and takes over its service cleanup.
-    ++_translationRunGeneration;
+    final int inspectionGeneration = ++_translationRunGeneration;
+    _progressCoalescer.clear();
     _clearActiveTranslationHistory();
     _translationStopwatch?.stop();
     _translationStopwatch = null;
@@ -1217,9 +1256,7 @@ class TranslationDashboardController
     _styleFieldsEditedDuringGeneration.clear();
     // Drop the previous book's strong cache reference before inspection,
     // including when the replacement inspection fails.
-    _estimateStaticChaptersKey = null;
-    _estimateStaticChunkSizeKey = -1;
-    _estimateStaticCache = null;
+    _estimateMemoizer.reset();
     state = state.copyWith(
       outputDirectory: outputDirectory,
       actionableError: null,
@@ -1252,17 +1289,31 @@ class TranslationDashboardController
         outputDirectory: outputDirectory,
         config: state.config,
         onProgress: (TranslationJob job, String logLine) {
-          if (!mounted || _cancelRequested) {
+          if (!mounted ||
+              _cancelRequested ||
+              _isStaleTranslationRun(inspectionGeneration, inputPath)) {
             return;
           }
-          state = state.copyWith(
+          final TranslationJob? current = state.job;
+          final bool forceImmediate =
+              current == null ||
+              job.phase != current.phase ||
+              job.status != current.status ||
+              job.status != TranslationJobStatus.running ||
+              job.progress >= 1.0;
+          _progressCoalescer.enqueue(
             job: job,
-            logs: <String>[...state.logs, _safeLogText(logLine)],
+            logLines: <String>[_safeLogText(logLine)],
+            isTranslationRun: false,
+            forceImmediate: forceImmediate,
           );
         },
         isCancelled: () => _cancelRequested,
       );
-      if (!mounted) return;
+      if (!mounted || _isStaleTranslationRun(inspectionGeneration, inputPath)) {
+        return;
+      }
+      _progressCoalescer.flush();
       if (_cancelRequested) {
         _handleCancellation(const TranslationCancelledException());
         return;
@@ -1312,10 +1363,11 @@ class TranslationDashboardController
         // a cancel (_retryJob) recheck _cancelRequested themselves.
       }
     } catch (error) {
-      if (!mounted) return;
-      _estimateStaticChaptersKey = null;
-      _estimateStaticChunkSizeKey = -1;
-      _estimateStaticCache = null;
+      if (!mounted || _isStaleTranslationRun(inspectionGeneration, inputPath)) {
+        return;
+      }
+      _progressCoalescer.flush();
+      _estimateMemoizer.reset();
       if (_handleCancellation(error)) {
         return;
       }
@@ -1424,6 +1476,7 @@ class TranslationDashboardController
     // P1-#3: capture the generation for this run's progress callbacks (the
     // callback below drops anything from an older generation).
     final int runGeneration = ++_translationRunGeneration;
+    _progressCoalescer.clear();
     final String runInputPath = state.inputPath;
     final TranslationJob? currentJob = state.job;
     final bool currentJobIsResumable =
@@ -1550,6 +1603,8 @@ class TranslationDashboardController
     bool cacheRestorationLogged = false;
     // C-M7: keep the run alive under Doze via the Android foreground service
     // (Track B native side); stopped in the finally below on every exit path.
+    _coalescedRunGeneration = runGeneration;
+    _coalescedRunInputPath = runInputPath;
     _startTranslationForegroundService();
     try {
       final TranslationRunResult result = await repository.translateChapters(
@@ -1577,10 +1632,7 @@ class TranslationDashboardController
           final TranslationJob progressJob = _translationHistoryJob(
             _verifiedCacheProgress(job.copyWith(errorMessage: null)),
           );
-          final List<String> nextLogs = <String>[
-            ...state.logs,
-            _safeLogText(logLine),
-          ];
+          final List<String> newLogs = <String>[_safeLogText(logLine)];
           final bool cacheScanComplete =
               progressJob.phase == TranslationJobPhase.cacheRestoration &&
               progressJob.cacheScanTotalBlocks > 0 &&
@@ -1588,20 +1640,31 @@ class TranslationDashboardController
                   progressJob.cacheScanTotalBlocks;
           if (!cacheRestorationLogged && cacheScanComplete) {
             cacheRestorationLogged = true;
-            nextLogs.add(
+            newLogs.add(
               progressJob.cachedBlocks >= progressJob.totalBlocks
                   ? _s.logAllBlocksRestoredNoApi(progressJob.totalBlocks)
                   : _s.logCacheRestoredNoApi(progressJob.cachedBlocks),
             );
           }
-          state = state.copyWith(
+          final TranslationJob? current = state.job;
+          final bool blockMilestoneReached =
+              progressJob.totalBlocks > 0 &&
+              progressJob.completedBlocks >= progressJob.totalBlocks;
+          final bool forceImmediate =
+              current == null ||
+              progressJob.phase != current.phase ||
+              progressJob.status != current.status ||
+              progressJob.status != TranslationJobStatus.running ||
+              progressJob.completedFiles != current.completedFiles ||
+              cacheScanComplete ||
+              blockMilestoneReached ||
+              progressJob.progress >= 1.0;
+          _progressCoalescer.enqueue(
             job: progressJob,
-            jobHistory: _jobHistoryWith(progressJob, persist: false),
-            runEstimate: _buildEstimate(job: progressJob),
-            logs: nextLogs,
+            logLines: newLogs,
+            isTranslationRun: true,
+            forceImmediate: forceImmediate,
           );
-          _updateTranslationForegroundService(progressJob);
-          _persistProgressHistoryIfDue();
         },
         isCancelled: () => _cancelRequested,
         // The worker spooled this chapter's sources to disk and dropped its
@@ -1610,7 +1673,9 @@ class TranslationDashboardController
         // excerpt and the preview has no recovery path for finished
         // chapters (unlike the worker, which restores from spool/archive).
         onChapterSourcesReleased: (String chapterPath) {
-          if (!mounted) return;
+          if (!mounted || _isStaleTranslationRun(runGeneration, runInputPath)) {
+            return;
+          }
           final List<InspectedChapter> chapters = state.inspectedChapters;
           final int index = chapters.indexWhere(
             (InspectedChapter chapter) => chapter.path == chapterPath,
@@ -1637,12 +1702,11 @@ class TranslationDashboardController
           // (staticPart recomputes from block.sourceText) nor thrash the
           // identical-keyed cache into a full rescan every chapter: just
           // re-key the cache to the new list, keeping the frozen part.
-          if (identical(chapters, _estimateStaticChaptersKey)) {
-            _estimateStaticChaptersKey = next;
-            if (chapter.includeInTranslation) {
-              _estimateHasReleasedSources = true;
-            }
-          }
+          _estimateMemoizer.markChapterSourcesReleased(
+            previousChapters: chapters,
+            updatedChapters: next,
+            chapterWasIncluded: chapter.includeInTranslation,
+          );
         },
       );
       if (!mounted) return true;
@@ -1654,6 +1718,7 @@ class TranslationDashboardController
       if (_isStaleTranslationRun(runGeneration, runInputPath)) {
         return true;
       }
+      _progressCoalescer.flush();
       // A returned terminal result means the repository already committed the
       // EPUB. A cancellation arriving afterward cannot undo that output.
       final bool failedResult =
@@ -1717,7 +1782,7 @@ class TranslationDashboardController
       // instead of falling into the P2-#7 "selection changed after release"
       // branch that would ignore it. The frozen totals describe both lists
       // (same selection, sources released on both sides).
-      _estimateStaticChaptersKey = result.chapters;
+      _estimateMemoizer.adoptUpdatedChapters(result.chapters);
       _clearActiveTranslationHistory();
       _translationStopwatch?.stop();
     } catch (error) {
@@ -1730,6 +1795,7 @@ class TranslationDashboardController
       if (_isStaleTranslationRun(runGeneration, runInputPath)) {
         return true;
       }
+      _progressCoalescer.flush();
       if (_handleCancellation(error)) {
         // The run started and was then cancelled; report it as started.
         return true;
@@ -1805,6 +1871,7 @@ class TranslationDashboardController
     }
 
     if (_cancelRequested) {
+      _progressCoalescer.clear();
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logCancelAlreadyPending],
       );
@@ -1812,6 +1879,7 @@ class TranslationDashboardController
     }
 
     _cancelRequested = true;
+    _progressCoalescer.clear();
     final int cancellationRevision = ++_cancellationRevision;
     await repository.cancelJob(activeJob.id);
     if (!mounted ||
@@ -2332,32 +2400,8 @@ class TranslationDashboardController
   /// be driven on a desktop test host, but the mapping itself must never
   /// regress to surfacing the raw English native text.
   @visibleForTesting
-  String debugSaveErrorLogLine(Object error) {
-    // A7: no free space for the save — show the localized notice, not
-    // the raw English native text.
-    if (error is PlatformException && error.code == 'SAVE_NO_SPACE') {
-      return _s.logNotEnoughSpace;
-    }
-    if (error is PlatformException) {
-      switch (error.code) {
-        case 'SAVE_IN_PROGRESS':
-          return _s.logSaveInProgress;
-        case 'SAVE_FAILED':
-          return _s.logSaveFailed;
-        case 'SAVE_PERMISSION_DENIED':
-          return _s.logSavePermissionDenied;
-        case 'SAVE_PERMISSION_PERMANENTLY_DENIED':
-          return _s.logSavePermissionPermanentlyDenied;
-      }
-    }
-    final String safeError = _safeErrorText(error);
-    // H3: the 5-minute Dart-side timeout only stops *waiting* — the
-    // native worker keeps running to completion in the background,
-    // so tell the user where to find the finished file.
-    return safeError.contains('timed out')
-        ? _s.saveTimeoutContinuesBackground
-        : _s.logCouldNotSaveDownloads(safeError);
-  }
+  String debugSaveErrorLogLine(Object error) =>
+      DashboardErrorMessages.formatSaveErrorLogLine(error, _s, _safeErrorText);
 
   /// Maps a share failure to its log line.
   ///
@@ -2366,23 +2410,19 @@ class TranslationDashboardController
   /// be driven on a desktop test host, but the mapping itself must never
   /// regress to surfacing the raw English native text.
   @visibleForTesting
-  String debugShareErrorLogLine(Object error) {
-    if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
-      return _s.logNotEnoughSpace;
-    }
-    return _s.logCouldNotExport(_safeErrorText(error));
-  }
+  String debugShareErrorLogLine(Object error) =>
+      DashboardErrorMessages.formatShareErrorLogLine(error, _s, _safeErrorText);
 
   /// Maps an openJobOutput share failure to its log line. The no-space case
   /// shares the localized notice with [debugShareErrorLogLine]; other
   /// failures keep this call site's own message.
   @visibleForTesting
-  String debugOpenJobOutputErrorLogLine(Object error) {
-    if (error is PlatformException && error.code == 'SHARE_NO_SPACE') {
-      return _s.logNotEnoughSpace;
-    }
-    return _s.logCouldNotOpenJobOutput(_safeErrorText(error));
-  }
+  String debugOpenJobOutputErrorLogLine(Object error) =>
+      DashboardErrorMessages.formatOpenJobOutputErrorLogLine(
+        error,
+        _s,
+        _safeErrorText,
+      );
 
   Future<String?> _completedOutputPath() async {
     final TranslationJob? job = state.job;
@@ -2419,6 +2459,10 @@ class TranslationDashboardController
     if (!state.isRunActive) {
       return false;
     }
+    // Publish the latest progress alongside this interaction and make the
+    // next progress event the leading update of a fresh window.
+    _progressCoalescer.flush();
+    _progressCoalescer.clear();
     state = state.copyWith(logs: <String>[...state.logs, message]);
     return true;
   }
@@ -2427,39 +2471,21 @@ class TranslationDashboardController
   /// log line. Best-effort: never throws.
   void _logWindowsPathNotice(WindowsPathNotice notice, String? selectedPath) {
     if (!mounted) return;
-    final String message;
-    switch (notice) {
-      case WindowsPathNotice.dialogOpened:
-        message = _s.logFileDialogOpened;
-        break;
-      case WindowsPathNotice.longPathWithoutPolicy:
-        final String? path = selectedPath;
-        if (path == null || path.isEmpty) {
-          return;
-        }
-        message = _s.logLongPathWithoutPolicy(path);
-        break;
-      case WindowsPathNotice.oneDrivePlaceholder:
-        message = _s.logOneDrivePlaceholderHint;
-        break;
+    final String? message = DashboardErrorMessages.formatWindowsPathNotice(
+      notice,
+      selectedPath,
+      _s,
+    );
+    if (message != null) {
+      state = state.copyWith(logs: <String>[...state.logs, message]);
     }
-    state = state.copyWith(logs: <String>[...state.logs, message]);
   }
 
-  String _safeErrorText(Object error) {
-    // Redact with the key that was in effect when the run started (an error
-    // may surface the old key after the user changes it mid-run) as well as
-    // the current key.
-    String redacted = SensitiveText.redact(
-      error.toString(),
-      configuredApiKey: _runApiKey,
-    );
-    final String currentKey = state.config.apiKey;
-    if (_runApiKey != currentKey) {
-      redacted = SensitiveText.redact(redacted, configuredApiKey: currentKey);
-    }
-    return redacted;
-  }
+  String _safeErrorText(Object error) => DashboardErrorMessages.redactErrorText(
+    error,
+    runApiKey: _runApiKey,
+    currentApiKey: state.config.apiKey,
+  );
 
   /// Maps a file-picker failure to its log line. A path the WinForms dialog
   /// itself cannot handle gets an actionable localized message instead of
@@ -2468,38 +2494,15 @@ class TranslationDashboardController
   String debugPickErrorLogLine(Object error) =>
       _pickErrorLog(error, _s.logCouldNotSelectEpub);
 
-  String _pickErrorLog(Object error, String Function(String error) genericLog) {
-    if (error is WindowsLongPathException) {
-      AppLogger.warn(
-        'Windows dialog path too long: ${error.detail}',
-        tag: 'picker',
-      );
-      return _s.logWindowsDialogPathTooLong;
-    }
-    if (error is PlatformException && error.code == 'PICK_NO_SPACE') {
-      return _s.logNotEnoughSpace;
-    }
-    if (error is PlatformException && error.code == 'PICK_TOO_LARGE') {
-      return _s.logFileTooLarge;
-    }
-    if (error is PlatformException) {
-      switch (error.code) {
-        case 'PICK_TIMEOUT':
-          return _s.logPickTimeout;
-        case 'PICK_NO_PICKER':
-          return _s.logNoPicker;
-        case 'PICK_IN_PROGRESS':
-          return _s.logPickInProgress;
-        case 'PICK_REQUESTS_EXHAUSTED':
-          return _s.logPickRequestsExhausted;
-        case 'INVALID_FILE_TYPE':
-          return _s.logInvalidFileType;
-        case 'PICK_FAILED':
-          return _s.logPickFailed;
-      }
-    }
-    return genericLog(_safeErrorText(error));
-  }
+  String _pickErrorLog(
+    Object error,
+    String Function(String error) genericLog,
+  ) => DashboardErrorMessages.formatPickErrorLogLine(
+    error,
+    _s,
+    genericLog,
+    _safeErrorText,
+  );
 
   /// C-M6: surfaces a permanently-denied storage permission (native error
   /// code `PERMISSION_PERMANENTLY_DENIED`) as a log line plus a notice id
@@ -2841,173 +2844,40 @@ class TranslationDashboardController
     return history;
   }
 
-  // Memoized inputs for the static (source-text-derived) part of the run
-  // estimate. The per-block CJK token estimation is O(book size) and the
-  // source text never changes during a run, so it is computed once per
-  // chapter-list/config and reused across progress callbacks; only the
-  // cheap progress fields (speed, ETA) are refreshed per tick. Identity
-  // comparison is enough: state updates reuse the same list instance via
-  // copyWith unless the chapters actually changed.
-  List<InspectedChapter>? _estimateStaticChaptersKey;
-  int _estimateStaticChunkSizeKey = -1;
-  TranslationRunEstimate? _estimateStaticCache;
-  // The memoized totals still describe full sources after selected chapters
-  // release their text; even a partial release prevents a fresh replan.
-  bool _estimateHasReleasedSources = false;
-
-  // P2-#8: the chunk size and batch count the frozen estimate was planned
-  // from (full sources). Scaling released-source estimates compounds ceil()
-  // rounding, so changing chunkSize away and back drifts (1 -> 12); when
-  // the chunk size returns to this anchor the original batch count is
-  // restored directly instead of being re-scaled.
-  int _estimateAnchorChunkSize = -1;
-  int _estimateAnchorBatches = -1;
+  final DashboardEstimateMemoizer _estimateMemoizer =
+      DashboardEstimateMemoizer();
 
   /// Test-only: the memoized static estimate. Regression tests assert that
   /// progress ticks reuse the same instance (no re-scan of the book) while
   /// chapter or chunk-size changes invalidate it.
   @visibleForTesting
-  TranslationRunEstimate? get debugStaticEstimateCache => _estimateStaticCache;
+  TranslationRunEstimate? get debugStaticEstimateCache =>
+      _estimateMemoizer.staticCache;
 
   TranslationRunEstimate? _buildEstimate({
     List<InspectedChapter>? chapters,
     TranslationConfig? config,
     TranslationJob? job,
-  }) {
-    final List<InspectedChapter> sourceChapters =
-        chapters ?? state.inspectedChapters;
-    if (sourceChapters.isEmpty) {
-      return null;
-    }
-    final int chunkSize = (config ?? state.config).chunkSize;
-    TranslationRunEstimate? staticPart = _estimateStaticCache;
-    if (!identical(sourceChapters, _estimateStaticChaptersKey) ||
-        chunkSize != _estimateStaticChunkSizeKey ||
-        staticPart == null) {
-      // P2-#19: the frozen/release decision only looks at selected chapters.
-      // The estimate itself is computed from selected chapters only (see
-      // TranslationRunEstimate.staticPart), so an unselected chapter that
-      // kept its sources must not un-freeze the totals into a zeros
-      // rebuild. For an empty selection, consult the frozen key's chapters:
-      // if their sources are gone (post-release) we cannot recalculate and
-      // must keep the frozen totals (P2-#7); if sources exist (pre-release)
-      // recalculate to zeros (m17).
-      final selectedChapters = sourceChapters
-          .where((chapter) => chapter.includeInTranslation)
-          .toList();
-      final List<InspectedChapter> releaseCheckChapters =
-          selectedChapters.isNotEmpty
-          ? selectedChapters
-          : (_estimateStaticChaptersKey ?? sourceChapters);
-      final bool sourcesReleased =
-          (identical(sourceChapters, _estimateStaticChaptersKey) &&
-              _estimateHasReleasedSources) ||
-          (releaseCheckChapters.isNotEmpty &&
-              !releaseCheckChapters.any(
-                (chapter) =>
-                    chapter.blocks.any((block) => block.sourceText.isNotEmpty),
-              ));
-      if (sourcesReleased && staticPart != null) {
-        if (identical(sourceChapters, _estimateStaticChaptersKey)) {
-          // P2-#20: always scale the batch count from the anchor's original
-          // values, never from the already-scaled staticPart — chained
-          // ceil() rounding drifts (6000→4000→6000 yielded 1→2→2). When the
-          // estimate was first frozen after the sources were already
-          // released there is no planned anchor yet; the frozen estimate
-          // itself becomes the anchor.
-          if (_estimateAnchorBatches < 0) {
-            _estimateAnchorChunkSize = _estimateStaticChunkSizeKey;
-            _estimateAnchorBatches = staticPart.estimatedApiBatches;
-          }
-          final int batches = max(
-            1,
-            (_estimateAnchorBatches * _estimateAnchorChunkSize / chunkSize)
-                .ceil(),
-          );
-          staticPart = TranslationRunEstimate(
-            selectedChapters: staticPart.selectedChapters,
-            totalBlocks: staticPart.totalBlocks,
-            estimatedSourceChars: staticPart.estimatedSourceChars,
-            estimatedInputTokens: staticPart.estimatedInputTokens,
-            estimatedApiBatches: batches,
-          );
-        } else {
-          // P2-#7: the chapter selection changed after the sources were
-          // released (run finished/cancelled). The new list cannot be
-          // replanned — every sourceText is empty — so keep the frozen
-          // estimate instead of recomputing zeros that would collapse the
-          // character and cost totals. staticPart stays as the frozen
-          // estimate; only the memo keys advance below.
-        }
-      } else {
-        staticPart = TranslationRunEstimate.staticPart(
-          sourceChapters,
-          chunkSize: chunkSize,
-        );
-        _estimateHasReleasedSources = false;
-        // P2-#8 anchor: the batch count actually planned from full sources
-        // at this chunk size.
-        _estimateAnchorChunkSize = chunkSize;
-        _estimateAnchorBatches = staticPart.estimatedApiBatches;
-      }
-      _estimateStaticChaptersKey = sourceChapters;
-      _estimateStaticChunkSizeKey = chunkSize;
-      _estimateStaticCache = staticPart;
-    }
-    final TranslationJob? currentJob = job ?? state.job;
-    // Progress belongs to the chapter list it was measured against. When
-    // the caller passes an explicit new list (chapter selection changed),
-    // the old job's completedBlocks/totalBlocks and the frozen stopwatch no
-    // longer describe it — report zero progress instead of a stale mix.
-    final bool reuseProgress = identical(
-      sourceChapters,
-      state.inspectedChapters,
-    );
-    return staticPart.withProgress(
-      completedBlocks: reuseProgress ? currentJob?.completedBlocks ?? 0 : 0,
-      totalBlocks: reuseProgress
-          ? currentJob?.totalBlocks ?? staticPart.totalBlocks
-          : staticPart.totalBlocks,
-      elapsed: reuseProgress ? _translationStopwatch?.elapsed : null,
-      // Only blocks translated via the real API count toward speed/ETA —
-      // cache-restored blocks would otherwise distort the estimate (C-19).
-      // Scan-aware and degrade-aware (C-11/C-12): an unverified checkpoint
-      // during cache restoration and blocks degraded to their source text
-      // must not fabricate throughput.
-      apiTranslatedBlocks: reuseProgress
-          ? TranslationRunEstimate.apiTranslatedBlocksForThroughput(currentJob)
-          : 0,
-    );
-  }
+  }) => _estimateMemoizer.build(
+    sourceChapters: chapters ?? state.inspectedChapters,
+    stateChapters: state.inspectedChapters,
+    config: config ?? state.config,
+    job: job ?? state.job,
+    elapsed: _translationStopwatch?.elapsed,
+  );
 
-  TranslationJob? _findKnownJob(String jobId) {
-    final TranslationJob? currentJob = state.job;
-    if (currentJob?.id == jobId) {
-      return currentJob;
-    }
-    for (final TranslationJob job in state.jobHistory) {
-      if (job.id == jobId) {
-        return job;
-      }
-    }
-    return null;
-  }
+  TranslationJob? _findKnownJob(String jobId) =>
+      DashboardJobHistoryHelper.findKnownJob(
+        jobId,
+        currentJob: state.job,
+        jobHistory: state.jobHistory,
+      );
 
-  String _outputDirectoryForRetry(TranslationJob job) {
-    if (job.outputDirectory.isNotEmpty) {
-      return job.outputDirectory;
-    }
-    if (job.outputPath.isEmpty) {
-      return state.outputDirectory;
-    }
-    final type = FileSystemEntity.typeSync(job.outputPath);
-    if (type == FileSystemEntityType.file) {
-      return path.dirname(job.outputPath);
-    }
-    // An absent path could be either a former file or an intended directory.
-    // Preserve it rather than silently redirecting an export to its parent.
-    return job.outputPath;
-  }
+  String _outputDirectoryForRetry(TranslationJob job) =>
+      DashboardJobHistoryHelper.outputDirectoryForRetry(
+        job,
+        fallbackDirectory: state.outputDirectory,
+      );
 
   Future<void> _loadJobHistory() async {
     final JobHistoryStore? store = historyStore;
@@ -3048,68 +2918,20 @@ class TranslationDashboardController
         job.status != TranslationJobStatus.running) {
       return job;
     }
-    final restored = job.copyWith(
-      status: TranslationJobStatus.cancelled,
-      currentChapter: _isTranslationRunPhase(job.phase)
-          ? _s.jobStatusTranslationInterrupted
-          : _s.jobStatusInspectionInterrupted,
-      currentBlock: null,
-      // Note: the retry heuristic reads `phase`, not this display string,
-      // so currentChapter is safe to localize.
-      errorMessage: _s.jobInterruptedOnRestart,
+    final restored = DashboardJobHistoryHelper.restoreInterruptedJob(
+      job,
+      strings: _s,
+      isTranslationPhase: _isTranslationRunPhase(job.phase),
     );
     _inferredInterruptions[restored] = job;
     return restored;
   }
 
   List<TranslationJob> _mergeJobHistory(List<TranslationJob> jobs) {
-    return _mergeHistorySnapshots(state.jobHistory, jobs);
-  }
-
-  static List<TranslationJob> _mergeHistorySnapshots(
-    List<TranslationJob> memoryJobs,
-    List<TranslationJob> fileJobs,
-  ) {
-    // A new run supersedes every snapshot of the old one. Within one run,
-    // terminal states outrank in-flight snapshots; revisions break ties so
-    // a stale instance cannot roll back progress within the same status.
-    int priority(TranslationJob job) => switch (job.status) {
-      TranslationJobStatus.completed => 5,
-      TranslationJobStatus.completedWithWarnings => 4,
-      TranslationJobStatus.failed || TranslationJobStatus.cancelled => 3,
-      TranslationJobStatus.running || TranslationJobStatus.queued => 2,
-      _ => 1,
-    };
-    final merged = <String, TranslationJob>{};
-    for (final job in [...memoryJobs, ...fileJobs]) {
-      final previous = merged[job.id];
-      final int order = previous == null
-          ? 1
-          : job.runStartedAt != previous.runStartedAt
-          ? job.runStartedAt.compareTo(previous.runStartedAt)
-          : priority(job) != priority(previous)
-          ? priority(job).compareTo(priority(previous))
-          : job.recordRevision.compareTo(previous.recordRevision);
-      if (order > 0) {
-        merged[job.id] = job;
-      }
-    }
-    final sorted = merged.values.toList()
-      ..sort((a, b) {
-        // runStartedAt is microseconds; the ID prefix is wall-clock
-        // milliseconds — scale it so a fresh inspection record is not
-        // sorted below (and truncated in favor of) older translation
-        // records by the ~1000x unit gap.
-        int latestTaskTime(TranslationJob job) => job.runStartedAt > 0
-            ? job.runStartedAt
-            : (int.tryParse(job.id.split('-').first) ?? 0) * 1000;
-        final byRun = latestTaskTime(b).compareTo(latestTaskTime(a));
-        if (byRun != 0) return byRun;
-        // Legacy IDs begin with wall-clock milliseconds. Deterministic ID
-        // ordering also makes equal timestamps independent of insertion order.
-        return b.id.compareTo(a.id);
-      });
-    return sorted.take(20).toList(growable: false);
+    return DashboardJobHistoryHelper.mergeHistorySnapshots(
+      state.jobHistory,
+      jobs,
+    );
   }
 
   void _persistJobHistory() {
@@ -3139,6 +2961,7 @@ class TranslationDashboardController
   /// only when no history save is still in flight.
   @visibleForTesting
   Future<void> debugPersistJobHistoryNow() {
+    _progressCoalescer.flush();
     if (historyStore == null) {
       return Future<void>.value();
     }
@@ -3192,7 +3015,10 @@ class TranslationDashboardController
           final List<TranslationJob> preserved = fileJobs
               .where((job) => _isJobNewerThanClearUs(job, ownClearUs))
               .toList(growable: false);
-          return _mergeHistorySnapshots(memoryJobs, preserved);
+          return DashboardJobHistoryHelper.mergeHistorySnapshots(
+            memoryJobs,
+            preserved,
+          );
         }
         // Cross-instance append guard (Windows has no single-instance
         // lock): another instance may have added jobs after our last read.
@@ -3202,7 +3028,10 @@ class TranslationDashboardController
         for (final TranslationJob job in fileJobs) {
           _noteObservedRunStartedAtUs(job);
         }
-        return _mergeHistorySnapshots(memoryJobs, fileJobs);
+        return DashboardJobHistoryHelper.mergeHistorySnapshots(
+          memoryJobs,
+          fileJobs,
+        );
       },
     );
     if (result.fileClearedAt > _lastSeenHistoryClearedAt) {

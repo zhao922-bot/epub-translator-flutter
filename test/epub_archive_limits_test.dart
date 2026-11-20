@@ -2,8 +2,45 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub_isolate_worker.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub_streaming_zip.dart'
+    show openStreamingEpubArchiveAsync, openStreamingEpubArchiveSync;
 import 'package:flutter_test/flutter_test.dart';
+
+class _ChangingSource extends Fake implements File {
+  _ChangingSource(this.original, this.replacement);
+
+  final File original;
+  final File replacement;
+  int opens = 0;
+
+  // The second open models a replacement at the same path. Windows prevents
+  // renaming the first file until its handle is closed.
+  File _nextFile() => opens++ == 0 ? original : replacement;
+
+  @override
+  RandomAccessFile openSync({FileMode mode = FileMode.read}) =>
+      _nextFile().openSync(mode: mode);
+
+  @override
+  Future<RandomAccessFile> open({FileMode mode = FileMode.read}) =>
+      _nextFile().open(mode: mode);
+}
+
+final class _ChangingSourceOverride extends IOOverrides {
+  _ChangingSourceOverride(this.source);
+
+  final _ChangingSource source;
+
+  @override
+  File createFile(String path) =>
+      path == source.original.path ? source : super.createFile(path);
+}
+
+Uint8List _chapterZip(String content) => ZipEncoder().encodeBytes(
+  Archive()..addFile(ArchiveFile.string('chapter.xhtml', content)),
+);
 
 // Repeated names deliberately exercise the raw header count, not Archive's
 // deduplicated file count. No payload allocation or encoder is needed.
@@ -56,6 +93,44 @@ Uint8List _emptyEntryZip(int count, {int? declaredCount, bool zip64 = false}) {
 /// Regression tests for the zip-bomb guards and the source-file lock
 /// classification in [EpubIsolateWorker].
 void main() {
+  for (final asynchronous in [false, true]) {
+    test('decodes the fingerprinted file (async=$asynchronous)', () async {
+      final directory = await Directory.systemTemp.createTemp('epub_identity_');
+      addTearDown(() => directory.delete(recursive: true));
+      const chapter = 'Original text';
+      final sourceBytes = _chapterZip(chapter);
+      final original = await File(
+        '${directory.path}/original.epub',
+      ).writeAsBytes(sourceBytes);
+      final replacement = await File(
+        '${directory.path}/replacement.epub',
+      ).writeAsBytes(_chapterZip('Different text'));
+      final source = _ChangingSource(original, replacement);
+      final opened = await IOOverrides.runWithIOOverrides(() async {
+        if (asynchronous) {
+          return openStreamingEpubArchiveAsync(
+            inputPath: original.path,
+            isFileLockError: (_) => false,
+            isCancelled: () => false,
+            buildCancelledError: () => StateError('Unexpected cancellation'),
+          );
+        }
+        return openStreamingEpubArchiveSync(
+          inputPath: original.path,
+          isFileLockError: (_) => false,
+        );
+      }, _ChangingSourceOverride(source));
+      try {
+        expect(opened.fingerprint, sha256.convert(sourceBytes).toString());
+        final entry = opened.archive.find('chapter.xhtml')!;
+        expect(String.fromCharCodes(entry.content), chapter);
+        expect(source.opens, 1);
+      } finally {
+        opened.closeSync();
+      }
+    });
+  }
+
   group('archive decompression limits', () {
     for (final zip64 in [false, true]) {
       test(

@@ -12,6 +12,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'helpers/memory_session_path_store.dart';
+
 class _WidgetSettingsStore extends SettingsStore {
   _WidgetSettingsStore(this.loadCompleter);
 
@@ -58,6 +60,7 @@ void main() {
         settingsStoreProvider.overrideWithValue(
           _WidgetSettingsStore(completer),
         ),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(_WidgetJobHistoryStore()),
       ],
       child: const EpubTranslatorApp(),

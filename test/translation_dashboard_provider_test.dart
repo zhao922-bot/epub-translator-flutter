@@ -4,10 +4,11 @@ import 'package:epub_translator_flutter/features/settings/application/settings_c
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
-import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
-import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'helpers/memory_job_history_store.dart';
+import 'helpers/memory_session_path_store.dart';
 
 class _ControlledSettingsStore extends SettingsStore {
   _ControlledSettingsStore(this.loadCompleter);
@@ -24,26 +25,6 @@ class _ControlledSettingsStore extends SettingsStore {
   }) async {}
 }
 
-class _MemoryJobHistoryStore extends JobHistoryStore {
-  @override
-  Future<({List<TranslationJob> jobs, int clearedAt})>
-  loadWithTombstone() async => (jobs: const <TranslationJob>[], clearedAt: 0);
-
-  @override
-  Future<void> save(
-    List<TranslationJob> jobs, {
-    int clearedAtEpochMs = 0,
-  }) async {}
-
-  @override
-  Future<({bool written, int fileClearedAt})> saveMerged({
-    required List<TranslationJob> Function(List<TranslationJob>, int) merge,
-    required int clearedAtEpochMs,
-  }) async {
-    return (written: true, fileClearedAt: 0);
-  }
-}
-
 void main() {
   test('dashboard provider follows async settings load', () async {
     final Completer<TranslationConfig> loadCompleter =
@@ -53,7 +34,8 @@ void main() {
         settingsStoreProvider.overrideWithValue(
           _ControlledSettingsStore(loadCompleter),
         ),
-        jobHistoryStoreProvider.overrideWithValue(_MemoryJobHistoryStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
+        jobHistoryStoreProvider.overrideWithValue(MemoryJobHistoryStore()),
       ],
     );
     addTearDown(container.dispose);

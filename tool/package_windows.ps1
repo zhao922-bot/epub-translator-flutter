@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Build the Windows release and package a portable ZIP that runs on clean
@@ -13,8 +13,8 @@
       1. Runs `flutter build windows --release` (unless -SkipBuild).
       2. Finds the VC++ runtime DLLs on this machine and copies them next to
          the exe. Aborts with a clear message if they cannot be found.
-      3. Validates the release folder (exe, data folder, flutter_windows.dll,
-         the copied runtime DLLs).
+      3. Validates the executable, Flutter runtime, native plugins, data files,
+         and copied Visual C++ runtime DLLs in the release folder.
       4. Creates dist\folioferry-v<version>-windows-x64.zip and
          validates the zip contents.
 
@@ -197,6 +197,15 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 $BinaryName = Get-BinaryName
 $ExeName = "$BinaryName.exe"
 $ReleaseDir = Join-Path $RepoRoot 'build\windows\x64\runner\Release'
+$RequiredBundleFiles = @(
+    $ExeName
+    'flutter_windows.dll'
+    'flutter_secure_storage_windows_plugin.dll'
+    'dartjni.dll'
+    'data/app.so'
+    'data/icudtl.dat'
+    'data/flutter_assets/AssetManifest.bin'
+) + $RequiredDlls
 
 Write-Host "Repository : $RepoRoot"
 Write-Host "Version    : $Version"
@@ -243,25 +252,11 @@ Invoke-Step 'Copy VC++ runtime DLLs next to the exe' {
 # --- 3. Validate the release folder -------------------------------------------
 
 Invoke-Step 'Validate release folder' {
-    $missing = @()
-    foreach ($req in @($ExeName, 'flutter_windows.dll')) {
-        if (-not (Test-Path -Path (Join-Path $ReleaseDir $req) -PathType Leaf)) {
-            $missing += $req
-        }
-    }
-    if (-not (Test-Path -Path (Join-Path $ReleaseDir 'data') -PathType Container)) {
-        $missing += 'data\'
-    }
-    foreach ($dll in $RequiredDlls) {
-        if (-not (Test-Path -Path (Join-Path $ReleaseDir $dll) -PathType Leaf)) {
-            $missing += $dll
-        }
-    }
+    $missing = @($RequiredBundleFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $ReleaseDir $_) -PathType Leaf)
+    })
     if ($missing.Count -gt 0) {
         throw "Release folder validation failed, missing: $($missing -join ', ')"
-    }
-    if (-not (Test-Path -Path (Join-Path $ReleaseDir 'plugins') -PathType Container)) {
-        Write-Warning 'plugins\ folder not found in the Release output.'
     }
     Write-Host 'Release folder OK.'
 }
@@ -282,21 +277,8 @@ Invoke-Step 'Create portable zip' {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
-        $entries = @($zip.Entries | ForEach-Object { $_.FullName })
-        $missing = @()
-        foreach ($req in @($ExeName, 'flutter_windows.dll')) {
-            if (-not ($entries -contains $req)) {
-                $missing += $req
-            }
-        }
-        if (-not ($entries | Where-Object { $_ -like 'data/*' })) {
-            $missing += 'data\*'
-        }
-        foreach ($dll in $RequiredDlls) {
-            if (-not ($entries -contains $dll)) {
-                $missing += $dll
-            }
-        }
+        $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+        $missing = @($RequiredBundleFiles | Where-Object { $_ -notin $entries })
         if ($missing.Count -gt 0) {
             throw "Zip validation failed, missing: $($missing -join ', ')"
         }

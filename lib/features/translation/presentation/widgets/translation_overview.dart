@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'translation_run_details.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
@@ -7,6 +6,9 @@ import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/widgets/section_card.dart';
 import '../../domain/models/translation_job.dart';
 import '../../domain/models/translation_run_estimate.dart';
+import '../pages/translation_review_page.dart';
+import '../workbench_strings.dart';
+import 'translation_run_details.dart';
 
 class TranslationOverview extends StatelessWidget {
   const TranslationOverview({
@@ -17,6 +19,7 @@ class TranslationOverview extends StatelessWidget {
     required this.onSaveToDownloadsPressed,
     required this.canTranslate,
     this.estimate,
+    this.onPreviewWarnings,
     this.onCancelPressed,
     this.canCancel = false,
     // H2: while a save/share is in flight the controller sets these so the
@@ -39,6 +42,7 @@ class TranslationOverview extends StatelessWidget {
   final bool isSaving;
   final bool isSharing;
   final TranslationRunEstimate? estimate;
+  final VoidCallback? onPreviewWarnings;
   final VoidCallback? onCancelPressed;
   final bool canCancel;
   final String? actionableErrorTitle;
@@ -56,6 +60,7 @@ class TranslationOverview extends StatelessWidget {
     final bool canExport = job?.hasExportableEpub ?? false;
     final bool hasWarnings =
         status == TranslationJobStatus.completedWithWarnings;
+    final String? reportPath = job?.qualityReportPath;
     final String statusText = strings.jobStatusLabel(status);
     final double progress = (job?.progress ?? 0).clamp(0.0, 1.0);
     final int percent = (progress * 100).round();
@@ -115,8 +120,13 @@ class TranslationOverview extends StatelessWidget {
           ],
           Row(
             children: <Widget>[
-              _StatusPill(status: status, label: statusText),
-              const Spacer(),
+              Expanded(
+                child: Align(
+                  alignment: AlignmentDirectional.centerStart,
+                  child: _StatusPill(status: status, label: statusText),
+                ),
+              ),
+              const SizedBox(width: 12),
               Text(
                 '$percent%',
                 style: theme.textTheme.titleMedium?.copyWith(
@@ -171,6 +181,34 @@ class TranslationOverview extends StatelessWidget {
                 ),
               ],
             ),
+            if (onPreviewWarnings != null || reportPath?.isNotEmpty == true)
+              Wrap(
+                spacing: 8,
+                children: [
+                  if (onPreviewWarnings != null)
+                    TextButton.icon(
+                      onPressed: onPreviewWarnings,
+                      icon: const Icon(
+                        Icons.chrome_reader_mode_outlined,
+                        size: 17,
+                      ),
+                      label: Text(strings.previewTranslationWarnings),
+                    ),
+                  if (reportPath?.isNotEmpty == true)
+                    TextButton.icon(
+                      onPressed: canExport && !canCancel
+                          ? () => TranslationReviewPage.open(
+                              context,
+                              reportPath: reportPath!,
+                              outputPath: job!.outputPath,
+                              isChinese: strings.isChinese,
+                            )
+                          : null,
+                      icon: const Icon(Icons.fact_check_outlined, size: 17),
+                      label: Text(strings.reviewTranslationWarnings),
+                    ),
+                ],
+              ),
             const SizedBox(height: 12),
           ],
           if (restoringCache) ...<Widget>[

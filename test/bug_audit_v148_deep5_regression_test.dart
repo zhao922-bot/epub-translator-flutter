@@ -10,6 +10,7 @@ import 'package:html/parser.dart' as hp;
 import 'package:xml/xml.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:epub_translator_flutter/features/settings/application/connection_diagnostic.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:epub_translator_flutter/shared/widgets/app_shell.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_repacker.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
@@ -518,6 +519,9 @@ void main() {
         );
         final container = ProviderContainer(
           overrides: [
+            appStringsProvider.overrideWithValue(
+              const AppStrings(UiLanguage.english),
+            ),
             translationDashboardProvider.overrideWith((_) => controller),
           ],
         );

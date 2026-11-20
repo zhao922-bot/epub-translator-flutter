@@ -778,6 +778,19 @@ class _FailingInspectionRepository extends _SuccessfulInspectionRepository {
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
   }) async {
+    final running = TranslationJob(
+      id: 'failing-inspection',
+      inputPath: inputPath,
+      outputPath: outputDirectory,
+      status: TranslationJobStatus.running,
+      phase: TranslationJobPhase.inspection,
+      progress: 0.25,
+    );
+    onProgress?.call(running, 'inspection started');
+    onProgress?.call(
+      running.copyWith(progress: 0.5),
+      'inspection read chapter',
+    );
     throw const FormatException('cannot decode chapter');
   }
 }
@@ -1246,6 +1259,7 @@ void main() {
           repository: _FailingInspectionRepository(),
           historyStore: _MemoryJobHistoryStore(),
         );
+    addTearDown(controller.dispose);
     controller.syncSettings(
       TranslationConfig.defaults().copyWith(
         uiLanguage: UiLanguage.chinese,
@@ -1257,6 +1271,7 @@ void main() {
     await controller.startInspection();
 
     expect(controller.state.job?.status, TranslationJobStatus.failed);
+    expect(controller.state.logs, contains('inspection read chapter'));
     expect(
       controller.state.job?.currentChapter,
       const AppStrings(UiLanguage.chinese).jobStatusInspectionFailed,

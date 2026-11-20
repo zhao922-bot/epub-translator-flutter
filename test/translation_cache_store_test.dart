@@ -524,4 +524,131 @@ void main() {
       );
     });
   });
+
+  group('cache_index.json & background isolate scan', () {
+    late Directory root;
+
+    setUp(() async {
+      root = await Directory.systemTemp.createTemp('cache_index_');
+    });
+
+    tearDown(() async {
+      if (await root.exists()) {
+        await root.delete(recursive: true);
+      }
+    });
+
+    test(
+      'persists index on first scan and reuses hashes on cold start',
+      () async {
+        final File f1 = File(path.join(root.path, 'blocks', 'aa', 'aa1.html'));
+        final File f2 = File(path.join(root.path, 'blocks', 'bb', 'bb2.html'));
+        await f1.parent.create(recursive: true);
+        await f2.parent.create(recursive: true);
+        await f1.writeAsString('alpha payload');
+        await f2.writeAsString('beta payload');
+
+        final store1 = TranslationCacheStore(cacheRoot: root);
+        await store1.pruneCacheDirectoryForTest(root);
+        final stats1 = store1.lastScanStatsForTest!;
+        expect(stats1.ranInBackgroundIsolate, isTrue);
+        expect(stats1.totalEntries, 2);
+        expect(stats1.hashedCount, 2);
+        expect(stats1.indexReusedCount, 0);
+
+        final File indexFile = File(path.join(root.path, 'cache_index.json'));
+        expect(await indexFile.exists(), isTrue);
+        // cache_index.json itself must never inflate cached block byte totals.
+        expect(
+          store1.estimatedCacheBytesForTest,
+          await f1.length() + await f2.length(),
+        );
+
+        // Brand-new store on cold start must reuse persisted hashes cleanly.
+        final store2 = TranslationCacheStore(cacheRoot: root);
+        await store2.pruneCacheDirectoryForTest(root);
+        final stats2 = store2.lastScanStatsForTest!;
+        expect(stats2.ranInBackgroundIsolate, isTrue);
+        expect(stats2.totalEntries, 2);
+        expect(stats2.hashedCount, 0);
+        expect(stats2.indexReusedCount, 2);
+
+        // Mutating one file on disk invalidates only that entry in the index.
+        await f2.writeAsString('beta payload updated!!');
+        await f2.setLastModified(
+          DateTime.now().add(const Duration(seconds: 2)),
+        );
+        final store3 = TranslationCacheStore(cacheRoot: root);
+        await store3.pruneCacheDirectoryForTest(root);
+        final stats3 = store3.lastScanStatsForTest!;
+        expect(stats3.hashedCount, 1);
+        expect(stats3.indexReusedCount, 1);
+      },
+    );
+
+    test(
+      'rebuilds an invalid digest and reuses the rest of the index',
+      () async {
+        final good = File(path.join(root.path, 'blocks', 'aa', 'aa1.html'));
+        final invalid = File(path.join(root.path, 'blocks', 'bb', 'bb2.html'));
+        await good.parent.create(recursive: true);
+        await invalid.parent.create(recursive: true);
+        await good.writeAsString('valid entry');
+        await invalid.writeAsString('entry with corrupt index metadata');
+        await TranslationCacheStore(
+          cacheRoot: root,
+        ).pruneCacheDirectoryForTest(root);
+
+        final index = File(path.join(root.path, 'cache_index.json'));
+        final raw =
+            jsonDecode(await index.readAsString()) as Map<String, dynamic>;
+        final entries = raw['entries'] as Map<String, dynamic>;
+        const invalidPath = 'blocks/bb/bb2.html';
+        final invalidEntry = entries[invalidPath] as Map<String, dynamic>;
+        final String validDigest = invalidEntry['d'] as String;
+        invalidEntry['d'] = 'g' * 64;
+        await index.writeAsString(jsonEncode(raw));
+
+        final store = TranslationCacheStore(cacheRoot: root);
+        await store.pruneCacheDirectoryForTest(root);
+        expect(store.lastScanStatsForTest!.hashedCount, 1);
+        expect(store.lastScanStatsForTest!.indexReusedCount, 1);
+        expect(
+          jsonDecode(await index.readAsString())['entries'][invalidPath]['d'],
+          validDigest,
+        );
+      },
+    );
+
+    test('eviction removes evicted files from cache_index.json', () async {
+      final File oldFile = File(
+        path.join(root.path, 'blocks', 'aa', 'aaold.html'),
+      );
+      final File newFile = File(
+        path.join(root.path, 'blocks', 'bb', 'bbnew.html'),
+      );
+      await oldFile.parent.create(recursive: true);
+      await newFile.parent.create(recursive: true);
+      await oldFile.writeAsString('a' * 20);
+      await oldFile.setLastModified(
+        DateTime.now().subtract(const Duration(hours: 1)),
+      );
+      await newFile.writeAsString('b' * 20);
+
+      final store = TranslationCacheStore(cacheRoot: root, maxCacheBytes: 30);
+      await store.pruneCacheDirectoryForTest(root, maxBytes: 30);
+      expect(await oldFile.exists(), isFalse);
+      expect(await newFile.exists(), isTrue);
+
+      final indexJson =
+          jsonDecode(
+                await File(
+                  path.join(root.path, 'cache_index.json'),
+                ).readAsString(),
+              )
+              as Map<String, dynamic>;
+      final entries = indexJson['entries'] as Map<String, dynamic>;
+      expect(entries.keys, ['blocks/bb/bbnew.html']);
+    });
+  });
 }

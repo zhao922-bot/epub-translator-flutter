@@ -52,6 +52,41 @@ class NativePlatformBridge {
     'epub_translator_flutter/android_export',
   );
 
+  static const MethodChannel _windowsNativeChannel = MethodChannel(
+    'epub_translator/windows_native',
+  );
+
+  /// Invokes the C++ Win32 MethodChannel when running inside the Windows runner.
+  /// Returns `const (handled: false, value: null)` when the channel is not
+  /// registered (e.g. headless Dart unit tests) or [debugWindowsProcessStarter]
+  /// is active so legacy PowerShell test seams continue working.
+  static Future<({bool handled, T? value})> _tryWindowsNative<T>(
+    String method, [
+    Map<String, Object?>? arguments,
+  ]) async {
+    if (debugWindowsProcessStarter != null) {
+      return (handled: false, value: null);
+    }
+    try {
+      final T? result = await _windowsNativeChannel.invokeMethod<T>(
+        method,
+        arguments,
+      );
+      return (handled: true, value: result);
+    } on MissingPluginException {
+      return (handled: false, value: null);
+    } on PlatformException catch (error) {
+      throw StateError(error.message ?? 'Windows native "$method" failed.');
+    } catch (error) {
+      // Headless `flutter test` units that never initialize ServicesBinding
+      // throw FlutterError/AssertionError when accessing a MethodChannel.
+      if (error is FlutterError || error is AssertionError) {
+        return (handled: false, value: null);
+      }
+      rethrow;
+    }
+  }
+
   /// Timeout for Android KeyStore secret operations. The native side runs
   /// them on a single-thread executor, so a wedged keystore daemon would
   /// otherwise hang the settings page forever; the file operations already
@@ -96,6 +131,15 @@ class NativePlatformBridge {
     }
 
     if (!kIsWeb && Platform.isWindows) {
+      final nativeResult = await _tryWindowsNative<String>('pickEpubFile');
+      if (nativeResult.handled) {
+        final String? raw = nativeResult.value?.trim();
+        final String? selected = (raw == null || raw.isEmpty)
+            ? null
+            : path.normalize(raw);
+        await _notifyWindowsPathObservations(selected, onWindowsNotice);
+        return selected;
+      }
       const String script = r'''
 Add-Type -AssemblyName System.Windows.Forms
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -172,6 +216,15 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     void Function(WindowsPathNotice notice)? onWindowsNotice,
   }) async {
     if (!kIsWeb && Platform.isWindows) {
+      final nativeResult = await _tryWindowsNative<String>('pickDirectory');
+      if (nativeResult.handled) {
+        final String? raw = nativeResult.value?.trim();
+        final String? selected = (raw == null || raw.isEmpty)
+            ? null
+            : path.normalize(raw);
+        await _notifyWindowsPathObservations(selected, onWindowsNotice);
+        return selected;
+      }
       const String script = r'''
 Add-Type -AssemblyName System.Windows.Forms
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -253,7 +306,15 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
       if (encrypted.isEmpty) {
         return null;
       }
-      final String decrypted = await _runWindowsSecretScript(r'''
+      final nativeResult = await _tryWindowsNative<String>(
+        'unprotectSecret',
+        <String, Object?>{'encrypted': encrypted},
+      );
+      final String decrypted;
+      if (nativeResult.handled) {
+        decrypted = nativeResult.value ?? '';
+      } else {
+        decrypted = await _runWindowsSecretScript(r'''
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = $utf8NoBom
 Add-Type -AssemblyName System.Security
@@ -270,6 +331,7 @@ $protected = [Convert]::FromBase64String($raw)
 $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Console]::Out.Write([System.Text.Encoding]::UTF8.GetString($bytes))
 ''', encrypted);
+      }
       // Belt and braces: never let a stray BOM/whitespace prefix reach the
       // API key (a \uFEFF prefix would cause 401s on every request).
       final String clean = decrypted.trim();
@@ -299,7 +361,15 @@ $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $nu
     if (!kIsWeb && Platform.isWindows) {
       final File file = await _windowsSecretFile(name);
       await file.parent.create(recursive: true);
-      final String encrypted = await _runWindowsSecretScript(r'''
+      final nativeResult = await _tryWindowsNative<String>(
+        'protectSecret',
+        <String, Object?>{'value': value},
+      );
+      final String encrypted;
+      if (nativeResult.handled) {
+        encrypted = nativeResult.value ?? '';
+      } else {
+        encrypted = await _runWindowsSecretScript(r'''
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = $utf8NoBom
 Add-Type -AssemblyName System.Security
@@ -314,6 +384,7 @@ $bytes = [System.Text.Encoding]::UTF8.GetBytes($plain)
 $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Console]::Out.Write([Convert]::ToBase64String($protected))
 ''', value);
+      }
       // Atomic write: a kill mid-save must not leave a truncated DPAPI file
       // behind (that would force the user to re-enter the key).
       await writeFileAtomically(file, encrypted);
@@ -863,6 +934,16 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
 
   static Future<bool?> _queryWindowsLongPathsEnabled() async {
     try {
+      if (debugWindowsProcessStarter == null) {
+        final nativeResult = await _tryWindowsNative<bool>(
+          'isLongPathsEnabled',
+        );
+        if (nativeResult.handled) {
+          _windowsLongPathsEnabledCache = nativeResult.value;
+          _windowsLongPathsQueried = true;
+          return _windowsLongPathsEnabledCache;
+        }
+      }
       // Process.start (not Process.run) so a 30s timeout kills the child:
       // Process.run's timeout only stops *waiting* and leaves the
       // PowerShell behind.
@@ -1011,6 +1092,12 @@ $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null
         r'[Security.Principal.WindowsIdentity]::GetCurrent());'
         r'$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)';
     return WindowsElevationCheck(
+      probe: debugWindowsProcessStarter != null
+          ? null
+          : () async {
+              final result = await _tryWindowsNative<bool>('isProcessElevated');
+              return result.handled ? result.value ?? false : null;
+            },
       start: () => startWindowsSecretProcess(<String>[
         '-NoProfile',
         '-ExecutionPolicy',

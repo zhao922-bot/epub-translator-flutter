@@ -1,4 +1,6 @@
 import 'package:epub_translator_flutter/features/jobs/application/jobs_provider.dart';
+import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
+import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspected_chapter.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/inspection_result.dart';
@@ -8,8 +10,11 @@ import 'package:epub_translator_flutter/features/translation/domain/models/trans
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_style_profile.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
+import 'package:epub_translator_flutter/shared/localization/app_strings.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+import 'helpers/memory_session_path_store.dart';
 
 class _CompletedInspectionRepository implements TranslationRepository {
   @override
@@ -93,10 +98,23 @@ class _MemoryJobHistoryStore extends JobHistoryStore {
   }
 }
 
+class _MemorySettingsStore extends SettingsStore {
+  @override
+  Future<TranslationConfig> load() async => TranslationConfig.defaults();
+
+  @override
+  Future<void> save(
+    TranslationConfig config, {
+    Set<SettingsSecretSlot>? explicitSecretMutations,
+  }) async {}
+}
+
 void main() {
   test('starts empty instead of showing sample jobs', () {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
+        settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(
           _MemoryJobHistoryStore(const <TranslationJob>[]),
         ),
@@ -110,9 +128,14 @@ void main() {
   test('shows the real current translation job', testOn: 'windows', () async {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
+        settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+        appStringsProvider.overrideWithValue(
+          const AppStrings(UiLanguage.english),
+        ),
         translationRepositoryProvider.overrideWithValue(
           _CompletedInspectionRepository(),
         ),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(
           _MemoryJobHistoryStore(const <TranslationJob>[]),
         ),
@@ -136,6 +159,8 @@ void main() {
   test('marks failed and cancelled history items as retryable', () async {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
+        settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(
           _MemoryJobHistoryStore(const <TranslationJob>[
             TranslationJob(
@@ -206,6 +231,8 @@ void main() {
   test('retry is reported blocked while another run is active', () async {
     final ProviderContainer container = ProviderContainer(
       overrides: <Override>[
+        settingsStoreProvider.overrideWithValue(_MemorySettingsStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
         jobHistoryStoreProvider.overrideWithValue(
           _MemoryJobHistoryStore(const <TranslationJob>[
             TranslationJob(

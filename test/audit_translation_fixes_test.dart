@@ -156,10 +156,10 @@ void main() {
         ),
       );
       await tester.enterText(find.byType(TextField), sample.$5);
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byType(ExpansionTile), findsOneWidget);
       await tester.enterText(find.byType(TextField), 'absent phrase');
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byType(ExpansionTile), findsNothing);
     });
   }
@@ -188,7 +188,7 @@ void main() {
       );
       final search = find.byType(TextField).first;
       await tester.enterText(search, 'accepted wording');
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byType(ExpansionTile), findsOneWidget);
       await tester.tap(find.byType(ExpansionTile));
       await tester.pumpAndSettle();
@@ -204,7 +204,7 @@ void main() {
       await tester.pump(const Duration(milliseconds: 300));
       expect(find.byType(ExpansionTile), findsNothing);
       await tester.enterText(search, 'fresh edit & biscuits');
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byType(ExpansionTile), findsOneWidget);
       await tester.tap(find.byType(ExpansionTile));
       await tester.pumpAndSettle();
@@ -213,7 +213,7 @@ void main() {
       await tester.pump();
       expect(find.byType(ExpansionTile), findsNothing);
       await tester.enterText(search, 'accepted wording');
-      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
       expect(find.byType(ExpansionTile), findsOneWidget);
     },
   );

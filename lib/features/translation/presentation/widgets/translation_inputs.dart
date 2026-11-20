@@ -5,7 +5,9 @@ import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/platform/platform_utils.dart';
+import '../../../../shared/widgets/app_shell.dart';
 import '../../../../shared/widgets/section_card.dart';
+import '../workbench_strings.dart';
 import 'translation_preferences.dart';
 
 class TranslationInputs extends StatefulWidget {
@@ -26,6 +28,7 @@ class TranslationInputs extends StatefulWidget {
     this.actions = const <Widget>[],
     this.chapterSummary,
     this.onPreviewPressed,
+    this.reviewBudget,
   });
 
   final AppStrings strings;
@@ -49,6 +52,7 @@ class TranslationInputs extends StatefulWidget {
   final List<Widget> actions;
   final String? chapterSummary;
   final VoidCallback? onPreviewPressed;
+  final Widget? reviewBudget;
 
   @override
   State<TranslationInputs> createState() => _TranslationInputsState();
@@ -197,6 +201,9 @@ class _TranslationInputsState extends State<TranslationInputs> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
+    final bool draggingFile = AppShell.isFileDraggingOf(context);
+    final bool showDropHighlight = widget.enabled && draggingFile;
+    const BorderRadius importRadius = BorderRadius.all(Radius.circular(8));
     final hasFile = widget.inputPath.isNotEmpty;
     final fileName = hasFile
         ? path.basename(widget.inputPath)
@@ -205,11 +212,18 @@ class _TranslationInputsState extends State<TranslationInputs> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Material(
-          color: scheme.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(8),
+          color: showDropHighlight
+              ? scheme.primaryContainer
+              : scheme.surfaceContainerHigh,
+          shape: RoundedRectangleBorder(
+            borderRadius: importRadius,
+            side: showDropHighlight
+                ? BorderSide(color: scheme.primary, width: 2)
+                : BorderSide.none,
+          ),
           child: InkWell(
             key: const ValueKey<String>('translation-import-zone'),
-            borderRadius: BorderRadius.circular(8),
+            borderRadius: importRadius,
             onTap: widget.enabled ? widget.onPickInputPressed : null,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
@@ -217,24 +231,37 @@ class _TranslationInputsState extends State<TranslationInputs> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Icon(
-                    hasFile
+                    showDropHighlight
+                        ? Icons.file_download_outlined
+                        : hasFile
                         ? Icons.menu_book_outlined
                         : Icons.upload_file_outlined,
                     size: 32,
-                    color: scheme.onSurfaceVariant,
+                    color: showDropHighlight
+                        ? scheme.onPrimaryContainer
+                        : scheme.onSurfaceVariant,
                   ),
                   const SizedBox(height: 20),
-                  Tooltip(
-                    message: hasFile ? widget.inputPath : '',
-                    child: Text(
-                      hasFile
-                          ? fileName
-                          : PlatformUtils.isWindows
-                          ? widget.strings.dropOrChooseEpub
-                          : widget.strings.chooseEpub,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleMedium,
+                  Semantics(
+                    liveRegion: showDropHighlight,
+                    child: Tooltip(
+                      message: hasFile ? widget.inputPath : '',
+                      child: Text(
+                        showDropHighlight
+                            ? widget.strings.releaseToImportEpub
+                            : hasFile
+                            ? fileName
+                            : PlatformUtils.isWindows
+                            ? widget.strings.dropOrChooseEpub
+                            : widget.strings.chooseEpub,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          color: showDropHighlight
+                              ? scheme.onPrimaryContainer
+                              : null,
+                        ),
+                      ),
                     ),
                   ),
                   const SizedBox(height: 8),
@@ -275,13 +302,25 @@ class _TranslationInputsState extends State<TranslationInputs> {
           ),
       ],
     );
-    final preferences = TranslationPreferences(
-      strings: widget.strings,
-      targetLanguage: widget.targetLanguage,
-      bilingual: widget.bilingual,
-      enabled: widget.enabled,
-      onTargetLanguageChanged: widget.onTargetLanguageChanged,
-      onBilingualChanged: widget.onBilingualChanged,
+    final preferences = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TranslationPreferences(
+          strings: widget.strings,
+          targetLanguage: widget.targetLanguage,
+          bilingual: widget.bilingual,
+          enabled: widget.enabled,
+          onTargetLanguageChanged: widget.onTargetLanguageChanged,
+          onBilingualChanged: widget.onBilingualChanged,
+        ),
+        if (widget.reviewBudget != null) ...[
+          const SizedBox(height: 12),
+          Align(
+            alignment: AlignmentDirectional.centerStart,
+            child: widget.reviewBudget,
+          ),
+        ],
+      ],
     );
     final output = Row(
       children: [

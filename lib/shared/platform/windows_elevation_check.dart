@@ -8,11 +8,12 @@ class WindowsElevationCheck {
   WindowsElevationCheck({
     required Future<Process> Function() start,
     required this.parseOutput,
+    Future<bool?> Function()? probe,
     this.onSuccess,
     Duration timeout = const Duration(seconds: 10),
   }) {
     _timer = Timer(timeout, cancel);
-    unawaited(_start(start));
+    unawaited(_start(start, probe));
   }
 
   WindowsElevationCheck.completed(bool value)
@@ -37,8 +38,19 @@ class WindowsElevationCheck {
 
   void cancel() => _finish(false);
 
-  Future<void> _start(Future<Process> Function() start) async {
+  Future<void> _start(
+    Future<Process> Function() start,
+    Future<bool?> Function()? probe,
+  ) async {
     try {
+      if (probe != null) {
+        final elevated = await probe();
+        if (_result.isCompleted) return;
+        if (elevated != null) {
+          _finish(elevated, successful: true);
+          return;
+        }
+      }
       final Process process = await start();
       _process = process;
       if (_result.isCompleted) {

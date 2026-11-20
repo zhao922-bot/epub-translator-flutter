@@ -45,24 +45,35 @@ PreviewChapter projectPreviewChapter(
   InspectedChapter chapter, {
   required String source,
   required String? translated,
-}) => PreviewChapter(
-  title: chapter.title,
-  // Limit both recovery joins and already cached excerpts at the shared data
-  // projection. Twelve blocks can still be one enormous block; bounding here
-  // also protects the provider's direct path without changing the renderer.
-  body: EpubHtmlExtractor.limitPreviewText(source),
-  translatedBody: translated == null
-      ? null
-      : EpubHtmlExtractor.limitPreviewText(translated),
-  path: chapter.path,
-  category: chapter.categoryLabel,
-  recommendedForTranslation: chapter.recommendedForTranslation,
-  includeInTranslation: chapter.includeInTranslation,
-  blockCount: chapter is _PreviewRecoveryPayload
+}) {
+  final blockCount = chapter is _PreviewRecoveryPayload
       ? chapter.blockCount
-      : chapter.blocks.length,
-  translatedBlockCount: chapter.translatedBlockCount,
-);
+      : chapter.blocks.length;
+  // The source extractor uses an ellipsis (possibly one code unit short at
+  // a surrogate boundary). The translated excerpt can end at its budget
+  // without an ellipsis.
+  const excerptBoundary = EpubHtmlExtractor.previewCharacterLimit - 1;
+  return PreviewChapter(
+    title: chapter.title,
+    body: EpubHtmlExtractor.limitPreviewText(source),
+    translatedBody: translated == null
+        ? null
+        : EpubHtmlExtractor.limitPreviewText(translated),
+    path: chapter.path,
+    category: chapter.categoryLabel,
+    recommendedForTranslation: chapter.recommendedForTranslation,
+    includeInTranslation: chapter.includeInTranslation,
+    blockCount: blockCount,
+    translatedBlockCount: chapter.translatedBlockCount,
+    degradedBlockCount: chapter.degradedBlockCount,
+    reviewWarningBlockCount: chapter.reviewWarningBlockCount,
+    hasTruncatedExcerpt:
+        blockCount > 0 &&
+        (blockCount > 12 ||
+            source.length >= excerptBoundary ||
+            (translated?.length ?? 0) >= excerptBoundary),
+  );
+}
 
 typedef PreviewRecoveryRunner =
     Future<List<PreviewChapter>> Function(List<InspectedChapter> chapters);
@@ -91,6 +102,8 @@ class _PreviewRecoveryPayload extends InspectedChapter {
         category: chapter.category,
         recommendedForTranslation: chapter.recommendedForTranslation,
         includeInTranslation: chapter.includeInTranslation,
+        degradedBlockCount: chapter.degradedBlockCount,
+        reviewWarningBlockCount: chapter.reviewWarningBlockCount,
       );
 
   /// Parse-dependent finish, run inside the isolate: bounds the markup and
@@ -116,6 +129,8 @@ class _PreviewRecoveryPayload extends InspectedChapter {
          category: payload.category,
          recommendedForTranslation: payload.recommendedForTranslation,
          includeInTranslation: payload.includeInTranslation,
+         degradedBlockCount: payload.degradedBlockCount,
+         reviewWarningBlockCount: payload.reviewWarningBlockCount,
        );
 
   final int blockCount;

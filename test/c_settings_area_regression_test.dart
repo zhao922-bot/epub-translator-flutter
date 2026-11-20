@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:epub_translator_flutter/features/settings/application/custom_endpoint_template.dart';
 import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/settings/presentation/pages/settings_page.dart';
 import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
+import 'package:epub_translator_flutter/features/translation/domain/models/api_provider_preset.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
@@ -17,6 +19,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:logger/logger.dart';
+
+import 'helpers/memory_session_path_store.dart';
 
 class _Secrets implements SettingsSecretStore {
   final values = <SettingsSecretSlot, String>{};
@@ -113,6 +117,7 @@ ProviderContainer _container(SettingsStore store, {_Repository? repository}) {
     overrides: [
       settingsStoreProvider.overrideWithValue(store),
       jobHistoryStoreProvider.overrideWithValue(_History()),
+      sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
       if (repository != null)
         settingsRepositoryProvider.overrideWithValue(repository),
     ],
@@ -498,6 +503,174 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  testWidgets(
+    'numeric tuning fields save exact values and reject out-of-range input',
+    (tester) async {
+      final store = _DelayedStore()
+        ..loading.complete(TranslationConfig.defaults());
+      final container = _container(store);
+      await container.read(settingsProvider.notifier).ready;
+      await _page(tester, container);
+      await tester.ensureVisible(find.byType(ExpansionTile));
+      await tester.tap(find.byType(ExpansionTile));
+      await tester.pumpAndSettle();
+
+      for (final (name, value) in [
+        ('maxOutputTokens', 12345),
+        ('maxSemanticReviewTokens', 72345),
+        ('chunkSize', 4321),
+        ('timeoutSeconds', 127),
+      ]) {
+        final input = find.byKey(ValueKey('settings-$name'));
+        await tester.ensureVisible(input);
+        await tester.enterText(input, '$value');
+        await tester.testTextInput.receiveAction(TextInputAction.done);
+        await tester.pumpAndSettle();
+        expect(store.saved.last.toJson()[name], value);
+      }
+      expect(store.saved, hasLength(4));
+
+      final chunkInput = find.byKey(const ValueKey('settings-chunkSize'));
+      await tester.ensureVisible(chunkInput);
+      await tester.enterText(chunkInput, '999');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pumpAndSettle();
+      expect(store.saved, hasLength(4));
+      expect(find.text('1000–12000'), findsOneWidget);
+
+      final chunkSlider = find.byWidgetPredicate(
+        (widget) => widget is Slider && widget.min == 1000,
+      );
+      final slider = tester.widget<Slider>(chunkSlider);
+      expect(slider.value, 4321);
+      slider.onChanged!(5000);
+      slider.onChangeEnd!(5000);
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(chunkInput).controller?.text, '5000');
+      expect(store.saved.last.chunkSize, 5000);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'endpoint templates quick-fill Custom and ask before reusing a key',
+    (tester) async {
+      final store = _DelayedStore()
+        ..loading.complete(TranslationConfig.defaults());
+      final container = _container(store);
+      final controller = container.read(settingsProvider.notifier);
+      await controller.ready;
+      await _page(tester, container);
+      await tester.pumpAndSettle();
+
+      final templates = find.byKey(
+        const ValueKey('settings-endpoint-templates'),
+      );
+      expect(templates, findsNothing);
+      expect(ApiProviderPreset.values, [
+        ApiProviderPreset.deepseek,
+        ApiProviderPreset.custom,
+      ]);
+      await tester.tap(find.byKey(const ValueKey('api-provider-custom')));
+      await tester.pumpAndSettle();
+
+      Future<void> choose(String label) async {
+        await tester.tap(templates);
+        await tester.pumpAndSettle();
+        for (final name in ['OpenAI', 'SiliconFlow', 'OpenRouter', 'Ollama']) {
+          expect(find.text(name), findsOneWidget);
+        }
+        await tester.tap(find.text(label));
+        await tester.pumpAndSettle();
+      }
+
+      await choose('OpenAI');
+      expect(find.byType(AlertDialog), findsNothing);
+      expect(store.saved.last.apiBaseUrl, 'https://api.openai.com/v1');
+      expect(store.saved.last.customModel, 'gpt-4o-mini');
+      expect(store.saved.last.apiKey, isEmpty);
+      expect(await controller.setApiKey('custom-fixture-key'), isTrue);
+      await tester.pumpAndSettle();
+
+      await choose('Ollama');
+      expect(find.byType(AlertDialog), findsOneWidget);
+      await tester.tap(find.widgetWithText(TextButton, 'Cancel'));
+      await tester.pumpAndSettle();
+      expect(store.saved.last.apiBaseUrl, 'https://api.openai.com/v1');
+      await choose('Ollama');
+      await tester.tap(find.widgetWithText(FilledButton, 'Use endpoint'));
+      await tester.pumpAndSettle();
+      expect(store.saved.last.apiBaseUrl, 'http://localhost:11434/v1');
+      expect(store.saved.last.customApiBaseUrl, 'http://localhost:11434/v1');
+      expect(store.saved.last.apiKey, 'custom-fixture-key');
+      expect(store.saved.last.deepseekApiKey, isEmpty);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  test(
+    'endpoint approval is scoped to the key and service the user saw',
+    () async {
+      final store = _DelayedStore()
+        ..loading.complete(
+          TranslationConfig.defaults().copyWith(
+            apiProviderSelection: ApiProviderSelection.custom,
+            apiBaseUrl: 'https://old.example/v1',
+            customApiBaseUrl: 'https://old.example/v1',
+            apiKey: 'old-fixture-key',
+            customApiKey: 'old-fixture-key',
+          ),
+        );
+      final container = _container(store);
+      final controller = container.read(settingsProvider.notifier);
+      await controller.ready;
+      final before = container.read(settingsProvider);
+      await controller.setApiKey('new-fixture-key');
+      await controller.applyCustomEndpointTemplate(
+        CustomEndpointTemplate.openAi,
+        approvedCredentialConfig: before,
+      );
+      final current = container.read(settingsProvider);
+      expect(current.apiBaseUrl, before.apiBaseUrl);
+      expect(current.apiKey, 'new-fixture-key');
+    },
+  );
+
+  testWidgets('streaming switch persists across a settings store restart', (
+    tester,
+  ) async {
+    final file = (await tester.runAsync(_file))!;
+    final secrets = _Secrets();
+    SettingsStore openStore() => SettingsStore(
+      settingsFileProvider: () async => file,
+      secretStore: secrets,
+    );
+    final store = openStore();
+    final container = _container(store);
+    await tester.runAsync(
+      () => container.read(settingsProvider.notifier).ready,
+    );
+    await _page(tester, container);
+    await tester.pumpAndSettle();
+
+    final streaming = find.byKey(const ValueKey('settings-use-streaming-api'));
+    await tester.ensureVisible(streaming);
+    expect(tester.widget<SwitchListTile>(streaming).value, isFalse);
+    await tester.runAsync(() async {
+      await tester.tap(streaming);
+      // Saves are queued, so wait for a following benign edit to complete.
+      await container
+          .read(settingsProvider.notifier)
+          .setOutputSuffix('_translated');
+    });
+    await tester.pumpAndSettle();
+    expect(tester.widget<SwitchListTile>(streaming).value, isTrue);
+    final reopened = (await tester.runAsync(openStore().load))!;
+    expect(reopened.useStreamingApi, isTrue);
+    expect(secrets.writes, 0);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets('C-12 proxy credentials start obscured and toggle visibility', (
     tester,

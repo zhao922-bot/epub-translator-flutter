@@ -5,6 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/repositories/epub_translation_repository.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// Regression test: when several batches fail at once, their per-block
@@ -45,7 +46,11 @@ void main() {
       retryDelaySeconds: 0,
       styleProfileEnabled: false,
     );
-    final EpubTranslationRepository repository = EpubTranslationRepository();
+    final EpubTranslationRepository repository = EpubTranslationRepository(
+      cacheStore: TranslationCacheStore(
+        cacheRoot: Directory('${temp.path}/cache'),
+      ),
+    );
     final inspection = await repository.startJob(
       inputPath: epubFile.path,
       outputDirectory: temp.path,
@@ -68,6 +73,81 @@ void main() {
       reason: '4 concurrent batches x 4-wide fallback windows would peak at 16',
     );
   });
+
+  test(
+    'resumed chapters share one request budget across batch fallbacks',
+    () async {
+      final temp = await Directory.systemTemp.createTemp(
+        'chapter_concurrency_',
+      );
+      addTearDown(() => temp.delete(recursive: true));
+      final server = _ConcurrencyTrackingServer();
+      await server.start();
+      addTearDown(server.close);
+      final epub = File('${temp.path}/chapters.epub');
+      await _writeTestEpub(
+        epub,
+        chapters: {
+          for (int chapter = 1; chapter <= 3; chapter++)
+            'OPS/Text/ch$chapter.xhtml': List<String>.generate(
+              8,
+              (index) =>
+                  '<p>Fixturechapter$chapter paragraph number $index.</p>',
+            ).join('\n'),
+        },
+      );
+      final cacheRoot = Directory('${temp.path}/cache');
+      const maxConcurrent = 4;
+      final config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        chunkSize: 160,
+        maxConcurrent: maxConcurrent,
+        maxRetries: 1,
+        retryDelaySeconds: 0,
+        styleProfileEnabled: false,
+      );
+
+      Future<TranslationJob> translate() async {
+        final repository = EpubTranslationRepository(
+          cacheStore: _CheckpointOnlyCache(cacheRoot: cacheRoot),
+        );
+        final inspection = await repository.startJob(
+          inputPath: epub.path,
+          outputDirectory: temp.path,
+          config: config,
+        );
+        final result = await repository.translateChapters(
+          inputPath: epub.path,
+          outputDirectory: temp.path,
+          config: config,
+          chapters: inspection.chapters,
+        );
+        return result.job;
+      }
+
+      // Build real chapter-memory checkpoints, then rerun with body cache misses.
+      // Since the memory updates are already recorded, the chapters can overlap.
+      expect((await translate()).status, TranslationJobStatus.completed);
+      expect(server.chapterMemoryRequests, greaterThanOrEqualTo(2));
+      server.peakConcurrent = 0;
+      server.peakConcurrentChapters = 0;
+      final result = await translate();
+
+      expect(result.status, TranslationJobStatus.completed);
+      expect(result.completedFiles, 3);
+      expect(server.peakConcurrentChapters, greaterThan(1));
+      expect(server.peakConcurrent, lessThanOrEqualTo(maxConcurrent));
+    },
+  );
+}
+
+/// Uses the production checkpoint store while simulating evicted body translations.
+class _CheckpointOnlyCache extends TranslationCacheStore {
+  _CheckpointOnlyCache({required super.cacheRoot});
+
+  @override
+  Future<String?> getBlockTranslation(String cacheKey) async => null;
 }
 
 /// Fake translation API: multi-block batch requests get a non-JSON reply
@@ -78,6 +158,10 @@ class _ConcurrencyTrackingServer {
   HttpServer? _server;
   int inFlight = 0;
   int peakConcurrent = 0;
+  int chapterMemoryRequests = 0;
+  int peakConcurrentChapters = 0;
+  final Map<String, int> _activeChapters = <String, int>{};
+  final RegExp _chapterMarker = RegExp(r'Fixturechapter(\d+)');
 
   int get port => _server!.port;
 
@@ -88,6 +172,7 @@ class _ConcurrencyTrackingServer {
       if (inFlight > peakConcurrent) {
         peakConcurrent = inFlight;
       }
+      String? activeChapter;
       try {
         final String rawBody = await utf8.decoder.bind(request).join();
         final Map<String, dynamic> requestBody =
@@ -108,6 +193,7 @@ class _ConcurrencyTrackingServer {
           });
         } else if (payload is Map<String, dynamic> &&
             payload['kind'] == 'chapterMemory') {
+          chapterMemoryRequests++;
           responseContent = jsonEncode(<String, Object?>{
             'title': 'Chapter',
             'summary': 'The chapter was translated.',
@@ -122,6 +208,17 @@ class _ConcurrencyTrackingServer {
           responseContent = 'this is not json';
         } else {
           // Single-block fallback request: slow enough to overlap.
+          activeChapter = _chapterMarker.firstMatch(userContent)?.group(1);
+          if (activeChapter != null) {
+            _activeChapters.update(
+              activeChapter,
+              (count) => count + 1,
+              ifAbsent: () => 1,
+            );
+            if (_activeChapters.length > peakConcurrentChapters) {
+              peakConcurrentChapters = _activeChapters.length;
+            }
+          }
           await Future<void>.delayed(const Duration(milliseconds: 100));
           responseContent = '<p>Translated.</p>';
         }
@@ -139,6 +236,14 @@ class _ConcurrencyTrackingServer {
         await request.response.close();
       } finally {
         inFlight -= 1;
+        if (activeChapter != null) {
+          final remaining = _activeChapters[activeChapter]! - 1;
+          if (remaining == 0) {
+            _activeChapters.remove(activeChapter);
+          } else {
+            _activeChapters[activeChapter] = remaining;
+          }
+        }
       }
     });
   }

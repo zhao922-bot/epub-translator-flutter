@@ -184,30 +184,55 @@ void main() {
     expect(controller.state.isRunActive, isTrue);
   });
 
-  test('B-P1-3 newer run completes cleanly after stale terminal return', () async {
-    final newerJob = controller.state.job!;
-    final historyLength = controller.state.jobHistory.length;
-    repository.results[0].complete(repository.terminalResult(0));
-    expect(await runA, isTrue);
-    expect(controller.state.job, same(newerJob));
+  test(
+    'stale progress and completion preserve buffered newer updates',
+    () async {
+      final newerProgress = repository.jobs[1].copyWith(
+        progress: 0.75,
+        currentBlock: 'newer progress',
+      );
+      repository.progressCallbacks[1]?.call(
+        newerProgress,
+        'newer buffered update',
+      );
+      repository.progressCallbacks[0]?.call(repository.jobs[0], 'stale update');
+      repository.results[0].complete(repository.terminalResult(0));
+      expect(await runA, isTrue);
 
-    final resultB = repository.terminalResult(1);
-    repository.results[1].complete(resultB);
-    expect(await runB, isTrue);
+      await controller.debugPersistJobHistoryNow();
+      expect(controller.state.job!.currentBlock, 'newer progress');
+      expect(controller.state.logs, contains('newer buffered update'));
+      expect(controller.state.logs, isNot(contains('stale update')));
+    },
+  );
 
-    // The controller retains its history identity, not the repository job id.
-    expect(controller.state.job!.id, newerJob.id);
-    expect(controller.state.job!.runStartedAt, newerJob.runStartedAt);
-    expect(
-      controller.state.job!.recordRevision,
-      greaterThan(newerJob.recordRevision),
-    );
-    expect(controller.state.job!.status, TranslationJobStatus.completed);
-    expect(controller.state.job!.outputPath, resultB.job.outputPath);
-    expect(controller.state.inspectedChapters, resultB.chapters);
-    expect(controller.state.jobHistory.length, historyLength);
-    expect(controller.state.jobHistory.first, same(controller.state.job));
-    expect(controller.state.isRunActive, isFalse);
-    expect(controller.state.actionableError, isNull);
-  });
+  test(
+    'B-P1-3 newer run completes cleanly after stale terminal return',
+    () async {
+      final newerJob = controller.state.job!;
+      final historyLength = controller.state.jobHistory.length;
+      repository.results[0].complete(repository.terminalResult(0));
+      expect(await runA, isTrue);
+      expect(controller.state.job, same(newerJob));
+
+      final resultB = repository.terminalResult(1);
+      repository.results[1].complete(resultB);
+      expect(await runB, isTrue);
+
+      // The controller retains its history identity, not the repository job id.
+      expect(controller.state.job!.id, newerJob.id);
+      expect(controller.state.job!.runStartedAt, newerJob.runStartedAt);
+      expect(
+        controller.state.job!.recordRevision,
+        greaterThan(newerJob.recordRevision),
+      );
+      expect(controller.state.job!.status, TranslationJobStatus.completed);
+      expect(controller.state.job!.outputPath, resultB.job.outputPath);
+      expect(controller.state.inspectedChapters, resultB.chapters);
+      expect(controller.state.jobHistory.length, historyLength);
+      expect(controller.state.jobHistory.first, same(controller.state.job));
+      expect(controller.state.isRunActive, isFalse);
+      expect(controller.state.actionableError, isNull);
+    },
+  );
 }

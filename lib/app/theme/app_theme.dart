@@ -90,8 +90,10 @@ class AppTheme {
     );
     final bool isDark = scheme.brightness == Brightness.dark;
 
-    final BorderRadius buttonRadius = BorderRadius.circular(8);
-    final BorderRadius fieldRadius = BorderRadius.circular(8);
+    const BorderRadius controlRadius = BorderRadius.all(Radius.circular(8));
+    const RoundedRectangleBorder controlShape = RoundedRectangleBorder(
+      borderRadius: controlRadius,
+    );
 
     return ThemeData(
       useMaterial3: true,
@@ -105,9 +107,7 @@ class AppTheme {
       navigationRailTheme: NavigationRailThemeData(
         backgroundColor: Colors.transparent,
         indicatorColor: scheme.primary.withValues(alpha: isDark ? 0.22 : 0.14),
-        indicatorShape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
-        ),
+        indicatorShape: controlShape,
         selectedIconTheme: IconThemeData(color: scheme.primary, size: 22),
         unselectedIconTheme: IconThemeData(
           color: scheme.onSurfaceVariant,
@@ -129,6 +129,7 @@ class AppTheme {
             ? scheme.surfaceContainerHighest.withValues(alpha: 0.92)
             : scheme.surfaceContainerHighest,
         indicatorColor: scheme.primary.withValues(alpha: 0.16),
+        indicatorShape: controlShape,
         elevation: 0,
         height: 68,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
@@ -153,7 +154,7 @@ class AppTheme {
         margin: EdgeInsets.zero,
         shadowColor: scheme.shadow.withValues(alpha: isDark ? 0.4 : 0.08),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: controlRadius,
           side: BorderSide(
             color: scheme.outlineVariant.withValues(alpha: isDark ? 0.6 : 0.85),
           ),
@@ -169,17 +170,17 @@ class AppTheme {
           vertical: 10,
         ),
         border: OutlineInputBorder(
-          borderRadius: fieldRadius,
+          borderRadius: controlRadius,
           borderSide: BorderSide.none,
         ),
         enabledBorder: OutlineInputBorder(
-          borderRadius: fieldRadius,
+          borderRadius: controlRadius,
           borderSide: BorderSide(
             color: scheme.outlineVariant.withValues(alpha: 0.7),
           ),
         ),
         focusedBorder: OutlineInputBorder(
-          borderRadius: fieldRadius,
+          borderRadius: controlRadius,
           borderSide: BorderSide(color: scheme.primary, width: 1.6),
         ),
         labelStyle: textTheme.bodyMedium?.copyWith(
@@ -195,9 +196,7 @@ class AppTheme {
           side: WidgetStatePropertyAll<BorderSide>(
             BorderSide(color: scheme.outlineVariant),
           ),
-          shape: WidgetStatePropertyAll<OutlinedBorder>(
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-          ),
+          shape: WidgetStatePropertyAll<OutlinedBorder>(controlShape),
           backgroundColor: WidgetStateProperty.resolveWith((states) {
             if (states.contains(WidgetState.selected)) {
               return scheme.primary.withValues(alpha: isDark ? 0.24 : 0.12);
@@ -216,7 +215,7 @@ class AppTheme {
       filledButtonTheme: FilledButtonThemeData(
         style: FilledButton.styleFrom(
           elevation: 0,
-          shape: RoundedRectangleBorder(borderRadius: buttonRadius),
+          shape: controlShape,
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           textStyle: textTheme.labelLarge?.copyWith(
             fontWeight: FontWeight.w600,
@@ -228,20 +227,18 @@ class AppTheme {
         style: OutlinedButton.styleFrom(
           foregroundColor: scheme.onSurface,
           side: BorderSide(color: scheme.outline.withValues(alpha: 0.55)),
-          shape: RoundedRectangleBorder(borderRadius: buttonRadius),
+          shape: controlShape,
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         ),
       ),
       textButtonTheme: TextButtonThemeData(
         style: TextButton.styleFrom(
           foregroundColor: scheme.primary,
-          shape: RoundedRectangleBorder(borderRadius: buttonRadius),
+          shape: controlShape,
         ),
       ),
       iconButtonTheme: IconButtonThemeData(
-        style: IconButton.styleFrom(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        ),
+        style: IconButton.styleFrom(shape: controlShape),
       ),
       chipTheme: ChipThemeData(
         backgroundColor: scheme.surfaceContainer,
@@ -285,10 +282,8 @@ class AppTheme {
         linearMinHeight: 8,
       ),
       expansionTileTheme: ExpansionTileThemeData(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        collapsedShape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
+        shape: controlShape,
+        collapsedShape: controlShape,
         tilePadding: EdgeInsets.zero,
         childrenPadding: const EdgeInsets.only(top: 4, bottom: 8),
       ),
@@ -298,7 +293,7 @@ class AppTheme {
         space: 1,
       ),
       listTileTheme: ListTileThemeData(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: controlShape,
         iconColor: scheme.onSurfaceVariant,
         contentPadding: const EdgeInsets.symmetric(horizontal: 4),
       ),
@@ -311,7 +306,7 @@ class AppTheme {
       ),
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        shape: controlShape,
       ),
       tooltipTheme: TooltipThemeData(
         textStyle: TextStyle(

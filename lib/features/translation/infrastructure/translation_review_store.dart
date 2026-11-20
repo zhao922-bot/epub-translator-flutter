@@ -82,6 +82,17 @@ class TranslationReviewStore {
   Future<Map<String, dynamic>> load(
     String reportPath, {
     String? expectedOutputPath,
+  }) => loadPrepared(
+    reportPath,
+    (report) => report,
+    expectedOutputPath: expectedOutputPath,
+  );
+
+  /// Prepares a validated report before the worker sends it to the UI isolate.
+  Future<T> loadPrepared<T>(
+    String reportPath,
+    T Function(Map<String, dynamic>) prepare, {
+    String? expectedOutputPath,
   }) => Isolate.run(() async {
     final file = File(reportPath);
     if (await file.length() > 64 * 1024 * 1024) {
@@ -208,7 +219,7 @@ class TranslationReviewStore {
         }
       }
     }
-    return decoded;
+    return prepare(decoded);
   });
 
   /// Every displayed/exported suggestion must belong to a hashed chapter.

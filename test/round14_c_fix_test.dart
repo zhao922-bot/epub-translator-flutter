@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:epub_translator_flutter/features/settings/application/settings_controller.dart';
 import 'package:epub_translator_flutter/features/settings/infrastructure/settings_store.dart';
 import 'package:epub_translator_flutter/features/settings/presentation/pages/settings_page.dart';
+import 'package:epub_translator_flutter/features/translation/application/translation_dashboard_controller.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/job_history_store.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
@@ -17,6 +18,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:logger/logger.dart';
 import 'package:path/path.dart' as path;
+
+import 'helpers/memory_job_history_store.dart';
+import 'helpers/memory_session_path_store.dart';
 
 /// Gate-based fixture, matching the round10/round13 replay tests. Loading
 /// deliberately clears the error before returning its snapshot (real store).
@@ -343,7 +347,11 @@ void main() {
 
   Future<ProviderContainer> showSettings(WidgetTester tester) async {
     final container = ProviderContainer(
-      overrides: [settingsStoreProvider.overrideWithValue(store)],
+      overrides: [
+        settingsStoreProvider.overrideWithValue(store),
+        jobHistoryStoreProvider.overrideWithValue(MemoryJobHistoryStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
+      ],
     );
     addTearDown(container.dispose);
     await container.read(settingsProvider.notifier).ready;
@@ -449,7 +457,11 @@ void main() {
 
   testWidgets('C-P2-16 pre-existing error shown on page init', (tester) async {
     final container = ProviderContainer(
-      overrides: [settingsStoreProvider.overrideWithValue(store)],
+      overrides: [
+        settingsStoreProvider.overrideWithValue(store),
+        jobHistoryStoreProvider.overrideWithValue(MemoryJobHistoryStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
+      ],
     );
     addTearDown(container.dispose);
     final uiController = container.read(settingsProvider.notifier);
@@ -481,7 +493,11 @@ void main() {
     tester,
   ) async {
     final container = ProviderContainer(
-      overrides: [settingsStoreProvider.overrideWithValue(store)],
+      overrides: [
+        settingsStoreProvider.overrideWithValue(store),
+        jobHistoryStoreProvider.overrideWithValue(MemoryJobHistoryStore()),
+        sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
+      ],
     );
     addTearDown(container.dispose);
     await container.read(settingsProvider.notifier).ready;

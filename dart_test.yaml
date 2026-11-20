@@ -1,0 +1,6 @@
+tags:
+  slow:
+    # Heavy multi-thousand-block stress/benchmark tests.
+    # Run fast feedback locally with: flutter test -x slow
+  live:
+    # Tests requiring live external LLM API credentials.

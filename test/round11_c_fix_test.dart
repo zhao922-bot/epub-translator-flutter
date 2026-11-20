@@ -20,6 +20,39 @@ import 'package:path/path.dart' as p;
 // Round 11, area C regression tests (Spark).
 // ---------------------------------------------------------------------------
 
+/// Resolves the `dart` executable even when Windows PATH only points to
+/// `flutter/bin/dart.bat` (where `Process.start('dart', ...)` fails).
+String _resolveDartExecutable() {
+  final String exeName = Platform.isWindows ? 'dart.exe' : 'dart';
+  // Walk up from Platform.resolvedExecutable (e.g. flutter_tester.exe inside
+  // flutter/bin/cache/artifacts/engine/...) to find flutter/bin/cache/dart-sdk.
+  Directory dir = File(Platform.resolvedExecutable).parent;
+  for (int i = 0; i < 8; i++) {
+    final candidate = File(
+      p.join(dir.path, 'cache', 'dart-sdk', 'bin', exeName),
+    );
+    if (candidate.existsSync()) return candidate.path;
+    final sibling = File(p.join(dir.path, 'dart-sdk', 'bin', exeName));
+    if (sibling.existsSync()) return sibling.path;
+    final direct = File(p.join(dir.path, exeName));
+    if (direct.existsSync()) return direct.path;
+    final parent = dir.parent;
+    if (parent.path == dir.path) break;
+    dir = parent;
+  }
+  final String pathEnv = Platform.environment['PATH'] ?? '';
+  for (final entry in pathEnv.split(Platform.isWindows ? ';' : ':')) {
+    if (entry.trim().isEmpty) continue;
+    final exe = File(p.join(entry.trim(), exeName));
+    if (exe.existsSync()) return exe.path;
+    final sdkExe = File(
+      p.join(entry.trim(), 'cache', 'dart-sdk', 'bin', exeName),
+    );
+    if (sdkExe.existsSync()) return sdkExe.path;
+  }
+  return 'dart';
+}
+
 class _FakeSecretStore implements SettingsSecretStore {
   final Map<SettingsSecretSlot, String?> values = {};
   bool hangReads = false;
@@ -154,11 +187,14 @@ Future<void> main(List<String> args) async {
   await handle.close();
 }
 ''');
-        final holder = await Process.start('dart', [
+        final holder = await Process.start(_resolveDartExecutable(), [
           helper.path,
           lockPath,
         ]);
-        addTearDown(() async { holder.kill(); await holder.exitCode; });
+        addTearDown(() async {
+          holder.kill();
+          await holder.exitCode;
+        });
         await holder.stdout
             .transform(const SystemEncoding().decoder)
             .firstWhere((line) => line.contains('LOCKED'));
@@ -173,7 +209,7 @@ Future<void> main(List<String> args) async {
         // Writer C commits a newer history during the race window.
         await file.writeAsString(newer);
         await holder.stdin.close();
-          await holder.exitCode;
+        await holder.exitCode;
         await loadFuture;
 
         // The newer history wins; it is not overwritten by the stale backup.
@@ -251,33 +287,30 @@ Future<void> main(List<String> args) async {
   });
 
   group('P2-#25 undecodable history bytes', () {
-    test(
-      'invalid UTF-8 inside a JSON string takes the backup path',
-      () async {
-        final temp = await Directory.systemTemp.createTemp('c11_p25_');
-        addTearDown(() => temp.delete(recursive: true));
-        final file = File(p.join(temp.path, 'job-history.json'));
-        final store = JobHistoryStore(historyFileProvider: () async => file);
-        // Invalid UTF-8 inside a JSON string value: allowMalformed would
-        // substitute U+FFFD and jsonDecode would still succeed.
-        final bytes = <int>[
-          ...utf8.encode('{"version":2,"clearedAt":0,"jobs":[{"id":"a'),
-          0xff,
-          ...utf8.encode('b","inputPath":"x","outputPath":"y"}]}'),
-        ];
-        await file.writeAsBytes(bytes);
+    test('invalid UTF-8 inside a JSON string takes the backup path', () async {
+      final temp = await Directory.systemTemp.createTemp('c11_p25_');
+      addTearDown(() => temp.delete(recursive: true));
+      final file = File(p.join(temp.path, 'job-history.json'));
+      final store = JobHistoryStore(historyFileProvider: () async => file);
+      // Invalid UTF-8 inside a JSON string value: allowMalformed would
+      // substitute U+FFFD and jsonDecode would still succeed.
+      final bytes = <int>[
+        ...utf8.encode('{"version":2,"clearedAt":0,"jobs":[{"id":"a'),
+        0xff,
+        ...utf8.encode('b","inputPath":"x","outputPath":"y"}]}'),
+      ];
+      await file.writeAsBytes(bytes);
 
-        final loaded = await store.loadWithTombstone();
+      final loaded = await store.loadWithTombstone();
 
-        expect(loaded.jobs, isEmpty);
-        // The original bytes are preserved in a backup, not silently
-        // overwritten by the U+FFFD-substituted text on the next save.
-        expect(await file.exists(), isFalse);
-        final backups = await _badHistoryBackups(temp);
-        expect(backups, hasLength(1));
-        expect(await backups.single.readAsBytes(), bytes);
-      },
-    );
+      expect(loaded.jobs, isEmpty);
+      // The original bytes are preserved in a backup, not silently
+      // overwritten by the U+FFFD-substituted text on the next save.
+      expect(await file.exists(), isFalse);
+      final backups = await _badHistoryBackups(temp);
+      expect(backups, hasLength(1));
+      expect(await backups.single.readAsBytes(), bytes);
+    });
   });
 
   group('P2-#34 structurally invalid history', () {
@@ -336,18 +369,13 @@ Future<void> main(List<String> args) async {
         );
 
         // Must complete (with per-slot read failures), not hang.
-        final config = await store
-            .load()
-            .timeout(
-              const Duration(seconds: 45),
-              onTimeout: () => throw StateError('load hung'),
-            );
+        final config = await store.load().timeout(
+          const Duration(seconds: 45),
+          onTimeout: () => throw StateError('load hung'),
+        );
 
         expect(config, isA<TranslationConfig>());
-        expect(
-          store.secretReadFailed(SettingsSecretSlot.deepSeek),
-          isTrue,
-        );
+        expect(store.secretReadFailed(SettingsSecretSlot.deepSeek), isTrue);
       },
       timeout: const Timeout(Duration(seconds: 90)),
     );
@@ -436,8 +464,14 @@ Future<void> main(List<String> args) async {
   await handle.close();
 }
 ''');
-        final holder = await Process.start('dart', [helper.path, lockPath]);
-        addTearDown(() async { holder.kill(); await holder.exitCode; });
+        final holder = await Process.start(_resolveDartExecutable(), [
+          helper.path,
+          lockPath,
+        ]);
+        addTearDown(() async {
+          holder.kill();
+          await holder.exitCode;
+        });
         await holder.stdout
             .transform(const SystemEncoding().decoder)
             .firstWhere((line) => line.contains('LOCKED'));
@@ -463,27 +497,18 @@ Future<void> main(List<String> args) async {
   });
 
   group('P2-#30 security -i quoting', () {
-    test(
-      'backslash and single quote survive the security -i tokenizer',
-      () {
-        // security -i is not a shell: it splits on whitespace, groups
-        // double-quoted segments, and lets backslash escape " and \.
-        // POSIX single-quote wrapping stored `ab\\cd` as `abcd`.
-        expect(
-          NativePlatformBridge.securityInteractiveQuote(r'ab\cd'),
-          r'"ab\\cd"',
-        );
-        expect(
-          NativePlatformBridge.securityInteractiveQuote("it's"),
-          '"it\'s"',
-        );
-        expect(
-          NativePlatformBridge.securityInteractiveQuote('a"b'),
-          r'"a\"b"',
-        );
-        expect(NativePlatformBridge.securityInteractiveQuote(''), '""');
-      },
-    );
+    test('backslash and single quote survive the security -i tokenizer', () {
+      // security -i is not a shell: it splits on whitespace, groups
+      // double-quoted segments, and lets backslash escape " and \.
+      // POSIX single-quote wrapping stored `ab\\cd` as `abcd`.
+      expect(
+        NativePlatformBridge.securityInteractiveQuote(r'ab\cd'),
+        r'"ab\\cd"',
+      );
+      expect(NativePlatformBridge.securityInteractiveQuote("it's"), '"it\'s"');
+      expect(NativePlatformBridge.securityInteractiveQuote('a"b'), r'"a\"b"');
+      expect(NativePlatformBridge.securityInteractiveQuote(''), '""');
+    });
 
     test('store command double-quotes every value', () {
       expect(
@@ -498,47 +523,51 @@ Future<void> main(List<String> args) async {
   });
 
   group('P2-#24 failed digest read keeps the old baseline', () {
-    test('mtime baseline does not advance when the digest read fails',
-        () async {
-      final root = await Directory.systemTemp.createTemp('c11_p24_');
-      addTearDown(() => root.delete(recursive: true));
-      var now = DateTime(2026);
-      bool sabotage = false;
-      final store = TranslationCacheStore(
-        cacheRoot: root,
-        maxCacheBytes: 100000,
-        now: () => now,
-        onMaintenanceScan: () async {
-          if (sabotage) {
-            // Swap the listed file for a directory after the listing so the
-            // digest openRead() fails.
-            final file = File(p.join(root.path, 'blocks', 'aa', 'aa01.html'));
-            await file.delete();
-            await Directory(
-              p.join(root.path, 'blocks', 'aa', 'aa01.html'),
-            ).create();
-          }
-        },
-      );
-      await store.putBlockTranslation('aa01', 'x' * 100);
-      await store.waitForMaintenanceForTest();
-      final filePath = p.join(root.path, 'blocks', 'aa', 'aa01.html');
-      final baseline = store.mtimeBaselineForTest(filePath);
-      expect(baseline, isNotNull);
+    test(
+      'mtime baseline does not advance when the digest read fails',
+      () async {
+        final root = await Directory.systemTemp.createTemp('c11_p24_');
+        addTearDown(() => root.delete(recursive: true));
+        var now = DateTime(2026);
+        bool sabotage = false;
+        final store = TranslationCacheStore(
+          cacheRoot: root,
+          maxCacheBytes: 100000,
+          now: () => now,
+          onMaintenanceScan: () async {
+            if (sabotage) {
+              // Invalidate the scanned file before its digest is committed.
+              final file = File(p.join(root.path, 'blocks', 'aa', 'aa01.html'));
+              await file.delete();
+              await Directory(
+                p.join(root.path, 'blocks', 'aa', 'aa01.html'),
+              ).create();
+            }
+          },
+        );
+        await store.putBlockTranslation('aa01', 'x' * 100);
+        await store.waitForMaintenanceForTest();
+        final filePath = p.join(root.path, 'blocks', 'aa', 'aa01.html');
+        final baseline = store.mtimeBaselineForTest(filePath);
+        expect(baseline, isNotNull);
 
-      // Externally rewrite (new mtime), then sabotage the digest read.
-      now = now.add(const Duration(minutes: 10));
-      await File(filePath).writeAsString('y' * 100);
-      sabotage = true;
-      now = now.add(const Duration(minutes: 6));
-      await store.putBlockTranslation('aa02', 'z' * 10);
-      await store.waitForMaintenanceForTest();
-      sabotage = false;
+        // Externally rewrite (new mtime), then sabotage the digest read.
+        now = now.add(const Duration(minutes: 10));
+        final rewritten = await File(filePath).writeAsString('y' * 100);
+        await rewritten.setLastModified(
+          baseline!.add(const Duration(seconds: 2)),
+        );
+        sabotage = true;
+        now = now.add(const Duration(minutes: 6));
+        await store.putBlockTranslation('aa02', 'z' * 10);
+        await store.waitForMaintenanceForTest();
+        sabotage = false;
 
-      // The digest could not be read: the mtime baseline must not advance
-      // past the stale digest.
-      expect(store.mtimeBaselineForTest(filePath), baseline);
-    });
+        // The digest could not be read: the mtime baseline must not advance
+        // past the stale digest.
+        expect(store.mtimeBaselineForTest(filePath), baseline);
+      },
+    );
   });
 
   group('P2-#27 atomic checkpoint pair deletion', () {
@@ -630,10 +659,8 @@ Future<void> main(List<String> args) async {
       await store.pruneJobCheckpointsForTest(jobsDir, maxCheckpoints: 20);
 
       // 20 tasks (40 files) fit the cap: nothing pruned.
-      int countFiles() => Directory(jobsDir.path)
-          .listSync()
-          .whereType<File>()
-          .length;
+      int countFiles() =>
+          Directory(jobsDir.path).listSync().whereType<File>().length;
       expect(countFiles(), 40);
 
       // 21 tasks: the oldest pair goes, 20 tasks remain
@@ -642,7 +669,9 @@ Future<void> main(List<String> args) async {
       final job = File(p.join(jobsDir.path, '$jobKey.json'));
       await job.writeAsString('{"jobKey":"$jobKey"}');
       await store.pruneJobCheckpointsForTest(jobsDir, maxCheckpoints: 20);
-      final afterSecond = Directory(jobsDir.path).listSync().whereType<File>().length;
+      final afterSecond = Directory(
+        jobsDir.path,
+      ).listSync().whereType<File>().length;
       expect(afterSecond, 39);
       expect(await File(p.join(jobsDir.path, 'job-19.json')).exists(), isFalse);
       expect(await File(p.join(jobsDir.path, 'job-0.json')).exists(), isTrue);
@@ -650,48 +679,50 @@ Future<void> main(List<String> args) async {
   });
 
   group('P2-#29 lightweight quota pass during backoff', () {
-    test('puts still enforce the quota while the backoff skips full scans',
-        () async {
-      final root = await Directory.systemTemp.createTemp('c11_p29_');
-      addTearDown(() => root.delete(recursive: true));
-      var now = DateTime(2026);
-      int scans = 0;
-      final scanGate = Completer<void>();
-      final store = TranslationCacheStore(
-        cacheRoot: root,
-        maxCacheBytes: 1000,
-        now: () => now,
-        onMaintenanceScan: () async {
-          scans++;
-          // Hold the baseline until all puts are in, so it deterministically
-          // observes the over-capacity cache and arms the backoff.
-          await scanGate.future;
-          throw StateError('simulated unscannable cache');
-        },
-      );
+    test(
+      'puts still enforce the quota while the backoff skips full scans',
+      () async {
+        final root = await Directory.systemTemp.createTemp('c11_p29_');
+        addTearDown(() => root.delete(recursive: true));
+        var now = DateTime(2026);
+        int scans = 0;
+        final scanGate = Completer<void>();
+        final store = TranslationCacheStore(
+          cacheRoot: root,
+          maxCacheBytes: 1000,
+          now: () => now,
+          onMaintenanceScan: () async {
+            scans++;
+            // Hold the baseline until all puts are in, so it deterministically
+            // observes the over-capacity cache and arms the backoff.
+            await scanGate.future;
+            throw StateError('simulated unscannable cache');
+          },
+        );
 
-      for (int i = 1; i <= 6; i++) {
-        await store.putBlockTranslation('aa0$i', 'x' * 100);
-      }
-      scanGate.complete();
-      await store.waitForMaintenanceForTest();
-      // The throwing scan armed the backoff.
-      expect(scans, 1);
-      expect(store.estimatedCacheBytesForTest, greaterThan(1000));
+        for (int i = 1; i <= 6; i++) {
+          await store.putBlockTranslation('aa0$i', 'x' * 100);
+        }
+        scanGate.complete();
+        await store.waitForMaintenanceForTest();
+        // The throwing scan armed the backoff.
+        expect(scans, 1);
+        expect(store.estimatedCacheBytesForTest, greaterThan(1000));
 
-      // Interval still active, backoff active, still over capacity: the old
-      // code returned here and let the cache grow unbounded. The fix runs
-      // the lightweight pass instead of the full scan.
-      await store.putBlockTranslation('aa07', 'y' * 100);
-      await store.waitForMaintenanceForTest();
+        // Interval still active, backoff active, still over capacity: the old
+        // code returned here and let the cache grow unbounded. The fix runs
+        // the lightweight pass instead of the full scan.
+        await store.putBlockTranslation('aa07', 'y' * 100);
+        await store.waitForMaintenanceForTest();
 
-      expect(scans, 1, reason: 'no full scan during backoff');
-      expect(
-        store.estimatedCacheBytesForTest,
-        lessThanOrEqualTo(900),
-        reason: 'lightweight pass evicted down to 90% of cap',
-      );
-    });
+        expect(scans, 1, reason: 'no full scan during backoff');
+        expect(
+          store.estimatedCacheBytesForTest,
+          lessThanOrEqualTo(900),
+          reason: 'lightweight pass evicted down to 90% of cap',
+        );
+      },
+    );
   });
 
   group('perf-#42 rollback digest memo', () {
@@ -735,20 +766,20 @@ Future<void> main(List<String> args) async {
 
   group('perf-#43 checkpoint prune throttle', () {
     JobResumeState jobState(String key) => JobResumeState(
-          jobKey: key,
-          inputFingerprint: 'fp',
-          inputPath: '/in.epub',
-          outputPath: '/out.epub',
-          status: 'running',
-          completedFiles: 1,
-          totalFiles: 3,
-          completedBlocks: 10,
-          totalBlocks: 30,
-          cachedBlocks: 5,
-          resumedBlocks: 2,
-          currentChapter: 'ch2',
-          updatedAtIso8601: '2026-10-12T00:00:00Z',
-        );
+      jobKey: key,
+      inputFingerprint: 'fp',
+      inputPath: '/in.epub',
+      outputPath: '/out.epub',
+      status: 'running',
+      completedFiles: 1,
+      totalFiles: 3,
+      completedBlocks: 10,
+      totalBlocks: 30,
+      cachedBlocks: 5,
+      resumedBlocks: 2,
+      currentChapter: 'ch2',
+      updatedAtIso8601: '2026-10-12T00:00:00Z',
+    );
 
     Future<int> jobFileCount(Directory jobsDir) =>
         jobsDir.list().where((e) => e is File).length;

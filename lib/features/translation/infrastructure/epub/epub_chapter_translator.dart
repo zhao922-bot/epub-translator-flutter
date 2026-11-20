@@ -55,6 +55,8 @@ part 'epub_book_memory.dart';
 part 'epub_translation_strategy.dart';
 part 'epub_semantic_reviewer.dart';
 part 'epub_semantic_grounding.dart';
+part 'epub_response_dom_locker.dart';
+part 'epub_translator_paths.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
 ///
@@ -2063,263 +2065,51 @@ class EpubChapterTranslator {
         return endChapterIndex;
       }
 
-      try {
-        for (
-          int chapterIndex = 0;
-          chapterIndex < selectedChapters.length;
-          chapterIndex += 1
-        ) {
+      Future<void> translateSingleChapter(int chapterIndex) async {
+        throwIfCancelled();
+        final InspectedChapter chapter = selectedChapters[chapterIndex];
+        final Stopwatch chapterStopwatch = Stopwatch()..start();
+        Duration chapterApiElapsed = Duration.zero;
+        Duration chapterCacheWriteElapsed = Duration.zero;
+        int chapterApiBlocks = 0;
+        int chapterCacheWrites = 0;
+        await cacheSpool.loadChapter(restoration, chapter.path);
+        emit(
+          currentJob.copyWith(
+            currentChapter: chapter.title,
+            currentBlock: null,
+            completedFiles: completedFiles,
+            completedBlocks: completedBlocks,
+          ),
+          s.runLogTranslatingChapter(
+            chapterIndex + 1,
+            selectedChapters.length,
+            chapter.title,
+          ),
+        );
+
+        final Map<String, ExtractedBlock> translatedById =
+            <String, ExtractedBlock>{};
+        int chapterCacheHits = 0;
+        final List<ExtractedBlock> pendingBlocks = <ExtractedBlock>[];
+        for (final ExtractedBlock block in chapter.blocks) {
           throwIfCancelled();
-          final InspectedChapter chapter = selectedChapters[chapterIndex];
-          if (isFootnoteChapter(chapterIndex)) {
-            chapterIndex = await translateFootnoteRun(chapterIndex);
+          final String? cachedTranslation = restoration.translationFor(
+            chapter.path,
+            block.id,
+          );
+          if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
+            pendingBlocks.add(block);
             continue;
           }
-          final Stopwatch chapterStopwatch = Stopwatch()..start();
-          Duration chapterApiElapsed = Duration.zero;
-          Duration chapterCacheWriteElapsed = Duration.zero;
-          int chapterApiBlocks = 0;
-          int chapterCacheWrites = 0;
-          await cacheSpool.loadChapter(restoration, chapter.path);
-          emit(
-            currentJob.copyWith(
-              currentChapter: chapter.title,
-              currentBlock: null,
-              completedFiles: completedFiles,
-              completedBlocks: completedBlocks,
-            ),
-            s.runLogTranslatingChapter(
-              chapterIndex + 1,
-              selectedChapters.length,
-              chapter.title,
-            ),
+          translatedById[block.id] = block.copyWith(
+            translatedHtml: cachedTranslation,
           );
+          chapterCacheHits += 1;
+        }
 
-          final Map<String, ExtractedBlock> translatedById =
-              <String, ExtractedBlock>{};
-          int chapterCacheHits = 0;
-          final List<ExtractedBlock> pendingBlocks = <ExtractedBlock>[];
-          for (final ExtractedBlock block in chapter.blocks) {
-            throwIfCancelled();
-            final String? cachedTranslation = restoration.translationFor(
-              chapter.path,
-              block.id,
-            );
-            if (cachedTranslation == null || cachedTranslation.trim().isEmpty) {
-              pendingBlocks.add(block);
-              continue;
-            }
-            translatedById[block.id] = block.copyWith(
-              translatedHtml: cachedTranslation,
-            );
-            chapterCacheHits += 1;
-          }
-
-          if (chapterCacheHits > 0) {
-            final TranslationJob cachedJob = currentJob.copyWith(
-              progress: completedBlocks / totalBlocks,
-              currentChapter: chapter.title,
-              currentBlock: null,
-              completedFiles: completedFiles,
-              totalFiles: selectedChapters.length,
-              completedBlocks: completedBlocks,
-              totalBlocks: totalBlocks,
-              cachedBlocks: cachedBlocks,
-              resumedBlocks: resumedBlocks,
-            );
-            emit(
-              cachedJob,
-              s.runLogReusedChapterCache(chapterCacheHits, chapter.title),
-            );
-          }
-
-          if (pendingBlocks.isNotEmpty) {
-            await ensureInitialBookMemory();
-            throwIfCancelled();
-          }
-
-          final List<TranslationBlockBatch> batches = _batchPlanner.plan(
-            pendingBlocks: pendingBlocks,
-            chunkSize: config.chunkSize,
-            chapterBlocks: chapter.blocks,
-            chapterTitle: chapter.title,
-            // Positional snapshot: a retranslated earlier chapter must not
-            // see rolling memory that already contains later chapters.
-            bookMemory: bookMemorySnapshotFor(chapter),
-          );
-          emit(
-            currentJob.copyWith(
-              currentChapter: chapter.title,
-              completedFiles: completedFiles,
-              completedBlocks: completedBlocks,
-            ),
-            s.runLogPreparedBatches(batches.length, chapter.title),
-          );
-
-          await const TranslationWorkQueue().map<TranslationBlockBatch, void>(
-            batches,
-            concurrency: concurrency,
-            throwIfCancelled: throwIfCancelled,
-            process: (TranslationBlockBatch batch, int batchIndex) async {
-              final int batchNumber = batchIndex + 1;
-              final Stopwatch apiStopwatch = Stopwatch()..start();
-              final List<String> translated = await _strategy
-                  .translateBlockBatch(
-                    dio: dio,
-                    config: config,
-                    batch: batch,
-                    chapterPath: chapter.path,
-                    cancelToken: cancelToken,
-                    onValidated: (String id, String html) async {
-                      final block = batch.blocks.firstWhere((b) => b.id == id);
-                      final Stopwatch stopwatch = Stopwatch()..start();
-                      if (await putValidated(
-                        _blockCacheKey(
-                          config,
-                          block,
-                          chapterPath: chapter.path,
-                          inputFingerprint: inputFingerprint,
-                          contextIdentity: contextIdentity,
-                          confirmedStyleProfile: userStyleProfile,
-                        ),
-                        html,
-                      )) {
-                        chapterCacheWrites += 1;
-                        cacheWriteCount += 1;
-                      }
-                      chapterCacheWriteElapsed += stopwatch.elapsed;
-                      totalCacheWriteElapsed += stopwatch.elapsed;
-                    },
-                  );
-              apiStopwatch.stop();
-              // Persist paid responses before reporting completion,
-              // including when another worker has already failed.
-              // Degraded marks for this batch's own blocks are all
-              // recorded by now, so the cacheable check is complete.
-              final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
-              final List<int> cacheableIndexes = <int>[
-                for (int index = 0; index < batch.blocks.length; index += 1)
-                  if (!_isDegradedBlock(
-                    chapterPath: chapter.path,
-                    blockId: batch.blocks[index].id,
-                  ))
-                    index,
-              ];
-              final List<bool> cacheWriteResults =
-                  await Future.wait<bool>(<Future<bool>>[
-                    for (final int index in cacheableIndexes)
-                      putValidated(
-                        _blockCacheKey(
-                          config,
-                          batch.blocks[index],
-                          chapterPath: chapter.path,
-                          inputFingerprint: inputFingerprint,
-                          contextIdentity: contextIdentity,
-                          confirmedStyleProfile: userStyleProfile,
-                        ),
-                        translated[index],
-                      ),
-                  ]);
-              cacheWriteStopwatch.stop();
-              // Count only the writes that actually succeeded: a
-              // swallowed cache failure must not inflate the final
-              // "cache writes" report.
-              final int succeededCacheWrites = cacheWriteResults
-                  .where((bool ok) => ok)
-                  .length;
-              // Each compound assignment below executes synchronously
-              // (no await between read and write), so concurrent
-              // window closures cannot interleave mid-update.
-              chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-              totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
-              chapterCacheWrites += succeededCacheWrites;
-              cacheWriteCount += succeededCacheWrites;
-              final _TimedBatchResult timedBatch = _TimedBatchResult(
-                batch: batch,
-                translatedBlocks: translated,
-                batchNumber: batchNumber,
-                elapsed: apiStopwatch.elapsed,
-              );
-              throwIfCancelled();
-              final List<String> translatedBatch = timedBatch.translatedBlocks;
-              chapterApiElapsed += timedBatch.elapsed;
-              totalApiElapsed += timedBatch.elapsed;
-              chapterApiBlocks += batch.blocks
-                  .where(
-                    (block) => !_run.reusedDraftBlocks.contains(
-                      EpubRepacker.degradedKeyForBlock(
-                        chapterPath: chapter.path,
-                        blockId: block.id,
-                      ),
-                    ),
-                  )
-                  .length;
-              apiTranslatedBlocks += batch.blocks.length;
-              emit(
-                currentJob.copyWith(
-                  currentChapter: chapter.title,
-                  completedFiles: completedFiles,
-                  completedBlocks: completedBlocks,
-                ),
-                s.runLogBatchPerformance(
-                  timedBatch.batchNumber,
-                  batches.length,
-                  chapter.title,
-                  batch.blocks.length,
-                  _formatDuration(timedBatch.elapsed),
-                ),
-              );
-
-              for (int index = 0; index < batch.blocks.length; index += 1) {
-                throwIfCancelled();
-                final ExtractedBlock sourceBlock = batch.blocks[index];
-                final ExtractedBlock translatedBlock = sourceBlock.copyWith(
-                  translatedHtml: translatedBatch[index],
-                );
-                translatedById[sourceBlock.id] = translatedBlock;
-                completedBlocks += 1;
-                persistence.blockCompleted();
-                final TranslationJob nextJob = currentJob.copyWith(
-                  progress: completedBlocks / totalBlocks,
-                  currentChapter: chapter.title,
-                  currentBlock: _linePreview(sourceBlock.sourceText),
-                  completedFiles: completedFiles,
-                  totalFiles: selectedChapters.length,
-                  completedBlocks: completedBlocks,
-                  totalBlocks: totalBlocks,
-                  apiDegradedBlocks: _apiDegradedBlocks,
-                  cachedBlocks: cachedBlocks,
-                  resumedBlocks: resumedBlocks,
-                );
-                currentJob = nextJob;
-                await saveResumeStateBestEffort(nextJob);
-              }
-              emit(
-                currentJob,
-                s.runLogBatchDone(
-                  completedBlocks,
-                  totalBlocks,
-                  timedBatch.batchNumber,
-                  batches.length,
-                  chapter.title,
-                ),
-              );
-            },
-          );
-
-          completedFiles += 1;
-          chapterStopwatch.stop();
-          final List<ExtractedBlock> translatedBlocks = chapter.blocks
-              .map((ExtractedBlock block) => translatedById[block.id] ?? block)
-              .toList();
-          updatedByPath[chapter.path] = chapter.copyWith(
-            blocks: translatedBlocks,
-            translatedBody: _previewBodyFromBlocks(
-              translatedBlocks,
-              fallback: '',
-            ),
-          );
-          final TranslationJob chapterDoneJob = currentJob.copyWith(
+        if (chapterCacheHits > 0) {
+          final TranslationJob cachedJob = currentJob.copyWith(
             progress: completedBlocks / totalBlocks,
             currentChapter: chapter.title,
             currentBlock: null,
@@ -2331,123 +2121,378 @@ class EpubChapterTranslator {
             resumedBlocks: resumedBlocks,
           );
           emit(
-            chapterDoneJob,
-            s.runLogChapterCompleted(
-              completedFiles,
-              selectedChapters.length,
-              chapter.title,
-            ),
+            cachedJob,
+            s.runLogReusedChapterCache(chapterCacheHits, chapter.title),
           );
+        }
+
+        if (pendingBlocks.isNotEmpty) {
+          await ensureInitialBookMemory();
+          throwIfCancelled();
+        }
+
+        final List<TranslationBlockBatch> batches = _batchPlanner.plan(
+          pendingBlocks: pendingBlocks,
+          chunkSize: config.chunkSize,
+          chapterBlocks: chapter.blocks,
+          chapterTitle: chapter.title,
+          // Positional snapshot: a retranslated earlier chapter must not
+          // see rolling memory that already contains later chapters.
+          bookMemory: bookMemorySnapshotFor(chapter),
+        );
+        emit(
+          currentJob.copyWith(
+            currentChapter: chapter.title,
+            completedFiles: completedFiles,
+            completedBlocks: completedBlocks,
+          ),
+          s.runLogPreparedBatches(batches.length, chapter.title),
+        );
+
+        await const TranslationWorkQueue().map<TranslationBlockBatch, void>(
+          batches,
+          concurrency: concurrency,
+          throwIfCancelled: throwIfCancelled,
+          process: (TranslationBlockBatch batch, int batchIndex) async {
+            final int batchNumber = batchIndex + 1;
+            final Stopwatch apiStopwatch = Stopwatch()..start();
+            final List<String> translated = await _strategy.translateBlockBatch(
+              dio: dio,
+              config: config,
+              batch: batch,
+              chapterPath: chapter.path,
+              cancelToken: cancelToken,
+              onValidated: (String id, String html) async {
+                final block = batch.blocks.firstWhere((b) => b.id == id);
+                final Stopwatch stopwatch = Stopwatch()..start();
+                if (await putValidated(
+                  _blockCacheKey(
+                    config,
+                    block,
+                    chapterPath: chapter.path,
+                    inputFingerprint: inputFingerprint,
+                    contextIdentity: contextIdentity,
+                    confirmedStyleProfile: userStyleProfile,
+                  ),
+                  html,
+                )) {
+                  chapterCacheWrites += 1;
+                  cacheWriteCount += 1;
+                }
+                chapterCacheWriteElapsed += stopwatch.elapsed;
+                totalCacheWriteElapsed += stopwatch.elapsed;
+              },
+            );
+            apiStopwatch.stop();
+            // Persist paid responses before reporting completion,
+            // including when another worker has already failed.
+            // Degraded marks for this batch's own blocks are all
+            // recorded by now, so the cacheable check is complete.
+            final Stopwatch cacheWriteStopwatch = Stopwatch()..start();
+            final List<int> cacheableIndexes = <int>[
+              for (int index = 0; index < batch.blocks.length; index += 1)
+                if (!_isDegradedBlock(
+                  chapterPath: chapter.path,
+                  blockId: batch.blocks[index].id,
+                ))
+                  index,
+            ];
+            final List<bool> cacheWriteResults =
+                await Future.wait<bool>(<Future<bool>>[
+                  for (final int index in cacheableIndexes)
+                    putValidated(
+                      _blockCacheKey(
+                        config,
+                        batch.blocks[index],
+                        chapterPath: chapter.path,
+                        inputFingerprint: inputFingerprint,
+                        contextIdentity: contextIdentity,
+                        confirmedStyleProfile: userStyleProfile,
+                      ),
+                      translated[index],
+                    ),
+                ]);
+            cacheWriteStopwatch.stop();
+            // Count only the writes that actually succeeded: a
+            // swallowed cache failure must not inflate the final
+            // "cache writes" report.
+            final int succeededCacheWrites = cacheWriteResults
+                .where((bool ok) => ok)
+                .length;
+            // Each compound assignment below executes synchronously
+            // (no await between read and write), so concurrent
+            // window closures cannot interleave mid-update.
+            chapterCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+            totalCacheWriteElapsed += cacheWriteStopwatch.elapsed;
+            chapterCacheWrites += succeededCacheWrites;
+            cacheWriteCount += succeededCacheWrites;
+            final _TimedBatchResult timedBatch = _TimedBatchResult(
+              batch: batch,
+              translatedBlocks: translated,
+              batchNumber: batchNumber,
+              elapsed: apiStopwatch.elapsed,
+            );
+            throwIfCancelled();
+            final List<String> translatedBatch = timedBatch.translatedBlocks;
+            chapterApiElapsed += timedBatch.elapsed;
+            totalApiElapsed += timedBatch.elapsed;
+            chapterApiBlocks += batch.blocks
+                .where(
+                  (block) => !_run.reusedDraftBlocks.contains(
+                    EpubRepacker.degradedKeyForBlock(
+                      chapterPath: chapter.path,
+                      blockId: block.id,
+                    ),
+                  ),
+                )
+                .length;
+            apiTranslatedBlocks += batch.blocks.length;
+            emit(
+              currentJob.copyWith(
+                currentChapter: chapter.title,
+                completedFiles: completedFiles,
+                completedBlocks: completedBlocks,
+              ),
+              s.runLogBatchPerformance(
+                timedBatch.batchNumber,
+                batches.length,
+                chapter.title,
+                batch.blocks.length,
+                _formatDuration(timedBatch.elapsed),
+              ),
+            );
+
+            for (int index = 0; index < batch.blocks.length; index += 1) {
+              throwIfCancelled();
+              final ExtractedBlock sourceBlock = batch.blocks[index];
+              final ExtractedBlock translatedBlock = sourceBlock.copyWith(
+                translatedHtml: translatedBatch[index],
+              );
+              translatedById[sourceBlock.id] = translatedBlock;
+              completedBlocks += 1;
+              persistence.blockCompleted();
+              final TranslationJob nextJob = currentJob.copyWith(
+                progress: completedBlocks / totalBlocks,
+                currentChapter: chapter.title,
+                currentBlock: _linePreview(sourceBlock.sourceText),
+                completedFiles: completedFiles,
+                totalFiles: selectedChapters.length,
+                completedBlocks: completedBlocks,
+                totalBlocks: totalBlocks,
+                apiDegradedBlocks: _apiDegradedBlocks,
+                cachedBlocks: cachedBlocks,
+                resumedBlocks: resumedBlocks,
+              );
+              currentJob = nextJob;
+              await saveResumeStateBestEffort(nextJob);
+            }
+            emit(
+              currentJob,
+              s.runLogBatchDone(
+                completedBlocks,
+                totalBlocks,
+                timedBatch.batchNumber,
+                batches.length,
+                chapter.title,
+              ),
+            );
+          },
+        );
+
+        completedFiles += 1;
+        chapterStopwatch.stop();
+        final List<ExtractedBlock> translatedBlocks = chapter.blocks
+            .map((ExtractedBlock block) => translatedById[block.id] ?? block)
+            .toList();
+        updatedByPath[chapter.path] = chapter.copyWith(
+          blocks: translatedBlocks,
+          translatedBody: _previewBodyFromBlocks(
+            translatedBlocks,
+            fallback: '',
+          ),
+        );
+        final TranslationJob chapterDoneJob = currentJob.copyWith(
+          progress: completedBlocks / totalBlocks,
+          currentChapter: chapter.title,
+          currentBlock: null,
+          completedFiles: completedFiles,
+          totalFiles: selectedChapters.length,
+          completedBlocks: completedBlocks,
+          totalBlocks: totalBlocks,
+          cachedBlocks: cachedBlocks,
+          resumedBlocks: resumedBlocks,
+        );
+        emit(
+          chapterDoneJob,
+          s.runLogChapterCompleted(
+            completedFiles,
+            selectedChapters.length,
+            chapter.title,
+          ),
+        );
+        emit(
+          chapterDoneJob,
+          s.runLogChapterPerformance(
+            chapterIndex + 1,
+            selectedChapters.length,
+            _formatDuration(chapterStopwatch.elapsed),
+            _formatDuration(chapterApiElapsed),
+            chapterApiBlocks,
+            _formatDuration(chapterCacheWriteElapsed),
+            chapterCacheWrites,
+            _formatBlocksPerMinute(chapterApiBlocks, chapterStopwatch.elapsed),
+          ),
+        );
+        throwIfCancelled();
+        final bool futurePendingBlocks = restoration
+            .hasPendingBlocksFromChapter(chapterIndex + 1);
+        if (futurePendingBlocks) {
+          await ensureInitialBookMemory();
+          if (!memoryChapters.contains(chapter.path)) {
+            try {
+              final Stopwatch memoryStopwatch = Stopwatch()..start();
+              bookMemory = await trackMemoryRequests(
+                () => _memory.updateBookMemoryAfterChapter(
+                  dio: dio,
+                  config: config,
+                  currentMemory: _BookMemory.fromJson(
+                    bookMemorySnapshotFor(chapter) ?? <String, Object?>{},
+                    trustedLocks: true,
+                  ),
+                  chapter: updatedByPath[chapter.path]!,
+                  degradedBlockIds: _degradedBlocks,
+                  cancelToken: cancelToken,
+                ),
+              );
+              memoryStopwatch.stop();
+              memoryChapters.add(chapter.path);
+              // Resolve user locks before recording so the timeline entry
+              // carries them (previously achieved by recording after the
+              // persist, which applied the locks inside persistBookMemory).
+              bookMemory = bookMemory!.withLockedGlossary(
+                config.lockedGlossary,
+              );
+              // Record BEFORE persist (A-2): no persist happens after the run
+              // ends, so persisting first would leave the checkpoint lagging
+              // one chapter behind after a cancellation.
+              await _recordAndPersistChapterMemory(
+                record: () => recordMemoryTimeline(chapter.path, bookMemory!),
+                persist: persistBookMemory,
+              );
+              emit(
+                chapterDoneJob,
+                s.runLogBookMemoryUpdated(
+                  chapter.title,
+                  _formatDuration(memoryStopwatch.elapsed),
+                ),
+              );
+            } catch (error) {
+              emit(
+                chapterDoneJob,
+                s.runLogBookMemoryChapterSkipped(
+                  chapter.title,
+                  _linePreview(_safeErrorText(error, config)),
+                ),
+              );
+            }
+          }
+        } else {
           emit(
             chapterDoneJob,
-            s.runLogChapterPerformance(
-              chapterIndex + 1,
-              selectedChapters.length,
-              _formatDuration(chapterStopwatch.elapsed),
-              _formatDuration(chapterApiElapsed),
-              chapterApiBlocks,
-              _formatDuration(chapterCacheWriteElapsed),
-              chapterCacheWrites,
-              _formatBlocksPerMinute(
-                chapterApiBlocks,
-                chapterStopwatch.elapsed,
-              ),
-            ),
+            s.runLogBookMemoryChapterSkippedNoNeed(chapter.title),
           );
+        }
+        throwIfCancelled();
+        await saveResumeStateBestEffort(chapterDoneJob, force: true);
+        // This chapter is fully translated and cached: release its
+        // per-block source strings (see _releaseChapterSourceStrings).
+        selectedChapters[chapterIndex] = _releaseChapterSourceStrings(chapter);
+        updatedByPath[chapter.path] = _releaseChapterSourceStrings(
+          updatedByPath[chapter.path]!,
+        );
+        final released = await sourceSpool.release(
+          chapter.copyWith(
+            blocks: translatedBlocks,
+            translatedBody: updatedByPath[chapter.path]!.translatedBody,
+          ),
+        );
+        selectedChapters[chapterIndex] = released;
+        updatedByPath[chapter.path] = released;
+        final int? originalIndex = chapterIndexByPath[chapter.path];
+        if (originalIndex != null) chapters[originalIndex] = released;
+        final int? invocationIndex = invocationIndexByPath[chapter.path];
+        if (invocationIndex != null) {
+          invocationChapters[invocationIndex] = released;
+        }
+        try {
+          onChapterSourcesReleased?.call(chapter.path);
+        } catch (error) {
+          // A UI-side chapter-sources-released listener must never abort a
+          // translation run. Log the failure and keep the pipeline going.
+          AppLogger.warn(
+            'Chapter-sources-released callback failed (${error.runtimeType}); continuing.',
+            tag: 'translate',
+          );
+        }
+        restoration.translationsByChapter.remove(chapter.path);
+      }
+
+      bool isIndependentOfSequentialMemory(int index) {
+        if (index < 0 ||
+            index >= selectedChapters.length ||
+            isFootnoteChapter(index)) {
+          return false;
+        }
+        final InspectedChapter candidate = selectedChapters[index];
+        return memoryChapters.contains(candidate.path) ||
+            !restoration.hasPendingBlocksFromChapter(index + 1);
+      }
+
+      try {
+        for (
+          int chapterIndex = 0;
+          chapterIndex < selectedChapters.length;
+          chapterIndex += 1
+        ) {
           throwIfCancelled();
-          final bool futurePendingBlocks = restoration
-              .hasPendingBlocksFromChapter(chapterIndex + 1);
-          if (futurePendingBlocks) {
-            await ensureInitialBookMemory();
-            if (!memoryChapters.contains(chapter.path)) {
-              try {
-                final Stopwatch memoryStopwatch = Stopwatch()..start();
-                bookMemory = await trackMemoryRequests(
-                  () => _memory.updateBookMemoryAfterChapter(
-                    dio: dio,
-                    config: config,
-                    currentMemory: _BookMemory.fromJson(
-                      bookMemorySnapshotFor(chapter) ?? <String, Object?>{},
-                      trustedLocks: true,
-                    ),
-                    chapter: updatedByPath[chapter.path]!,
-                    degradedBlockIds: _degradedBlocks,
-                    cancelToken: cancelToken,
-                  ),
-                );
-                memoryStopwatch.stop();
-                memoryChapters.add(chapter.path);
-                // Resolve user locks before recording so the timeline entry
-                // carries them (previously achieved by recording after the
-                // persist, which applied the locks inside persistBookMemory).
-                bookMemory = bookMemory!.withLockedGlossary(
-                  config.lockedGlossary,
-                );
-                // Record BEFORE persist (A-2): no persist happens after the run
-                // ends, so persisting first would leave the checkpoint lagging
-                // one chapter behind after a cancellation.
-                await _recordAndPersistChapterMemory(
-                  record: () => recordMemoryTimeline(chapter.path, bookMemory!),
-                  persist: persistBookMemory,
-                );
-                emit(
-                  chapterDoneJob,
-                  s.runLogBookMemoryUpdated(
-                    chapter.title,
-                    _formatDuration(memoryStopwatch.elapsed),
-                  ),
-                );
-              } catch (error) {
-                emit(
-                  chapterDoneJob,
-                  s.runLogBookMemoryChapterSkipped(
-                    chapter.title,
-                    _linePreview(_safeErrorText(error, config)),
-                  ),
-                );
-              }
+          if (isFootnoteChapter(chapterIndex)) {
+            chapterIndex = await translateFootnoteRun(chapterIndex);
+            continue;
+          }
+          if (concurrency > 1 &&
+              isIndependentOfSequentialMemory(chapterIndex)) {
+            final List<int> parallelGroup = <int>[chapterIndex];
+            while (parallelGroup.length < concurrency &&
+                chapterIndex + parallelGroup.length < selectedChapters.length &&
+                isIndependentOfSequentialMemory(
+                  chapterIndex + parallelGroup.length,
+                )) {
+              parallelGroup.add(chapterIndex + parallelGroup.length);
             }
-          } else {
-            emit(
-              chapterDoneJob,
-              s.runLogBookMemoryChapterSkippedNoNeed(chapter.title),
-            );
+            if (parallelGroup.length >= 2) {
+              final bool anyPending = parallelGroup.any((int idx) {
+                final InspectedChapter candidate = selectedChapters[idx];
+                final Map<String, String>? cached =
+                    restoration.translationsByChapter[candidate.path];
+                return candidate.blocks.any(
+                  (ExtractedBlock block) =>
+                      cached == null || !cached.containsKey(block.id),
+                );
+              });
+              if (anyPending) {
+                await ensureInitialBookMemory();
+              }
+              await const TranslationWorkQueue().map<int, void>(
+                parallelGroup,
+                concurrency: concurrency,
+                throwIfCancelled: throwIfCancelled,
+                process: (int idx, _) => translateSingleChapter(idx),
+              );
+              chapterIndex += parallelGroup.length - 1;
+              continue;
+            }
           }
-          throwIfCancelled();
-          await saveResumeStateBestEffort(chapterDoneJob, force: true);
-          // This chapter is fully translated and cached: release its
-          // per-block source strings (see _releaseChapterSourceStrings).
-          selectedChapters[chapterIndex] = _releaseChapterSourceStrings(
-            chapter,
-          );
-          updatedByPath[chapter.path] = _releaseChapterSourceStrings(
-            updatedByPath[chapter.path]!,
-          );
-          final released = await sourceSpool.release(
-            chapter.copyWith(
-              blocks: translatedBlocks,
-              translatedBody: updatedByPath[chapter.path]!.translatedBody,
-            ),
-          );
-          selectedChapters[chapterIndex] = released;
-          updatedByPath[chapter.path] = released;
-          final int? originalIndex = chapterIndexByPath[chapter.path];
-          if (originalIndex != null) chapters[originalIndex] = released;
-          final int? invocationIndex = invocationIndexByPath[chapter.path];
-          if (invocationIndex != null) {
-            invocationChapters[invocationIndex] = released;
-          }
-          try {
-            onChapterSourcesReleased?.call(chapter.path);
-          } catch (error) {
-            // A UI-side chapter-sources-released listener must never abort a
-            // translation run. Log the failure and keep the pipeline going.
-            AppLogger.warn(
-              'Chapter-sources-released callback failed (${error.runtimeType}); continuing.',
-              tag: 'translate',
-            );
-          }
-          restoration.translationsByChapter.remove(chapter.path);
+          await translateSingleChapter(chapterIndex);
         }
       } catch (error) {
         final bool cancelled =
@@ -2713,11 +2758,24 @@ class EpubChapterTranslator {
       // The EPUB file is committed from here on. Capture the terminal result
       // now so a late error or cancellation below still reports the finished
       // output instead of an aborted translation.
+      final degradedByChapter = _countBlocksByChapter(_degradedBlocks);
+      final reviewWarningsByChapter = _countBlocksByChapter({
+        ..._run.semanticUnreviewed,
+        ..._run.consistencyFindings.keys,
+        for (final item in _run.semanticCorrections)
+          if (item case {'chapter': final String path, 'id': final String id})
+            EpubRepacker.degradedKeyForBlock(chapterPath: path, blockId: id),
+      });
       for (var index = 0; index < updatedChapters.length; index++) {
         final chapter = updatedChapters[index];
-        if (chapter.sourceIdentity != null && chapter.includeInTranslation) {
-          updatedChapters[index] = chapter.copyWith(originalHtml: '');
-        }
+        updatedChapters[index] = chapter.copyWith(
+          originalHtml:
+              chapter.sourceIdentity != null && chapter.includeInTranslation
+              ? ''
+              : chapter.originalHtml,
+          degradedBlockCount: degradedByChapter[chapter.path] ?? 0,
+          reviewWarningBlockCount: reviewWarningsByChapter[chapter.path] ?? 0,
+        );
       }
       committedResult = TranslationRunResult(
         job: terminalJob,
@@ -3065,1286 +3123,89 @@ class EpubChapterTranslator {
     Map<String, int>? instrumentation,
     bool rejectEmptyResponse = false,
     void Function(String html, String text)? onLocked,
-  }) {
-    final replyDom = _cleanResponseDom(
-      translatedHtml,
-      sourceText: block.sourceText,
-      instrumentation: instrumentation,
-      rejectEmptyResponse: rejectEmptyResponse,
-    );
-    return _lockAndValidateTranslatedBlockDom(
-      config: config,
-      block: block,
-      replyDom: replyDom,
-      instrumentation: instrumentation,
-      onLocked: onLocked,
-    );
-  }
+  }) => _EpubResponseDomLocker._lockAndValidateTranslatedBlock(
+    config: config,
+    block: block,
+    translatedHtml: translatedHtml,
+    instrumentation: instrumentation,
+    rejectEmptyResponse: rejectEmptyResponse,
+    onLocked: onLocked,
+  );
 
-  /// Single-parse entry: [replyDom] is the already-parsed model reply (see
-  /// _cleanResponseDom), so the reply is never parsed twice for one block.
   static String _lockAndValidateTranslatedBlockDom({
     required TranslationConfig config,
     required ExtractedBlock block,
     required _ResponseHtml replyDom,
     Map<String, int>? instrumentation,
     void Function(String html, String text)? onLocked,
-  }) {
-    final sourceDom = _ResponseHtml.parse(block.sourceHtml, instrumentation);
-    final locked = _lockResponseDom(sourceDom, replyDom);
-    final html = locked.html;
-    // Single-block quality retries/degrades must retain the usable locked
-    // response even when validation below rejects residual source text.
-    onLocked?.call(html, locked.plainText);
-    _validateTranslatedBlockQuality(
-      config: config,
-      block: block,
-      sourceDom: sourceDom,
-      translatedDom: locked,
-    );
-    return html;
-  }
+  }) => _EpubResponseDomLocker._lockAndValidateTranslatedBlockDom(
+    config: config,
+    block: block,
+    replyDom: replyDom,
+    instrumentation: instrumentation,
+    onLocked: onLocked,
+  );
 
   static String _lockHtmlStructure({
     required String sourceHtml,
     required String translatedHtml,
     Map<String, int>? instrumentation,
-  }) {
-    final sourceDom = _ResponseHtml.parse(sourceHtml, instrumentation);
-    final replyDom = _cleanResponseDom(
-      translatedHtml,
-      sourceText: sourceDom.plainText,
-      instrumentation: instrumentation,
-    );
-    return _lockResponseDom(sourceDom, replyDom).html;
-  }
+  }) => _EpubResponseDomLocker._lockHtmlStructure(
+    sourceHtml: sourceHtml,
+    translatedHtml: translatedHtml,
+    instrumentation: instrumentation,
+  );
 
-  static _ResponseHtml _lockResponseDom(
-    _ResponseHtml sourceDom,
-    _ResponseHtml replyDom,
-  ) {
-    _validateNonemptyDoms(sourceDom, replyDom);
-    // Anchor normalization and protected restoration mutate the working reply.
-    // Keep the model's original DOM for language alignment, without reparsing.
-    final modelDom = _ResponseHtml(
-      replyDom.fragment.clone(true),
-      replyDom.instrumentation,
-    );
-    final locked = _lockHtmlStructureCore(
-      sourceDom: sourceDom,
-      translatedDom: replyDom,
-    );
-    final source = sourceDom.root;
-    final model = modelDom.root;
-    final result = locked.root;
-    if (source == null || model == null || result == null) return locked;
-    late final textAlignment = _ResponseTextAlignment(
-      modelDom.facts,
-      locked.facts,
-    );
-    void preserve(dom.Element original, dom.Element reply, dom.Element output) {
-      if (original.localName != reply.localName ||
-          original.localName != output.localName ||
-          EpubHtmlExtractor.nonTextAncestors.contains(
-            EpubHtmlExtractor.tagLocalName(original),
-          )) {
-        return;
-      }
-      // Only carry language metadata on an unambiguously aligned subtree.
-      // Source IDs, links and all other attributes remain source-owned.
-      if (!original.attributes.containsKey('lang') &&
-          !original.attributes.containsKey('xml:lang') &&
-          (reply.attributes.containsKey('lang') ||
-              reply.attributes.containsKey('xml:lang')) &&
-          textAlignment.matches(reply, output)) {
-        final language =
-            reply.attributes['lang'] ?? reply.attributes['xml:lang'];
-        final xmlLanguage = reply.attributes['xml:lang'];
-        if (language != null &&
-            RegExp(
-              r'^[A-Za-z]{1,8}(?:-[A-Za-z0-9]{1,8})*$',
-            ).hasMatch(language) &&
-            (xmlLanguage == null || xmlLanguage == language)) {
-          output.attributes['lang'] = language;
-          output.attributes['xml:lang'] = language;
-        }
-      }
-      if (original.children.length != reply.children.length ||
-          original.children.length != output.children.length) {
-        return;
-      }
-      for (var i = 0; i < original.children.length; i++) {
-        preserve(original.children[i], reply.children[i], output.children[i]);
-      }
-    }
-
-    preserve(source, model, result);
-    return locked;
-  }
-
-  /// Apply the strategy's wrapper rules using the same DOM that structure
-  /// handling will consume. Its string cleaner parses both markup and plain
-  /// text separately, so calling it here would hide two additional parses.
   static _ResponseHtml _cleanResponseDom(
     String response, {
     required String sourceText,
     Map<String, int>? instrumentation,
     bool rejectEmptyResponse = false,
-  }) {
-    String value = response.trim();
-    final fence = RegExp(
-      r'^```(?:html|xhtml)?\s*\n([\s\S]*?)\n```$',
-      caseSensitive: false,
-    ).firstMatch(value);
-    if (fence != null) value = fence.group(1)!.trim();
-    if (rejectEmptyResponse && value.isEmpty) {
-      throw const FormatException(
-        'The translation API returned an empty block.',
-      );
-    }
-    _responseCount(instrumentation, 'replyParses');
-    final _ResponseHtml reply;
-    try {
-      reply = _ResponseHtml.parse(value, instrumentation);
-    } on InvalidEpubXmlCharacterException catch (error) {
-      // A malformed model reply follows the existing per-block retry/source
-      // fallback policy. Invalid source/cache files retain their format error.
-      throw TranslationParseException(error.message);
-    }
-    final hasMarkup = reply.fragment.nodes.any((node) => node is dom.Element);
-    if (TranslationResponseGuard.isNonTranslationReply(
-      sourceText: sourceText,
-      translatedText: reply.plainText,
-    )) {
-      throw const NonTranslationReplyException();
-    }
-    final hasOutsideText = reply.fragment.nodes.any(
-      (node) => node is dom.Text && node.data.trim().isNotEmpty,
-    );
-    if (value.contains('```') ||
-        _EpubTranslationStrategy._hasTranslationExplanationPrefix(value) ||
-        (hasMarkup && hasOutsideText) ||
-        _EpubTranslationStrategy._hasTranslationExplanationPrefix(
-          reply.plainText,
-        ) ||
-        _EpubTranslationStrategy._hasMarkdownWrapper(value) ||
-        _EpubTranslationStrategy._hasUnexpectedJsonWrapper(
-          sourceText: sourceText,
-          translatedText: value,
-        )) {
-      throw const TranslationParseException(
-        'HTML translation contains wrapper content.',
-      );
-    }
-    return reply;
-  }
+  }) => _EpubResponseDomLocker._cleanResponseDom(
+    response,
+    sourceText: sourceText,
+    instrumentation: instrumentation,
+    rejectEmptyResponse: rejectEmptyResponse,
+  );
 
-  static _ResponseHtml _lockHtmlStructureCore({
+  static void _validateTranslatedBlockQuality({
+    required TranslationConfig config,
+    required ExtractedBlock block,
     required _ResponseHtml sourceDom,
     required _ResponseHtml translatedDom,
-  }) {
-    final _NormalizedAnchorHtml normalizedTranslation =
-        _normalizeProtectedAnchorMarkers(
-          sourceDom: sourceDom,
-          translatedDom: translatedDom,
-        );
-    if (normalizedTranslation.hasOverflow &&
-        normalizedTranslation.root != null &&
-        _elementSkeletonMatches(sourceDom.root!, normalizedTranslation.root!) &&
-        _overflowTextFitsSourceSlots(
-          sourceDom: sourceDom,
-          translatedDom: translatedDom,
-          trustedOverflowTexts: normalizedTranslation.trustedOverflowTexts,
-        )) {
-      translatedDom.invalidate();
-      return translatedDom;
-    }
-    if (_domStructureMatches(sourceDom, translatedDom)) {
-      final _ResponseHtml? restored = _restoreProtectedTexts(
-        sourceDom: sourceDom,
-        translatedDom: translatedDom,
-      );
-      if (restored != null) {
-        return restored;
-      }
-    }
-    // Models sometimes fold small-caps authored spans (e.g.
-    // <span class="smallcaps">EES</span>) into plain text
-    // ("REES DAVIES"). That changes the element skeleton, so the normal
-    // structure-matching path above fails and the rebuild path misplaces
-    // text. Flatten those spans on the source side; if the flattened source
-    // skeleton now matches the translation, restore text into it and return.
-    if (sourceDom.html.contains('smallcaps')) {
-      final _ResponseHtml? flattenedRestored = _restoreWithFlattenedSmallcaps(
-        sourceDom: sourceDom,
-        translatedDom: translatedDom,
-      );
-      if (flattenedRestored != null) {
-        return flattenedRestored;
-      }
-    }
-    final dom.Element? sourceRoot = sourceDom.root;
-    if (sourceRoot == null) {
-      return translatedDom;
-    }
-    final dom.Element rebuiltRoot = sourceRoot.clone(true);
-    final rebuilt = _ResponseHtml.fromRoot(
-      rebuiltRoot,
-      sourceDom.instrumentation,
-    );
-    final List<_HtmlTextSlot> sourceSlots = rebuilt.slots;
-    if (sourceSlots.isEmpty) {
-      return rebuilt;
-    }
+  }) => _EpubResponseDomLocker._validateTranslatedBlockQuality(
+    config: config,
+    block: block,
+    sourceDom: sourceDom,
+    translatedDom: translatedDom,
+  );
 
-    final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
-    // P2-#7: effective protection is positional, not tag-based. A response
-    // protected slot keeps its protected status only when the source has a
-    // protected slot with the same (protecting tag, ordinal within that
-    // tag); a protected-kind element the model introduced (an extra <code>,
-    // a moved marker, ...) holds real translation text and must not be
-    // dropped as protected content. 性能-#42: decided once per slot in a
-    // single pass and cached — the old code walked up the ancestor chain
-    // once per filter pass.
-    final Map<String, int> sourceProtectedCounts = _protectedSlotCountsByTag(
-      rebuilt,
-      sourceSlots,
-    );
-    final Map<dom.Text, bool> effectiveProtectedByNode =
-        Map<dom.Text, bool>.identity();
-    final Map<dom.Element, bool> effectiveProtectedByElement =
-        Map<dom.Element, bool>.identity();
-    final Map<dom.Text, int> writableIndexByNode =
-        Map<dom.Text, int>.identity();
-    final List<String> writableTranslatedTexts = <String>[];
-    int protectedTranslatedCount = 0;
-    final Map<String, int> seenProtectedByTag = <String, int>{};
-    for (final _HtmlTextSlot slot in translatedSlots) {
-      if (!slot.protected) {
-        if (slot.text.isNotEmpty) {
-          writableIndexByNode[slot.node] = writableTranslatedTexts.length;
-          writableTranslatedTexts.add(slot.text);
-        }
-        continue;
-      }
-      final String tag = _nearestProtectingTag(translatedDom, slot.node) ?? '';
-      final int ordinal = seenProtectedByTag[tag] ?? 0;
-      seenProtectedByTag[tag] = ordinal + 1;
-      final bool effective =
-          tag == 'script' ||
-          tag == 'style' ||
-          ordinal < (sourceProtectedCounts[tag] ?? 0);
-      effectiveProtectedByNode[slot.node] = effective;
-      dom.Node? ancestor = slot.node.parentNode;
-      while (ancestor is dom.Element) {
-        if (translatedDom.isProtected(ancestor)) {
-          effectiveProtectedByElement[ancestor] = effective;
-          break;
-        }
-        ancestor = ancestor.parentNode;
-      }
-      if (slot.text.isEmpty) {
-        continue;
-      }
-      if (effective) {
-        protectedTranslatedCount++;
-      } else {
-        writableIndexByNode[slot.node] = writableTranslatedTexts.length;
-        writableTranslatedTexts.add(slot.text);
-      }
-    }
-    // Whitespace-only protected-kind wrappers have no slots. Resolve them
-    // using the same source-counterpart fallback before collecting gaps.
-    for (final element in translatedDom.fragment.querySelectorAll('*')) {
-      if (translatedDom.isProtected(element)) {
-        effectiveProtectedByElement.putIfAbsent(element, () {
-          final String tag = EpubHtmlExtractor.tagLocalName(element);
-          return tag == 'script' ||
-              tag == 'style' ||
-              (sourceProtectedCounts[tag] ?? 0) > 0;
-        });
-      }
-    }
-    // Positional mapping must pair unprotected slots with unprotected
-    // slots: protected slots (footnote markers, page breaks, code) keep
-    // their source text, so consuming translation texts across the
-    // protected boundary would silently drop real translation text and
-    // duplicate marker text whenever the model moves a marker to another
-    // position. Fall back to the plain-text path when the protected counts
-    // do not line up either.
-    final List<_HtmlTextSlot> writableSourceSlots = sourceSlots
-        .where((_HtmlTextSlot slot) => !slot.protected)
-        .toList(growable: false);
-    final int protectedSourceCount =
-        sourceSlots.length - writableSourceSlots.length;
-
-    if (writableTranslatedTexts.length == writableSourceSlots.length &&
-        protectedTranslatedCount == protectedSourceCount) {
-      // P2-#6: standalone whitespace-only text nodes never become slots, so
-      // writing slot texts alone would drop them and glue words the model
-      // separated with standalone whitespace. Fold each into the adjacent
-      // slot text so the written text sequence keeps the response's word
-      // separation.
-      final Map<dom.Text, int> writableSourceIndexByNode =
-          Map<dom.Text, int>.identity();
-      for (int index = 0; index < writableSourceSlots.length; index += 1) {
-        writableSourceIndexByNode[writableSourceSlots[index].node] = index;
-      }
-      final List<String> finalTexts = _withStandaloneWhitespace(
-        translatedDom,
-        writableTranslatedTexts,
-        writableIndexByNode,
-        rebuilt,
-        writableSourceIndexByNode,
-        effectiveProtectedByElement,
-      );
-      for (int index = 0; index < writableSourceSlots.length; index += 1) {
-        writableSourceSlots[index].text = finalTexts[index];
-      }
-      rebuilt.invalidate();
-      return rebuilt;
-    }
-
-    // P2-#13: rebuild the plain text from every non-protected text node,
-    // including whitespace-only ones that never become slots, so words the
-    // model separated with standalone whitespace do not glue together.
-    // Protected source slots retain their text; including genuinely
-    // protected response text here would duplicate it in the first writable
-    // source slot.
-    final String translatedPlainText = _unprotectedResponseText(
-      translatedDom,
-      effectiveProtectedByNode,
-      effectiveProtectedByElement,
-    );
-    bool wroteMainText = false;
-    final List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots =
-        <({_HtmlTextSlot slot, String sourceText})>[];
-    for (final _HtmlTextSlot slot in sourceSlots) {
-      if (slot.protected) {
-        continue;
-      }
-      if (!wroteMainText) {
-        slot.text = translatedPlainText;
-        wroteMainText = true;
-      } else {
-        final String sourceText = slot.text;
-        slot.text = '';
-        emptiedSlots.add((slot: slot, sourceText: sourceText));
-      }
-    }
-    _removeEmptiedInlineEmphasis(emptiedSlots);
-    rebuilt.invalidate();
-    return rebuilt;
-  }
-
-  /// If [sourceDom] contains `<span class="smallcaps">` nodes that the
-  /// translation folded into a single plain text run, return a version of the
-  /// source with those spans flattened so the skeletons match and the
-  /// translation text can be restored positionally. Returns null when the
-  /// flattened source still does not align with the translation.
-  static _ResponseHtml? _restoreWithFlattenedSmallcaps({
-    required _ResponseHtml sourceDom,
-    required _ResponseHtml translatedDom,
-  }) {
-    final dom.Element? sourceRoot = sourceDom.root;
-    final dom.Element? translatedRoot = translatedDom.root;
-    if (sourceRoot == null || translatedRoot == null) {
-      return null;
-    }
-    // Flatten smallcaps spans in a clone of the source root.
-    final dom.Element flattened = sourceRoot.clone(true);
-    bool changed = false;
-    bool retainedSemanticSpan = false;
-    for (final dom.Element span
-        in flattened.querySelectorAll('span').toList(growable: false)) {
-      final String cls = span.className.toLowerCase();
-      if (!cls.split(RegExp(r'\s+')).contains('smallcaps')) {
-        continue;
-      }
-      if (_spanHasSemanticAttributes(span)) {
-        span.classes.removeWhere(_isSmallCapsClass);
-        changed = true;
-        retainedSemanticSpan = true;
-        continue;
-      }
-      final List<dom.Node> children = span.nodes.toList(growable: false);
-      for (final dom.Node child in children) {
-        span.parentNode?.insertBefore(child.clone(true), span);
-      }
-      span.remove();
-      changed = true;
-    }
-    if (!changed) {
-      return null;
-    }
-    // Unwrapping spans leaves adjacent Text nodes. The former serialize/parse
-    // round-trip merged these; do that directly so positional matching retains
-    // the same text-slot boundaries without another parse.
-    _mergeAdjacentTextNodes(flattened);
-    final flattenedDom = _ResponseHtml.fromRoot(
-      flattened,
-      sourceDom.instrumentation,
-    );
-    if (!_domStructureMatches(flattenedDom, translatedDom)) {
-      if (!retainedSemanticSpan) return null;
-      return _lockHtmlStructureCore(
-        sourceDom: flattenedDom,
-        translatedDom: translatedDom,
-      );
-    }
-    final _ResponseHtml? restored = _restoreProtectedTexts(
-      sourceDom: flattenedDom,
-      translatedDom: translatedDom,
-    );
-    if (restored == null) {
-      return null;
-    }
-    // The translation folded the small-caps spans into plain uppercase text.
-    // Return the restored translation inside the flattened source skeleton.
-    // (The authored small-caps spans are not re-introduced here; the content
-    // and structure are correct, which is what downstream validation needs.)
-    return restored;
-  }
-
-  static void _mergeAdjacentTextNodes(dom.Node parent) {
-    dom.Text? previous;
-    for (final node in parent.nodes.toList(growable: false)) {
-      if (node is dom.Text) {
-        if (previous == null) {
-          previous = node;
-        } else {
-          previous.data += node.data;
-          node.remove();
-        }
-      } else {
-        previous = null;
-        _mergeAdjacentTextNodes(node);
-      }
-    }
-  }
-
-  /// After rebuilding the source skeleton, inline emphasis wrappers whose
-  /// source text is an audited foreign term and that were emptied (for example
-  /// `<i class="calibre3">agri deserti,</i>` when the model folded the whole
-  /// translation into the first text slot) are removed. Keeping them would
-  /// make the residual checker treat the emptied node as an untranslated
-  /// audited term and reject a perfectly valid translation. Ordinary empty
-  /// emphasis wrappers are preserved so source skeletons stay stable.
-  static void _removeEmptiedInlineEmphasis(
-    List<({_HtmlTextSlot slot, String sourceText})> emptiedSlots,
-  ) {
-    final Set<dom.Element> candidates = <dom.Element>{};
-    for (final ({_HtmlTextSlot slot, String sourceText}) entry
-        in emptiedSlots) {
-      if (!TranslationQuality.isAuditedForeignTermNodeText(
-        entry.sourceText.trim(),
-      )) {
-        continue;
-      }
-      final dom.Node? parent = entry.slot.node.parentNode;
-      if (parent is dom.Element &&
-          (parent.localName == 'i' || parent.localName == 'em')) {
-        candidates.add(parent);
-      }
-    }
-    for (final dom.Element element in candidates) {
-      if (element.children.isNotEmpty || element.text.trim().isNotEmpty) {
-        continue;
-      }
-      element.remove();
-    }
-  }
-
-  static bool _overflowTextFitsSourceSlots({
-    required _ResponseHtml sourceDom,
-    required _ResponseHtml translatedDom,
-    required List<dom.Text> trustedOverflowTexts,
-  }) {
-    final int sourceTextSlots = sourceDom.slots
-        .where((_HtmlTextSlot slot) => !slot.protected)
-        .length;
-    final List<_HtmlTextSlot> untrustedTranslatedSlots = translatedDom.slots
-        .where(
-          (_HtmlTextSlot slot) =>
-              !slot.protected && !trustedOverflowTexts.contains(slot.node),
-        )
-        .toList(growable: false);
-    if (untrustedTranslatedSlots.length <= sourceTextSlots) {
-      return true;
-    }
-    if (sourceTextSlots != 0) {
-      return false;
-    }
-    for (final _HtmlTextSlot slot in untrustedTranslatedSlots) {
-      slot.text = '';
-    }
-    return true;
-  }
-
-  static _ResponseHtml? _restoreProtectedTexts({
-    required _ResponseHtml sourceDom,
-    required _ResponseHtml translatedDom,
-  }) {
-    final dom.Element? sourceRoot = sourceDom.root;
-    final dom.Element? translatedRoot = translatedDom.root;
-    if (sourceRoot == null || translatedRoot == null) {
-      return translatedDom;
-    }
-
-    final List<_HtmlTextSlot> sourceSlots = sourceDom.slots;
-    final List<_HtmlTextSlot> translatedSlots = translatedDom.slots;
-    if (sourceSlots.length != translatedSlots.length) {
-      return null;
-    }
-
-    for (int index = 0; index < sourceSlots.length; index += 1) {
-      if (sourceSlots[index].protected) {
-        translatedSlots[index].text = sourceSlots[index].text;
-      }
-    }
-    translatedDom.invalidate();
-    return translatedDom;
-  }
-
-  static bool _elementSkeletonMatches(
-    dom.Element source,
-    dom.Element translated, {
-    Iterable<dom.Node> ignoredTranslatedNodes = const <dom.Node>[],
-  }) {
-    if (source.localName != translated.localName ||
-        !_attributesMatch(source, translated)) {
-      return false;
-    }
-    final List<dom.Element> sourceChildren = source.children.toList(
-      growable: false,
-    );
-    final List<dom.Element> translatedChildren = translated.children.toList(
-      growable: true,
-    )..removeWhere(ignoredTranslatedNodes.contains);
-    if (sourceChildren.length != translatedChildren.length) {
-      return false;
-    }
-    for (int index = 0; index < sourceChildren.length; index += 1) {
-      if (!_elementSkeletonMatches(
-        sourceChildren[index],
-        translatedChildren[index],
-        ignoredTranslatedNodes: ignoredTranslatedNodes,
-      )) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  static _NormalizedAnchorHtml _normalizeProtectedAnchorMarkers({
-    required _ResponseHtml sourceDom,
-    required _ResponseHtml translatedDom,
-  }) {
-    final dom.Element? sourceRoot = sourceDom.root;
-    final dom.Element? translatedRoot = translatedDom.root;
-    if (sourceRoot == null || translatedRoot == null) {
-      return const _NormalizedAnchorHtml();
-    }
-    final List<String> overflowTexts = <String>[];
-    final List<dom.Text> trustedOverflowTexts = <dom.Text>[];
-    _normalizePairedProtectedAnchors(
-      sourceRoot,
-      translatedRoot,
-      overflowTexts,
-      trustedOverflowTexts,
-      sourceDom,
-    );
-    translatedDom.invalidate();
-    return _NormalizedAnchorHtml(
-      root: translatedRoot,
-      hasOverflow: overflowTexts.isNotEmpty,
-      trustedOverflowTexts: trustedOverflowTexts,
-    );
-  }
-
-  static void _normalizePairedProtectedAnchors(
-    dom.Element source,
-    dom.Element translated,
-    List<String> overflowTexts,
-    List<dom.Text> trustedOverflowTexts,
-    _ResponseHtml sourceDom,
-  ) {
-    if (source.localName != translated.localName ||
-        !_attributesMatch(source, translated)) {
-      return;
-    }
-
-    if (!EpubHtmlExtractor.nonTextAncestors.contains(
-          EpubHtmlExtractor.tagLocalName(source),
-        ) &&
-        sourceDom.isProtected(source) &&
-        _isProtectedMarkerText(sourceDom.textOf(source))) {
-      _normalizeProtectedAnchor(
-        source: source,
-        translated: translated,
-        sourceMarker: sourceDom.textOf(source).trim(),
-        overflowTexts: overflowTexts,
-        trustedOverflowTexts: trustedOverflowTexts,
-      );
-      return;
-    }
-
-    final List<dom.Element> sourceChildren = source.children.toList(
-      growable: false,
-    );
-    final List<dom.Element> translatedChildren = translated.children.toList(
-      growable: false,
-    );
-    if (sourceChildren.length != translatedChildren.length) {
-      return;
-    }
-    for (int index = 0; index < sourceChildren.length; index += 1) {
-      _normalizePairedProtectedAnchors(
-        sourceChildren[index],
-        translatedChildren[index],
-        overflowTexts,
-        trustedOverflowTexts,
-        sourceDom,
-      );
-    }
-  }
-
-  static void _normalizeProtectedAnchor({
-    required dom.Element source,
-    required dom.Element translated,
-    required String sourceMarker,
-    required List<String> overflowTexts,
-    required List<dom.Text> trustedOverflowTexts,
-  }) {
-    final dom.Text? markerText = _firstNonWhitespaceTextDescendant(translated);
-    if (markerText == null) {
-      _removeAdjacentMarker(
-        source: source,
-        translated: translated,
-        marker: sourceMarker,
-      );
-      return;
-    }
-
-    final List<int>? markerRange = _markerRangeAtTextStart(
-      markerText.data,
-      sourceMarker,
-    );
-    if (markerRange == null) {
-      return;
-    }
-    final String overflowText = _overflowTextAfterMarker(
-      anchor: translated,
-      markerText: markerText,
-      markerEnd: markerRange[1],
-    );
-    final dom.Node? parent = translated.parentNode;
-    if (parent == null) {
-      return;
-    }
-    final int anchorIndex = parent.nodes.indexOf(translated);
-    if (anchorIndex < 0) {
-      return;
-    }
-    final dom.Element restoredAnchor = source.clone(true);
-    parent.nodes.removeAt(anchorIndex);
-    parent.nodes.insert(anchorIndex, restoredAnchor);
-    if (overflowText.isNotEmpty) {
-      final dom.Text? insertedOverflow = _placeOverflowTextAfter(
-        parent: parent,
-        anchorIndex: anchorIndex,
-        overflowText: overflowText,
-      );
-      overflowTexts.add(overflowText);
-      if (insertedOverflow != null) {
-        trustedOverflowTexts.add(insertedOverflow);
-      }
-    }
-  }
-
-  static String _overflowTextAfterMarker({
-    required dom.Element anchor,
-    required dom.Text markerText,
-    required int markerEnd,
-  }) {
-    String overflow = markerText.data.substring(markerEnd).trimLeft();
-
-    dom.Node branch = markerText;
-    while (true) {
-      final dom.Node? parent = branch.parentNode;
-      if (parent == null) {
-        return overflow;
-      }
-      final int index = parent.nodes.indexOf(branch);
-      for (
-        int siblingIndex = index + 1;
-        siblingIndex < parent.nodes.length;
-        siblingIndex += 1
-      ) {
-        overflow += _safeOverflowText(parent.nodes[siblingIndex]);
-      }
-      if (parent == anchor) {
-        return overflow;
-      }
-      branch = parent;
-    }
-  }
-
-  static String _safeOverflowText(dom.Node node) {
-    if (node is dom.Text) {
-      return node.data;
-    }
-    if (node is! dom.Element) {
-      return '';
-    }
-    const Set<String> unsafeTags = <String>{
-      'script',
-      'style',
-      'iframe',
-      'object',
-      'embed',
-      'img',
-    };
-    if (unsafeTags.contains(EpubHtmlExtractor.tagLocalName(node))) {
-      return '';
-    }
-    return node.nodes.map(_safeOverflowText).join();
-  }
-
-  static dom.Text? _placeOverflowTextAfter({
-    required dom.Node parent,
-    required int anchorIndex,
-    required String overflowText,
-  }) {
-    final int nextIndex = anchorIndex + 1;
-    if (nextIndex < parent.nodes.length &&
-        parent.nodes[nextIndex] is dom.Text) {
-      final dom.Text nextText = parent.nodes[nextIndex] as dom.Text;
-      nextText.data = _joinOverflowText(overflowText, nextText.data);
-      return null;
-    }
-    final dom.Text inserted = dom.Text(overflowText);
-    parent.nodes.insert(nextIndex, inserted);
-    return inserted;
-  }
-
-  static String _joinOverflowText(String overflow, String followingText) {
-    if (overflow.isEmpty || followingText.isEmpty) {
-      return '$overflow$followingText';
-    }
-    final bool needsSeparator =
-        RegExp(r'[A-Za-z0-9]$').hasMatch(overflow) &&
-        RegExp(r'^[A-Za-z0-9]').hasMatch(followingText);
-    return needsSeparator
-        ? '$overflow $followingText'
-        : '$overflow$followingText';
-  }
-
-  static dom.Text? _firstNonWhitespaceTextDescendant(dom.Node node) {
-    if (node is dom.Text) {
-      return node.data.trim().isEmpty ? null : node;
-    }
-    for (final dom.Node child in node.nodes) {
-      final dom.Text? text = _firstNonWhitespaceTextDescendant(child);
-      if (text != null) {
-        return text;
-      }
-    }
-    return null;
-  }
-
-  static void _removeAdjacentMarker({
-    required dom.Element source,
-    required dom.Element translated,
-    required String marker,
-  }) {
-    final dom.Text? translatedPrevious = _adjacentText(
-      translated,
-      before: true,
-    );
-    final dom.Text? sourcePrevious = _adjacentText(source, before: true);
-    if (translatedPrevious != null &&
-        !_textEndsWithMarker(sourcePrevious?.data ?? '', marker) &&
-        _textEndsWithMarker(translatedPrevious.data, marker) &&
-        _removeMarkerAtTextEnd(translatedPrevious, marker)) {
-      return;
-    }
-
-    final dom.Text? translatedNext = _adjacentText(translated, before: false);
-    final dom.Text? sourceNext = _adjacentText(source, before: false);
-    if (translatedNext != null &&
-        !_textStartsWithMarker(sourceNext?.data ?? '', marker) &&
-        _textStartsWithMarker(translatedNext.data, marker)) {
-      _removeMarkerAtTextStart(translatedNext, marker);
-    }
-  }
-
-  static dom.Text? _adjacentText(dom.Element element, {required bool before}) {
-    final dom.Node? parent = element.parentNode;
-    if (parent == null) {
-      return null;
-    }
-    final int index = parent.nodes.indexOf(element);
-    final int adjacentIndex = before ? index - 1 : index + 1;
-    if (index < 0 ||
-        adjacentIndex < 0 ||
-        adjacentIndex >= parent.nodes.length) {
-      return null;
-    }
-    final dom.Node adjacent = parent.nodes[adjacentIndex];
-    return adjacent is dom.Text ? adjacent : null;
-  }
-
-  static bool _textEndsWithMarker(String value, String marker) {
-    int end = value.length;
-    while (end > 0 && value[end - 1].trim().isEmpty) {
-      end -= 1;
-    }
-    final int start = end - marker.length;
-    return start >= 0 && value.substring(start, end) == marker;
-  }
-
-  static bool _textStartsWithMarker(String value, String marker) {
-    int start = 0;
-    while (start < value.length && value[start].trim().isEmpty) {
-      start += 1;
-    }
-    final int end = start + marker.length;
-    return end <= value.length && value.substring(start, end) == marker;
-  }
-
-  static bool _removeMarkerAtTextEnd(dom.Text textNode, String marker) {
-    final String value = textNode.data;
-    int end = value.length;
-    while (end > 0 && value[end - 1].trim().isEmpty) {
-      end -= 1;
-    }
-    final int start = end - marker.length;
-    if (start >= 0 && value.substring(start, end) == marker) {
-      textNode.data = value.substring(0, start) + value.substring(end);
-      return true;
-    }
-    return false;
-  }
-
-  static bool _removeMarkerAtTextStart(dom.Text textNode, String marker) {
-    final String value = textNode.data;
-    int start = 0;
-    while (start < value.length && value[start].trim().isEmpty) {
-      start += 1;
-    }
-    final int end = start + marker.length;
-    if (end <= value.length && value.substring(start, end) == marker) {
-      textNode.data = value.substring(0, start) + value.substring(end);
-      return true;
-    }
-    return false;
-  }
-
-  static List<int>? _markerRangeAtTextStart(String value, String marker) {
-    int start = 0;
-    while (start < value.length && value[start].trim().isEmpty) {
-      start += 1;
-    }
-    final int end = start + marker.length;
-    if (end <= value.length && value.substring(start, end) == marker) {
-      return <int>[start, end];
-    }
-    return null;
-  }
-
-  static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) {
-    return _domStructureMatches(
-      _ResponseHtml.parse(sourceHtml),
-      _ResponseHtml.parse(translatedHtml),
-    );
-  }
-
-  static bool _domStructureMatches(
-    _ResponseHtml sourceDom,
-    _ResponseHtml translatedDom,
-  ) {
-    final dom.Element? sourceRoot = sourceDom.root;
-    final dom.Element? translatedRoot = translatedDom.root;
-    if (sourceRoot == null || translatedRoot == null) {
-      return false;
-    }
-    return _elementStructureMatches(sourceRoot, translatedRoot);
-  }
-
-  static dom.Element? _fragmentRoot(dom.DocumentFragment fragment) {
-    final List<dom.Node> nodes = fragment.nodes
-        .where((dom.Node node) => !_isIgnorableStructureNode(node))
-        .toList(growable: false);
-    if (nodes.length != 1 || nodes.single is! dom.Element) {
-      return null;
-    }
-    return nodes.single as dom.Element;
-  }
-
-  static bool _elementStructureMatches(
-    dom.Element source,
-    dom.Element translated,
-  ) {
-    if (source.localName != translated.localName) {
-      return false;
-    }
-    if (!_attributesMatch(source, translated)) {
-      return false;
-    }
-
-    final List<dom.Node> sourceNodes = _meaningfulStructureNodes(source);
-    final List<dom.Node> translatedNodes = _meaningfulStructureNodes(
-      translated,
-    );
-    if (sourceNodes.length != translatedNodes.length) {
-      return false;
-    }
-    for (int index = 0; index < sourceNodes.length; index += 1) {
-      final dom.Node sourceNode = sourceNodes[index];
-      final dom.Node translatedNode = translatedNodes[index];
-      if (sourceNode is dom.Text && translatedNode is dom.Text) {
-        continue;
-      }
-      if (sourceNode is dom.Element && translatedNode is dom.Element) {
-        if (!_elementStructureMatches(sourceNode, translatedNode)) {
-          return false;
-        }
-        continue;
-      }
-      return false;
-    }
-    return true;
-  }
-
-  static bool _attributesMatch(dom.Element source, dom.Element translated) {
-    if (source.attributes.length != translated.attributes.length) {
-      return false;
-    }
-    for (final MapEntry<Object, String> entry in source.attributes.entries) {
-      if (translated.attributes[entry.key] != entry.value) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  static List<dom.Node> _meaningfulStructureNodes(dom.Element element) {
-    return element.nodes
-        .where((dom.Node node) => !_isIgnorableStructureNode(node))
-        .toList(growable: false);
-  }
-
-  static bool _isIgnorableStructureNode(dom.Node node) {
-    return node is dom.Text && node.data.trim().isEmpty;
-  }
-
-  static void _collectTextSlots(
-    dom.Node node,
-    List<_HtmlTextSlot> slots, {
-    required bool protected,
-    required _ResponseNodeFacts facts,
-  }) {
-    if (node is dom.Text) {
-      if (node.data.trim().isNotEmpty) {
-        slots.add(_HtmlTextSlot(node: node, protected: protected));
-      }
-      return;
-    }
-    if (node is! dom.Element) {
-      return;
-    }
-    final bool childProtected = protected || facts.isProtected(node);
-    for (final dom.Node child in node.nodes) {
-      _collectTextSlots(child, slots, protected: childProtected, facts: facts);
-    }
-  }
-
-  /// P2-#7: per-tag counts of protected source slots. A response protected
-  /// slot is effectively protected only when the source has a protected
-  /// slot with the same (protecting tag, ordinal within that tag): the
-  /// identity of protected content is positional, not a tag-name set.
-  static Map<String, int> _protectedSlotCountsByTag(
-    _ResponseHtml dom,
-    List<_HtmlTextSlot> slots,
-  ) {
-    final Map<String, int> counts = <String, int>{};
-    for (final _HtmlTextSlot slot in slots) {
-      if (!slot.protected) {
-        continue;
-      }
-      final String tag = _nearestProtectingTag(dom, slot.node) ?? '';
-      counts[tag] = (counts[tag] ?? 0) + 1;
-    }
-    return counts;
-  }
-
-  /// Tag of the nearest ancestor that protects [slotNode]'s text, or null
-  /// when none does. Callers only ask for protected slots, which always
-  /// have a protecting ancestor by construction.
-  static String? _nearestProtectingTag(
-    _ResponseHtml document,
-    dom.Text slotNode,
-  ) {
-    dom.Node? ancestor = slotNode.parentNode;
-    while (ancestor is dom.Element) {
-      if (document.isProtected(ancestor)) {
-        return EpubHtmlExtractor.tagLocalName(ancestor);
-      }
-      ancestor = ancestor.parentNode;
-    }
-    return null;
-  }
-
-  /// Walks [document] in document order and reports each standalone
-  /// whitespace-only text node (which never becomes a slot) via [onGap],
-  /// keyed by the index of the preceding writable slot ([writableIndexByNode]
-  /// maps each writable slot's text node to its index; -1 when the
-  /// whitespace leads). Whitespace inside protected subtrees is skipped,
-  /// mirroring the slot walk.
-  static void _collectStandaloneWhitespaceGaps(
-    _ResponseHtml document,
-    Map<dom.Text, int> writableIndexByNode,
-    void Function(int precedingSlot, String data) onGap, [
-    Map<dom.Element, bool>? effectiveProtection,
-  ]) {
-    int lastWritable = -1;
-    void visit(dom.Node node, bool protected) {
-      if (node is dom.Text) {
-        if (node.data.trim().isEmpty) {
-          if (!protected) {
-            onGap(lastWritable, node.data);
-          }
-          return;
-        }
-        final int? writableIndex = writableIndexByNode[node];
-        if (writableIndex != null) {
-          lastWritable = writableIndex;
-        }
-        return;
-      }
-      if (node is! dom.Element) {
-        return;
-      }
-      final String tag = EpubHtmlExtractor.tagLocalName(node);
-      if (tag == 'script' || tag == 'style') return;
-      final bool childProtected =
-          protected ||
-          (effectiveProtection?[node] ?? document.isProtected(node));
-      for (final dom.Node child in node.nodes) {
-        visit(child, childProtected);
-      }
-    }
-
-    for (final dom.Node node in document.fragment.nodes) {
-      visit(node, false);
-    }
-  }
-
-  /// P2-#6: folds standalone whitespace-only text nodes (which never become
-  /// slots) into the adjacent writable slot texts, in document order. Each
-  /// whitespace node is appended to the preceding writable slot's text (or
-  /// prepended to the first slot's text when it leads), so the written text
-  /// sequence keeps the response's word separation instead of gluing words.
-  /// [writableIndexByNode] maps each writable slot's text node to its index
-  /// in [writableTexts].
-  ///
-  /// P2-#6 regression: [sourceDom] is the rebuilt (source-clone) DOM whose
-  /// own standalone whitespace nodes survive the write (they never become
-  /// slots), and [writableSourceIndexByNode] maps its writable slots to
-  /// their indices. The writable slot sequences are positionally aligned
-  /// (the branch precondition), so a response gap is skipped when the
-  /// source already has whitespace at the same gap position — folding it
-  /// as well would double the whitespace in the output.
-  static List<String> _withStandaloneWhitespace(
-    _ResponseHtml translatedDom,
-    List<String> writableTexts,
-    Map<dom.Text, int> writableIndexByNode,
-    _ResponseHtml sourceDom,
-    Map<dom.Text, int> writableSourceIndexByNode,
-    Map<dom.Element, bool> effectiveProtection,
-  ) {
-    final List<({int precedingSlot, String data})> gaps =
-        <({int precedingSlot, String data})>[];
-    _collectStandaloneWhitespaceGaps(
-      translatedDom,
-      writableIndexByNode,
-      (int precedingSlot, String data) =>
-          gaps.add((precedingSlot: precedingSlot, data: data)),
-      effectiveProtection,
-    );
-    if (gaps.isEmpty) {
-      return writableTexts;
-    }
-    final Set<int> sourceWhitespaceSlots = <int>{};
-    _collectStandaloneWhitespaceGaps(
-      sourceDom,
-      writableSourceIndexByNode,
-      (int precedingSlot, String _) => sourceWhitespaceSlots.add(precedingSlot),
-    );
-    final List<String> result = List<String>.from(writableTexts);
-    for (final gap in gaps) {
-      if (result.isEmpty) {
-        break;
-      }
-      if (sourceWhitespaceSlots.contains(gap.precedingSlot)) {
-        continue;
-      }
-      if (gap.precedingSlot >= 0 && gap.precedingSlot < result.length) {
-        result[gap.precedingSlot] = result[gap.precedingSlot] + gap.data;
-      } else {
-        result[0] = gap.data + result[0];
-      }
-    }
-    return result;
-  }
-
-  /// Plain text of the translated DOM for the merge fallback: the data of
-  /// every text node except effectively-protected ones, including
-  /// whitespace-only nodes that never become slots, so words the model
-  /// separated with standalone whitespace do not glue together (P2-#13).
-  /// P2-#7: [effectiveProtectedByNode] carries the per-slot identity
-  /// decision — a protected-kind element the model introduced has no
-  /// source counterpart, so its text is real translation content and is
-  /// kept; only genuinely-protected text is excluded (protected source
-  /// slots retain their text, and including it here would duplicate it in
-  /// the first writable source slot).
-  static String _unprotectedResponseText(
-    _ResponseHtml translatedDom,
-    Map<dom.Text, bool> effectiveProtectedByNode,
-    Map<dom.Element, bool> effectiveProtection,
-  ) {
-    final StringBuffer buffer = StringBuffer();
-    void visit(dom.Node node, bool protected) {
-      if (node is dom.Text) {
-        if (!(effectiveProtectedByNode[node] ?? protected)) {
-          buffer.write(node.data);
-        }
-        return;
-      }
-      if (node is! dom.Element) {
-        return;
-      }
-      final String tag = EpubHtmlExtractor.tagLocalName(node);
-      if (tag == 'script' || tag == 'style') return;
-      final bool childProtected =
-          protected ||
-          (effectiveProtection[node] ?? translatedDom.isProtected(node));
-      for (final dom.Node child in node.nodes) {
-        visit(child, childProtected);
-      }
-    }
-
-    for (final dom.Node node in translatedDom.fragment.nodes) {
-      visit(node, false);
-    }
-    return buffer.toString();
-  }
-
-  static bool _isProtectedTextElement(dom.Element element, {String? text}) {
-    final String tag = EpubHtmlExtractor.tagLocalName(element);
-    if (EpubHtmlExtractor.nonTextAncestors.contains(tag)) return true;
-    final Set<String> roles = _roleTokens(element);
-    final Set<String> epubTypes = _epubTypes(element);
-    // Ordinary wrappers cannot protect text; do not read their descendants.
-    if (tag != 'a' &&
-        !roles.contains('doc-noteref') &&
-        !epubTypes.contains('noteref') &&
-        !roles.contains('doc-pagebreak') &&
-        !epubTypes.contains('pagebreak')) {
-      return false;
-    }
-    final String value = text ?? element.text;
-    final bool protectedMarkerText = _isProtectedMarkerText(value);
-
-    if ((roles.contains('doc-noteref') || epubTypes.contains('noteref')) &&
-        protectedMarkerText) {
-      return true;
-    }
-    if (roles.contains('doc-pagebreak') || epubTypes.contains('pagebreak')) {
-      return _isProtectedPagebreakText(value);
-    }
-    final String href = element.attributes['href'] ?? '';
-    if (tag != 'a') {
-      return false;
-    }
-    final String id = element.attributes['id']?.toLowerCase() ?? '';
-    if (protectedMarkerText &&
-        (roles.contains('doc-backlink') || id.startsWith('footnote_ref_'))) {
-      return true;
-    }
-    if (protectedMarkerText &&
-        _isCrossFileHref(href) &&
-        _containsFootnoteMarkerClass(element)) {
-      return true;
-    }
-    return href.startsWith('#') && protectedMarkerText;
-  }
-
-  static bool _isCrossFileHref(String href) {
-    final int fragmentIndex = href.indexOf('#');
-    return fragmentIndex > 0 && fragmentIndex < href.length - 1;
-  }
-
-  static bool _containsFootnoteMarkerClass(dom.Element element) {
-    return ProtectedAnchorTextSlots.hasFootnoteMarkerClass(element);
-  }
-
-  static Set<String> _epubTypes(dom.Element element) {
-    return EpubSemantics.typesOf(element);
-  }
-
-  static Set<String> _roleTokens(dom.Element element) {
-    return (element.attributes['role']?.toLowerCase() ?? '')
-        .split(RegExp(r'\s+'))
-        .where((String role) => role.isNotEmpty)
-        .toSet();
-  }
-
-  static bool _isProtectedPagebreakText(String value) {
-    final String compact = value.replaceAll(RegExp(r'\s+'), '');
-    if (compact.isEmpty || compact.length > 12) {
-      return false;
-    }
-    return _isProtectedMarkerText(value) ||
-        RegExp(r'^[0-9]+$').hasMatch(compact) ||
-        RegExp(r'^[ivxlcdmIVXLCDM]+$').hasMatch(compact);
-  }
-
-  static bool _isProtectedMarkerText(String value) {
-    final String compact = value.replaceAll(RegExp(r'\s+'), '');
-    if (compact.isEmpty || compact.length > 10) {
-      return false;
-    }
-    if (compact == '＊' || _chineseNumberMarkerToAscii.containsKey(compact)) {
-      return true;
-    }
-    return RegExp(r'^[\[\(（【].+[\]\)）】]$').hasMatch(compact) ||
-        RegExp(r'^[0-9]+[.)]?$').hasMatch(compact) ||
-        RegExp(r'^[*†‡§¶]+$').hasMatch(compact) ||
-        compact == '↩';
-  }
-
-  static const Map<String, String> _chineseNumberMarkerToAscii =
-      <String, String>{
-        '零': '0',
-        '一': '1',
-        '二': '2',
-        '三': '3',
-        '四': '4',
-        '五': '5',
-        '六': '6',
-        '七': '7',
-        '八': '8',
-        '九': '9',
-        '十': '10',
-        '十一': '11',
-      };
+  static bool _htmlStructureMatches(String sourceHtml, String translatedHtml) =>
+      _EpubResponseDomLocker._htmlStructureMatches(sourceHtml, translatedHtml);
 
   /// Test-visible detector used by individual protected-slot translation.
   @visibleForTesting
   static bool slotTranslationHasWrapperTag(String text) =>
       _EpubTranslationStrategy._slotWrapperTagPattern.hasMatch(text);
+
+  static InspectedChapter _prepareChapterForTarget(
+    InspectedChapter chapter, {
+    required String targetLanguage,
+  }) => _EpubResponseDomLocker._prepareChapterForTarget(
+    chapter,
+    targetLanguage: targetLanguage,
+  );
+
+  static String _prepareBlockHtmlForTarget({
+    required String sourceHtml,
+    required String targetLanguage,
+  }) => _EpubResponseDomLocker._prepareBlockHtmlForTarget(
+    sourceHtml: sourceHtml,
+    targetLanguage: targetLanguage,
+  );
+
+  static String normalizeTargetLanguage(String language) =>
+      _EpubResponseDomLocker.normalizeTargetLanguage(language);
 
   static String idiomaticTranslationInstructionForTest() {
     return EpubChapterTranslator()._strategy._idiomaticTranslationInstruction();
@@ -4636,55 +3497,6 @@ class EpubChapterTranslator {
     );
   }
 
-  static void _validateTranslatedBlockQuality({
-    required TranslationConfig config,
-    required ExtractedBlock block,
-    required _ResponseHtml sourceDom,
-    required _ResponseHtml translatedDom,
-  }) {
-    _validateNonemptyDoms(sourceDom, translatedDom);
-    if (!config.residualQualityCheck) {
-      return;
-    }
-    // A bibliography / endnote / index entry conventionally keeps reference
-    // fields (author, journal, volume/issue/year, publisher, page numbers,
-    // index terms) in the original language. Detect such entries by their
-    // source markup class (for example `endnotes1`, `indexmain`) or epub:type
-    // (for example `index-term`, `index-locator`) rather than the block root
-    // tag, because the extractor may split a `<li>` into its inner `<a>` /
-    // `<i>` / `<span>` nodes while still exposing the surrounding class in
-    // `sourceHtml`.
-    final bool isBibliographicEntry = RegExp(
-      r'class="[^"]*(?:endnote|bibliograph|reference|index)[^"]*"'
-      r'|epub:type="[^"]*index[^"]*"',
-      caseSensitive: false,
-    ).hasMatch(block.sourceHtml);
-    // A pure cross-reference / citation-metadata endnote (for example
-    // `Ibid.` or `Fiorentini and Peltzman, op. cit., p. 15.`) has no
-    // natural-language sentence to translate; keeping it verbatim is the
-    // correct behaviour. Skip the residual check for these so they are not
-    // mistaken for untranslated prose.
-    if (isBibliographicEntry &&
-        TranslationQuality.isPureCitationMetadata(block.sourceText)) {
-      return;
-    }
-    final TranslationResidualFinding? finding =
-        TranslationQuality.findSuspiciousFragmentResidual(
-          sourceFragment: sourceDom.fragment,
-          translatedFragment: translatedDom.fragment,
-          targetLanguage: config.targetLanguage,
-          allowRetainedAuthorSignature: block.isAuthorSignature,
-          allowBibliographicRetention: isBibliographicEntry,
-          lockedGlossary: config.lockedGlossary,
-        );
-    _responseCount(translatedDom.instrumentation, 'qualityDomChecks');
-    if (finding == null) {
-      return;
-    }
-
-    throw FormatException(finding.messageForBlock(block.id));
-  }
-
   static String _truncateUtf16(String value, int limit) {
     if (value.length <= limit) return value;
     // Do not leave a dangling high surrogate at the truncation boundary.
@@ -4762,26 +3574,14 @@ class EpubChapterTranslator {
     required String inputPath,
     required String outputDirectory,
     required String suffix,
-  }) {
-    final String safeSuffix = TranslationApiClient.sanitizeOutputSuffix(suffix);
-    final String baseName = path.basenameWithoutExtension(inputPath);
-    String candidate = path.join(
-      outputDirectory,
-      outputFileName(baseName, safeSuffix),
-    );
-    // Never overwrite the source EPUB even if sanitization collapses the name.
-    if (_sameFilesystemPath(candidate, inputPath)) {
-      candidate = path.join(
-        outputDirectory,
-        outputFileName(baseName, '${safeSuffix}_out'),
-      );
-    }
-    return candidate;
-  }
+  }) => _EpubTranslatorPaths.outputFilePath(
+    inputPath: inputPath,
+    outputDirectory: outputDirectory,
+    suffix: suffix,
+  );
 
-  /// Reports append at most `.diagnostics.json` and then the shared atomic
-  /// write suffix. This also covers EPUB temp/backup/recovery suffixes.
-  static const int outputPathSuffixBudget = 17 + atomicWriteSuffixBudget;
+  static const int outputPathSuffixBudget =
+      _EpubTranslatorPaths.outputPathSuffixBudget;
 
   @visibleForTesting
   static String outputFileNameForTest(
@@ -4790,246 +3590,67 @@ class EpubChapterTranslator {
     bool? windows,
   }) => outputFileName(baseName, suffix, windows: windows);
 
-  /// Keep every derived artifact writable. Windows counts UTF-16 units;
-  /// POSIX filesystems count UTF-8 bytes per filename component.
   static String outputFileName(
     String baseName,
     String suffix, {
     bool? windows,
-  }) {
-    final bool useUtf16 = windows ?? Platform.isWindows;
-    int size(String value) =>
-        useUtf16 ? value.length : utf8.encode(value).length;
-    String truncate(String value, int budget) {
-      if (useUtf16) return _truncateUtf16(value, budget);
-      final result = StringBuffer();
-      int used = 0;
-      for (final rune in value.runes) {
-        final character = String.fromCharCode(rune);
-        final bytes = utf8.encode(character).length;
-        if (used + bytes > budget) break;
-        result.write(character);
-        used += bytes;
-      }
-      return result.toString();
-    }
-
-    const int limit = 255 - outputPathSuffixBudget;
-    final String name = '$baseName$suffix.epub';
-    if (size(name) <= limit) return name;
-    final String hash = sha256
-        .convert(utf8.encode(name))
-        .toString()
-        .substring(0, 12);
-    final String tail = '${truncate(suffix, 64)}_$hash.epub';
-    return '${truncate(baseName, limit - size(tail))}$tail';
-  }
+  }) => _EpubTranslatorPaths.outputFileName(baseName, suffix, windows: windows);
 
   @visibleForTesting
   static Future<void> validateOutputDirectory(
     String directory,
     UiLanguage language,
-  ) async {
-    final bool chinese = language == UiLanguage.chinese;
-    if (await FileSystemEntity.type(directory) !=
-        FileSystemEntityType.directory) {
-      throw StateError(
-        chinese
-            ? '输出目录不存在或不是目录：$directory'
-            : 'Output directory does not exist or is not a directory: $directory',
-      );
-    }
-    File? probe;
-    try {
-      // Probe the directory itself: Windows ACLs distinguish creating files
-      // from creating subdirectories (which can also inherit different ACLs).
-      final candidate = File(
-        path.join(
-          directory,
-          '.epub-write-probe-${DateTime.now().microsecondsSinceEpoch}-'
-          '${Random.secure().nextInt(1 << 32)}',
-        ),
-      );
-      await candidate.create(exclusive: true);
-      probe = candidate;
-      await probe.writeAsBytes([0], flush: true);
-      await probe.delete();
-      probe = null;
-    } on FileSystemException catch (error) {
-      throw StateError(
-        chinese
-            ? '无法写入输出目录：$directory（$error）'
-            : 'Output directory is not writable: $directory ($error)',
-      );
-    } finally {
-      if (probe != null && await probe.exists()) {
-        try {
-          await probe.delete();
-        } on FileSystemException {
-          // Preserve the original write failure if cleanup also fails.
-        }
-      }
-    }
-  }
+  ) => _EpubTranslatorPaths.validateOutputDirectory(directory, language);
 
-  /// Include reports and their atomic temporary names, as well as EPUB
-  /// recovery files. [String.length] counts Windows UTF-16 code units.
-  ///
-  /// Visible for testing.
   @visibleForTesting
-  static bool outputPathExceedsWindowsMaxPath(String outputFilePath) {
-    // MAX_PATH (260) counts the terminating NUL, so 259 is the longest
-    // usable path; a final path of exactly 260 already overflows.
-    return outputFilePath.length + outputPathSuffixBudget >= 260;
-  }
+  static bool outputPathExceedsWindowsMaxPath(String outputFilePath) =>
+      _EpubTranslatorPaths.outputPathExceedsWindowsMaxPath(outputFilePath);
 
-  /// Throws [WindowsLongPathException] when the longest write path the
-  /// commit produces would exceed Windows MAX_PATH (260) while the system
-  /// long-path policy is off. Runs before any paid API work. Fails open
-  /// when the policy cannot be determined (null): blocking on a guess would
-  /// be worse than the registry read failing silently.
-  ///
-  /// [longPathsEnabledReader] is a test seam for the (slow, PowerShell-based)
-  /// registry read.
   static Future<void> throwIfOutputPathTooLongForWindows(
     String outputFilePath, {
     Future<bool?> Function()? longPathsEnabledReader,
-  }) async {
-    final String fileName = path.windows.basename(outputFilePath);
-    if (fileName.length + outputPathSuffixBudget > 255) {
-      throw FileSystemException(
-        'Output filename plus temporary suffix exceeds 255 UTF-16 code units.',
-        outputFilePath,
-      );
-    }
-    if (!outputPathExceedsWindowsMaxPath(outputFilePath)) {
-      return;
-    }
-    final bool? enabled =
-        await (longPathsEnabledReader ??
-            NativePlatformBridge.windowsLongPathsEnabled)();
-    if (enabled == false) {
-      throw WindowsLongPathException(outputFilePath);
-    }
-  }
+  }) => _EpubTranslatorPaths.throwIfOutputPathTooLongForWindows(
+    outputFilePath,
+    longPathsEnabledReader: longPathsEnabledReader,
+  );
 
-  /// Classifies a pre-run exclusive-create probe failure: a real sharing/lock
-  /// violation (Windows osError 32/33) is reported as "locked" (close the
-  /// reader); anything else (e.g. ERROR_ACCESS_DENIED = 5 on a read-only
-  /// file, or a Unix EACCES/EROFS) is an access problem and must not be
-  /// misreported as "locked".
-  ///
-  /// Visible for testing.
   @visibleForTesting
   static String preRunProbeErrorMessage(
     FileSystemException error,
     AppStrings strings,
     String outputFilePath,
-  ) {
-    return EpubIsolateWorker.isFileLockError(error)
-        ? strings.outputFileLocked(outputFilePath)
-        : strings.outputFileNotWritable(outputFilePath);
-  }
+  ) => _EpubTranslatorPaths.preRunProbeErrorMessage(
+    error,
+    strings,
+    outputFilePath,
+  );
 
-  static bool _sameFilesystemPath(String left, String right) {
-    final String a = _normalizeInputPathForCache(left);
-    final String b = _normalizeInputPathForCache(right);
-    if (a.isEmpty || b.isEmpty) {
-      return false;
-    }
-    return a == b;
-  }
-
-  /// Canonical path used in fingerprints so Windows casing/separators match.
-  static String _normalizeInputPathForCache(String inputPath) {
-    final String trimmed = inputPath.trim();
-    if (trimmed.isEmpty) {
-      return trimmed;
-    }
-    String normalized = path.normalize(trimmed);
-    try {
-      normalized = path.normalize(File(trimmed).absolute.path);
-    } catch (_) {
-      // Keep the best-effort normalize above.
-    }
-    if (Platform.isWindows) {
-      return normalized.toLowerCase();
-    }
-    return normalized;
-  }
+  static String _normalizeInputPathForCache(String inputPath) =>
+      _EpubTranslatorPaths._normalizeInputPathForCache(inputPath);
 
   Future<String> _inputFingerprint(
     String inputPath, {
     String? expectedSourceFingerprint,
     required CancelToken cancelToken,
-  }) async {
-    // Read as a stream: context changes elsewhere in the book must invalidate
-    // block translations even when the file size and timestamp are unchanged.
-    final Digest contentHash = await cancellableFingerprint(
-      File(inputPath).openRead(),
-      cancelToken: cancelToken,
-      throwIfCancelled: _run.throwIfCancelled,
-    );
-    checkEpubSourceHash(contentHash.toString(), expectedSourceFingerprint);
-    final String normalizedPath = _normalizeInputPathForCache(inputPath);
-    return sha256
-        .convert(
-          utf8.encode(
-            <Object>[
-              _cacheSchemaVersion,
-              qualityCacheSchemaVersion,
-              normalizedPath,
-              contentHash.toString(),
-            ].join('|'),
-          ),
-        )
-        .toString();
-  }
+  }) => _EpubTranslatorPaths.inputFingerprint(
+    inputPath,
+    expectedSourceFingerprint: expectedSourceFingerprint,
+    cancelToken: cancelToken,
+    throwIfCancelled: _run.throwIfCancelled,
+  );
 
   String _jobKey({
     required String inputFingerprint,
     required TranslationConfig config,
     required List<InspectedChapter> chapters,
     TranslationStyleProfile? confirmedStyleProfile,
-  }) {
-    return sha256
-        .convert(
-          utf8.encode(
-            <Object>[
-              _cacheSchemaVersion,
-              qualityCacheSchemaVersion,
-              config.chunkSize,
-              inputFingerprint,
-              _apiClient.normalizedBaseUrl(config.apiBaseUrl),
-              config.model.trim(),
-              config.targetLanguage.trim(),
-              config.bilingual,
-              config.lockedGlossary.trim(),
-              config.residualQualityCheck,
-              if (config.effectiveReasoningEffort != null ||
-                  config.maxOutputTokens != 8192 ||
-                  config.semanticQualityCheck) ...[
-                config.effectiveReasoningEffort ?? 'provider-default',
-                config.maxOutputTokens,
-                config.semanticQualityCheck,
-              ],
-              if (config.semanticQualityCheck) ...[
-                config.maxSemanticReviewRequests,
-                config.maxSemanticReviewTokens,
-                config.semanticReviewScope.name,
-                "semantic-suggestions-v2",
-                config.autoApplyVerifiedCorrections,
-              ],
-              config.styleProfileEnabled,
-              _styleProfileCacheValue(confirmedStyleProfile),
-              chapters
-                  .map((InspectedChapter chapter) => chapter.path)
-                  .join('|'),
-            ].join('|'),
-          ),
-        )
-        .toString();
-  }
+  }) => _EpubTranslatorPaths.jobKey(
+    apiClient: _apiClient,
+    inputFingerprint: inputFingerprint,
+    config: config,
+    chapters: chapters,
+    confirmedStyleProfile: confirmedStyleProfile,
+  );
 
   String _blockCacheKey(
     TranslationConfig config,
@@ -5038,265 +3659,15 @@ class EpubChapterTranslator {
     required String inputFingerprint,
     String contextIdentity = '',
     TranslationStyleProfile? confirmedStyleProfile,
-  }) {
-    return sha256
-        .convert(
-          utf8.encode(
-            <Object>[
-              _cacheSchemaVersion,
-              qualityCacheSchemaVersion,
-              _apiClient.normalizedBaseUrl(config.apiBaseUrl),
-              config.model.trim(),
-              config.targetLanguage.trim(),
-              config.lockedGlossary.trim(),
-              config.chunkSize,
-              config.residualQualityCheck,
-              if (config.effectiveReasoningEffort != null ||
-                  config.maxOutputTokens != 8192 ||
-                  config.semanticQualityCheck) ...[
-                config.effectiveReasoningEffort ?? 'provider-default',
-                config.maxOutputTokens,
-                config.semanticQualityCheck,
-              ],
-              if (config.semanticQualityCheck) ...[
-                'semantic-suggestions-v2',
-                config.autoApplyVerifiedCorrections,
-                config.semanticReviewScope.name,
-              ],
-              config.styleProfileEnabled,
-              _styleProfileCacheValue(confirmedStyleProfile),
-              inputFingerprint,
-              chapterPath,
-              if (contextIdentity.isNotEmpty)
-                'selection-context-v1:$contextIdentity',
-              // Block ids are positional within a chapter (e.g. "p-3"), so
-              // two blocks with identical source HTML at different positions
-              // get different keys. Neighbor context feeds the prompt for
-              // each position, so sharing a key across positions would reuse
-              // a translation that was shaped by the wrong context. Old
-              // entries keyed without the id hash differently and are simply
-              // never hit again.
-              block.id,
-              block.sourceHtml,
-              // Earlier alias-marked footnotes were translated as prose.
-              // Invalidate only those cache entries, retaining ordinary text.
-              if (RegExp(
-                r'\b(?!epub:)[\w-]+:type\s*=',
-              ).hasMatch(block.sourceHtml))
-                'epub-type-alias-protection-v1',
-              // Old cell caches may contain model-owned layout or links.
-              // Invalidate just these blocks, retaining ordinary paid text.
-              if (block.tagName == 'td' || block.tagName == 'th')
-                'table-cell-structure-v2',
-              if (block.tagName == 'caption') 'table-caption-structure-v2',
-              if (RegExp(
-                r'<(?:pre|code|var|kbd|samp|svg|math|script|style)(?=[\s/>])',
-                caseSensitive: false,
-              ).hasMatch(block.sourceHtml))
-                'non-prose-text-v2',
-              if (block.isAuthorSignature) 'author-signature-v1',
-            ].join('|'),
-          ),
-        )
-        .toString();
-  }
-
-  static String _styleProfileCacheValue(
-    TranslationStyleProfile? confirmedStyleProfile,
-  ) {
-    if (confirmedStyleProfile == null) {
-      return 'none';
-    }
-    return jsonEncode(confirmedStyleProfile.toJson());
-  }
-
-  static InspectedChapter _prepareChapterForTarget(
-    InspectedChapter chapter, {
-    required String targetLanguage,
-  }) {
-    if (!_isCjkTargetLanguage(targetLanguage)) {
-      return chapter;
-    }
-    return chapter.copyWith(
-      blocks: chapter.blocks
-          .map(
-            (ExtractedBlock block) => block.copyWith(
-              sourceHtml: _prepareBlockHtmlForTarget(
-                sourceHtml: block.sourceHtml,
-                targetLanguage: targetLanguage,
-              ),
-            ),
-          )
-          .toList(growable: false),
-    );
-  }
-
-  static String _prepareBlockHtmlForTarget({
-    required String sourceHtml,
-    required String targetLanguage,
-  }) {
-    if (!_isCjkTargetLanguage(targetLanguage) ||
-        (!sourceHtml.toLowerCase().contains('dropcap') &&
-            !sourceHtml.toLowerCase().contains('small'))) {
-      return sourceHtml;
-    }
-    final dom.DocumentFragment fragment = XhtmlHtmlCompatibility.parseFragment(
-      sourceHtml,
-    );
-    bool changed = false;
-    final List<dom.Element> spans = fragment
-        .querySelectorAll('span[class]')
-        .toList(growable: false);
-    for (final dom.Element span in spans) {
-      if (_isInsideFootnoteMarkerAnchor(span) ||
-          const EpubHtmlExtractor().isInsideSkippedAncestor(span)) {
-        continue;
-      }
-      final bool isDropCap = span.classes.any(
-        (String className) => className.toLowerCase().startsWith('dropcap'),
-      );
-      final bool isUppercaseSmallCaps =
-          span.classes.any(_isSmallCapsClass) &&
-          _isUppercaseLatinRun(span.text);
-      if (!isDropCap && !isUppercaseSmallCaps) {
-        continue;
-      }
-      if (_spanHasSemanticAttributes(span)) {
-        span.classes.removeWhere(
-          (token) =>
-              token.toLowerCase().startsWith('dropcap') ||
-              _isSmallCapsClass(token),
-        );
-      } else {
-        _unwrapElement(span);
-      }
-      changed = true;
-    }
-    return changed ? fragment.outerHtml : sourceHtml;
-  }
-
-  static bool _isInsideFootnoteMarkerAnchor(dom.Element element) {
-    dom.Node? current = element;
-    while (current is dom.Element) {
-      if (EpubHtmlExtractor.tagLocalName(current) == 'a' &&
-          _containsFootnoteMarkerClass(current)) {
-        return true;
-      }
-      current = current.parentNode;
-    }
-    return false;
-  }
-
-  static bool _isCjkTargetLanguage(String targetLanguage) {
-    return const {
-      'zh',
-      'ja',
-      'ko',
-    }.contains(normalizeTargetLanguage(targetLanguage));
-  }
-
-  static void _validateNonemptyDoms(
-    _ResponseHtml sourceDom,
-    _ResponseHtml translatedDom,
-  ) {
-    try {
-      validateEpubDomXmlCharacters(translatedDom.fragment);
-    } on InvalidEpubXmlCharacterException catch (error) {
-      throw TranslationParseException(error.message);
-    }
-    bool hasBody(_ResponseHtml html) => html.slots.any(
-      (slot) => !slot.protected && slot.text.trim().isNotEmpty,
-    );
-    if (hasBody(sourceDom) && !hasBody(translatedDom)) {
-      throw const TranslationParseException(
-        'Translated block has empty body text for a nonempty source.',
-      );
-    }
-
-    // A-P1-1: reject a translation that carries no linguistic content for a
-    // long source (e.g. the API returned only punctuation for a full
-    // paragraph). Only obvious body loss is rejected: any translated word
-    // passes, so legitimate short translations (titles) and tiny
-    // translations in existing tests are unaffected.
-    if (_linguisticBodyLength(sourceDom) >= 200 &&
-        _linguisticBodyLength(translatedDom) == 0) {
-      throw const TranslationParseException(
-        'Translated block has no linguistic content for a long source.',
-      );
-    }
-  }
-
-  /// Matches every rune that is not a letter or number, used to measure how
-  /// much linguistic content a translated body actually carries.
-  static final RegExp _nonLinguisticChars = RegExp(
-    r'[^\p{L}\p{N}]',
-    unicode: true,
+  }) => _EpubTranslatorPaths.blockCacheKey(
+    _apiClient,
+    config,
+    block,
+    chapterPath: chapterPath,
+    inputFingerprint: inputFingerprint,
+    contextIdentity: contextIdentity,
+    confirmedStyleProfile: confirmedStyleProfile,
   );
-
-  /// Counts letters/digits across scripts in the non-protected slots,
-  /// ignoring whitespace and punctuation.
-  static int _linguisticBodyLength(_ResponseHtml html) {
-    var length = 0;
-    for (final slot in html.slots) {
-      if (slot.protected) continue;
-      length += slot.text.replaceAll(_nonLinguisticChars, '').runes.length;
-    }
-    return length;
-  }
-
-  /// Canonical language identity for local script and prompt rules.
-  static String normalizeTargetLanguage(String language) {
-    final String value = language.trim().toLowerCase();
-    final String base = value.split(RegExp('[-_]')).first;
-    if (base == 'zh' ||
-        value.contains('chinese') ||
-        RegExp('中文|汉语|漢語').hasMatch(value)) {
-      return 'zh';
-    }
-    if (base == 'ja' ||
-        value.contains('japanese') ||
-        RegExp('日语|日語|日本語').hasMatch(value)) {
-      return 'ja';
-    }
-    if (base == 'ko' ||
-        value.contains('korean') ||
-        RegExp('韩语|韓語|한국어').hasMatch(value)) {
-      return 'ko';
-    }
-    return base;
-  }
-
-  static bool _spanHasSemanticAttributes(dom.Element span) =>
-      span.attributes.keys.any((key) => key != 'class' && key != 'style');
-
-  static bool _isSmallCapsClass(String className) {
-    final String normalized = className.toLowerCase();
-    return normalized == 'small' ||
-        normalized == 'small-caps' ||
-        normalized == 'smallcaps';
-  }
-
-  static bool _isUppercaseLatinRun(String value) {
-    final String letters = value.replaceAll(RegExp('[^A-Za-z]'), '');
-    return letters.isNotEmpty && letters == letters.toUpperCase();
-  }
-
-  static void _unwrapElement(dom.Element element) {
-    final dom.Node? parent = element.parentNode;
-    if (parent == null) {
-      return;
-    }
-    final int index = parent.nodes.indexOf(element);
-    if (index < 0) {
-      return;
-    }
-    final List<dom.Node> children = element.nodes.toList(growable: false);
-    for (final dom.Node child in children) {
-      child.remove();
-    }
-    element.remove();
-    parent.nodes.insertAll(index, children);
-  }
 
   JobResumeState _resumeStateFromJob({
     required String jobKey,
@@ -5329,6 +3700,17 @@ class EpubChapterTranslator {
   /// Generous HTML-to-text size headroom when truncating a block's HTML
   /// before parsing it for the preview.
   static const int _previewHtmlHeadroomFactor = 8;
+
+  static Map<String, int> _countBlocksByChapter(Iterable<String> scopedKeys) {
+    final counts = <String, int>{};
+    for (final key in scopedKeys) {
+      final separator = key.indexOf('\u0000');
+      if (separator < 0) continue;
+      final chapterPath = key.substring(0, separator);
+      counts.update(chapterPath, (count) => count + 1, ifAbsent: () => 1);
+    }
+    return counts;
+  }
 
   String _previewBodyFromBlocks(
     List<ExtractedBlock> blocks, {
@@ -5417,177 +3799,6 @@ class MemorySnapshotCursor {
   int index = 0;
   Object? winner;
   int lastPosition = -1;
-}
-
-/// A response-local DOM. Clones and rebuilt skeletons stay in DOM form;
-/// serialization is deferred until the response leaves structure handling.
-class _ResponseHtml {
-  _ResponseHtml(this.fragment, [this.instrumentation]);
-
-  factory _ResponseHtml.parse(
-    String html, [
-    Map<String, int>? instrumentation,
-  ]) {
-    _responseCount(instrumentation, 'parses');
-    return _ResponseHtml(
-      XhtmlHtmlCompatibility.parseFragment(html),
-      instrumentation,
-    );
-  }
-
-  factory _ResponseHtml.fromRoot(
-    dom.Element root,
-    Map<String, int>? instrumentation,
-  ) => _ResponseHtml(dom.DocumentFragment()..append(root), instrumentation);
-
-  final dom.DocumentFragment fragment;
-  final Map<String, int>? instrumentation;
-  _ResponseNodeFacts? _facts;
-  List<_HtmlTextSlot>? _slots;
-
-  dom.Element? get root => EpubChapterTranslator._fragmentRoot(fragment);
-  String get html => root?.outerHtml ?? fragment.outerHtml.trim();
-  _ResponseNodeFacts get facts =>
-      _facts ??= _ResponseNodeFacts(fragment, instrumentation);
-  String get plainText => facts.fullText;
-  String textOf(dom.Element node) => facts.textOf(node);
-  bool isProtected(dom.Element node) => facts.isProtected(node);
-
-  List<_HtmlTextSlot> get slots => _slots ??= () {
-    final slots = <_HtmlTextSlot>[];
-    for (final node in fragment.nodes) {
-      EpubChapterTranslator._collectTextSlots(
-        node,
-        slots,
-        protected: false,
-        facts: facts,
-      );
-    }
-    return slots;
-  }();
-
-  // All text/structure mutations must invalidate before the next read.
-  void invalidate() {
-    _facts = null;
-    _slots = null;
-  }
-}
-
-void _responseCount(Map<String, int>? counts, String key) {
-  if (counts != null) counts[key] = (counts[key] ?? 0) + 1;
-}
-
-/// One linear text index per immutable DOM phase. Marker classification needs
-/// at most 12 non-whitespace characters, so summaries are capped at 13. This
-/// avoids concatenating every ancestor's entire descendant text in deep trees.
-class _ResponseNodeFacts {
-  _ResponseNodeFacts(dom.Node root, [this.instrumentation]) {
-    _index(root);
-    fullText = _buffer.toString();
-  }
-
-  final Map<String, int>? instrumentation;
-  final _buffer = StringBuffer();
-  final _ranges = Map<dom.Node, (int, int)>.identity();
-  final _compact = Map<dom.Node, String>.identity();
-  final _protected = Map<dom.Element, bool>.identity();
-  final _texts = <(int, int), String>{};
-  late final String fullText;
-
-  void _index(dom.Node node) {
-    _responseCount(instrumentation, 'indexedNodes');
-    final start = _buffer.length;
-    String compact = '';
-    if (node is dom.Text) {
-      _buffer.write(node.data);
-      compact = node.data.replaceAll(RegExp(r'\s+'), '');
-      if (compact.length > 13) compact = compact.substring(0, 13);
-    } else {
-      for (final child in node.nodes) {
-        _index(child);
-        if (compact.length < 13) {
-          compact += _compact[child]!;
-          if (compact.length > 13) compact = compact.substring(0, 13);
-        }
-      }
-    }
-    _ranges[node] = (start, _buffer.length);
-    _compact[node] = compact;
-  }
-
-  String textOf(dom.Node node) {
-    final range = _ranges[node]!;
-    return _texts.putIfAbsent(range, () {
-      _responseCount(instrumentation, 'textMaterializations');
-      return fullText.substring(range.$1, range.$2);
-    });
-  }
-
-  bool isProtected(dom.Element node) => _protected.putIfAbsent(node, () {
-    _responseCount(instrumentation, 'protectionChecks');
-    return EpubChapterTranslator._isProtectedTextElement(
-      node,
-      text: _compact[node]!,
-    );
-  });
-}
-
-/// Compare aligned subtree ranges in O(1) after one linear mismatch index.
-/// This also covers a lang attribute on every level of a nested reply. When
-/// rebuilding shifts text boundaries, fall back to cached exact text rather
-/// than using a probabilistic hash for a semantic alignment decision.
-class _ResponseTextAlignment {
-  _ResponseTextAlignment(this.reply, this.output) {
-    final length = min(reply.fullText.length, output.fullText.length);
-    var lastMismatch = -1;
-    _lastMismatch = List<int>.generate(length, (index) {
-      _responseCount(reply.instrumentation, 'alignmentCharacters');
-      if (reply.fullText.codeUnitAt(index) !=
-          output.fullText.codeUnitAt(index)) {
-        lastMismatch = index;
-      }
-      return lastMismatch;
-    });
-  }
-
-  final _ResponseNodeFacts reply;
-  final _ResponseNodeFacts output;
-  late final List<int> _lastMismatch;
-
-  bool matches(dom.Element replyNode, dom.Element outputNode) {
-    final a = reply._ranges[replyNode]!;
-    final b = output._ranges[outputNode]!;
-    if (a == b) {
-      return a.$1 == a.$2 || _lastMismatch[a.$2 - 1] < a.$1;
-    }
-    if (a.$2 - a.$1 != b.$2 - b.$1) return false;
-    return reply.textOf(replyNode) == output.textOf(outputNode);
-  }
-}
-
-class _NormalizedAnchorHtml {
-  const _NormalizedAnchorHtml({
-    this.root,
-    this.hasOverflow = false,
-    this.trustedOverflowTexts = const <dom.Text>[],
-  });
-
-  final dom.Element? root;
-  final bool hasOverflow;
-  final List<dom.Text> trustedOverflowTexts;
-}
-
-class _HtmlTextSlot {
-  const _HtmlTextSlot({required this.node, required this.protected});
-
-  final dom.Text node;
-  final bool protected;
-
-  String get text => node.data;
-
-  set text(String value) {
-    node.data = value;
-  }
 }
 
 class _TimedBatchResult {

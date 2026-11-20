@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/sse_stream_decoder.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -843,5 +846,225 @@ void main() {
         ),
       );
     });
+  });
+
+  group('SSE streaming and ModelCapabilityProfile', () {
+    test('dispatches all data lines in a single SSE event', () async {
+      final result = await decodeChatCompletionStream(
+        contentType: 'text/event-stream',
+        stream: Stream<Uint8List>.value(
+          Uint8List.fromList(
+            utf8.encode(
+              'data: {"choices": [\r\n'
+              ': comment within the event\r\n'
+              'data: {"delta": {"content": "translated"}}]}\r\n\r\n'
+              'data: [DONE]\r\n\r\n',
+            ),
+          ),
+        ),
+      );
+      expect(client.extractMessageContent(result), 'translated');
+    });
+
+    for (final contentType in ['application/json', 'text/event-stream']) {
+      test('cancels an idle $contentType response', () async {
+        final subscribed = Completer<void>();
+        final stream = StreamController<Uint8List>(
+          onListen: subscribed.complete,
+        );
+        addTearDown(stream.close);
+        final token = CancelToken();
+        final result = decodeChatCompletionStream(
+          stream: stream.stream,
+          contentType: contentType,
+          cancelToken: token,
+        );
+        final cancelled = expectLater(
+          result.timeout(const Duration(seconds: 1)),
+          throwsA(
+            isA<DioException>().having(
+              (error) => error.type,
+              'type',
+              DioExceptionType.cancel,
+            ),
+          ),
+        );
+        await subscribed.future;
+        token.cancel('test cancellation');
+        await cancelled;
+        expect(stream.hasListener, isFalse);
+      });
+    }
+
+    test('assembles SSE chunks including split UTF-8 bytes and usage', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final recordedRequests = <Map<String, dynamic>>[];
+      server.listen((request) async {
+        final rawBody = await utf8.decoder.bind(request).join();
+        recordedRequests.add(jsonDecode(rawBody) as Map<String, dynamic>);
+        request.response.headers.set(
+          HttpHeaders.contentTypeHeader,
+          'text/event-stream; charset=utf-8',
+        );
+        final chunk1 = utf8.encode(
+          ': keepalive\n\ndata: ${jsonEncode(<String, Object>{
+            'id': 'cmpl-1',
+            'model': 'deepseek-v4-flash',
+            'choices': <Object>[
+              <String, Object>{
+                'delta': <String, Object>{'role': 'assistant', 'reasoning_content': '思考中'},
+              },
+            ],
+          })}\n\n',
+        );
+        // Split a multibyte Chinese character "你" (3 UTF-8 bytes) across chunks.
+        final chunk2Full = utf8.encode(
+          'data: ${jsonEncode(<String, Object>{
+            'choices': <Object>[
+              <String, Object>{
+                'delta': <String, Object>{'content': '你好'},
+              },
+            ],
+          })}\n\n',
+        );
+        final splitAt = chunk2Full.length - 6;
+        final chunk2a = chunk2Full.sublist(0, splitAt);
+        final chunk2b = chunk2Full.sublist(splitAt);
+        final chunk3 = utf8.encode(
+          'data: ${jsonEncode(<String, Object>{
+            'choices': <Object>[
+              <String, Object>{
+                'finish_reason': 'stop',
+                'delta': <String, Object>{'content': '世界'},
+              },
+            ],
+            'usage': <String, Object>{'total_tokens': 42},
+          })}\n\ndata: [DONE]\n\n',
+        );
+        request.response.add(chunk1);
+        await request.response.flush();
+        request.response.add(chunk2a);
+        await request.response.flush();
+        request.response.add(chunk2b);
+        await request.response.flush();
+        request.response.add(chunk3);
+        await request.response.close();
+      });
+
+      final config = TranslationConfig.defaults().copyWith(
+        apiBaseUrl: 'http://127.0.0.1:${server.port}',
+        apiKey: 'sk-test',
+        useStreamingApi: true,
+      );
+      final dio = client.buildDio(config);
+      addTearDown(() => dio.close(force: true));
+
+      final deltas = <String>[];
+      final response = await client.postChatCompletionsStream(
+        dio: dio,
+        data: <String, dynamic>{
+          'model': config.model,
+          'messages': <Map<String, String>>[
+            <String, String>{'role': 'user', 'content': 'hello'},
+          ],
+          'max_tokens': 256,
+        },
+        onStreamDelta: deltas.add,
+      );
+
+      expect(recordedRequests.single['stream'], isTrue);
+      expect(deltas, ['你好', '世界']);
+      expect(client.extractMessageContent(response.data), '你好世界');
+      final choices = (response.data as Map)['choices'] as List;
+      expect((choices.first as Map)['finish_reason'], 'stop');
+      expect((choices.first as Map)['message']['reasoning_content'], '思考中');
+      expect((response.data as Map)['usage']['total_tokens'], 42);
+    });
+
+    test(
+      'falls back seamlessly when gateway returns buffered JSON or rejects stream',
+      () async {
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        int callCount = 0;
+        server.listen((request) async {
+          callCount++;
+          final body =
+              jsonDecode(await utf8.decoder.bind(request).join())
+                  as Map<String, dynamic>;
+          if (callCount == 1) {
+            // Gateway ignores stream: true and returns normal application/json.
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(
+              jsonEncode(<String, Object>{
+                'choices': <Object>[
+                  <String, Object>{
+                    'finish_reason': 'stop',
+                    'message': <String, Object>{'content': 'JSON回退成功'},
+                  },
+                ],
+              }),
+            );
+            await request.response.close();
+            return;
+          }
+          if (body['stream'] == true) {
+            request.response.statusCode = HttpStatus.badRequest;
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(
+              jsonEncode(<String, Object>{
+                'error': <String, Object>{
+                  'message': 'Unsupported parameter: stream',
+                },
+              }),
+            );
+            await request.response.close();
+            return;
+          }
+          request.response.headers.contentType = ContentType.json;
+          request.response.write(
+            jsonEncode(<String, Object>{
+              'choices': <Object>[
+                <String, Object>{
+                  'finish_reason': 'stop',
+                  'message': <String, Object>{'content': '非流式重试成功'},
+                },
+              ],
+            }),
+          );
+          await request.response.close();
+        });
+
+        final config = TranslationConfig.defaults().copyWith(
+          apiBaseUrl: 'http://127.0.0.1:${server.port}',
+          apiKey: 'sk-test',
+          useStreamingApi: true,
+        );
+        final dio = client.buildDio(config);
+        addTearDown(() => dio.close(force: true));
+
+        final first = await client.postChatCompletions(
+          dio: dio,
+          data: <String, dynamic>{
+            'model': 'm',
+            'messages': [],
+            'max_tokens': 64,
+          },
+        );
+        expect(client.extractMessageContent(first.data), 'JSON回退成功');
+
+        final second = await client.postChatCompletions(
+          dio: dio,
+          data: <String, dynamic>{
+            'model': 'm',
+            'messages': [],
+            'max_tokens': 64,
+          },
+        );
+        expect(client.extractMessageContent(second.data), '非流式重试成功');
+        expect(callCount, 3);
+      },
+    );
   });
 }

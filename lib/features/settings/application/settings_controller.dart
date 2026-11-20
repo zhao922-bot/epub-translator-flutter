@@ -1,148 +1,18 @@
 import 'dart:async';
 
-import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../translation/domain/models/api_provider_preset.dart';
 import '../../translation/domain/models/translation_config.dart';
 import '../../translation/domain/repositories/translation_repository.dart';
 import '../../translation/infrastructure/repositories/epub_translation_repository.dart';
-import '../../translation/infrastructure/epub/translation_api_client.dart';
-import '../../../shared/security/sensitive_text.dart';
-import 'connection_diagnostic.dart';
+import 'connection_test_controller.dart';
+import 'custom_endpoint_template.dart';
 import '../infrastructure/settings_store.dart';
 
-final settingsStoreProvider = Provider<SettingsStore>((ref) => SettingsStore());
+export 'connection_test_controller.dart';
 
-final settingsRepositoryProvider = Provider<TranslationRepository>(
-  (ref) => EpubTranslationRepository(),
-);
-
-final settingsProvider =
-    StateNotifierProvider<SettingsController, TranslationConfig>(
-      (ref) => SettingsController(
-        ref.watch(settingsStoreProvider),
-        onSaveError: (Object? error) {
-          final notifier = ref.read(settingsSaveErrorProvider.notifier);
-          if (error == null) {
-            // Successful persist: clear any previous failure notice.
-            notifier.state = null;
-            // A save that went through also resolves a pending write
-            // conflict (the snapshot is fresh again).
-            ref.read(settingsWriteConflictProvider.notifier).state = null;
-            return;
-          }
-          notifier.state = (
-            id: DateTime.now().microsecondsSinceEpoch,
-            // For a locked settings file the UI shows an actionable
-            // localized message; the record carries the file path for it.
-            message: error is SettingsFileLockedException
-                ? error.filePath
-                : '$error',
-            settingsFileLocked: error is SettingsFileLockedException,
-          );
-        },
-        onCorruptReset: (String? backupPath) =>
-            ref.read(settingsResetNoticeProvider.notifier).state = (
-              id: DateTime.now().microsecondsSinceEpoch,
-              backupPath: backupPath,
-            ),
-        onSecretKeyRotated: () =>
-            ref.read(secretKeyRotatedNoticeProvider.notifier).state = (
-              id: DateTime.now().microsecondsSinceEpoch,
-            ),
-        onSecretsRecovered: () =>
-            ref.read(secretKeyRotatedNoticeProvider.notifier).state = null,
-        onWriteConflict: () =>
-            ref.read(settingsWriteConflictProvider.notifier).state = (
-              id: DateTime.now().microsecondsSinceEpoch,
-            ),
-        onReplayBlocked: () =>
-            ref.read(settingsReplayBlockedProvider.notifier).state = (
-              id: DateTime.now().microsecondsSinceEpoch,
-            ),
-        onReplayProgressChanged: (value) =>
-            ref.read(settingsReplayInProgressProvider.notifier).state = value,
-      ),
-    );
-
-/// Holds the latest settings persistence failure event, if any.
-///
-/// Settings writes (secret store + settings.json) can fail after the UI
-/// already shows the new value; this surfaces the failure so the settings
-/// page can warn the user instead of failing silently.
-///
-/// Each failure is wrapped in a distinct event (unique id + message) instead
-/// of a plain string: Riverpod suppresses state updates that equal the current
-/// value, so two consecutive failures with identical text would otherwise only
-/// notify once and the second SnackBar would be swallowed.
-final settingsSaveErrorProvider =
-    StateProvider<({int id, String? message, bool settingsFileLocked})?>(
-      (ref) => null,
-    );
-
-/// Holds the latest cross-instance write-conflict event, if any.
-///
-/// Another app instance saved settings.json after this instance loaded it,
-/// so this instance's snapshot is stale and further saves keep conflicting.
-/// The settings page shows a notice with a "reload" action; reloading
-/// re-reads the file so the user can review the other instance's values and
-/// save again.
-///
-/// Same event-record pattern as [settingsSaveErrorProvider].
-final settingsWriteConflictProvider = StateProvider<({int id})?>((ref) => null);
-
-/// Holds the latest credential replay blocked by a changed service route.
-///
-/// The queued edit is retained until the user explicitly confirms the new
-/// target or discards it. Uses the event-record pattern so repeated blocked
-/// replay attempts can each notify the UI.
-final settingsReplayBlockedProvider = StateProvider<({int id})?>((ref) => null);
-final settingsReplayInProgressProvider = StateProvider<bool>((ref) => false);
-
-/// Holds the latest "settings.json was unreadable/corrupt, defaults were
-/// restored" event, if any.
-///
-/// A corrupt (or transiently locked, on Windows) settings file used to reset
-/// a dozen user settings with only a log line to show for it. This surfaces
-/// the reset — and the backup location — so the UI can warn the user.
-///
-/// Same event-record pattern as [settingsSaveErrorProvider]: Riverpod
-/// suppresses state updates that equal the current value, so a plain string
-/// could swallow a second reset notice.
-final settingsResetNoticeProvider =
-    StateProvider<({int id, String? backupPath})?>((ref) => null);
-
-/// Holds the "Android KeyStore key was invalidated and regenerated" event,
-/// if any. The stored secrets are unrecoverable then, so the settings page
-/// shows a warning banner telling the user to re-enter their API keys.
-///
-/// Same event-record pattern as [settingsSaveErrorProvider].
-final secretKeyRotatedNoticeProvider = StateProvider<({int id})?>(
-  (ref) => null,
-);
-
-final settingsLoadedProvider = FutureProvider<void>((ref) async {
-  await ref.watch(settingsProvider.notifier).ready;
-});
-
-final connectionTestProvider =
-    StateNotifierProvider<ConnectionTestController, AsyncValue<String?>>((ref) {
-      final controller = ConnectionTestController(
-        ref.watch(settingsRepositoryProvider),
-      );
-      ref.listen<TranslationConfig>(settingsProvider, (previous, next) {
-        if (previous == null ||
-            previous.apiBaseUrl != next.apiBaseUrl ||
-            previous.apiKey != next.apiKey ||
-            previous.model != next.model ||
-            previous.httpProxy != next.httpProxy ||
-            previous.targetLanguage != next.targetLanguage) {
-          controller.clear();
-        }
-      });
-      return controller;
-    });
+part 'settings_providers.dart';
 
 /// An edit whose save failed with [SettingsWriteConflict], kept as a pure
 /// transformation so [SettingsController.reloadSettings] can re-apply it
@@ -215,6 +85,9 @@ Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
     changed.add('lockedGlossary');
   }
   if (before.httpProxy != after.httpProxy) changed.add('httpProxy');
+  if (before.useStreamingApi != after.useStreamingApi) {
+    changed.add('useStreamingApi');
+  }
   if (before.reasoningEffort != after.reasoningEffort) {
     changed.add('reasoningEffort');
   }
@@ -1108,6 +981,30 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     });
   }
 
+  Future<bool> applyCustomEndpointTemplate(
+    CustomEndpointTemplate template, {
+    TranslationConfig? approvedCredentialConfig,
+  }) => _update((config) {
+    if (config.apiProviderSelection != ApiProviderSelection.custom) {
+      return config;
+    }
+    // Recovery and conflict replay may have loaded a different key or URL
+    // after the user approved the previous combination.
+    if (config.apiKey.isNotEmpty &&
+        template.changesOrigin(config.apiBaseUrl) &&
+        (config.apiKey != approvedCredentialConfig?.apiKey ||
+            config.apiBaseUrl != approvedCredentialConfig?.apiBaseUrl)) {
+      return config;
+    }
+    providerSelectionRevision++;
+    return config.copyWith(
+      apiBaseUrl: template.baseUrl,
+      customApiBaseUrl: template.baseUrl,
+      model: template.model,
+      customModel: template.model,
+    );
+  });
+
   Future<bool> setApiKey(String value) => _update(
     (config) {
       final String nextKey = value.trim();
@@ -1134,6 +1031,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       customModel: nextModel,
     );
   });
+
+  Future<void> setUseStreamingApi(bool value) =>
+      _update((config) => config.copyWith(useStreamingApi: value));
 
   Future<void> setUiLanguage(UiLanguage value) =>
       _update((config) => config.copyWith(uiLanguage: value));
@@ -1238,69 +1138,6 @@ class SettingsController extends StateNotifier<TranslationConfig> {
   @override
   void dispose() {
     unawaited(flushSliderChanges());
-    super.dispose();
-  }
-}
-
-class ConnectionTestController extends StateNotifier<AsyncValue<String?>> {
-  ConnectionTestController(this._repository)
-    : super(const AsyncData<String?>(null));
-
-  final TranslationRepository _repository;
-  int _revision = 0;
-  CancelToken? _probeCancelToken;
-
-  Future<void> run(TranslationConfig config) async {
-    if (!mounted) {
-      return;
-    }
-    final revision = ++_revision;
-    _probeCancelToken?.cancel();
-    final token = _probeCancelToken = CancelToken();
-    state = const AsyncLoading<String?>();
-    try {
-      final String result = await TranslationApiClient.runWithProbeCancelToken(
-        token,
-        () => _repository.testConnection(config: config),
-      );
-      if (!mounted || revision != _revision) {
-        return;
-      }
-      // P1-#5: a successful probe response can echo the request, including
-      // the current API key — redact it like the error path does, so the
-      // displayed result can never leak the key via screenshot or copy.
-      state = AsyncData<String?>(
-        SensitiveText.redact(result, configuredApiKey: config.apiKey),
-      );
-    } catch (error, stackTrace) {
-      if (!mounted || revision != _revision) {
-        return;
-      }
-      final ConnectionDiagnostic diagnostic = ConnectionDiagnostic.fromError(
-        error,
-        config: config,
-      );
-      state = AsyncError<String?>(diagnostic.message, stackTrace);
-    } finally {
-      if (identical(_probeCancelToken, token)) _probeCancelToken = null;
-    }
-  }
-
-  void clear() {
-    if (!mounted) {
-      return;
-    }
-    _revision++;
-    _probeCancelToken?.cancel();
-    _probeCancelToken = null;
-    state = const AsyncData<String?>(null);
-  }
-
-  @override
-  void dispose() {
-    _revision++;
-    _probeCancelToken?.cancel();
-    _probeCancelToken = null;
     super.dispose();
   }
 }

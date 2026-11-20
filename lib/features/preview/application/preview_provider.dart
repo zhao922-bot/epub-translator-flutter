@@ -18,6 +18,18 @@ final previewRecoveryProvider = FutureProvider<void>((ref) async {
 
 final previewSelectedIndexProvider = StateProvider<int>((ref) => 0);
 
+final previewSelectionProvider = Provider<({int index, int safeIndex})>((ref) {
+  final index = ref.watch(previewSelectedIndexProvider);
+  final hasBook = ref.watch(
+    translationDashboardProvider.select((s) => s.inspectedChapters.isNotEmpty),
+  );
+  final count = ref.watch(
+    previewChaptersProvider.select((list) => list.length),
+  );
+  final safeIndex = !hasBook || count == 0 ? 0 : index.clamp(0, count - 1);
+  return (index: index, safeIndex: safeIndex);
+});
+
 final previewChaptersProvider = Provider<List<PreviewChapter>>((ref) {
   // Only the inspected chapters matter here; a plain watch of the whole
   // dashboard state would rebuild the preview on every log tick.

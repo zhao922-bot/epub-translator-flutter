@@ -74,6 +74,46 @@ void main() {
     await tester.pump();
   });
 
+  testWidgets('cancelling a pending native probe prevents fallback', (
+    tester,
+  ) async {
+    final probe = Completer<bool?>();
+    var started = false;
+    final check = WindowsElevationCheck(
+      probe: () => probe.future,
+      start: () async {
+        started = true;
+        return _ProbeProcess();
+      },
+      parseOutput: NativePlatformBridge.parseWindowsElevationResult,
+    );
+    check.cancel();
+    probe.complete(null);
+    await tester.pump();
+    expect(await check.result, isFalse);
+    expect(started, isFalse);
+  });
+
+  testWidgets('cancelling native fallback releases its process and timer', (
+    tester,
+  ) async {
+    final process = _ProbeProcess();
+    final check = WindowsElevationCheck(
+      probe: () async => null,
+      start: () async => process,
+      parseOutput: NativePlatformBridge.parseWindowsElevationResult,
+    );
+    await tester.pump();
+    expect(process.output.hasListener, isTrue);
+    check.cancel();
+    expect(await check.result, isFalse);
+    expect(process.killed, isTrue);
+    expect(process.output.hasListener, isFalse);
+    expect(process.errors.hasListener, isFalse);
+    process.finish('True');
+    await tester.pump();
+  });
+
   testWidgets('nonzero exit never caches a successful-looking stdout', (
     tester,
   ) async {

@@ -741,7 +741,7 @@ class _EpubSemanticReviewer {
       ];
       final outputCap = config.maxOutputTokens.clamp(512, 32768);
       final outputTokens = max(
-        config.isGlm53 || config.effectiveReasoningEffort != null ? 4096 : 1024,
+        config.capabilities.needsReasoningHeadroom ? 4096 : 1024,
         blocks.fold<int>(
               0,
               (n, b) => n + utf8.encode(translations[b.id]!).length,

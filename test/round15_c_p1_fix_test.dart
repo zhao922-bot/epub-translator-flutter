@@ -11,6 +11,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'helpers/memory_session_path_store.dart';
+
 class _ReplayStore extends SettingsStore {
   TranslationConfig persisted = TranslationConfig.defaults().copyWith(
     uiLanguage: UiLanguage.english,
@@ -213,6 +215,7 @@ void main() {
       final container = ProviderContainer(
         overrides: [
           settingsStoreProvider.overrideWithValue(store),
+          sessionPathStoreProvider.overrideWithValue(MemorySessionPathStore()),
           jobHistoryStoreProvider.overrideWithValue(_History()),
         ],
       );

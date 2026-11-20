@@ -5,16 +5,40 @@ import '../../../../shared/localization/app_strings.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../application/preview_provider.dart';
+import '../widgets/chapter_block_dialog.dart';
 import '../widgets/chapter_checklist.dart';
 import '../widgets/chapter_preview_content.dart';
 
-class PreviewPage extends ConsumerWidget {
+class PreviewPage extends ConsumerStatefulWidget {
   const PreviewPage({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<PreviewPage> createState() => _PreviewPageState();
+}
+
+class _PreviewPageState extends ConsumerState<PreviewPage> {
+  @override
+  void initState() {
+    super.initState();
+    ref.listenManual(previewSelectionProvider, (_, selection) {
+      if (selection.index == selection.safeIndex) return;
+      // Route entry can notify during widget mounting. Recheck after mounting
+      // so an intervening chapter update or selection wins.
+      Future.microtask(() {
+        if (!mounted) return;
+        final current = ref.read(previewSelectionProvider);
+        if (current.index != current.safeIndex) {
+          ref.read(previewSelectedIndexProvider.notifier).state =
+              current.safeIndex;
+        }
+      });
+    }, fireImmediately: true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final chapters = ref.watch(previewChaptersProvider);
-    final index = ref.watch(previewSelectedIndexProvider);
+    final selection = ref.watch(previewSelectionProvider);
     // The preview only needs the inspected chapters (for the excerpt) and
     // the run-active flag (to disable the checklist); watching the whole
     // dashboard state would rebuild this page on every log tick.
@@ -33,15 +57,7 @@ class PreviewPage extends ConsumerWidget {
     // projecting empty excerpts / "no translation yet".
     final recovery = ref.watch(previewRecoveryProvider);
     final empty = previewState.inspectedChapters.isEmpty || chapters.isEmpty;
-    final safeIndex = empty ? 0 : index.clamp(0, chapters.length - 1);
-    if (safeIndex != index) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (context.mounted &&
-            ref.read(previewSelectedIndexProvider) == index) {
-          ref.read(previewSelectedIndexProvider.notifier).state = safeIndex;
-        }
-      });
-    }
+    final safeIndex = selection.safeIndex;
     return PageScaffold(
       title: strings.previewTitle,
       subtitle: strings.previewSubtitle,
@@ -87,6 +103,10 @@ class PreviewPage extends ConsumerWidget {
                   child: LayoutBuilder(
                     builder: (context, constraints) {
                       final selected = chapters[safeIndex];
+                      final inspected =
+                          safeIndex < previewState.inspectedChapters.length
+                          ? previewState.inspectedChapters[safeIndex]
+                          : null;
                       final textScale = MediaQuery.textScalerOf(
                         context,
                       ).scale(1);
@@ -116,6 +136,20 @@ class PreviewPage extends ConsumerWidget {
                           chapter: selected,
                           strings: strings,
                           parallel: parallel,
+                          onBrowseBlocks:
+                              selected.hasTruncatedExcerpt &&
+                                  inspected != null &&
+                                  inspected.path == selected.path &&
+                                  inspected.blocks.isNotEmpty
+                              ? (query) => showDialog<void>(
+                                  context: context,
+                                  builder: (_) => ChapterBlockDialog(
+                                    chapter: inspected,
+                                    strings: strings,
+                                    initialQuery: query,
+                                  ),
+                                )
+                              : null,
                         ),
                       );
                       if (wide) {
