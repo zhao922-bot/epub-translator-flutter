@@ -57,6 +57,8 @@ part 'epub_semantic_reviewer.dart';
 part 'epub_semantic_grounding.dart';
 part 'epub_response_dom_locker.dart';
 part 'epub_translator_paths.dart';
+part 'epub_token_saving_strategy.dart';
+part 'epub_chapter_memory_batch.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
 ///
@@ -151,6 +153,13 @@ class EpubChapterTranslator {
   final TranslationCacheStore _cacheStore;
   final EpubRepacker _repacker;
   final TranslationApiClient _apiClient;
+  _AdaptiveBodyBudget? _adaptiveBodyBudget;
+  _AdaptiveBodyBudget _bodyBudget(TranslationConfig config) {
+    final current = _adaptiveBodyBudget;
+    if (current != null && identical(current.config, config)) return current;
+    return _adaptiveBodyBudget = _AdaptiveBodyBudget(config);
+  }
+
   final TranslationBatchPlanner _batchPlanner;
   final FootnoteBatchPlanner _footnoteBatchPlanner;
   late final _EpubBookMemory _memory = _EpubBookMemory(this);
@@ -1310,7 +1319,10 @@ class EpubChapterTranslator {
         emit(currentJob, s.runLogCheckpointUnreadable);
       }
 
-      _run.sourceHints = BookSourceIndex.build(selectedChapters);
+      _run.sourceHints = BookSourceIndex.build(
+        selectedChapters,
+        trackMemorySignals: config.tokenSavingMode,
+      );
       if (config.semanticQualityCheck) {
         for (final chapter in selectedChapters) {
           final seen = <String>{};
@@ -1345,6 +1357,152 @@ class EpubChapterTranslator {
       );
       throwIfCancelled();
 
+      _BookMemory? bookMemory = userStyleProfile == null
+          ? null
+          : _BookMemory.empty.copyWith(
+              styleProfile: userStyleProfile,
+              styleProfileConfirmed: true,
+            );
+      bool initialBookMemoryAttempted = false;
+      _BookMemory? initialMemoryForRun = restoredMemory?.initialMemory;
+      final chapterMemoryBatch = _ChapterMemoryBatch(
+        config.tokenSavingMode
+            ? restoredMemory?.pendingChapters ?? const []
+            : const [],
+      );
+      final memoryChapters = <String>{
+        ...?restoredMemory?.completedChapterPaths,
+      };
+      // Positional memory history for retranslated chapters: each entry is
+      // the rolling memory right after its chapter's update, in book order.
+      // A chapter that is (re)translated later receives the newest entry
+      // before its own position, never memory already containing later
+      // chapters' summaries and terms.
+      final List<({String path, _BookMemory memory})> memoryTimeline = [
+        ...?restoredMemory?.timeline,
+      ];
+      // 性能-#52: incremental write cursor for [recordMemoryTimeline].
+      // Entries are append-only with strictly increasing positions (a
+      // re-recorded earlier chapter is dropped, never rewritten), so the
+      // write side only needs the high-water mark instead of rescanning
+      // the whole timeline per chapter (O(n^2) total for a book).
+      int maxRecordedTimelinePosition = -1;
+      for (final entry in memoryTimeline) {
+        final int? restoredPosition = selectedPositionByPath[entry.path];
+        if (restoredPosition != null &&
+            restoredPosition > maxRecordedTimelinePosition) {
+          maxRecordedTimelinePosition = restoredPosition;
+        }
+      }
+      if (restoredMemory != null) {
+        bookMemory = restoredMemory.memory;
+        initialBookMemoryAttempted = true;
+        AppLogger.info(
+          'Restored book memory; skipping initial API generation.',
+          tag: 'book-memory',
+        );
+      }
+
+      /// Rolling-memory snapshot for [chapter]'s own time position: the
+      /// newest timeline entry strictly before the chapter in book order.
+      ///
+      /// 性能-#38: chapters are translated in book order and the timeline
+      /// only appends entries with strictly increasing positions, so the
+      /// selection cursor only moves forward — each timeline entry is
+      /// examined once per run instead of once per chapter (O(n) total,
+      /// not O(n^2)). A non-monotonic call resyncs via a fresh scan.
+      ///
+      /// P2-#16: when no earlier entry exists, the live memory is used as
+      /// the fallback only for a fresh run (or a restore that never
+      /// recorded a chapter, where the live memory is still the initial
+      /// memory). After a checkpoint restore with a non-empty timeline the
+      /// live rolling memory may already contain later chapters, so a
+      /// chapter with no earlier entry receives no memory rather than
+      /// leaking future content (positional snapshot isolation).
+      final MemorySnapshotCursor snapshotCursorState =
+          EpubChapterTranslator.memorySnapshotCursorForTest();
+
+      final snapshots = Expando<Map<String, Object?>>();
+      Map<String, Object?> serializeSnapshot(_BookMemory memory) =>
+          snapshots[memory] ??= memory.toJson();
+
+      Map<String, Object?>? snapshotFallback() {
+        final initial = initialMemoryForRun;
+        if (config.tokenSavingMode && initial != null) {
+          return serializeSnapshot(initial);
+        }
+        return EpubChapterTranslator.memorySnapshotFallbackForTest(
+          hasRestoredMemory: restoredMemory != null,
+          timelineIsEmpty: memoryTimeline.isEmpty,
+          liveMemory: bookMemory?.toJson(),
+        );
+      }
+
+      Map<String, Object?>? bookMemorySnapshotFor(InspectedChapter chapter) {
+        return EpubChapterTranslator.selectMemorySnapshotForTest(
+          timeline: memoryTimeline,
+          positionByPath: selectedPositionByPath,
+          chapterPath: chapter.path,
+          cursor: snapshotCursorState,
+          serialize: (Object memory) => config.tokenSavingMode
+              ? serializeSnapshot(memory as _BookMemory)
+              : (memory as _BookMemory).toJson(),
+          fallback: snapshotFallback,
+        );
+      }
+
+      final contextIds = Expando<String>();
+      String cacheContextForChapter(InspectedChapter chapter) {
+        if (!config.tokenSavingMode) return contextIdentity;
+        final snapshot = bookMemorySnapshotFor(chapter);
+        if (snapshot == null) return '$contextIdentity:unavailable';
+        return contextIds[snapshot] ??=
+            '$contextIdentity:${sha256.convert(utf8.encode(jsonEncode(snapshot)))}';
+      }
+
+      /// Records a chapter's post-update memory in the positional timeline.
+      /// Only forward progress extends the timeline: re-updating an earlier
+      /// chapter must not rewrite history that later chapters already rely
+      /// on for their own snapshots.
+      void recordMemoryTimeline(String chapterPath, _BookMemory memory) {
+        final int? position = selectedPositionByPath[chapterPath];
+        // 性能-#52: incremental cursor — only forward progress extends the
+        // timeline. Anything at or behind the high-water mark is a
+        // re-recorded earlier chapter and must not rewrite history that
+        // later chapters already rely on for their own snapshots.
+        if (!EpubChapterTranslator.shouldRecordMemoryTimelineEntryForTest(
+          position: position,
+          maxRecordedPosition: maxRecordedTimelinePosition,
+        )) {
+          return;
+        }
+        memoryTimeline.add((path: chapterPath, memory: memory));
+        maxRecordedTimelinePosition = position!;
+      }
+
+      Future<void> persistBookMemory() async {
+        final memory = bookMemory;
+        if (memory == null) return;
+        bookMemory = memory.withLockedGlossary(config.lockedGlossary);
+        if (config.tokenSavingMode) initialMemoryForRun ??= bookMemory;
+        try {
+          await memoryCheckpoint.save(
+            bookMemory!,
+            completedChapterPaths: memoryChapters,
+            timeline: memoryTimeline,
+            initialMemory: config.tokenSavingMode ? initialMemoryForRun : null,
+            pendingChapters: config.tokenSavingMode
+                ? chapterMemoryBatch.chapters
+                : const [],
+          );
+        } catch (error) {
+          AppLogger.warn(
+            'Book memory checkpoint save failed (${error.runtimeType}).',
+            tag: 'book-memory',
+          );
+        }
+      }
+
       final CacheRestorationResult restoration =
           await CacheRestorationScanner(
             readTranslation: _cacheStore.getBlockTranslation,
@@ -1375,7 +1533,7 @@ class EpubChapterTranslator {
                   block,
                   chapterPath: chapter.path,
                   inputFingerprint: inputFingerprint,
-                  contextIdentity: contextIdentity,
+                  contextIdentity: cacheContextForChapter(chapter),
                   confirmedStyleProfile: userStyleProfile,
                 ),
             throwIfCancelled: throwIfCancelled,
@@ -1440,122 +1598,6 @@ class EpubChapterTranslator {
             for (final InspectedChapter chapter in chapters)
               chapter.path: chapter,
           };
-
-      _BookMemory? bookMemory = userStyleProfile == null
-          ? null
-          : _BookMemory.empty.copyWith(
-              styleProfile: userStyleProfile,
-              styleProfileConfirmed: true,
-            );
-      bool initialBookMemoryAttempted = false;
-      final memoryChapters = <String>{
-        ...?restoredMemory?.completedChapterPaths,
-      };
-      // Positional memory history for retranslated chapters: each entry is
-      // the rolling memory right after its chapter's update, in book order.
-      // A chapter that is (re)translated later receives the newest entry
-      // before its own position, never memory already containing later
-      // chapters' summaries and terms.
-      final List<({String path, _BookMemory memory})> memoryTimeline = [
-        ...?restoredMemory?.timeline,
-      ];
-      // 性能-#52: incremental write cursor for [recordMemoryTimeline].
-      // Entries are append-only with strictly increasing positions (a
-      // re-recorded earlier chapter is dropped, never rewritten), so the
-      // write side only needs the high-water mark instead of rescanning
-      // the whole timeline per chapter (O(n^2) total for a book).
-      int maxRecordedTimelinePosition = -1;
-      for (final entry in memoryTimeline) {
-        final int? restoredPosition = selectedPositionByPath[entry.path];
-        if (restoredPosition != null &&
-            restoredPosition > maxRecordedTimelinePosition) {
-          maxRecordedTimelinePosition = restoredPosition;
-        }
-      }
-      if (restoredMemory != null) {
-        bookMemory = restoredMemory.memory;
-        initialBookMemoryAttempted = true;
-        AppLogger.info(
-          'Restored book memory; skipping initial API generation.',
-          tag: 'book-memory',
-        );
-      }
-
-      /// Rolling-memory snapshot for [chapter]'s own time position: the
-      /// newest timeline entry strictly before the chapter in book order.
-      ///
-      /// 性能-#38: chapters are translated in book order and the timeline
-      /// only appends entries with strictly increasing positions, so the
-      /// selection cursor only moves forward — each timeline entry is
-      /// examined once per run instead of once per chapter (O(n) total,
-      /// not O(n^2)). A non-monotonic call resyncs via a fresh scan.
-      ///
-      /// P2-#16: when no earlier entry exists, the live memory is used as
-      /// the fallback only for a fresh run (or a restore that never
-      /// recorded a chapter, where the live memory is still the initial
-      /// memory). After a checkpoint restore with a non-empty timeline the
-      /// live rolling memory may already contain later chapters, so a
-      /// chapter with no earlier entry receives no memory rather than
-      /// leaking future content (positional snapshot isolation).
-      final MemorySnapshotCursor snapshotCursorState =
-          EpubChapterTranslator.memorySnapshotCursorForTest();
-
-      Map<String, Object?>? snapshotFallback() {
-        return EpubChapterTranslator.memorySnapshotFallbackForTest(
-          hasRestoredMemory: restoredMemory != null,
-          timelineIsEmpty: memoryTimeline.isEmpty,
-          liveMemory: bookMemory?.toJson(),
-        );
-      }
-
-      Map<String, Object?>? bookMemorySnapshotFor(InspectedChapter chapter) {
-        return EpubChapterTranslator.selectMemorySnapshotForTest(
-          timeline: memoryTimeline,
-          positionByPath: selectedPositionByPath,
-          chapterPath: chapter.path,
-          cursor: snapshotCursorState,
-          serialize: (Object memory) => (memory as _BookMemory).toJson(),
-          fallback: snapshotFallback,
-        );
-      }
-
-      /// Records a chapter's post-update memory in the positional timeline.
-      /// Only forward progress extends the timeline: re-updating an earlier
-      /// chapter must not rewrite history that later chapters already rely
-      /// on for their own snapshots.
-      void recordMemoryTimeline(String chapterPath, _BookMemory memory) {
-        final int? position = selectedPositionByPath[chapterPath];
-        // 性能-#52: incremental cursor — only forward progress extends the
-        // timeline. Anything at or behind the high-water mark is a
-        // re-recorded earlier chapter and must not rewrite history that
-        // later chapters already rely on for their own snapshots.
-        if (!EpubChapterTranslator.shouldRecordMemoryTimelineEntryForTest(
-          position: position,
-          maxRecordedPosition: maxRecordedTimelinePosition,
-        )) {
-          return;
-        }
-        memoryTimeline.add((path: chapterPath, memory: memory));
-        maxRecordedTimelinePosition = position!;
-      }
-
-      Future<void> persistBookMemory() async {
-        final memory = bookMemory;
-        if (memory == null) return;
-        bookMemory = memory.withLockedGlossary(config.lockedGlossary);
-        try {
-          await memoryCheckpoint.save(
-            bookMemory!,
-            completedChapterPaths: memoryChapters,
-            timeline: memoryTimeline,
-          );
-        } catch (error) {
-          AppLogger.warn(
-            'Book memory checkpoint save failed (${error.runtimeType}).',
-            tag: 'book-memory',
-          );
-        }
-      }
 
       if (userStyleProfile != null && !userStyleProfile.isEmpty) {
         emit(
@@ -1673,6 +1715,10 @@ class EpubChapterTranslator {
                 _linePreview(_safeErrorText(error, config)),
               ),
             );
+          }
+          if (config.tokenSavingMode && initialMemoryForRun == null) {
+            bookMemory ??= _BookMemory.empty;
+            await persistBookMemory();
           }
         }
       }
@@ -1838,7 +1884,7 @@ class EpubChapterTranslator {
                   reference.block,
                   chapterPath: reference.chapter.path,
                   inputFingerprint: inputFingerprint,
-                  contextIdentity: contextIdentity,
+                  contextIdentity: cacheContextForChapter(reference.chapter),
                   confirmedStyleProfile: userStyleProfile,
                 ),
                 translated,
@@ -1907,7 +1953,9 @@ class EpubChapterTranslator {
                         reference.block,
                         chapterPath: reference.chapter.path,
                         inputFingerprint: inputFingerprint,
-                        contextIdentity: contextIdentity,
+                        contextIdentity: cacheContextForChapter(
+                          reference.chapter,
+                        ),
                         confirmedStyleProfile: userStyleProfile,
                       ),
                       html,
@@ -2131,9 +2179,13 @@ class EpubChapterTranslator {
           throwIfCancelled();
         }
 
+        final String chapterCacheContext = cacheContextForChapter(chapter);
+        final int chunkSize = config.tokenSavingMode
+            ? _bodyBudget(config).plannedChunkSize
+            : config.chunkSize;
         final List<TranslationBlockBatch> batches = _batchPlanner.plan(
           pendingBlocks: pendingBlocks,
-          chunkSize: config.chunkSize,
+          chunkSize: chunkSize,
           chapterBlocks: chapter.blocks,
           chapterTitle: chapter.title,
           // Positional snapshot: a retranslated earlier chapter must not
@@ -2171,7 +2223,7 @@ class EpubChapterTranslator {
                     block,
                     chapterPath: chapter.path,
                     inputFingerprint: inputFingerprint,
-                    contextIdentity: contextIdentity,
+                    contextIdentity: chapterCacheContext,
                     confirmedStyleProfile: userStyleProfile,
                   ),
                   html,
@@ -2206,7 +2258,7 @@ class EpubChapterTranslator {
                         batch.blocks[index],
                         chapterPath: chapter.path,
                         inputFingerprint: inputFingerprint,
-                        contextIdentity: contextIdentity,
+                        contextIdentity: chapterCacheContext,
                         confirmedStyleProfile: userStyleProfile,
                       ),
                       translated[index],
@@ -2346,7 +2398,70 @@ class EpubChapterTranslator {
         throwIfCancelled();
         final bool futurePendingBlocks = restoration
             .hasPendingBlocksFromChapter(chapterIndex + 1);
-        if (futurePendingBlocks) {
+        if (config.tokenSavingMode && futurePendingBlocks) {
+          await ensureInitialBookMemory();
+          final int lastPending =
+              selectedPositionByPath[chapterMemoryBatch.lastPath] ?? -1;
+          if (chapterIndex > maxRecordedTimelinePosition &&
+              chapterIndex > lastPending &&
+              !memoryChapters.contains(chapter.path)) {
+            final memory = bookMemory ?? _BookMemory.empty;
+            final sample = _memory.chapterMemorySample(
+              chapter: updatedByPath[chapter.path]!,
+              currentMemory: memory,
+              degradedBlockIds: _degradedBlocks,
+            );
+            if (sample != null) chapterMemoryBatch.add(sample);
+            final samples = chapterMemoryBatch.chapters;
+            final bool footnotesNext =
+                chapterIndex + 1 < selectedChapters.length &&
+                isFootnoteChapter(chapterIndex + 1);
+            final bool lastTranslationNext =
+                memoryTimeline.isEmpty &&
+                !restoration.hasPendingBlocksFromChapter(chapterIndex + 2);
+            if (samples.isNotEmpty &&
+                (chapterMemoryBatch.shouldUpdate ||
+                    footnotesNext ||
+                    lastTranslationNext)) {
+              final clock = Stopwatch()..start();
+              try {
+                bookMemory = await trackMemoryRequests(
+                  () => _memory.updateBookMemoryBatch(
+                    dio: dio,
+                    config: config,
+                    currentMemory: memory,
+                    chapters: samples,
+                    cancelToken: cancelToken,
+                  ),
+                );
+                throwIfCancelled();
+                memoryChapters.addAll(samples.map((sample) => sample.path));
+                bookMemory = bookMemory!.withLockedGlossary(
+                  config.lockedGlossary,
+                );
+                recordMemoryTimeline(chapter.path, bookMemory!);
+                emit(
+                  chapterDoneJob,
+                  s.runLogBookMemoryUpdated(
+                    chapter.title,
+                    _formatDuration(clock.elapsed),
+                  ),
+                );
+              } catch (error) {
+                throwIfCancelled();
+                emit(
+                  chapterDoneJob,
+                  s.runLogBookMemoryChapterSkipped(
+                    chapter.title,
+                    _linePreview(_safeErrorText(error, config)),
+                  ),
+                );
+              }
+              chapterMemoryBatch.clear();
+            }
+            await persistBookMemory();
+          }
+        } else if (futurePendingBlocks) {
           await ensureInitialBookMemory();
           if (!memoryChapters.contains(chapter.path)) {
             try {
@@ -2444,7 +2559,9 @@ class EpubChapterTranslator {
           return false;
         }
         final InspectedChapter candidate = selectedChapters[index];
-        return memoryChapters.contains(candidate.path) ||
+        return (config.tokenSavingMode &&
+                index <= maxRecordedTimelinePosition) ||
+            memoryChapters.contains(candidate.path) ||
             !restoration.hasPendingBlocksFromChapter(index + 1);
       }
 
@@ -3472,6 +3589,8 @@ class EpubChapterTranslator {
       'styleProfile': '风格',
       'initialBookMemory': '初始记忆',
       'chapterMemory': '章节记忆',
+      'chapterMemoryBatch': '批量章节记忆',
+      'bodyRepair': '正文补译',
       'translation': '正文',
       'semanticReview': '语义复核',
       'semanticSourceAnalysis': '原文释义',

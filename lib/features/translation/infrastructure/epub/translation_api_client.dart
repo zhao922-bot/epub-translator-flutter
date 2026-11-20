@@ -9,6 +9,7 @@ import 'package:dio/io.dart';
 
 import '../../../../shared/localization/app_strings.dart';
 
+import '../../domain/models/chat_api_endpoint.dart';
 import '../../domain/models/translation_config.dart';
 import '../../domain/repositories/translation_repository.dart';
 import '../translation_response_guard.dart';
@@ -197,13 +198,13 @@ class TranslationApiClient {
             : strings.httpProxyInvalidFormat,
       );
     }
+    final capabilities = config.capabilities;
     final Dio dio = Dio(
       BaseOptions(
         baseUrl: normalizedBaseUrl(config.apiBaseUrl),
         extra: <String, dynamic>{
-          'reasoningEffort': config.effectiveReasoningEffort,
-          'automaticThinkingDisabled': config.automaticThinkingDisabled,
-          'reasoningModel': config.capabilities.needsReasoningHeadroom,
+          'modelCapabilities': capabilities,
+          'reasoningModel': capabilities.needsReasoningHeadroom,
           'maxOutputTokens': config.maxOutputTokens.clamp(512, 32768),
           'useStreamingApi': config.useStreamingApi,
         },
@@ -647,11 +648,8 @@ class TranslationApiClient {
     required Dio dio,
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
-  }) => postChatCompletionsStream(
-    dio: dio,
-    data: data,
-    cancelToken: cancelToken,
-  );
+  }) =>
+      postChatCompletionsStream(dio: dio, data: data, cancelToken: cancelToken);
 
   Future<Response<dynamic>> postChatCompletionsStream({
     required Dio dio,
@@ -668,21 +666,27 @@ class TranslationApiClient {
       fragment: '',
     );
     final request = Map<String, dynamic>.from(data);
+    final budgetedBody = request.remove('_folioFerryBudgetedBody') == true;
+    final bodyRepair = request.remove('_folioFerryBodyRepair') == true;
+    final preferLowReasoning =
+        request.remove('_folioFerryPreferLowReasoning') == true;
+    final capabilities =
+        dio.options.extra['modelCapabilities'] as ModelCapabilityProfile?;
+    _applyReasoningParameters(request, capabilities, preferLowReasoning);
     final cap = (dio.options.extra['maxOutputTokens'] as int? ?? 8192).clamp(
       512,
       32768,
     );
-    final reasoning = dio.options.extra['reasoningEffort'] as String?;
-    if (dio.options.extra['automaticThinkingDisabled'] == true &&
-        !request.containsKey('thinking')) {
-      request['thinking'] = {'type': 'disabled'};
-    }
-    if (reasoning != null) request['reasoning_effort'] = reasoning;
     final requested = request['max_tokens'] as int? ?? 900;
-    request['max_tokens'] = effectiveOutputTokens(
+    final outputLimitField = capabilities?.usesCompletionTokenLimit == true
+        ? 'max_completion_tokens'
+        : 'max_tokens';
+    request.remove('max_tokens');
+    request[outputLimitField] = effectiveOutputTokens(
       requested: requested,
       maximum: cap,
-      reasoningModel: dio.options.extra['reasoningModel'] == true,
+      reasoningModel:
+          !budgetedBody && dio.options.extra['reasoningModel'] == true,
     );
     // A length-truncated answer cannot be cached as complete. Retry at most
     // once with a genuinely larger budget, never repeat an identical paid call.
@@ -703,6 +707,7 @@ class TranslationApiClient {
         /* Normal prose/title requests are not JSON. */
       }
     }
+    if (bodyRepair) kind = 'bodyRepair';
     final bool wantStream =
         stream ??
         (request['stream'] as bool?) ??
@@ -727,8 +732,9 @@ class TranslationApiClient {
           choices.isNotEmpty &&
           choices.first is Map &&
           choices.first['finish_reason'] == 'length';
-      final budget = request['max_tokens'] as int;
+      final budget = request[outputLimitField] as int;
       if (!truncated ||
+          budgetedBody ||
           kind == 'semanticReview' ||
           kind == 'semanticSourceAnalysis' ||
           kind == 'semanticDraftAnalysis' ||
@@ -754,10 +760,48 @@ class TranslationApiClient {
                   message['reasoning_content'] is String &&
                   (message['reasoning_content'] as String).isNotEmpty) ||
               (reasoningTokens is int && reasoningTokens > 0));
-      request['max_tokens'] = min(
+      request[outputLimitField] = min(
         cap,
         max(budget * 2, reasoningOnly ? 4096 : 0),
       );
+    }
+  }
+
+  static void _applyReasoningParameters(
+    Map<String, dynamic> request,
+    ModelCapabilityProfile? capabilities,
+    bool preferLowReasoning,
+  ) {
+    if (capabilities == null) return;
+    if (capabilities.forceProviderDefaults) {
+      for (final key in const [
+        'reasoning_effort',
+        'reasoning',
+        'thinking',
+        'enable_thinking',
+        'thinking_budget',
+      ]) {
+        request.remove(key);
+      }
+    } else {
+      final parameters = preferLowReasoning
+          ? capabilities.ordinaryBodyReasoningParameters
+          : capabilities.reasoningParameters;
+      for (final entry in parameters.entries) {
+        if (capabilities.automaticThinkingDisabled && entry.key == 'thinking') {
+          request.putIfAbsent(entry.key, () => entry.value);
+        } else {
+          request[entry.key] = entry.value;
+        }
+      }
+    }
+    if (capabilities.usesCompletionTokenLimit) {
+      // GPT-5 Chat Completions rejects these sampling controls with reasoning.
+      // The app uses one compatible request shape for all supported efforts.
+      request.remove('temperature');
+      request.remove('top_p');
+      request.remove('logprobs');
+      request.remove('top_logprobs');
     }
   }
 
@@ -1381,28 +1425,10 @@ class TranslationApiClient {
   /// `/chat/completions` suffix.
   String normalizedBaseUrl(String value) {
     TranslationConfig.validateApiUrl(value);
-    String trimmed = value.trim();
-    if (trimmed.isEmpty) {
-      return trimmed;
-    }
-    if (!trimmed.contains('://')) {
-      trimmed = 'https://$trimmed';
-    }
-    final Uri uri = Uri.parse(trimmed);
-    final List<String> segments = uri.pathSegments
-        .where((String segment) => segment.isNotEmpty)
-        .toList(growable: true);
-    if (segments.length >= 2 &&
-        segments[segments.length - 2].toLowerCase() == 'chat' &&
-        segments[segments.length - 1].toLowerCase() == 'completions') {
-      segments.removeRange(segments.length - 2, segments.length);
-    }
-    if (segments.isEmpty || segments.last.toLowerCase() != 'v1') {
-      segments.add('v1');
-    } else {
-      segments[segments.length - 1] = 'v1';
-    }
-    return uri.replace(pathSegments: segments).toString();
+    if (value.trim().isEmpty) return '';
+    final uri = normalizedChatApiBaseUri(value);
+    if (uri == null) throw const FormatException('Invalid API base URL.');
+    return uri.toString();
   }
 
   String lockedGlossaryInstruction(TranslationConfig config) {

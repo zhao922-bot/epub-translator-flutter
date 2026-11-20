@@ -2,7 +2,12 @@ import '../../../../shared/logging/app_logger.dart';
 import 'model_capability_profile.dart';
 
 export 'model_capability_profile.dart'
-    show ModelCapabilityProfile, ModelReasoningEffort;
+    show
+        CustomReasoningField,
+        CustomReasoningParameters,
+        ModelCapabilityProfile,
+        ModelReasoningEffort,
+        ModelThinkingMode;
 
 enum UiLanguage { english, chinese }
 
@@ -40,6 +45,8 @@ class TranslationConfig {
     required this.lockedGlossary,
     required this.httpProxy,
     this.reasoningEffort = ModelReasoningEffort.automatic,
+    this.thinkingMode = ModelThinkingMode.automatic,
+    this.customReasoning,
     this.maxOutputTokens = 8192,
     this.semanticQualityCheck = false,
     this.autoApplyVerifiedCorrections = false,
@@ -48,6 +55,7 @@ class TranslationConfig {
     this.semanticReviewScope = SemanticReviewScope.risksOnly,
     this.maxSemanticReviewTokens = 64000,
     this.useStreamingApi = false,
+    this.tokenSavingMode = false,
   });
 
   final String apiBaseUrl;
@@ -92,6 +100,8 @@ class TranslationConfig {
   final String httpProxy;
 
   final ModelReasoningEffort reasoningEffort;
+  final ModelThinkingMode thinkingMode;
+  final CustomReasoningParameters? customReasoning;
   final int maxOutputTokens;
   final bool semanticQualityCheck;
 
@@ -109,11 +119,19 @@ class TranslationConfig {
   /// to buffered JSON responses when the server returns `application/json`).
   final bool useStreamingApi;
 
+  /// Opts into compact prompts and adaptive translation request planning.
+  final bool tokenSavingMode;
+
   /// Resolved capability profile for the active endpoint, model, and effort.
   ModelCapabilityProfile get capabilities => ModelCapabilityProfile.resolve(
     apiBaseUrl: apiBaseUrl,
     model: model,
     reasoningEffort: reasoningEffort,
+    thinkingMode: thinkingMode,
+    tokenSavingMode: tokenSavingMode,
+    customReasoning: apiProviderSelection == ApiProviderSelection.custom
+        ? customReasoning
+        : null,
   );
 
   /// Only auto-configure models with verified reasoning-effort support.
@@ -208,6 +226,8 @@ class TranslationConfig {
     String? lockedGlossary,
     String? httpProxy,
     ModelReasoningEffort? reasoningEffort,
+    ModelThinkingMode? thinkingMode,
+    CustomReasoningParameters? customReasoning,
     int? maxOutputTokens,
     bool? semanticQualityCheck,
     bool? autoApplyVerifiedCorrections,
@@ -216,6 +236,7 @@ class TranslationConfig {
     SemanticReviewScope? semanticReviewScope,
     int? maxSemanticReviewTokens,
     bool? useStreamingApi,
+    bool? tokenSavingMode,
   }) {
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
@@ -223,6 +244,7 @@ class TranslationConfig {
       maxSemanticReviewTokens:
           maxSemanticReviewTokens ?? this.maxSemanticReviewTokens,
       useStreamingApi: useStreamingApi ?? this.useStreamingApi,
+      tokenSavingMode: tokenSavingMode ?? this.tokenSavingMode,
       apiKey: apiKey ?? this.apiKey,
       model: model ?? this.model,
       apiProviderSelection: apiProviderSelection ?? this.apiProviderSelection,
@@ -246,6 +268,8 @@ class TranslationConfig {
       lockedGlossary: lockedGlossary ?? this.lockedGlossary,
       httpProxy: httpProxy ?? this.httpProxy,
       reasoningEffort: reasoningEffort ?? this.reasoningEffort,
+      thinkingMode: thinkingMode ?? this.thinkingMode,
+      customReasoning: customReasoning ?? this.customReasoning,
       maxOutputTokens: maxOutputTokens ?? this.maxOutputTokens,
       semanticQualityCheck: semanticQualityCheck ?? this.semanticQualityCheck,
       autoApplyVerifiedCorrections:
@@ -289,6 +313,8 @@ class TranslationConfig {
       'lockedGlossary': lockedGlossary,
       'httpProxy': httpProxyAddress,
       'reasoningEffort': reasoningEffort.name,
+      'thinkingMode': thinkingMode.name,
+      if (customReasoning != null) 'customReasoning': customReasoning!.toJson(),
       'maxOutputTokens': maxOutputTokens,
       'semanticQualityCheck': semanticQualityCheck,
       'autoApplyVerifiedCorrections': autoApplyVerifiedCorrections,
@@ -297,6 +323,7 @@ class TranslationConfig {
       'semanticReviewScope': semanticReviewScope.name,
       'maxSemanticReviewTokens': maxSemanticReviewTokens,
       'useStreamingApi': useStreamingApi,
+      'tokenSavingMode': tokenSavingMode,
     };
   }
 
@@ -419,6 +446,13 @@ class TranslationConfig {
         (v) => v.name == json['reasoningEffort'],
         orElse: () => ModelReasoningEffort.automatic,
       ),
+      thinkingMode: ModelThinkingMode.values.firstWhere(
+        (value) => value.name == json['thinkingMode'],
+        orElse: () => ModelThinkingMode.automatic,
+      ),
+      customReasoning: CustomReasoningParameters.fromJson(
+        json['customReasoning'],
+      ),
       maxOutputTokens: _readBoundedInt(
         json['maxOutputTokens'],
         fallback: 8192,
@@ -507,6 +541,7 @@ class TranslationConfig {
       lockedGlossary: _readTrimmedString(json['lockedGlossary']),
       httpProxy: _readTrimmedStringAllowEmpty(json['httpProxy']),
       useStreamingApi: json['useStreamingApi'] == true,
+      tokenSavingMode: json['tokenSavingMode'] == true,
     );
   }
 

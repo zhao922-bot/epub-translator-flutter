@@ -17,10 +17,11 @@ class _EpubSemanticReviewer {
     // Persist all paid cross-file results before the first review/cancellation.
     for (final reference in batch.references) {
       (groups[reference.chapter.path] ??= []).add(reference);
-      if (!owner._isDegradedBlock(
-        chapterPath: reference.chapter.path,
-        blockId: reference.block.id,
-      )) {
+      if (!config.tokenSavingMode &&
+          !owner._isDegradedBlock(
+            chapterPath: reference.chapter.path,
+            blockId: reference.block.id,
+          )) {
         await owner._artifactCache.write(
           draftKey(
             config,
@@ -68,6 +69,17 @@ class _EpubSemanticReviewer {
     context.bookMemory,
     config.autoApplyVerifiedCorrections,
   ]);
+
+  Future<void> writeDraft(
+    TranslationConfig config,
+    String chapterPath,
+    ExtractedBlock block,
+    TranslationBatchContext context,
+    String html,
+  ) => owner._artifactCache.write(
+    draftKey(config, chapterPath, block, context),
+    {'html': html},
+  );
 
   Future<String?> readDraft(
     TranslationConfig config,
@@ -540,10 +552,9 @@ class _EpubSemanticReviewer {
         continue;
       }
       final draft = translations[block.id]!;
-      await owner._artifactCache.write(
-        draftKey(config, chapterPath, block, batch.context),
-        {'html': draft},
-      );
+      if (!config.tokenSavingMode) {
+        await writeDraft(config, chapterPath, block, batch.context, draft);
+      }
       final key = _scopeKey(chapterPath, block.id);
       final findings = _checker.check(
         sourceHtml: block.sourceHtml,

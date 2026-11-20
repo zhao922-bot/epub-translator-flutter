@@ -1,9 +1,14 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:html/parser.dart' as html_parser;
+
 import '../../../../shared/logging/app_logger.dart';
 import '../../../../shared/text/unicode_prefix.dart';
 import '../../domain/models/inspected_chapter.dart';
+import '../../domain/models/translation_style_profile.dart';
+
+part 'translation_request_context.dart';
 
 /// Plans block batches and neighboring read-only context for API calls.
 class TranslationBatchPlanner {
@@ -282,6 +287,9 @@ class TranslationBatchPlanner {
     required String chapterTitle,
     Map<String, Object?>? bookMemory,
     Map<String, int>? indexById,
+    bool tokenSavingMode = false,
+    String lockedGlossary = '',
+    bool compactContext = false,
   }) {
     final List<ExtractedBlock> immutableBlocks =
         List<ExtractedBlock>.unmodifiable(blocks);
@@ -298,6 +306,9 @@ class TranslationBatchPlanner {
         chapterBlocks: chapterBlocks,
         bookMemory: bookMemory,
         indexById: chapterIndex,
+        tokenSavingMode: tokenSavingMode,
+        lockedGlossary: lockedGlossary,
+        compactContext: compactContext,
       ),
     );
   }
@@ -320,7 +331,23 @@ class TranslationBatchPlanner {
     required List<ExtractedBlock> chapterBlocks,
     Map<String, Object?>? bookMemory,
     Map<String, int>? indexById,
+    bool tokenSavingMode = false,
+    String lockedGlossary = '',
+    bool compactContext = false,
   }) {
+    if (tokenSavingMode) {
+      return selectRequestContext(
+        context: TranslationBatchContext(
+          chapterTitle: chapterTitle,
+          bookMemory: bookMemory,
+        ),
+        batchBlocks: batchBlocks,
+        lockedGlossary: lockedGlossary,
+        chapterBlocks: chapterBlocks,
+        indexById: indexById,
+        compact: compactContext,
+      );
+    }
     if (batchBlocks.isEmpty || chapterBlocks.isEmpty) {
       return TranslationBatchContext(
         chapterTitle: chapterTitle,
@@ -360,6 +387,28 @@ class TranslationBatchPlanner {
       bookMemory: bookMemory,
     );
   }
+
+  /// Shapes the read-only context for the blocks in one candidate or request.
+  /// A second selection starts from the source memory, so a split or repair
+  /// can regain useful context that was omitted from the earlier request.
+  TranslationBatchContext selectRequestContext({
+    required TranslationBatchContext context,
+    required List<ExtractedBlock> batchBlocks,
+    String lockedGlossary = '',
+    List<ExtractedBlock> chapterBlocks = const [],
+    Map<String, int>? indexById,
+    bool compact = false,
+  }) => _selectTranslationRequestContext(
+    planner: this,
+    source: context._selectionSource ?? context,
+    batchBlocks: batchBlocks,
+    lockedGlossary: lockedGlossary.isEmpty
+        ? context._sourceLockedGlossary
+        : lockedGlossary,
+    chapterBlocks: chapterBlocks,
+    indexById: indexById,
+    compact: compact,
+  );
 
   List<TranslationContextSnippet> contextSnippets(List<ExtractedBlock> blocks) {
     return blocks
@@ -432,20 +481,61 @@ class TranslationBatchContext {
     this.before = const <TranslationContextSnippet>[],
     this.after = const <TranslationContextSnippet>[],
     this.bookMemory,
-  });
+  }) : _selectionSource = null,
+       _sourceLockedGlossary = '',
+       needsContinuity = false,
+       lockedGlossary = const [],
+       lockedGlossaryNotes = const [];
+
+  const TranslationBatchContext._selected(
+    this._sourceLockedGlossary, {
+    required this.chapterTitle,
+    required this.before,
+    required this.after,
+    required this.bookMemory,
+    required this.lockedGlossary,
+    required this.lockedGlossaryNotes,
+    required this.needsContinuity,
+    required TranslationBatchContext source,
+  }) : _selectionSource = source;
 
   final String chapterTitle;
   final List<TranslationContextSnippet> before;
   final List<TranslationContextSnippet> after;
   final Map<String, Object?>? bookMemory;
+  final List<Map<String, String>> lockedGlossary;
+  final List<String> lockedGlossaryNotes;
+  final bool needsContinuity;
+  final TranslationBatchContext? _selectionSource;
+  final String _sourceLockedGlossary;
+
+  bool get usesSelectiveContext => _selectionSource != null;
 
   bool get isEmpty =>
       chapterTitle.trim().isEmpty &&
       before.isEmpty &&
       after.isEmpty &&
-      (bookMemory == null || bookMemory!.isEmpty);
+      lockedGlossary.isEmpty &&
+      lockedGlossaryNotes.isEmpty &&
+      (usesSelectiveContext
+          ? (promptBookMemory(bookMemory)?.isEmpty ?? true)
+          : (bookMemory?.isEmpty ?? true));
 
   Map<String, Object?> toJson() {
+    if (usesSelectiveContext) {
+      final memory = promptBookMemory(bookMemory);
+      return {
+        if (chapterTitle.trim().isNotEmpty) 'chapterTitle': chapterTitle.trim(),
+        if (before.isNotEmpty)
+          'before': [for (final snippet in before) snippet.toJson()],
+        if (after.isNotEmpty)
+          'after': [for (final snippet in after) snippet.toJson()],
+        if (lockedGlossary.isNotEmpty) 'lockedGlossary': lockedGlossary,
+        if (lockedGlossaryNotes.isNotEmpty)
+          'lockedGlossaryNotes': lockedGlossaryNotes,
+        if (memory != null && memory.isNotEmpty) 'bookMemory': memory,
+      };
+    }
     return <String, Object?>{
       if (chapterTitle.trim().isNotEmpty) 'chapterTitle': chapterTitle.trim(),
       'before': before

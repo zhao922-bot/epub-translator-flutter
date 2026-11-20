@@ -137,6 +137,97 @@ Future<void> _page(WidgetTester tester, ProviderContainer container) =>
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('settings saves opt-in mode and shows model-specific reasoning', (
+    tester,
+  ) async {
+    final store = _DelayedStore()
+      ..loading.complete(
+        TranslationConfig.defaults().copyWith(
+          apiBaseUrl: 'https://api.openai.com/v1',
+          model: 'gpt-5.4',
+          apiProviderSelection: ApiProviderSelection.custom,
+        ),
+      );
+    final container = _container(store);
+    final controller = container.read(settingsProvider.notifier);
+    await controller.ready;
+    await _page(tester, container);
+    await tester.pumpAndSettle();
+
+    final saving = find.byKey(const ValueKey('settings-token-saving-mode'));
+    await tester.ensureVisible(saving);
+    expect(tester.widget<SwitchListTile>(saving).value, isFalse);
+    await tester.tap(saving);
+    await tester.pumpAndSettle();
+    expect(store.saved.last.tokenSavingMode, isTrue);
+    expect(store.saved.last.residualQualityCheck, isTrue);
+    expect(
+      container.read(translationDashboardProvider).config.tokenSavingMode,
+      isTrue,
+    );
+
+    final advanced = find.byType(ExpansionTile);
+    await tester.ensureVisible(advanced);
+    await tester.tap(advanced);
+    await tester.pumpAndSettle();
+    final choices = find.byType(DropdownButton<ModelReasoningEffort>);
+    await tester.ensureVisible(choices);
+    await tester.tap(choices);
+    await tester.pumpAndSettle();
+    expect(find.text('Medium'), findsWidgets);
+    expect(find.text('Extra high (xhigh)'), findsWidgets);
+    expect(find.text('Maximum (max)'), findsNothing);
+    expect(find.text('Thinking mode'), findsNothing);
+    await tester.tap(find.text('Provider default').last);
+    await tester.pumpAndSettle();
+    expect(
+      store.saved.last.reasoningEffort,
+      ModelReasoningEffort.providerDefault,
+    );
+
+    await controller.setModel('unregistered-model');
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(choices);
+    await tester.tap(choices);
+    await tester.pumpAndSettle();
+    expect(find.text('Medium'), findsNothing);
+    expect(find.text('Extra high (xhigh)'), findsNothing);
+    expect(find.text('Provider default'), findsWidgets);
+    await tester.tap(find.text('Provider default').last);
+    await tester.pumpAndSettle();
+
+    final custom = find.text('Configure custom reasoning');
+    await tester.ensureVisible(custom);
+    await tester.tap(custom);
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsOneWidget);
+    await tester.tap(find.text('Apply parameter'));
+    await tester.pumpAndSettle();
+    expect(store.saved.last.reasoningEffort, ModelReasoningEffort.custom);
+    expect(store.saved.last.capabilities.reasoningParameters, {
+      'reasoning_effort': 'low',
+    });
+    await controller.setUseStreamingApi(true);
+    await controller.setThinkingMode(ModelThinkingMode.enabled);
+    final dashboardConfig = container.read(translationDashboardProvider).config;
+    expect(dashboardConfig.useStreamingApi, isTrue);
+    expect(dashboardConfig.thinkingMode, ModelThinkingMode.enabled);
+    expect(dashboardConfig.customReasoning, isNotNull);
+    expect(dashboardConfig.capabilities.reasoningParameters, {
+      'reasoning_effort': 'low',
+    });
+    expect(await controller.reloadSettings(), isTrue);
+    expect(
+      container.read(translationDashboardProvider).config.customReasoning,
+      isNull,
+    );
+    expect(
+      container.read(translationDashboardProvider).config.tokenSavingMode,
+      isFalse,
+    );
+    await tester.pumpWidget(const SizedBox());
+  });
+
   testWidgets('successful save and reopening settings never shows a failure', (
     tester,
   ) async {

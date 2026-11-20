@@ -85,8 +85,15 @@ Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
     changed.add('lockedGlossary');
   }
   if (before.httpProxy != after.httpProxy) changed.add('httpProxy');
+  if (before.tokenSavingMode != after.tokenSavingMode) {
+    changed.add('tokenSavingMode');
+  }
   if (before.useStreamingApi != after.useStreamingApi) {
     changed.add('useStreamingApi');
+  }
+  if (before.thinkingMode != after.thinkingMode) changed.add('thinkingMode');
+  if (before.customReasoning != after.customReasoning) {
+    changed.add('customReasoning');
   }
   if (before.reasoningEffort != after.reasoningEffort) {
     changed.add('reasoningEffort');
@@ -1032,6 +1039,9 @@ class SettingsController extends StateNotifier<TranslationConfig> {
     );
   });
 
+  Future<void> setTokenSavingMode(bool value) =>
+      _update((config) => config.copyWith(tokenSavingMode: value));
+
   Future<void> setUseStreamingApi(bool value) =>
       _update((config) => config.copyWith(useStreamingApi: value));
 
@@ -1086,6 +1096,21 @@ class SettingsController extends StateNotifier<TranslationConfig> {
 
   Future<void> setReasoningEffort(ModelReasoningEffort value) =>
       _update((config) => config.copyWith(reasoningEffort: value));
+
+  Future<void> setThinkingMode(ModelThinkingMode value) =>
+      _update((config) => config.copyWith(thinkingMode: value));
+
+  Future<void> setCustomReasoning(CustomReasoningParameters parameters) =>
+      _update((config) {
+        if (config.apiProviderSelection != ApiProviderSelection.custom ||
+            !parameters.matches(config.apiBaseUrl, config.model)) {
+          return config;
+        }
+        return config.copyWith(
+          reasoningEffort: ModelReasoningEffort.custom,
+          customReasoning: parameters,
+        );
+      });
   Future<void> setMaxOutputTokens(double value) => _update(
     (config) =>
         config.copyWith(maxOutputTokens: value.round().clamp(512, 32768)),

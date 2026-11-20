@@ -5,7 +5,9 @@ import '../../../../shared/localization/app_strings.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../../translation/domain/models/translation_config.dart';
 import '../../application/settings_controller.dart';
+import 'settings_copy.dart';
 import 'settings_fields.dart';
+import 'settings_reasoning_controls.dart';
 import 'settings_sections.dart';
 import 'settings_slider.dart';
 
@@ -21,6 +23,7 @@ class SettingsTranslationSection extends ConsumerWidget {
         (c) => (
           residualQualityCheck: c.residualQualityCheck,
           styleProfileEnabled: c.styleProfileEnabled,
+          tokenSavingMode: c.tokenSavingMode,
         ),
       ),
     );
@@ -33,6 +36,15 @@ class SettingsTranslationSection extends ConsumerWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
+          SwitchListTile.adaptive(
+            key: const ValueKey('settings-token-saving-mode'),
+            contentPadding: EdgeInsets.zero,
+            title: Text(strings.tokenSavingMode),
+            subtitle: Text(strings.tokenSavingModeBody),
+            value: config.tokenSavingMode,
+            onChanged: isRunActive ? null : controller.setTokenSavingMode,
+          ),
+          const SizedBox(height: 8),
           _TuningPresetSelector(enabled: !isRunActive),
           const SizedBox(height: 8),
           SwitchListTile.adaptive(
@@ -108,7 +120,6 @@ class _AdvancedTuning extends ConsumerWidget {
     final config = ref.watch(
       settingsProvider.select(
         (c) => (
-          reasoningEffort: c.reasoningEffort,
           semanticQualityCheck: c.semanticQualityCheck,
           autoApplyVerifiedCorrections: c.autoApplyVerifiedCorrections,
           retryIncompleteReviews: c.retryIncompleteReviews,
@@ -121,41 +132,7 @@ class _AdvancedTuning extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        DropdownButtonFormField<ModelReasoningEffort>(
-          key: ValueKey('reasoning-${config.reasoningEffort.name}'),
-          initialValue: config.reasoningEffort,
-          isExpanded: true,
-          decoration: InputDecoration(
-            labelText: strings.isChinese ? '模型推理强度' : 'Model reasoning effort',
-          ),
-          items: [
-            for (final value in ModelReasoningEffort.values)
-              DropdownMenuItem(
-                value: value,
-                child: Text(switch (value) {
-                  ModelReasoningEffort.automatic =>
-                    strings.isChinese ? '自动（按模型适配）' : 'Automatic (model-aware)',
-                  ModelReasoningEffort.low => strings.isChinese ? '较低' : 'Low',
-                  ModelReasoningEffort.high =>
-                    strings.isChinese ? '较高' : 'High',
-                  ModelReasoningEffort.max =>
-                    strings.isChinese ? '最高' : 'Maximum',
-                }),
-              ),
-          ],
-          onChanged: isRunActive
-              ? null
-              : (value) {
-                  if (value != null) {
-                    controller.setReasoningEffort(value);
-                  }
-                },
-        ),
-        Text(
-          strings.isChinese
-              ? '自动为已验证接口选择较低强度或关闭推理；手动选项需要接口支持。'
-              : 'Automatic uses low effort or disables thinking for verified APIs; manual options require API support.',
-        ),
+        SettingsReasoningControls(enabled: !isRunActive),
         SettingsSlider(
           inputKey: const ValueKey('settings-maxOutputTokens'),
           select: (c) => c.maxOutputTokens.toDouble(),

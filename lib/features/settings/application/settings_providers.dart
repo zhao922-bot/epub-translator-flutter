@@ -125,6 +125,10 @@ final connectionTestProvider =
             previous.apiKey != next.apiKey ||
             previous.model != next.model ||
             previous.useStreamingApi != next.useStreamingApi ||
+            previous.reasoningEffort != next.reasoningEffort ||
+            previous.thinkingMode != next.thinkingMode ||
+            previous.customReasoning != next.customReasoning ||
+            previous.tokenSavingMode != next.tokenSavingMode ||
             previous.httpProxy != next.httpProxy ||
             previous.targetLanguage != next.targetLanguage) {
           controller.clear();

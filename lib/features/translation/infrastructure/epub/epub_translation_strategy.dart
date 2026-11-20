@@ -19,6 +19,133 @@ class _EpubTranslationStrategy {
   _EpubTranslationStrategy(this.owner);
 
   final EpubChapterTranslator owner;
+  late final _TokenSavingBodyStrategy _tokenSavingBody =
+      _TokenSavingBodyStrategy(this);
+
+  TranslationBlockBatch _batchSubset(
+    TranslationBlockBatch source,
+    List<ExtractedBlock> blocks,
+  ) => TranslationBlockBatch(
+    blocks,
+    context: source.context,
+    sourceOrder: source.sourceOrder,
+    sourceIndexById: source.sourceIndexById,
+  );
+
+  TranslationBatchContext _bodyRequestContext(
+    TranslationConfig config,
+    TranslationBlockBatch batch,
+    List<ExtractedBlock> blocks, {
+    bool compact = false,
+  }) {
+    if (!config.tokenSavingMode) return batch.context;
+    return owner._batchPlanner.selectRequestContext(
+      context: batch.context,
+      batchBlocks: blocks,
+      chapterBlocks: batch.sourceOrder,
+      indexById: batch.sourceIndexById,
+      lockedGlossary: config.lockedGlossary,
+      compact: compact,
+    );
+  }
+
+  TranslationBatchContext _footnoteRequestContext(
+    TranslationConfig config,
+    TranslationBatchContext context,
+    List<FootnoteBlockReference> references, {
+    bool compact = false,
+  }) {
+    if (!config.tokenSavingMode) return context;
+    final before = {for (final snippet in context.before) snippet.id: snippet};
+    final after = {for (final snippet in context.after) snippet.id: snippet};
+    final requested = {
+      for (final reference in references)
+        (reference.chapter.path, reference.block.id),
+    };
+    for (final reference in references) {
+      final chapter = reference.chapter;
+      final index = chapter.blocks.indexWhere(
+        (block) => block.id == reference.block.id,
+      );
+      if (index < 0) continue;
+      void add(int neighbour, Map<String, TranslationContextSnippet> snippets) {
+        if (neighbour < 0 || neighbour >= chapter.blocks.length) return;
+        final block = chapter.blocks[neighbour];
+        if (requested.contains((chapter.path, block.id))) return;
+        final id = '${chapter.path}#${block.id}';
+        snippets.putIfAbsent(
+          id,
+          () => TranslationContextSnippet(
+            id: id,
+            text: unicodeSafePrefix(
+              block.sourceText,
+              owner._batchPlanner.contextTextLimit,
+            ),
+          ),
+        );
+      }
+
+      add(index - 1, before);
+      add(index + 1, after);
+    }
+    return owner._batchPlanner.selectRequestContext(
+      context: TranslationBatchContext(
+        chapterTitle: context.chapterTitle,
+        before: before.values.toList(growable: false),
+        after: after.values.toList(growable: false),
+        bookMemory: context.bookMemory,
+      ),
+      batchBlocks: [
+        for (final reference in references)
+          reference.block.copyWith(id: reference.requestId),
+      ],
+      lockedGlossary: config.lockedGlossary,
+      compact: compact,
+    );
+  }
+
+  String _bodyGlossaryInstruction(
+    TranslationConfig config,
+    TranslationBatchContext context,
+  ) {
+    if (!config.tokenSavingMode || !context.usesSelectiveContext) {
+      return owner._apiClient.lockedGlossaryInstruction(config);
+    }
+    return context.lockedGlossary.isNotEmpty ||
+            context.lockedGlossaryNotes.isNotEmpty
+        ? ' User-locked mappings and notes in context override automatic book glossary terms.'
+        : '';
+  }
+
+  _BodyRequestSize? _applyBodyBudget(
+    TranslationConfig config,
+    Map<String, dynamic> data,
+    Object outputShape, {
+    int? reserveOutput,
+  }) {
+    if (!config.tokenSavingMode) return null;
+    final size = owner
+        ._bodyBudget(config)
+        .measure(data, outputShape, reserveOutput: reserveOutput);
+    if (size.wireOutput <= 0) throw const _LocalBodyLimitException();
+    data['max_tokens'] = size.wireOutput;
+    data['_folioFerryBudgetedBody'] = true;
+    return size;
+  }
+
+  void _observeBodyBudget(
+    _BodyRequestSize? size,
+    Object? response, {
+    bool complete = true,
+  }) {
+    if (size == null) return;
+    owner._adaptiveBodyBudget!.observe(
+      size,
+      response,
+      truncated: _TokenSavingBodyStrategy._isTruncated(response),
+      complete: complete,
+    );
+  }
 
   /// Preserve the shared exception contract: structural replies use
   /// TranslationParseException (no retry), syntax jitter uses FormatException.
@@ -144,6 +271,19 @@ class _EpubTranslationStrategy {
     final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
     final Map<String, String> translatedById = <String, String>{};
+    final blocksById = {for (final block in batch.blocks) block.id: block};
+    final Future<void> Function(String, String)? onDraftValidated =
+        !config.semanticQualityCheck
+        ? onValidated
+        : config.tokenSavingMode
+        ? (id, html) => owner._semanticReviewer.writeDraft(
+            config,
+            chapterPath ?? '',
+            blocksById[id]!,
+            batch.context,
+            html,
+          )
+        : null;
     for (final ExtractedBlock block in batch.blocks) {
       if (config.semanticQualityCheck) {
         final draft = await owner._semanticReviewer.readDraft(
@@ -180,11 +320,13 @@ class _EpubTranslationStrategy {
         dio: dio,
         config: config,
         chapterPath: chapterPath,
-        batch: TranslationBlockBatch(htmlBlocks, context: batch.context),
+        batch: config.tokenSavingMode
+            ? _batchSubset(batch, htmlBlocks)
+            : TranslationBlockBatch(htmlBlocks, context: batch.context),
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
-        onValidated: config.semanticQualityCheck ? null : onValidated,
+        onValidated: onDraftValidated,
       );
       for (int index = 0; index < htmlBlocks.length; index += 1) {
         translatedById[htmlBlocks[index].id] = translatedHtml[index];
@@ -197,10 +339,11 @@ class _EpubTranslationStrategy {
           config: config,
           requests: slotRequests,
           context: batch.context,
+          sourceBatch: batch,
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           apiCounted: true,
-          onValidated: config.semanticQualityCheck ? null : onValidated,
+          onValidated: onDraftValidated,
         ),
       );
     }
@@ -238,6 +381,18 @@ class _EpubTranslationStrategy {
     int? fallbackWindow,
     Future<void> Function(String id, String html)? onValidated,
   }) async {
+    if (config.tokenSavingMode && batch.blocks.isNotEmpty) {
+      return _tokenSavingBody.translate(
+        dio: dio,
+        config: config,
+        batch: batch,
+        chapterPath: chapterPath,
+        retryDelayOverride: retryDelayOverride,
+        cancelToken: cancelToken,
+        fallbackWindow: fallbackWindow,
+        onValidated: onValidated,
+      );
+    }
     final Map<String, dynamic> payloadMap = <String, dynamic>{
       if (!batch.context.isEmpty) 'context': batch.context.toJson(),
       'blocks': batch.blocks
@@ -482,7 +637,7 @@ class _EpubTranslationStrategy {
             dio: dio,
             config: config,
             block: block,
-            context: batch.context,
+            context: _bodyRequestContext(config, batch, [block], compact: true),
             chapterPath: chapterPath,
             retryDelayOverride: retryDelayOverride,
             cancelToken: cancelToken,
@@ -532,6 +687,7 @@ class _EpubTranslationStrategy {
   }) async {
     Object? lastError;
     String? lastLocked;
+    int? retryOutput;
     for (int attempt = 1; ; attempt += 1) {
       try {
         if (cancelToken?.isCancelled ?? false) {
@@ -543,10 +699,14 @@ class _EpubTranslationStrategy {
           // retry has a concrete instruction instead of repeating the same
           // (often untranslated) output. Keep the reason lossy/safe — never
           // embed the raw exception or API key here.
-          final String reason = owner
-              ._safeErrorText(lastError, config)
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim();
+          final String reason = config.tokenSavingMode
+              ? (_isQualityRejection(lastError)
+                    ? 'untranslated source text remains'
+                    : 'incomplete or invalid HTML')
+              : owner
+                    ._safeErrorText(lastError, config)
+                    .replaceAll(RegExp(r'\s+'), ' ')
+                    .trim();
           final String retryInstruction = _isEmptyTranslationResponse(lastError)
               ? 'The previous response was empty. Return a complete HTML '
                     'fragment with every human-readable text node translated '
@@ -570,18 +730,43 @@ class _EpubTranslationStrategy {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleInstructionFragment(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. Preserve every HTML tag, attribute, inline emphasis, entity, and link target. Translate only human-readable text nodes. Return only the translated HTML fragment with no markdown fences and no explanation.${_styleInstructionFragment(config: config, styleProfile: styleProfile, confirmed: styleProfileConfirmed)}${_bodyGlossaryInstruction(config, context)}${_idiomaticTranslationInstruction()}',
             },
             if (!context.isEmpty)
               EpubChapterTranslator._fallbackContextMessage(context),
             <String, String>{'role': 'user', 'content': userContent},
           ],
         };
+        final size = _applyBodyBudget(
+          config,
+          requestData,
+          block.sourceHtml,
+          reserveOutput: retryOutput,
+        );
         final Response<dynamic> response = await owner._postChatCompletions(
           dio: dio,
           data: requestData,
           cancelToken: cancelToken,
         );
+
+        _observeBodyBudget(size, response.data);
+        if (size != null &&
+            _TokenSavingBodyStrategy._isTruncated(response.data) &&
+            retryOutput == null &&
+            attempt < config.maxRetries &&
+            size.wireOutput < size.maximumOutput) {
+          retryOutput = min(
+            size.maximumOutput,
+            max(
+              _AdaptiveBodyBudget.isReasoningOnly(response.data) ? 4096 : 256,
+              size.wireOutput * 2,
+            ),
+          );
+          lastError = const TranslationParseException(
+            'Previous response was truncated.',
+          );
+          continue;
+        }
 
         // Single-parse entry: _cleanResponseDom parses the reply once and
         // hands the DOM to the structure lock, instead of the old string
@@ -687,7 +872,8 @@ class _EpubTranslationStrategy {
     if (TranslationApiClient.isRequestTimeout(lastError)) {
       return degradeFallback();
     }
-    if (lastError is TranslationParseException) {
+    if (lastError is TranslationParseException ||
+        lastError is _LocalBodyLimitException) {
       // A single block whose reply never parsed (e.g. a non-JSON gateway
       // response) is deterministic for this prompt but not systemic: re-
       // sending would just re-bill the same broken prompt. Degrade this
@@ -796,6 +982,9 @@ class _EpubTranslationStrategy {
     if (TranslationApiClient.isContextOverflowError(error)) {
       return 'HTTP 400: block exceeds model context limit; source retained';
     }
+    if (error is _LocalBodyLimitException) {
+      return 'Block exceeds model context limit; source retained';
+    }
     if (error is FormatException) {
       return 'Translation structure validation failed';
     }
@@ -846,6 +1035,9 @@ class _EpubTranslationStrategy {
       }
     }
     if (pending.isNotEmpty) {
+      final referencesById = {
+        for (final reference in pending) reference.requestId: reference,
+      };
       translations.addAll(
         await _translateFootnoteBatchRaw(
           dio: dio,
@@ -854,6 +1046,18 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           onRequestAttempt: onRequestAttempt,
+          onValidated: config.tokenSavingMode
+              ? (id, html) {
+                  final reference = referencesById[id]!;
+                  return owner._semanticReviewer.writeDraft(
+                    config,
+                    reference.chapter.path,
+                    reference.block,
+                    batch.context,
+                    html,
+                  );
+                }
+              : null,
         ),
       );
     }
@@ -914,6 +1118,7 @@ class _EpubTranslationStrategy {
             block: reference.block,
             template: template,
             chapterPath: reference.chapter.path,
+            footnote: reference,
           ),
         );
         continue;
@@ -1054,7 +1259,9 @@ class _EpubTranslationStrategy {
               config: config,
               cancelToken: cancelToken,
               process: (List<FootnoteBlockReference> part) =>
-                  _translateFootnoteBatch(
+                  (config.tokenSavingMode
+                  ? _translateFootnoteBatchRaw
+                  : _translateFootnoteBatch)(
                     dio: dio,
                     config: config,
                     batch: FootnoteTranslationBatch(
@@ -1114,17 +1321,24 @@ class _EpubTranslationStrategy {
     required TranslationConfig config,
     required List<FootnoteBlockReference> references,
     required TranslationBatchContext context,
+    bool compact = false,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     Future<void> Function(String id, String html)? onValidated,
   }) async {
     final List<FootnoteBlockReference> failed = [];
+    final selectedContext = _footnoteRequestContext(
+      config,
+      context,
+      references,
+      compact: compact,
+    );
     final Set<String> requestedIds = references
         .map((FootnoteBlockReference reference) => reference.requestId)
         .toSet();
     final Map<String, dynamic> payloadMap = <String, dynamic>{
-      if (!context.isEmpty) 'context': context.toJson(),
+      if (!selectedContext.isEmpty) 'context': selectedContext.toJson(),
       'blocks': references
           .map(
             (FootnoteBlockReference reference) => <String, String>{
@@ -1146,10 +1360,12 @@ class _EpubTranslationStrategy {
           throw const TranslationCancelledException();
         }
         final TranslationStyleProfile batchStyleProfile =
-            _EpubBookMemory._styleProfileFromBookMemoryJson(context.bookMemory);
+            _EpubBookMemory._styleProfileFromBookMemoryJson(
+              selectedContext.bookMemory,
+            );
         final bool batchStyleConfirmed =
             _EpubBookMemory._styleProfileConfirmedFromBookMemoryJson(
-              context.bookMemory,
+              selectedContext.bookMemory,
             );
         final Map<String, dynamic> requestData = <String, dynamic>{
           'model': config.model,
@@ -1158,29 +1374,64 @@ class _EpubTranslationStrategy {
             <String, String>{
               'role': 'system',
               'content':
-                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
+                  'You translate EPUB HTML fragments into ${config.targetLanguage}. The user payload may include a compact read-only bookMemory summary. Use that context only for terminology and style. Translate only items in "blocks". Return strict JSON only. Preserve every HTML tag, attribute, entity, footnote marker, link target, and inline emphasis. Translate only human-readable text. The response must be a JSON object with a "blocks" array. Each array item must contain exactly one original request "id" and the translated HTML in "html". Return every requested id exactly once.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_bodyGlossaryInstruction(config, selectedContext)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
         };
-        onRequestAttempt?.call();
-        _TranslationRequestBudget.apply(requestData);
-        final Response<dynamic> response = await owner._postChatCompletions(
-          dio: dio,
-          data: requestData,
-          cancelToken: cancelToken,
-        );
-        final Map<String, dynamic> jsonPayload = _validateBatchReply(
-          response.data,
-          requestedIds,
-        );
-        final List<dynamic> rawBlocks = jsonPayload['blocks'] as List<dynamic>;
+        final size = _applyBodyBudget(config, requestData, {
+          'blocks': payloadMap['blocks'],
+        });
+        if (size != null && references.length > 1 && !size.fits) {
+          throw const _LocalBodyLimitException();
+        }
+        if (size == null) _TranslationRequestBudget.apply(requestData);
+        Future<Response<dynamic>> send() {
+          onRequestAttempt?.call();
+          return owner._postChatCompletions(
+            dio: dio,
+            data: requestData,
+            cancelToken: cancelToken,
+          );
+        }
+
+        var response = await send();
+        if (size != null &&
+            references.length == 1 &&
+            _TokenSavingBodyStrategy._isTruncated(response.data) &&
+            size.wireOutput < size.maximumOutput) {
+          _observeBodyBudget(size, response.data);
+          requestData['max_tokens'] = min(
+            size.maximumOutput,
+            max(
+              size.wireOutput * 2,
+              _AdaptiveBodyBudget.isReasoningOnly(response.data) ? 4096 : 256,
+            ),
+          );
+          response = await send();
+        }
+        final List<Object?> rawBlocks;
+        if (config.tokenSavingMode) {
+          rawBlocks = _TokenSavingBodyStrategy._uniqueResponseRows(
+            _tokenSavingBody._responseRows(
+              response.data,
+              truncated: _TokenSavingBodyStrategy._isTruncated(response.data),
+            ),
+            requestedIds,
+          ).values.toList(growable: false);
+        } else {
+          rawBlocks =
+              _validateBatchReply(response.data, requestedIds)['blocks']
+                  as List<dynamic>;
+        }
 
         final Map<String, String> rawTranslatedById = <String, String>{};
         for (final Map<String, dynamic> item
             in rawBlocks.cast<Map<String, dynamic>>()) {
           final String rawId = item['id'] as String;
-          final Object? rawHtml = item['html'];
+          final Object? rawHtml = item.length == 2 || !config.tokenSavingMode
+              ? item['html']
+              : null;
           if (rawId.isEmpty) {
             throw const FormatException(
               'Translated footnote batch item is missing id.',
@@ -1211,7 +1462,13 @@ class _EpubTranslationStrategy {
                 );
             translatedById[reference.requestId] = locked;
           } on FormatException {
-            if (references.length == 1) rethrow;
+            if (references.length == 1) {
+              if (!config.tokenSavingMode) rethrow;
+              _observeBodyBudget(size, response.data, complete: false);
+              throw const TranslationParseException(
+                'The footnote response is missing or invalid.',
+              );
+            }
             failed.add(reference);
             continue;
           }
@@ -1220,6 +1477,7 @@ class _EpubTranslationStrategy {
             translatedById[reference.requestId]!,
           );
         }
+        _observeBodyBudget(size, response.data, complete: failed.isEmpty);
         return translatedById;
       },
     );
@@ -1235,6 +1493,7 @@ class _EpubTranslationStrategy {
               config: config,
               references: [reference],
               context: context,
+              compact: true,
               retryDelayOverride: retryDelayOverride,
               cancelToken: cancelToken,
               onRequestAttempt: onRequestAttempt,
@@ -1261,10 +1520,12 @@ class _EpubTranslationStrategy {
     required TranslationConfig config,
     required List<_ProtectedSlotRequest> requests,
     required TranslationBatchContext context,
+    TranslationBlockBatch? sourceBatch,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     int? maxBatchAttempts,
+    bool repair = false,
     // The slot pipeline is shared: both the main block pipeline and the
     // footnote pipeline count every block up front (pass true so degrades
     // are subtracted from the report). Callers forward their own pipeline's
@@ -1278,16 +1539,27 @@ class _EpubTranslationStrategy {
     if (requestedIds.length != requests.length) {
       throw const FormatException('Protected slot request ids must be unique.');
     }
+    final rawBatch =
+        sourceBatch ?? TranslationBlockBatch(const [], context: context);
+    final selectedContext = requests.first.footnote != null
+        ? _footnoteRequestContext(config, context, [
+            for (final request in requests) request.footnote!,
+          ], compact: maxBatchAttempts == 1)
+        : _bodyRequestContext(config, rawBatch, [
+            for (final request in requests) request.block,
+          ], compact: maxBatchAttempts == 1);
     try {
       return await _translateProtectedSlotBatchOnce(
         dio: dio,
         config: config,
         requests: requests,
-        context: context,
+        context: selectedContext,
+        sourceBatch: rawBatch,
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         onRequestAttempt: onRequestAttempt,
         maxAttemptsOverride: maxBatchAttempts,
+        repair: repair,
         apiCounted: apiCounted,
         onValidated: onValidated,
       );
@@ -1299,7 +1571,7 @@ class _EpubTranslationStrategy {
                 dio: dio,
                 config: config,
                 request: requests.single,
-                context: context,
+                context: selectedContext,
                 retryDelayOverride: retryDelayOverride,
                 cancelToken: cancelToken,
                 onRequestAttempt: onRequestAttempt,
@@ -1340,6 +1612,8 @@ class _EpubTranslationStrategy {
                 config: config,
                 requests: half,
                 context: context,
+                sourceBatch: rawBatch,
+                repair: repair,
                 retryDelayOverride: retryDelayOverride,
                 cancelToken: cancelToken,
                 onRequestAttempt: onRequestAttempt,
@@ -1365,6 +1639,8 @@ class _EpubTranslationStrategy {
                 config: config,
                 requests: <_ProtectedSlotRequest>[request],
                 context: context,
+                sourceBatch: rawBatch,
+                repair: repair,
                 retryDelayOverride: retryDelayOverride,
                 cancelToken: cancelToken,
                 onRequestAttempt: onRequestAttempt,
@@ -1387,6 +1663,8 @@ class _EpubTranslationStrategy {
               config: config,
               requests: half,
               context: context,
+              sourceBatch: rawBatch,
+              repair: repair,
               retryDelayOverride: retryDelayOverride,
               cancelToken: cancelToken,
               onRequestAttempt: onRequestAttempt,
@@ -1465,6 +1743,8 @@ class _EpubTranslationStrategy {
             config: config,
             requests: half,
             context: context,
+            sourceBatch: rawBatch,
+            repair: repair,
             retryDelayOverride: retryDelayOverride,
             cancelToken: cancelToken,
             onRequestAttempt: onRequestAttempt,
@@ -1479,14 +1759,17 @@ class _EpubTranslationStrategy {
     required TranslationConfig config,
     required List<_ProtectedSlotRequest> requests,
     required TranslationBatchContext context,
+    required TranslationBlockBatch sourceBatch,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     void Function()? onRequestAttempt,
     int? maxAttemptsOverride,
+    required bool repair,
     bool apiCounted = false,
     Future<void> Function(String id, String html)? onValidated,
   }) async {
     final List<_ProtectedSlotRequest> failed = [];
+    bool truncated = false;
     final Set<String> requestedIds = requests
         .map((_ProtectedSlotRequest request) => request.id)
         .toSet();
@@ -1519,124 +1802,157 @@ class _EpubTranslationStrategy {
               context.bookMemory,
             );
         final Map<String, dynamic> requestData = <String, dynamic>{
+          if (repair) '_folioFerryBodyRepair': true,
           'model': config.model,
           'temperature': 0.2,
           'messages': <Map<String, String>>[
             <String, String>{
               'role': 'system',
               'content':
-                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
+                  'Translate only each slot "text" into ${config.targetLanguage}. Return strict JSON only, with exactly the requested block ids and slot ids. Every block must contain only "id" and "slots"; every slot must contain only string "id" and string "text"; never return HTML, tags, attributes, markdown, or explanations. Treat angle brackets in translated text as ordinary text.${repair ? ' Repair all requested slots. Complete every readable text segment and omit no words.' : ''}${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_bodyGlossaryInstruction(config, context)}${_idiomaticTranslationInstruction()}',
             },
             <String, String>{'role': 'user', 'content': payload},
           ],
         };
+        final size = _applyBodyBudget(config, requestData, {
+          'blocks': [for (final request in requests) request.toJson()],
+        });
+        if (size != null &&
+            requests.length > 1 &&
+            (!size.fits ||
+                size.bodyEstimate >
+                    owner._adaptiveBodyBudget!.targetBodyTokens)) {
+          throw const _DeterministicBatchStructureException(
+            'Protected batch exceeds its estimated budget.',
+          );
+        }
+        if (size == null) _TranslationRequestBudget.apply(requestData);
         onRequestAttempt?.call();
-        _TranslationRequestBudget.apply(requestData);
         final Response<dynamic> response = await owner._postChatCompletions(
           dio: dio,
           data: requestData,
           cancelToken: cancelToken,
         );
-        final Map<String, dynamic> jsonPayload = _validateBatchReply(
-          response.data,
-          requestedIds,
-          slotIds: {
-            for (final request in requests) request.id: request.slotIds.toSet(),
-          },
-        );
-        final Object? rawBlocks = jsonPayload['blocks'];
-        if (rawBlocks is! List<dynamic> ||
-            rawBlocks.length != requests.length) {
-          throw const FormatException(
-            'Translated slot block count does not match request count.',
+        truncated = _TokenSavingBodyStrategy._isTruncated(response.data);
+        final List<Object?> rawBlocks;
+        if (config.tokenSavingMode) {
+          rawBlocks = _TokenSavingBodyStrategy._uniqueResponseRows(
+            _tokenSavingBody._responseRows(response.data, truncated: truncated),
+            requestedIds,
+          ).values.toList(growable: false);
+        } else {
+          final jsonPayload = _validateBatchReply(
+            response.data,
+            requestedIds,
+            slotIds: {
+              for (final request in requests)
+                request.id: request.slotIds.toSet(),
+            },
           );
+          rawBlocks = jsonPayload['blocks'] as List<dynamic>;
         }
 
         final Map<String, List<String>> translatedSlotsById =
             <String, List<String>>{};
         for (final Object? rawBlock in rawBlocks) {
-          if (rawBlock is! Map<String, dynamic> ||
-              rawBlock.keys.toSet().difference(const <String>{
-                'id',
-                'slots',
-              }).isNotEmpty ||
-              const <String>{
-                'id',
-                'slots',
-              }.difference(rawBlock.keys.toSet()).isNotEmpty) {
-            throw const FormatException(
-              'Translated slot block must contain only id and slots.',
-            );
-          }
-          final Object? rawId = rawBlock['id'];
-          final Object? rawSlots = rawBlock['slots'];
-          if (rawId is! String ||
-              !requestedIds.contains(rawId) ||
-              translatedSlotsById.containsKey(rawId)) {
-            throw const FormatException(
-              'Translated slot response contains an unknown or duplicate block id.',
-            );
-          }
-          final _ProtectedSlotRequest request = requestById[rawId]!;
-          if (rawSlots is! List<dynamic> ||
-              rawSlots.length != request.template.slotTexts.length) {
-            throw FormatException(
-              'Translated slot count does not match block $rawId.',
-            );
-          }
-          final Map<String, String> textBySlotId = <String, String>{};
-          final Set<String> expectedSlotIds = request.slotIds.toSet();
-          // 性能-#36: resolve slot ids to indexes through a map instead of
-          // a per-slot indexOf scan (O(n^2) over the slots).
-          final Map<String, int> slotIndexById = <String, int>{
-            for (int index = 0; index < request.slotIds.length; index++)
-              request.slotIds[index]: index,
-          };
-          for (final Object? rawSlot in rawSlots) {
-            if (rawSlot is! Map<String, dynamic> ||
-                rawSlot.keys.toSet().difference(const <String>{
+          try {
+            if (rawBlock is! Map<String, dynamic> ||
+                rawBlock.keys.toSet().difference(const <String>{
                   'id',
-                  'text',
+                  'slots',
                 }).isNotEmpty ||
                 const <String>{
                   'id',
-                  'text',
-                }.difference(rawSlot.keys.toSet()).isNotEmpty) {
+                  'slots',
+                }.difference(rawBlock.keys.toSet()).isNotEmpty) {
               throw const FormatException(
-                'Translated slot must contain only id and text.',
+                'Translated slot block must contain only id and slots.',
               );
             }
-            final Object? rawSlotId = rawSlot['id'];
-            final Object? rawText = rawSlot['text'];
-            if (rawSlotId is! String ||
-                !expectedSlotIds.contains(rawSlotId) ||
-                textBySlotId.containsKey(rawSlotId) ||
-                rawText is! String) {
+            final Object? rawId = rawBlock['id'];
+            final Object? rawSlots = rawBlock['slots'];
+            if (rawId is! String ||
+                !requestedIds.contains(rawId) ||
+                translatedSlotsById.containsKey(rawId)) {
               throw const FormatException(
-                'Translated slot contains an unknown or duplicate id, or non-string text.',
+                'Translated slot response contains an unknown or duplicate block id.',
               );
             }
-            _validateIndividualSlotTranslation(
-              sourceText: request.template.slotTexts[slotIndexById[rawSlotId]!],
-              translatedText: rawText,
-              // Batch slots may carry HTML that the renderer escapes;
-              // only the non-HTML wrapper checks apply here.
-              checkHtmlTags: false,
-            );
-            textBySlotId[rawSlotId] = rawText;
+            final _ProtectedSlotRequest request = requestById[rawId]!;
+            if (rawSlots is! List<dynamic> ||
+                rawSlots.length != request.template.slotTexts.length) {
+              throw FormatException(
+                'Translated slot count does not match block $rawId.',
+              );
+            }
+            final Map<String, String> textBySlotId = <String, String>{};
+            final Set<String> expectedSlotIds = request.slotIds.toSet();
+            // 性能-#36: resolve slot ids to indexes through a map instead of
+            // a per-slot indexOf scan (O(n^2) over the slots).
+            final Map<String, int> slotIndexById = <String, int>{
+              for (int index = 0; index < request.slotIds.length; index++)
+                request.slotIds[index]: index,
+            };
+            for (final Object? rawSlot in rawSlots) {
+              if (rawSlot is! Map<String, dynamic> ||
+                  rawSlot.keys.toSet().difference(const <String>{
+                    'id',
+                    'text',
+                  }).isNotEmpty ||
+                  const <String>{
+                    'id',
+                    'text',
+                  }.difference(rawSlot.keys.toSet()).isNotEmpty) {
+                throw const FormatException(
+                  'Translated slot must contain only id and text.',
+                );
+              }
+              final Object? rawSlotId = rawSlot['id'];
+              final Object? rawText = rawSlot['text'];
+              if (rawSlotId is! String ||
+                  !expectedSlotIds.contains(rawSlotId) ||
+                  textBySlotId.containsKey(rawSlotId) ||
+                  rawText is! String) {
+                throw const FormatException(
+                  'Translated slot contains an unknown or duplicate id, or non-string text.',
+                );
+              }
+              _validateIndividualSlotTranslation(
+                sourceText:
+                    request.template.slotTexts[slotIndexById[rawSlotId]!],
+                translatedText: rawText,
+                // Batch slots may carry HTML that the renderer escapes;
+                // only the non-HTML wrapper checks apply here.
+                checkHtmlTags: false,
+              );
+              textBySlotId[rawSlotId] = rawText;
+            }
+            translatedSlotsById[rawId] = request.slotIds
+                .map((String slotId) => textBySlotId[slotId]!)
+                .toList(growable: false);
+          } on FormatException {
+            if (!config.tokenSavingMode) rethrow;
           }
-          translatedSlotsById[rawId] = request.slotIds
-              .map((String slotId) => textBySlotId[slotId]!)
-              .toList(growable: false);
         }
 
         final Map<String, String> translated = <String, String>{};
         for (final _ProtectedSlotRequest request in requests) {
+          final translatedSlots = translatedSlotsById[request.id];
+          if (translatedSlots == null) {
+            if (requests.length == 1) {
+              _observeBodyBudget(size, response.data, complete: false);
+              throw const TranslationParseException(
+                'The protected block response is missing or invalid.',
+              );
+            }
+            failed.add(request);
+            continue;
+          }
           try {
             final String html = _renderAndValidateProtectedSlots(
               config: config,
               request: request,
-              translatedSlots: translatedSlotsById[request.id]!,
+              translatedSlots: translatedSlots,
             );
             translated[request.id] = html;
           } on FormatException {
@@ -1646,24 +1962,41 @@ class _EpubTranslationStrategy {
           }
           await onValidated?.call(request.id, translated[request.id]!);
         }
+        _observeBodyBudget(
+          size,
+          response.data,
+          complete: !repair && failed.isEmpty,
+        );
         return translated;
       },
     );
+    if (failed.isEmpty) return result;
+    final int groupSize = !config.tokenSavingMode || repair
+        ? 1
+        : truncated || failed.length == requests.length
+        ? min(3, max(1, requests.length ~/ 2))
+        : 4;
+    final groups = [
+      for (var start = 0; start < failed.length; start += groupSize)
+        failed.sublist(start, min(start + groupSize, failed.length)),
+    ];
     result.addAll(
       await _mapTranslations(
-        failed,
+        groups,
         config: config,
         cancelToken: cancelToken,
-        process: (_ProtectedSlotRequest request) =>
+        process: (List<_ProtectedSlotRequest> group) =>
             _translateProtectedSlotBatch(
               dio: dio,
               config: config,
-              requests: [request],
-              context: context,
+              requests: group,
+              context: sourceBatch.context,
+              sourceBatch: sourceBatch,
               retryDelayOverride: retryDelayOverride,
               cancelToken: cancelToken,
               onRequestAttempt: onRequestAttempt,
               maxBatchAttempts: 1,
+              repair: config.tokenSavingMode,
               apiCounted: apiCounted,
               onValidated: onValidated,
             ),
@@ -2020,7 +2353,7 @@ class _EpubTranslationStrategy {
         <String, String>{
           'role': 'system',
           'content':
-              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${owner._apiClient.lockedGlossaryInstruction(config)}${_idiomaticTranslationInstruction()}',
+              'Translate the user text into ${config.targetLanguage}. Return only the translated text, with no JSON, HTML, Markdown formatting, labels, or explanation.${_styleInstructionFragment(config: config, styleProfile: batchStyleProfile, confirmed: batchStyleConfirmed)}${_bodyGlossaryInstruction(config, context)}${_idiomaticTranslationInstruction()}',
         },
         if (!context.isEmpty)
           EpubChapterTranslator._fallbackContextMessage(context),
@@ -2036,12 +2369,14 @@ class _EpubTranslationStrategy {
         <String, String>{'role': 'user', 'content': userText},
       ],
     };
+    final size = _applyBodyBudget(config, requestData, trimmedSource);
     onRequestAttempt?.call();
     final Response<dynamic> response = await owner._postChatCompletions(
       dio: dio,
       data: requestData,
       cancelToken: cancelToken,
     );
+    _observeBodyBudget(size, response.data);
     final String translated = owner._apiClient.extractMessageContent(
       response.data,
     );
@@ -2368,6 +2703,7 @@ class _ProtectedSlotRequest {
     required this.block,
     required this.template,
     required this.chapterPath,
+    this.footnote,
   });
 
   final String id;
@@ -2377,6 +2713,7 @@ class _ProtectedSlotRequest {
   /// Scopes degraded-block tracking: block ids restart per chapter, so the
   /// bare id would collide across chapters.
   final String chapterPath;
+  final FootnoteBlockReference? footnote;
 
   late final List<String> slotIds = List<String>.generate(
     template.slotTexts.length,

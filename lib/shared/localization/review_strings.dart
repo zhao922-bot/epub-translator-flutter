@@ -134,10 +134,12 @@ extension ReviewStrings on AppStrings {
       : 'The text must appear exactly once within one unprotected text span. Try a smaller passage.';
   String runRequestKind(Object? kind) => switch (kind) {
     'translation' => isChinese ? '正文／脚注' : 'Body / notes',
+    'bodyRepair' => isChinese ? '正文修复' : 'Body repair',
     'semanticReview' => isChinese ? '语义复核' : 'Review',
     'styleProfile' => isChinese ? '风格' : 'Style',
     'initialBookMemory' => isChinese ? '书籍记忆' : 'Book memory',
     'chapterMemory' => isChinese ? '章节记忆' : 'Chapter memory',
+    'chapterMemoryBatch' => isChinese ? '批量章节记忆' : 'Batched chapter memory',
     'bookTitle' => isChinese ? '书名' : 'Title',
     'probe' => isChinese ? '连接测试' : 'Connection probe',
     _ => kind.toString(),

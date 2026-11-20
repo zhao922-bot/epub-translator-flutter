@@ -848,39 +848,13 @@ class TranslationDashboardController
   }
 
   void syncSettings(TranslationConfig settingsConfig) {
-    final TranslationConfig nextConfig = state.config.copyWith(
-      apiBaseUrl: settingsConfig.apiBaseUrl,
-      apiKey: settingsConfig.apiKey,
-      model: settingsConfig.model,
-      uiLanguage: settingsConfig.uiLanguage,
-      themeMode: settingsConfig.themeMode,
-      targetLanguage: settingsConfig.targetLanguage,
-      bilingual: settingsConfig.bilingual,
-      chunkSize: settingsConfig.chunkSize,
-      maxConcurrent: settingsConfig.maxConcurrent,
-      timeoutSeconds: settingsConfig.timeoutSeconds,
-      maxRetries: settingsConfig.maxRetries,
-      retryDelaySeconds: settingsConfig.retryDelaySeconds,
-      outputSuffix: settingsConfig.outputSuffix,
-      residualQualityCheck: settingsConfig.residualQualityCheck,
-      styleProfileEnabled: settingsConfig.styleProfileEnabled,
-      textScale: settingsConfig.textScale,
-      lockedGlossary: settingsConfig.lockedGlossary,
-      httpProxy: settingsConfig.httpProxy,
-      reasoningEffort: settingsConfig.reasoningEffort,
-      maxOutputTokens: settingsConfig.maxOutputTokens,
-      semanticQualityCheck: settingsConfig.semanticQualityCheck,
-      autoApplyVerifiedCorrections: settingsConfig.autoApplyVerifiedCorrections,
-      semanticReviewScope: settingsConfig.semanticReviewScope,
-      maxSemanticReviewTokens: settingsConfig.maxSemanticReviewTokens,
-      maxSemanticReviewRequests: settingsConfig.maxSemanticReviewRequests,
-      retryIncompleteReviews: settingsConfig.retryIncompleteReviews,
-    );
+    // Both providers use the same immutable config. Carry the entire settings
+    // snapshot into each new run so new fields and cleared values survive.
     state = state.copyWith(
-      config: nextConfig,
+      config: settingsConfig,
       runEstimate: state.inspectedChapters.isEmpty
           ? state.runEstimate
-          : _buildEstimate(config: nextConfig),
+          : _buildEstimate(config: settingsConfig),
     );
   }
 

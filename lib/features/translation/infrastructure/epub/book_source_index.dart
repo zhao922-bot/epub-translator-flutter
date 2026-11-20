@@ -6,7 +6,13 @@ class BookSourceIndex {
   static const int _maxHeadingEvidence = 512;
   static const int _maxCousinEvidence = 2048;
 
-  static Map<String, Object> build(List<InspectedChapter> chapters) {
+  static Map<String, Object> build(
+    List<InspectedChapter> chapters, {
+    bool trackMemorySignals = false,
+  }) {
+    final locations = trackMemorySignals
+        ? <String, ({String chapterPath, String blockId})>{}
+        : null;
     final counts = <String, int>{};
     final names = <String, int>{};
     final nameContextCounts = <String, int>{};
@@ -136,6 +142,10 @@ class BookSourceIndex {
             continue;
           }
           if (seenNames.add(name)) {
+            locations?.putIfAbsent(
+              name,
+              () => (chapterPath: chapter.path, blockId: block.id),
+            );
             names.update(name, (n) => n + 1, ifAbsent: () => 1);
             nameEvidence.putIfAbsent(
               name,
@@ -192,6 +202,10 @@ class BookSourceIndex {
                 continue;
               }
               if (!counts.containsKey(term) && counts.length >= 2048) continue;
+              locations?.putIfAbsent(
+                term,
+                () => (chapterPath: chapter.path, blockId: block.id),
+              );
               counts.update(term, (n) => n + 1, ifAbsent: () => 1);
               evidence.putIfAbsent(term, () {
                 final from = (match.start - 35).clamp(0, text.length);
@@ -244,9 +258,21 @@ class BookSourceIndex {
             final frequency = b.value.compareTo(a.value);
             return frequency != 0 ? frequency : a.key.compareTo(b.key);
           });
+    final rankedTerms = ranked.take(24);
+    final rankedRecurringNames = rankedNames.take(32);
+    final memorySignals = <String, List<({String source, String blockId})>>{};
+    if (locations != null) {
+      for (final entry in [...rankedRecurringNames, ...rankedTerms]) {
+        final location = locations[entry.key]!;
+        memorySignals.putIfAbsent(location.chapterPath, () => []).add((
+          source: entry.key,
+          blockId: location.blockId,
+        ));
+      }
+    }
     return {
       'recurringTerms': [
-        for (final e in ranked.take(24))
+        for (final e in rankedTerms)
           {
             'source': e.key,
             'occurrences': e.value,
@@ -254,7 +280,7 @@ class BookSourceIndex {
           },
       ],
       'recurringNames': [
-        for (final e in rankedNames.take(32))
+        for (final e in rankedRecurringNames)
           {
             'source': e.key,
             'occurrences': e.value,
@@ -264,6 +290,7 @@ class BookSourceIndex {
       'relationshipEvidence': relations,
       'headingSources': headingSources,
       'cousinMentions': cousinMentions,
+      if (memorySignals.isNotEmpty) 'memorySignals': memorySignals,
     };
   }
 

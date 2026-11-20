@@ -12,24 +12,28 @@ class TranslationArtifactCache {
   const TranslationArtifactCache(this.store);
   final TranslationCacheStore store;
 
-  static String key(TranslationConfig config, String kind, Object source) =>
-      sha256
-          .convert(
-            utf8.encode(
-              jsonEncode([
-                'translation-artifact-v1',
-                kind,
-                config.apiBaseUrl.trim().replaceAll(RegExp(r'/+$'), ''),
-                config.model.trim(),
-                config.targetLanguage.trim(),
-                config.effectiveReasoningEffort,
-                config.maxOutputTokens,
-                config.lockedGlossary.trim(),
-                source,
-              ]),
-            ),
-          )
-          .toString();
+  static String key(TranslationConfig config, String kind, Object source) {
+    final catalog = config.capabilities;
+    return sha256
+        .convert(
+          utf8.encode(
+            jsonEncode([
+              'translation-artifact-v1',
+              kind,
+              config.apiBaseUrl.trim().replaceAll(RegExp(r'/+$'), ''),
+              config.model.trim(),
+              config.targetLanguage.trim(),
+              catalog.effectiveReasoningEffort,
+              ?catalog.reasoningCacheIdentity,
+              if (config.tokenSavingMode) 'token-saving-v1',
+              config.maxOutputTokens,
+              config.lockedGlossary.trim(),
+              source,
+            ]),
+          ),
+        )
+        .toString();
+  }
 
   Future<Map<String, dynamic>?> read(String key) async {
     try {

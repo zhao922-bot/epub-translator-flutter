@@ -247,6 +247,10 @@ class _EpubTranslatorPaths {
               config.bilingual,
               config.lockedGlossary.trim(),
               config.residualQualityCheck,
+              if (config.tokenSavingMode) 'token-saving-v1',
+              if (config.capabilities.reasoningCacheIdentity
+                  case final String reasoning)
+                reasoning,
               if (config.effectiveReasoningEffort != null ||
                   config.maxOutputTokens != 8192 ||
                   config.semanticQualityCheck) ...[
@@ -293,6 +297,10 @@ class _EpubTranslatorPaths {
               config.lockedGlossary.trim(),
               config.chunkSize,
               config.residualQualityCheck,
+              if (config.tokenSavingMode) 'token-saving-v1',
+              if (config.capabilities.reasoningCacheIdentity
+                  case final String reasoning)
+                reasoning,
               if (config.effectiveReasoningEffort != null ||
                   config.maxOutputTokens != 8192 ||
                   config.semanticQualityCheck) ...[
