@@ -158,12 +158,14 @@ void main() {
       });
       await store.putBlockTranslation('abkey', 'old contents');
       await entered.future;
+      // Keep the scan blocked until the writes finish. The test runner's
+      // timeout catches a deadlock without timing the serialized disk writes.
       await Future.wait(
         List.generate(
           20,
           (i) => store.putBlockTranslation('abkey', '你' * (i + 1)),
         ),
-      ).timeout(const Duration(seconds: 5));
+      );
       await store.putBlockTranslation('abnew', 'z');
       expect(scans, 1, reason: 'in-flight maintenance requests are coalesced');
       release.complete();
