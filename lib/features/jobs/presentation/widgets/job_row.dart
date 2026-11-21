@@ -3,6 +3,7 @@ import '../../../translation/presentation/pages/translation_review_page.dart';
 import '../../../translation/presentation/widgets/translation_run_details.dart';
 import '../../../translation/presentation/workbench_strings.dart';
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
 import '../../domain/models/job_summary.dart';
 import '../../../translation/domain/models/translation_job.dart';
 
@@ -27,7 +28,8 @@ class JobRow extends StatelessWidget {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final String? reportPath = job.qualityReportPath;
-    final color = job.hasWarnings
+    final paused = job.status == TranslationJobStatus.budgetPaused;
+    final color = job.hasWarnings || paused
         ? scheme.tertiary
         : job.status == TranslationJobStatus.failed
         ? scheme.error
@@ -36,7 +38,7 @@ class JobRow extends StatelessWidget {
         : scheme.onSurfaceVariant;
     final label = job.isActive
         ? strings.activeRun
-        : job.hasWarnings
+        : job.hasWarnings || paused
         ? strings.jobStatusLabel(job.status)
         : job.canResume
         ? strings.canResumeLabel
@@ -77,13 +79,18 @@ class JobRow extends StatelessWidget {
           IconButton(
             tooltip: job.retryBlocked
                 ? strings.retryBlockedByActiveRun
+                : paused
+                ? strings.adjustBudgetAndResume
                 : strings.retryJob,
             onPressed: job.retryBlocked
                 ? () => ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text(strings.retryBlockedByActiveRun)),
                   )
                 : onRetry,
-            icon: const Icon(Icons.replay_rounded, size: 19),
+            icon: Icon(
+              paused ? Icons.play_arrow_rounded : Icons.replay_rounded,
+              size: 19,
+            ),
           ),
       ],
     );

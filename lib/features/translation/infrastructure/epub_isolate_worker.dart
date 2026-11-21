@@ -526,27 +526,40 @@ class EpubIsolateWorker {
 
   /// Same synchronous extractor semantics, but the outer isolate is killable;
   /// nesting the extractor's Isolate.run would leave that child unmanaged.
-  static Future<List<InspectedChapter>> inspectChapterBatchCancellable({
+  static Future<
+    ({List<InspectedChapter> chapters, Map<String, String> sourceDigests})
+  >
+  inspectChapterBatchCancellable({
     required Map<String, List<int>> chapters,
     required EpubHtmlExtractor extractor,
     required bool Function() isCancelled,
+    bool fingerprintChapters = false,
   }) => prepareWithProgress(
-    operation: _chapterOperation(chapters, extractor),
+    operation: _chapterOperation(chapters, extractor, fingerprintChapters),
     isCancelled: isCancelled,
   );
 
-  static List<InspectedChapter> Function(void Function(int, int))
+  static ({List<InspectedChapter> chapters, Map<String, String> sourceDigests})
+  Function(void Function(int, int))
   _chapterOperation(
     Map<String, List<int>> chapters,
     EpubHtmlExtractor extractor,
+    bool fingerprintChapters,
   ) =>
-      (_) => [
-        for (final entry in chapters.entries)
-          extractor.inspectChapterBytes(
-            chapterPath: entry.key,
-            bytes: entry.value,
-          ),
-      ];
+      (_) => (
+        chapters: [
+          for (final entry in chapters.entries)
+            extractor.inspectChapterBytes(
+              chapterPath: entry.key,
+              bytes: entry.value,
+            ),
+        ],
+        sourceDigests: {
+          if (fingerprintChapters)
+            for (final entry in chapters.entries)
+              entry.key: sha256.convert(entry.value).toString(),
+        },
+      );
 
   /// Only the small title crosses the isolate boundary. ZIP limits and source
   /// identity still apply, but only container.xml and its OPF are inflated.

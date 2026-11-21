@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
 import '../../../../shared/localization/review_strings.dart';
 import '../../domain/models/translation_config.dart';
+import '../../domain/models/translation_token_usage.dart';
 import '../pages/translation_review_page.dart';
 
 class TranslationRunDetails extends StatelessWidget {
@@ -28,10 +30,12 @@ class TranslationRunDetails extends StatelessWidget {
     final strings = AppStrings(
       isChinese ? UiLanguage.chinese : UiLanguage.english,
     );
-    final kinds = apiUsage['byKind'] as Map? ?? {};
-    final times = apiUsage['elapsedMsByKind'] as Map? ?? {};
-    final inputs = apiUsage['promptTokensByKind'] as Map? ?? {};
-    final outputs = apiUsage['completionTokensByKind'] as Map? ?? {};
+    final usage = TranslationTokenUsage(apiUsage);
+    final cumulative = usage.cumulative;
+    final kinds = usage.countsByKind('byKind');
+    final times = usage.countsByKind('elapsedMsByKind');
+    final inputs = usage.countsByKind('promptTokensByKind');
+    final outputs = usage.countsByKind('completionTokensByKind');
     final reviewPath = reportPath;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -41,15 +45,22 @@ class TranslationRunDetails extends StatelessWidget {
             tilePadding: EdgeInsets.zero,
             title: Text(
               strings.runApiUsage(
-                apiUsage['requests'] ?? 0,
-                apiUsage['promptTokens'] ?? 0,
-                apiUsage['completionTokens'] ?? 0,
+                usage.requests,
+                usage.promptTokens,
+                usage.completionTokens,
               ),
             ),
             subtitle: Text(
-              strings.runElapsed(
-                (elapsedMilliseconds / 1000).toStringAsFixed(1),
-              ),
+              [
+                if (usage.maxBookTokens > 0) ...[
+                  strings.bookAccountedTokens(usage.accountedTokens),
+                  strings.bookBudgetThreshold(usage.maxBookTokens),
+                ],
+                if (elapsedMilliseconds > 0 || usage.maxBookTokens == 0)
+                  strings.runElapsed(
+                    (elapsedMilliseconds / 1000).toStringAsFixed(1),
+                  ),
+              ].join(' · '),
             ),
             children: [
               for (final entry in kinds.entries)
@@ -58,22 +69,52 @@ class TranslationRunDetails extends StatelessWidget {
                   title: Text(strings.runRequestKind(entry.key)),
                   subtitle: Text(
                     strings.runRequestUsage(
-                      entry.value ?? 0,
+                      entry.value,
                       inputs[entry.key] ?? 0,
                       outputs[entry.key] ?? 0,
-                      ((times[entry.key] as num? ?? 0) / 1000).toStringAsFixed(
-                        1,
-                      ),
+                      ((times[entry.key] ?? 0) / 1000).toStringAsFixed(1),
                     ),
                   ),
                 ),
               Text(strings.runUsageHelp),
               Text(
                 strings.runUsageReported(
-                  apiUsage['usageReportedRequests'] ?? 0,
-                  apiUsage['requests'] ?? 0,
+                  usage.reportedRequests,
+                  usage.requests,
                 ),
               ),
+              if (usage.priorAccountedTokens > 0)
+                Text(strings.bookEarlierTokens(usage.priorAccountedTokens)),
+              if (cumulative.totalReportedRequests > 0)
+                Text(
+                  strings.bookProviderTotal(
+                    cumulative.count('reportedTotalTokens'),
+                    cumulative.totalReportedRequests,
+                  ),
+                ),
+              if (cumulative.incompleteUsageRequests > 0)
+                Text(
+                  cumulative.estimatedUnreportedTokens > 0
+                      ? strings.bookUsageUnreported(
+                          cumulative.incompleteUsageRequests,
+                          cumulative.estimatedUnreportedTokens,
+                        )
+                      : strings.bookUsageUnknown(
+                          cumulative.incompleteUsageRequests,
+                        ),
+                ),
+              if (cumulative.hasReasoningUsage)
+                Text(
+                  strings.bookReasoningTokens(
+                    cumulative.count('reasoningTokens'),
+                  ),
+                ),
+              if (cumulative.hasCachedPromptUsage)
+                Text(
+                  strings.bookPromptCacheTokens(
+                    cumulative.count('cachedPromptTokens'),
+                  ),
+                ),
             ],
           ),
         if (showReviewLink && reviewPath != null)

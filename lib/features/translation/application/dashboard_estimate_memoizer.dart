@@ -119,6 +119,12 @@ class DashboardEstimateMemoizer {
       apiTranslatedBlocks: reuseProgress
           ? TranslationRunEstimate.apiTranslatedBlocksForThroughput(job)
           : 0,
+      budgetJob: reuseProgress ? job : null,
+      maxOutputTokens: config.maxOutputTokens,
+      tokenSavingMode: config.tokenSavingMode,
+      styleEnabled: config.styleProfileEnabled,
+      reviewEnabled: config.semanticQualityCheck,
+      reviewBudget: config.maxSemanticReviewTokens,
     );
   }
 }

@@ -5,7 +5,6 @@ import 'package:dio/dio.dart';
 import '../../domain/repositories/translation_repository.dart';
 import 'epub_repacker.dart';
 import 'translation_work_queue.dart';
-import 'translation_api_client.dart';
 import 'translation_consistency_checker.dart';
 
 /// Mutable state belongs to one invocation, even when a translator is reused.
@@ -25,7 +24,6 @@ class TranslationRunContext {
   final Map<String, String> degradedFallbacks = <String, String>{};
   int apiDegradedBlocks = 0;
   String cacheSourceIdentity = '';
-  final TranslationApiMetrics styleMetrics = TranslationApiMetrics();
   int semanticRequests = 0;
   final ReviewEvidenceIndex semanticEvidence = ReviewEvidenceIndex();
   Map<String, Object> sourceHints = const {};
@@ -53,10 +51,14 @@ class TranslationRunContext {
       );
   Timer? _cancellationTimer;
 
-  void throwIfCancelled() {
-    if (isCancelled?.call() ?? false) {
-      if (!cancelToken.isCancelled) cancelToken.cancel('Translation cancelled');
+  void syncCancellation() {
+    if (!cancelToken.isCancelled && (isCancelled?.call() ?? false)) {
+      cancelToken.cancel('Translation cancelled');
     }
+  }
+
+  void throwIfCancelled() {
+    syncCancellation();
     if (cancelToken.isCancelled) {
       throw const TranslationCancelledException();
     }

@@ -2,10 +2,18 @@ enum ChapterCategory { content, frontMatter, backMatter, reference, ancillary }
 
 /// Identity of the exact archive bytes used to inspect a chapter.
 class EpubSourceIdentity {
-  const EpubSourceIdentity({required this.inputPath, required this.sha256});
+  const EpubSourceIdentity({
+    required this.inputPath,
+    required this.sha256,
+    this.reuseFingerprint,
+  });
 
   final String inputPath;
   final String sha256;
+
+  /// Identifies an inspected publication for secondary cache lookups. The
+  /// archive [sha256] still guards the source used by the current run.
+  final String? reuseFingerprint;
 }
 
 class InspectedChapter {

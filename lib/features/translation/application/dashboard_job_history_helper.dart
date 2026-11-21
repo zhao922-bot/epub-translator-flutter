@@ -69,7 +69,9 @@ abstract final class DashboardJobHistoryHelper {
     int priority(TranslationJob job) => switch (job.status) {
       TranslationJobStatus.completed => 5,
       TranslationJobStatus.completedWithWarnings => 4,
-      TranslationJobStatus.failed || TranslationJobStatus.cancelled => 3,
+      TranslationJobStatus.failed ||
+      TranslationJobStatus.cancelled ||
+      TranslationJobStatus.budgetPaused => 3,
       TranslationJobStatus.running || TranslationJobStatus.queued => 2,
       _ => 1,
     };

@@ -2,9 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
+import '../../../settings/application/settings_controller.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../application/jobs_provider.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
+import '../../../translation/domain/models/translation_job.dart';
+import '../../../translation/domain/models/translation_token_usage.dart';
+import '../../../translation/presentation/widgets/book_token_budget_dialog.dart';
 import '../widgets/job_row.dart';
 
 class JobsPage extends ConsumerWidget {
@@ -105,7 +110,31 @@ class JobsPage extends ConsumerWidget {
                       ).showSnackBar(SnackBar(content: Text(error)));
                     }
                   },
-                  onRetry: () => controller.retryJob(job.id),
+                  onRetry: () async {
+                    if (job.status == TranslationJobStatus.budgetPaused) {
+                      final settings = ref.read(settingsProvider.notifier);
+                      final tokens = await askBookBudgetForResume(
+                        context: context,
+                        strings: strings,
+                        currentBudget: ref.read(settingsProvider).maxBookTokens,
+                        usage: TranslationTokenUsage(job.apiUsage),
+                      );
+                      if (tokens == null || !context.mounted) return;
+                      if (!await settings.setMaxBookTokens(tokens)) {
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(strings.savedBookBudgetFailed),
+                            ),
+                          );
+                        }
+                        return;
+                      }
+                      if (!context.mounted) return;
+                      GoRouter.maybeOf(context)?.go('/');
+                    }
+                    await controller.retryJob(job.id);
+                  },
                   onPreviewWarnings:
                       canNavigateToPreview && job.id == previewJobId
                       ? () => context.go('/preview')

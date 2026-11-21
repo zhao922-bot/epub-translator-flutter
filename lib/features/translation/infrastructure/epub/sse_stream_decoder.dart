@@ -11,6 +11,7 @@ Future<Map<String, dynamic>> decodeChatCompletionStream({
   String? contentType,
   CancelToken? cancelToken,
   void Function(String delta)? onContentDelta,
+  void Function(Map<String, dynamic> usage)? onUsage,
 }) async {
   final String normalizedType = (contentType ?? '').toLowerCase();
   bool sawSseFrame = normalizedType.contains('text/event-stream');
@@ -56,7 +57,11 @@ Future<Map<String, dynamic>> decodeChatCompletionStream({
       responseModel = decoded['model'] as String;
     }
     if (decoded['usage'] is Map) {
-      usage = Map<String, dynamic>.from(decoded['usage'] as Map);
+      usage = {
+        ...?usage,
+        ...Map<String, dynamic>.from(decoded['usage'] as Map),
+      };
+      onUsage?.call(usage!);
     }
 
     final Object? rawChoices = decoded['choices'];

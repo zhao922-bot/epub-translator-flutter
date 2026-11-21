@@ -173,7 +173,8 @@ class _EpubSemanticGrounding {
       }
       return (plans: plans, failure: 'invalidResponse');
     } catch (error) {
-      if (error is TranslationCancelledException ||
+      if (error is TranslationBookBudgetException ||
+          error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }
@@ -270,7 +271,8 @@ class _EpubSemanticGrounding {
       }
       return (meanings: meanings, failure: 'invalidResponse');
     } catch (error) {
-      if (error is TranslationCancelledException ||
+      if (error is TranslationBookBudgetException ||
+          error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }

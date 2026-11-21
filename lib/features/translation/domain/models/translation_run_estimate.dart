@@ -5,6 +5,7 @@ import '../../infrastructure/epub/footnote_batch_planner.dart';
 import '../../infrastructure/epub/translation_batch_planner.dart';
 import 'inspected_chapter.dart';
 import 'translation_job.dart';
+import 'translation_token_usage.dart';
 
 class TranslationRunEstimate {
   const TranslationRunEstimate({
@@ -16,6 +17,9 @@ class TranslationRunEstimate {
     this.estimatedRemaining,
     this.estimatedSourceChars = 0,
     this.estimatedInputTokens = 0,
+    this.bookTokensLow = 0,
+    this.bookTokensHigh = 0,
+    this.hasObservedBookUsage = false,
   });
 
   final int selectedChapters;
@@ -32,6 +36,9 @@ class TranslationRunEstimate {
   /// chars/token for CJK (Chinese/Japanese/Korean) text. Still a rough
   /// estimate, but no longer systematically ~2x low for Chinese books.
   final int estimatedInputTokens;
+  final int bookTokensLow;
+  final int bookTokensHigh;
+  final bool hasObservedBookUsage;
 
   /// CJK Unified Ideographs (+ extensions), Hangul syllables, Hiragana,
   /// Katakana, Bopomofo, CJK symbols/punctuation and fullwidth forms.
@@ -94,6 +101,10 @@ class TranslationRunEstimate {
       completedBlocks: job?.completedBlocks ?? 0,
       totalBlocks: job?.totalBlocks ?? base.totalBlocks,
       elapsed: elapsed,
+      apiTranslatedBlocks: job == null
+          ? null
+          : apiTranslatedBlocksForThroughput(job),
+      budgetJob: job,
     );
   }
 
@@ -161,6 +172,12 @@ class TranslationRunEstimate {
     required int totalBlocks,
     Duration? elapsed,
     int? apiTranslatedBlocks,
+    TranslationJob? budgetJob,
+    int maxOutputTokens = 8192,
+    bool tokenSavingMode = false,
+    bool styleEnabled = false,
+    bool reviewEnabled = false,
+    int reviewBudget = 0,
   }) {
     final int safeCompleted = min(completedBlocks, totalBlocks);
     final double? speed = _blocksPerMinute(
@@ -168,6 +185,17 @@ class TranslationRunEstimate {
           ? safeCompleted
           : max(0, min(apiTranslatedBlocks, safeCompleted)),
       elapsed,
+    );
+    final tokenRange = _estimateBookTokens(
+      totalBlocks: totalBlocks,
+      completedBlocks: safeCompleted,
+      usage: TranslationTokenUsage(budgetJob?.apiUsage ?? const {}),
+      apiTranslatedBlocks: apiTranslatedBlocks ?? 0,
+      maxOutputTokens: maxOutputTokens,
+      tokenSavingMode: tokenSavingMode,
+      styleEnabled: styleEnabled,
+      reviewEnabled: reviewEnabled,
+      reviewBudget: reviewBudget,
     );
     return TranslationRunEstimate(
       selectedChapters: selectedChapters,
@@ -182,7 +210,92 @@ class TranslationRunEstimate {
       ),
       estimatedSourceChars: estimatedSourceChars,
       estimatedInputTokens: estimatedInputTokens,
+      bookTokensLow: tokenRange.low,
+      bookTokensHigh: tokenRange.high,
+      hasObservedBookUsage: tokenRange.observed,
     );
+  }
+
+  ({int low, int high, bool observed}) _estimateBookTokens({
+    required int totalBlocks,
+    required int completedBlocks,
+    required TranslationTokenUsage usage,
+    required int apiTranslatedBlocks,
+    required int maxOutputTokens,
+    required bool tokenSavingMode,
+    required bool styleEnabled,
+    required bool reviewEnabled,
+    required int reviewBudget,
+  }) {
+    if (totalBlocks <= 0) return (low: 0, high: 0, observed: false);
+    final pending = max(0, totalBlocks - completedBlocks);
+    final spent = usage.accountedTokens;
+    if (pending == 0) {
+      return (
+        low: spent,
+        high: spent + usage.nextRequestTokens,
+        observed: spent > 0,
+      );
+    }
+
+    // Before samples, estimate from source volume, likely prompt overhead, and
+    // completion sizes. Full allowance only informs the upper end.
+    final batches = max(1, estimatedApiBatches);
+    final promptOverhead = tokenSavingMode ? 220 : 550;
+    final remainingRatio = pending / totalBlocks;
+    final modeledLow =
+        ((estimatedInputTokens * 1.5 + batches * promptOverhead) *
+                remainingRatio)
+            .ceil();
+    final modeledHigh =
+        ((estimatedInputTokens * 2.8 +
+                    batches *
+                        (promptOverhead * 2 + min(maxOutputTokens, 1400))) *
+                remainingRatio)
+            .ceil();
+
+    // Use paid body samples, excluding restored/degraded blocks and spend
+    // from previous attempts. Smooth the rate while the sample is small.
+    final billedByKind = usage.countsByKind('chargedTokensEstimateByKind');
+    final priorByKind = usage.countsByKind('priorChargedTokensEstimateByKind');
+    const bodyKinds = {
+      'translation',
+      'bodyRepair',
+      'footnoteTranslation',
+      'protectedSlots',
+    };
+    final observedBody = bodyKinds.fold<int>(
+      0,
+      (total, key) =>
+          total + max(0, (billedByKind[key] ?? 0) - (priorByKind[key] ?? 0)),
+    );
+    final observed = apiTranslatedBlocks > 0 && observedBody > 0;
+    final weight = observed
+        ? min(0.9, apiTranslatedBlocks / (12 + apiTranslatedBlocks))
+        : 0.0;
+    final projected = observed
+        ? observedBody * pending / apiTranslatedBlocks
+        : 0.0;
+    final int auxiliaryHigh =
+        (styleEnabled
+            ? (selectedChapters *
+                      remainingRatio *
+                      (tokenSavingMode ? 250 : 550))
+                  .ceil()
+            : 0) +
+        (reviewEnabled
+            ? min(
+                reviewBudget,
+                (estimatedInputTokens * remainingRatio * 1.2).ceil(),
+              )
+            : 0);
+    final low =
+        spent + (modeledLow * (1 - weight) + projected * 0.85 * weight).ceil();
+    final high =
+        spent +
+        (modeledHigh * (1 - weight) + projected * 1.35 * weight).ceil() +
+        auxiliaryHigh;
+    return (low: low, high: max(low, high), observed: observed);
   }
 
   /// API-translated block count eligible for throughput (speed/ETA) on a

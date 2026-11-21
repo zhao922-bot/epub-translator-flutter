@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:math' as math;
+
+import 'package:crypto/crypto.dart';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
@@ -110,10 +113,6 @@ class EpubInspector {
           cancelToken.isCancelled || (isCancelled?.call() ?? false),
     );
     final Map<String, List<int>> files = snapshot.files;
-    final sourceIdentity = EpubSourceIdentity(
-      inputPath: path.absolute(inputPath),
-      sha256: snapshot.fingerprint,
-    );
     throwIfCancelled();
 
     final List<int>? containerBytes = files['META-INF/container.xml'];
@@ -209,6 +208,8 @@ class EpubInspector {
       s.inspectLogFoundChapters(chapterPaths.length),
     );
 
+    final publicationIdentifier = _publicationIdentifier(opfDocument);
+    final sourceDigests = <String, String>{};
     final List<InspectedChapter> chapters = <InspectedChapter>[];
     final List<String> missingChapterFiles = <String>[];
     int totalBlocks = 0;
@@ -230,23 +231,26 @@ class EpubInspector {
           batch[chapterPath] = chapterBytes;
         }
       }
-      final List<InspectedChapter> indexed = batch.isEmpty
-          ? const <InspectedChapter>[]
+      final indexed = batch.isEmpty
+          ? (
+              chapters: const <InspectedChapter>[],
+              sourceDigests: const <String, String>{},
+            )
           : await EpubIsolateWorker.inspectChapterBatchCancellable(
               chapters: batch,
               extractor: _extractor,
+              fingerprintChapters: publicationIdentifier == null,
               isCancelled: () =>
                   cancelToken.isCancelled || (isCancelled?.call() ?? false),
             );
       throwIfCancelled();
+      sourceDigests.addAll(indexed.sourceDigests);
       int resultIndex = 0;
       for (int index = start; index < end; index += 1) {
         throwIfCancelled();
         final String chapterPath = chapterPaths[index];
         if (!batch.containsKey(chapterPath)) continue;
-        final InspectedChapter chapter = indexed[resultIndex++].copyWith(
-          sourceIdentity: sourceIdentity,
-        );
+        final InspectedChapter chapter = indexed.chapters[resultIndex++];
         chapters.add(chapter);
         totalBlocks += chapter.blocks.length;
         emit(
@@ -303,6 +307,32 @@ class EpubInspector {
         job: currentJob,
         chapters: chapters,
         warnings: warnings,
+      );
+    }
+    final sourceIdentity = EpubSourceIdentity(
+      inputPath: path.absolute(inputPath),
+      sha256: snapshot.fingerprint,
+      reuseFingerprint: sha256
+          .convert(
+            utf8.encode(
+              jsonEncode([
+                opfPath,
+                chapterPaths,
+                if (publicationIdentifier != null)
+                  ['package-identifier-v1', publicationIdentifier]
+                else
+                  [
+                    'exact-spine-content-v1',
+                    for (final name in chapterPaths) sourceDigests[name],
+                  ],
+              ]),
+            ),
+          )
+          .toString(),
+    );
+    for (var index = 0; index < chapters.length; index++) {
+      chapters[index] = chapters[index].copyWith(
+        sourceIdentity: sourceIdentity,
       );
     }
     final TranslationJob inspectedJob = currentJob.copyWith(
@@ -544,6 +574,29 @@ class EpubInspector {
       _parseOpfDocument(files, opfPath),
       opfPath,
     );
+  }
+
+  /// Prefer an unambiguous Dublin Core identifier referenced by the package.
+  static String? _publicationIdentifier(XmlDocument opf) {
+    final package = opf.rootElement;
+    final identifierRef = package.getAttribute('unique-identifier')?.trim();
+    final identifiers = <String>[];
+    if (identifierRef != null && identifierRef.isNotEmpty) {
+      for (final metadata in package.childElements.where(
+        (element) => element.name.local == 'metadata',
+      )) {
+        for (final element in metadata.childElements) {
+          if (element.name.local == 'identifier' &&
+              element.name.namespaceUri == 'http://purl.org/dc/elements/1.1/' &&
+              element.getAttribute('id') == identifierRef) {
+            identifiers.add(element.innerText.trim());
+          }
+        }
+      }
+    }
+    return identifiers.length == 1 && identifiers.single.isNotEmpty
+        ? identifiers.single
+        : null;
   }
 
   /// Parses the OPF once for the document-based helpers below (P-#47).

@@ -116,6 +116,126 @@ void main() {
   });
 
   test(
+    'the wire byte ceiling holds when medium and large excerpts come together',
+    () async {
+      final book = await _BookFixture.create(
+        overrides: {
+          1: 'the river carried leaves to the lagoon. ' * 43,
+          2: 'the river carried leaves to the estuary. ' * 43,
+        },
+      );
+      final api = _FakeApi(heavyInitialMemory: true);
+      await book.translate(api, book.newCache('saving'));
+      final request = api.batchUpdates.first;
+      expect(_titles(request), ['Section 1', 'Section 2']);
+      expect(api.memoryPromptBytes.first, inInclusiveRange(4300, 6200));
+      final text = (request['chapters'] as List).last['text'] as String;
+      expect(text, endsWith('…'));
+    },
+  );
+
+  test(
+    'equivalent short chapters skip a redundant grouped update after resume',
+    () async {
+      const repeated = 'a stone rested beside the old road.';
+      final book = await _BookFixture.create(
+        chapterCount: 10,
+        overrides: {for (var index = 1; index <= 10; index++) index: repeated},
+      );
+      final cache = book.newCache('saving');
+      final initial = _FakeApi();
+      final token = CancelToken();
+      await expectLater(
+        book.translate(initial, cache, cancelToken: token, stopAfter: 5),
+        throwsA(isA<TranslationCancelledException>()),
+      );
+      expect(initial.batchUpdates.map(_titles), [
+        ['Section 1', 'Section 2', 'Section 3', 'Section 4'],
+      ]);
+      expect(cache.checkpoint['recentFingerprints'], hasLength(1));
+      final resumed = _FakeApi();
+      await book.translate(resumed, cache);
+      expect(resumed.batchUpdates, isEmpty);
+      expect(
+        cache.expandMemoryState(cache.checkpoint)['memoryTimeline'],
+        hasLength(1),
+      );
+    },
+  );
+
+  test(
+    'changed wording and note boundaries preserve a grouped refresh',
+    () async {
+      const repeated = 'a stone rested beside the old road.';
+      final book = await _BookFixture.create(
+        chapterCount: 14,
+        footnoteIndex: 9,
+        overrides: {
+          for (var index = 1; index <= 14; index++) index: repeated,
+          7: 'a stone never rested beside the old road.',
+        },
+      );
+      final api = _FakeApi();
+      await book.translate(api, book.newCache('saving'));
+      expect(api.batchUpdates.map(_titles), [
+        ['Section 1', 'Section 2', 'Section 3', 'Section 4'],
+        ['Section 5', 'Section 6', 'Section 7', 'Section 8'],
+        ['Section 10', 'Section 11', 'Section 12', 'Section 13'],
+      ]);
+    },
+  );
+
+  test(
+    'grouped memory sends only bounded relevant terms, threads, and excerpts',
+    () async {
+      final book = await _BookFixture.create(chapterCount: 10);
+      final cache = book.newCache('saving');
+      final api = _FakeApi(heavyInitialMemory: true);
+      await book.translate(api, cache);
+      final first = api.batchUpdates.first;
+      final second = api.batchUpdates.last;
+      expect((first['bookMemory'] as Map).keys, ['glossary']);
+      expect((second['bookMemory'] as Map).keys, [
+        'glossary',
+        'continuityNotes',
+      ]);
+      final context = second['bookMemory'] as Map;
+      expect(context['continuityNotes'], ['旧路仍然封闭。']);
+      expect(jsonEncode(context['glossary']), contains('石头'));
+      expect(jsonEncode(context['glossary']), contains('旧路'));
+      expect(jsonEncode(context['glossary']), isNot(contains('irrelevant')));
+      final full = cache.checkpoint['memory'] as Map;
+      expect(jsonEncode(full), contains('irrelevant'));
+      expect(jsonEncode(full), isNot(contains('未经确认的术语')));
+      expect(_jsonBytes(context), lessThan(_jsonBytes(full) ~/ 4));
+      expect(api.memoryPromptBytes, everyElement(lessThanOrEqualTo(6200)));
+    },
+  );
+
+  test(
+    'a refused grouped request keeps its queue for replay before later chapters',
+    () async {
+      final book = await _BookFixture.create();
+      final cache = book.newCache('saving');
+      final paused = _FakeApi(pauseGroupedMemory: true);
+      await expectLater(
+        book.translate(paused, cache),
+        throwsA(isA<TranslationBudgetPausedException>()),
+      );
+      expect(_titles({'chapters': cache.checkpoint['pendingChapters']}), [
+        'Section 1',
+        'Section 2',
+        'Section 3',
+        'Section 4',
+      ]);
+      final resumed = _FakeApi();
+      await book.translate(resumed, cache);
+      expect(resumed.batchUpdates, paused.batchUpdates);
+      expect(resumed.payloads.first['kind'], 'chapterMemoryBatch');
+    },
+  );
+
+  test(
     'resume preserves queued excerpts and earlier positional memory',
     () async {
       final book = await _BookFixture.create();
@@ -302,8 +422,15 @@ class _Cache extends TranslationCacheStore with MemoryHistoryCache {
   }
 }
 
+int _jsonBytes(Object value) => utf8.encode(jsonEncode(value)).length;
+
 class _FakeApi extends TranslationApiClient {
+  _FakeApi({this.heavyInitialMemory = false, this.pauseGroupedMemory = false});
+
+  final bool heavyInitialMemory;
+  final bool pauseGroupedMemory;
   final payloads = <Map<String, dynamic>>[];
+  final memoryPromptBytes = <int>[];
 
   Iterable<Map<String, dynamic>> get batchUpdates =>
       payloads.where((payload) => payload['kind'] == 'chapterMemoryBatch');
@@ -314,7 +441,8 @@ class _FakeApi extends TranslationApiClient {
   List<Map<String, dynamic>> bodyRequestsFor(String text) => [
     for (final payload in payloads)
       if ((payload['blocks'] as List?)?.any(
-            (block) => (block['html'] as String).contains(text),
+            (block) => ((block['text'] ?? block['html']) as String? ?? '')
+                .contains(text),
           ) ??
           false)
         payload,
@@ -334,17 +462,43 @@ class _FakeApi extends TranslationApiClient {
     required Map<String, dynamic> data,
     CancelToken? cancelToken,
   }) async {
-    final user = ((data['messages'] as List).last as Map)['content'] as String;
+    final messages = data['messages'] as List;
+    final user = (messages.last as Map)['content'] as String;
     Object reply = '译名';
     if (user.startsWith('{')) {
       final payload = jsonDecode(user) as Map<String, dynamic>;
       payloads.add(payload);
+      if (payload['kind'] == 'chapterMemoryBatch') {
+        final system = (messages.first as Map)['content'] as String;
+        memoryPromptBytes.add(
+          utf8.encode(system).length + utf8.encode(user).length,
+        );
+        if (pauseGroupedMemory) {
+          throw const TranslationBudgetPausedException({
+            'maxBookTokens': 5000,
+            'nextRequestEstimatedTokens': 1000,
+          });
+        }
+      }
       reply = switch (payload['kind']) {
-        'initialBookMemory' => {'bookSummary': '书籍简介'},
+        'initialBookMemory' => {
+          'bookSummary': '书籍简介',
+          if (heavyInitialMemory) ...{
+            'styleGuide': ['Keep the exact tone of the initial memory.'],
+            'glossary': [
+              {'source': 'old road', 'target': '旧路'},
+              for (var index = 0; index < 20; index++)
+                {'source': 'irrelevant entry $index', 'target': '无关术语$index'},
+            ],
+          },
+        },
         'chapterMemoryBatch' || 'chapterMemory' => {
           'summary': '新章节的情节摘要。',
+          'continuityNotes': ['旧路仍然封闭。'],
           'glossary': [
             {'source': 'stone', 'target': '模型替换'},
+            if (heavyInitialMemory)
+              {'source': 'fabricated entry', 'target': '未经确认的术语'},
           ],
         },
         _ => {
@@ -352,7 +506,12 @@ class _FakeApi extends TranslationApiClient {
             for (final block in payload['blocks'] as List)
               {
                 'id': block['id'],
-                'html': _translatedHtml(block['html'] as String),
+                if (block['text'] case final String source)
+                  'text': _translatedHtml(
+                    source,
+                  ).replaceAll(RegExp(r'</?p>'), '')
+                else
+                  'html': _translatedHtml(block['html'] as String),
               },
           ],
         },

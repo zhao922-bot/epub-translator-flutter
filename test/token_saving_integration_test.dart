@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_job.dart';
@@ -15,7 +16,21 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
 
 const _chapterCount = 20;
+
+enum _SampleBook {
+  mixed(_chapterCount),
+  styledParagraphs(3),
+  linkedNotes(3),
+  shortChapters(12);
+
+  const _SampleBook(this.chapters);
+
+  final int chapters;
+}
+
 const _omittedSentence = 'The silver lantern cast a steady glow.';
+const _editedParagraph = 'The keeper lifted a bronze lantern from the shelf.';
+const _editedParagraphTranslation = '守门人从架子上拿起一盏铜灯。';
 const _sentences = <String, String>{
   _omittedSentence: '银灯投下了稳定的光芒。',
   'Aster Vale closed the wooden shutters before dusk.': '阿斯特谷在黄昏前关上了木百叶窗。',
@@ -41,6 +56,7 @@ const _sentences = <String, String>{
   'stone arch': '石拱门',
   ' until dusk.': '旁等到黄昏。',
   'The Lantern Log': '银灯日志',
+  _editedParagraph: _editedParagraphTranslation,
 };
 
 void main() {
@@ -93,20 +109,204 @@ void main() {
       expect(optimized.adapter.retryBytes, lessThan(legacy.adapter.retryBytes));
     },
   );
+
+  for (final sample in _SampleBook.values.where(
+    (sample) => sample != _SampleBook.mixed,
+  )) {
+    test(
+      'measure the ${sample.name} EPUB through the production transport',
+      () async {
+        final root = await Directory.systemTemp.createTemp(
+          'token_saving_sample_',
+        );
+        addTearDown(() => root.delete(recursive: true));
+        final epub = await _writeBook(root, sample: sample);
+        final run = await _runBook(
+          root,
+          epub,
+          tokenSaving: true,
+          sample: sample,
+        );
+        _printMeasurement(sample.name, run);
+        _expectComplete(run, sample: sample);
+        if (sample == _SampleBook.styledParagraphs) {
+          expect(run.adapter.textBodyRows, run.result.job.completedBlocks);
+          expect(run.adapter.htmlBodyRows, 0);
+        }
+        if (sample == _SampleBook.linkedNotes) {
+          expect(run.adapter.slotBodyRows, sample.chapters);
+          expect(run.adapter.htmlBodyRows, greaterThan(0));
+        }
+      },
+    );
+  }
+
+  test('edited EPUB reuses only unaffected body requests', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'token_saving_revision_',
+    );
+    addTearDown(() => root.delete(recursive: true));
+    const sample = _SampleBook.styledParagraphs;
+    final original = await _writeBook(root, sample: sample);
+    final originalBytes = await original.readAsBytes();
+    final cacheDirectory = Directory(p.join(root.path, 'revision-cache'));
+    final first = await _runBook(
+      root,
+      original,
+      tokenSaving: true,
+      sample: sample,
+      sharedCacheDirectory: cacheDirectory,
+      runName: 'first',
+    );
+    _expectComplete(first, sample: sample);
+
+    final repacked = await _writeBook(
+      root,
+      sample: sample,
+      metadataRevision: 1,
+    );
+    expect(await repacked.readAsBytes(), isNot(originalBytes));
+    final unchanged = await _runBook(
+      root,
+      repacked,
+      tokenSaving: true,
+      sample: sample,
+      sharedCacheDirectory: cacheDirectory,
+      runName: 'repacked',
+    );
+    _expectComplete(unchanged, sample: sample);
+    expect(
+      unchanged.adapter.requestsByKind['translation'] ?? 0,
+      0,
+      reason:
+          'Initial groups: ${first.adapter.bodyGroups}; '
+          'repacked groups: ${unchanged.adapter.bodyGroups}',
+    );
+    expect(
+      _readOutputChapters(unchanged.result.job.outputPath),
+      _readOutputChapters(first.result.job.outputPath),
+    );
+
+    final edited = await _writeBook(
+      root,
+      sample: sample,
+      metadataRevision: 2,
+      editLastParagraph: true,
+    );
+    final changed = await _runBook(
+      root,
+      edited,
+      tokenSaving: true,
+      sample: sample,
+      sharedCacheDirectory: cacheDirectory,
+      runName: 'edited',
+    );
+    _expectComplete(changed, sample: sample);
+    final initialBodyCalls = first.adapter.requestsByKind['translation']!;
+    final editedBodyCalls = changed.adapter.requestsByKind['translation']!;
+    expect(editedBodyCalls, inInclusiveRange(1, initialBodyCalls - 1));
+    final before = _readOutputChapters(first.result.job.outputPath);
+    final after = _readOutputChapters(changed.result.job.outputPath);
+    expect(after.take(2), before.take(2));
+    expect(after.last, contains(_editedParagraphTranslation));
+    expect(changed.adapter.bodySawEdit, isTrue);
+    _printMeasurement('original-revision', first);
+    _printMeasurement('metadata-revision', unchanged);
+    _printMeasurement('paragraph-revision', changed);
+  });
+
+  test(
+    'a book budget pauses and reopens with cumulative usage and cached work',
+    () async {
+      final root = await Directory.systemTemp.createTemp(
+        'token_saving_budget_',
+      );
+      addTearDown(() => root.delete(recursive: true));
+      const sample = _SampleBook.shortChapters;
+      final epub = await _writeBook(root, sample: sample);
+      final cacheDirectory = Directory(p.join(root.path, 'budget-cache'));
+      Future<({TranslationRunResult result, _FixtureAdapter adapter})> run(
+        String name,
+        int budget,
+      ) => _runBook(
+        root,
+        epub,
+        tokenSaving: true,
+        sample: sample,
+        sharedCacheDirectory: cacheDirectory,
+        runName: name,
+        maxBookTokens: budget,
+      );
+
+      final denied = await run('deny-before-network', 1);
+      expect(denied.result.job.status, TranslationJobStatus.budgetPaused);
+      expect(denied.result.job.outputPath, isEmpty);
+      expect(denied.adapter.requestCount, 0);
+      final startupReservation =
+          denied.result.apiUsage['nextRequestEstimatedTokens'] as int;
+      expect(startupReservation, greaterThan(1));
+
+      final cap = startupReservation + 5000;
+      final paused = await run('partial-work', cap);
+      expect(paused.result.job.status, TranslationJobStatus.budgetPaused);
+      expect(paused.result.job.outputPath, isEmpty);
+      expect(paused.result.job.degradedBlockCount, 0);
+      expect(paused.adapter.requestsByKind['translation'], greaterThan(0));
+      expect(paused.result.job.completedBlocks, greaterThan(0));
+      final spent = paused.result.apiUsage['chargedTokensEstimate'] as int;
+      expect(
+        spent,
+        paused.adapter.promptTokenProxy + paused.adapter.completionTokenProxy,
+      );
+      expect(spent, lessThanOrEqualTo(cap));
+
+      final resumed = await run('resume-after-reopen', 100000);
+      expect(resumed.result.job.status, TranslationJobStatus.completed);
+      expect(resumed.result.job.completedFiles, sample.chapters);
+      expect(resumed.result.job.degradedBlockCount, 0);
+      expect(resumed.adapter.requestsByKind['initialBookMemory'], isNull);
+      expect(
+        resumed.result.job.cachedBlocks + resumed.result.job.resumedBlocks,
+        greaterThanOrEqualTo(paused.result.job.completedBlocks),
+      );
+      expect(resumed.result.apiUsage['priorChargedTokensEstimate'], spent);
+      expect(
+        resumed.result.apiUsage['chargedTokensEstimate'],
+        spent +
+            resumed.adapter.promptTokenProxy +
+            resumed.adapter.completionTokenProxy,
+      );
+      expect(resumed.result.apiUsage['requests'], resumed.adapter.requestCount);
+      expect(
+        (resumed.result.apiUsage['cumulativeUsage'] as Map)['requests'],
+        paused.adapter.requestCount + resumed.adapter.requestCount,
+      );
+      expect(
+        _readOutputChapters(resumed.result.job.outputPath).last,
+        contains('银灯投下了稳定的光芒。'),
+      );
+    },
+  );
 }
 
 Future<({TranslationRunResult result, _FixtureAdapter adapter})> _runBook(
   Directory root,
   File epub, {
   required bool tokenSaving,
+  _SampleBook sample = _SampleBook.mixed,
+  Directory? sharedCacheDirectory,
+  String? runName,
+  int maxBookTokens = 0,
 }) async {
   final runDirectory = await Directory(
-    p.join(root.path, tokenSaving ? 'optimized' : 'legacy'),
+    p.join(root.path, runName ?? (tokenSaving ? 'optimized' : 'legacy')),
   ).create();
   final cache = TranslationCacheStore(
-    cacheRoot: Directory(p.join(runDirectory.path, 'empty-cache')),
+    cacheRoot:
+        sharedCacheDirectory ??
+        Directory(p.join(runDirectory.path, 'empty-cache')),
   );
-  final adapter = _FixtureAdapter();
+  final adapter = _FixtureAdapter(omitOnce: sample == _SampleBook.mixed);
   final repository = EpubTranslationRepository(
     cacheStore: cache,
     translator: EpubChapterTranslator(
@@ -123,6 +323,7 @@ Future<({TranslationRunResult result, _FixtureAdapter adapter})> _runBook(
     retryDelaySeconds: 0,
     styleProfileEnabled: false,
     tokenSavingMode: tokenSaving,
+    maxBookTokens: maxBookTokens,
     lockedGlossary: [
       'Aster Vale => 阿斯特谷',
       for (var index = 0; index < 24; index++)
@@ -135,7 +336,7 @@ Future<({TranslationRunResult result, _FixtureAdapter adapter})> _runBook(
       outputDirectory: runDirectory.path,
       config: config,
     );
-    expect(inspection.chapters, hasLength(_chapterCount));
+    expect(inspection.chapters, hasLength(sample.chapters));
     final result = await repository.translateChapters(
       inputPath: epub.path,
       outputDirectory: runDirectory.path,
@@ -149,11 +350,12 @@ Future<({TranslationRunResult result, _FixtureAdapter adapter})> _runBook(
 }
 
 void _expectComplete(
-  ({TranslationRunResult result, _FixtureAdapter adapter}) run,
-) {
+  ({TranslationRunResult result, _FixtureAdapter adapter}) run, {
+  _SampleBook sample = _SampleBook.mixed,
+}) {
   final (result: result, adapter: adapter) = run;
   expect(result.job.status, TranslationJobStatus.completed);
-  expect(result.job.completedFiles, _chapterCount);
+  expect(result.job.completedFiles, sample.chapters);
   expect(result.job.completedBlocks, result.job.totalBlocks);
   expect(result.job.degradedBlockCount, 0);
   expect(result.job.apiDegradedBlocks, 0);
@@ -165,13 +367,26 @@ void _expectComplete(
   expect(result.apiUsage['completionTokens'], adapter.completionTokenProxy);
   expect(result.apiUsage['byKind'], adapter.requestsByKind);
   final chapters = _readOutputChapters(result.job.outputPath);
-  expect(chapters, hasLength(_chapterCount));
-  expect(chapters.first, contains('阿斯特谷'));
-  expect(chapters.first, contains('银灯投下了稳定的光芒。'));
-  expect(chapters.last, contains('href="#chapter-note"'));
-  expect(chapters.last, contains('id="chapter-note"'));
-  expect(chapters.last, contains('这条注释记录了守门人的日常职责。'));
-  expect(chapters.last, contains('<em>石拱门</em>'));
+  expect(chapters, hasLength(sample.chapters));
+  if (sample == _SampleBook.mixed) {
+    expect(chapters.first, contains('阿斯特谷'));
+    expect(chapters.first, contains('银灯投下了稳定的光芒。'));
+  }
+  if (sample == _SampleBook.mixed || sample == _SampleBook.linkedNotes) {
+    expect(chapters.last, contains('href="#chapter-note"'));
+    expect(chapters.last, contains('id="chapter-note"'));
+    expect(chapters.last, contains('这条注释记录了守门人的日常职责。'));
+    expect(chapters.last, contains('<em>石拱门</em>'));
+  }
+  if (sample == _SampleBook.styledParagraphs) {
+    expect(chapters.first, contains(_layoutClass));
+    expect(chapters.first, contains('style="$_layoutStyle"'));
+    expect(chapters.first, contains('id="layout-a-0"'));
+    expect(chapters.first, contains('每个架子上都放着磨光的陶杯。'));
+  }
+  if (sample == _SampleBook.shortChapters) {
+    expect(chapters.last, contains('银灯投下了稳定的光芒。'));
+  }
 }
 
 void _printMeasurement(
@@ -196,6 +411,14 @@ void _printMeasurement(
       'retriedBodyBlocks': adapter.bodyBlockRetries,
       'retryRequestBodyBytes': adapter.retryBytes,
       'repairBlockCounts': adapter.repairBlockCounts,
+      'textBodyRows': adapter.textBodyRows,
+      'htmlBodyRows': adapter.htmlBodyRows,
+      'slotBodyRows': adapter.slotBodyRows,
+      'chapterXhtmlSha256': sha256
+          .convert(
+            utf8.encode(jsonEncode(_readOutputChapters(result.job.outputPath))),
+          )
+          .toString(),
       'ordinaryBodyCallsWithThinkingDisabled':
           adapter.thinkingDisabledBodyRequests,
       'translationOutputTokenLimits':
@@ -214,7 +437,17 @@ List<String> _readOutputChapters(String outputPath) => [
       utf8.decode(entry.content as List<int>),
 ];
 
-Future<File> _writeBook(Directory directory) async {
+const _layoutClass =
+    'body-justified continuation printable type-lantern margin-normal';
+const _layoutStyle =
+    'text-indent: 1.2em; margin-block: 0.75em; line-height: 1.45; widows: 3; orphans: 3';
+
+Future<File> _writeBook(
+  Directory directory, {
+  _SampleBook sample = _SampleBook.mixed,
+  int metadataRevision = 0,
+  bool editLastParagraph = false,
+}) async {
   final archive = Archive()
     ..addFile(
       ArchiveFile.noCompress(
@@ -235,7 +468,7 @@ Future<File> _writeBook(Directory directory) async {
   final spine = StringBuffer();
   final navigation = StringBuffer();
   final ordinary = _sentences.keys.take(18).toList();
-  for (var chapter = 0; chapter < _chapterCount; chapter++) {
+  for (var chapter = 0; chapter < sample.chapters; chapter++) {
     final name = String.fromCharCode('a'.codeUnitAt(0) + chapter);
     manifest.write(
       '<item id="$name" href="chapter-$name.xhtml" '
@@ -245,15 +478,35 @@ Future<File> _writeBook(Directory directory) async {
     navigation.write(
       '<li><a href="chapter-$name.xhtml">Lantern Passage $name</a></li>',
     );
-    final paragraphs = chapter == 0
-        ? ordinary.take(5)
-        : chapter < 18
-        ? List.generate(
-            4,
-            (index) => ordinary[1 + ((chapter * 4 + index) % 17)],
-          )
-        : List.generate(32, (index) => ordinary[1 + ((chapter + index) % 17)]);
-    final attachedNote = chapter == _chapterCount - 1
+    final paragraphs = switch (sample) {
+      _SampleBook.mixed when chapter == 0 => ordinary.take(5),
+      _SampleBook.mixed when chapter < 18 => List.generate(
+        4,
+        (index) => ordinary[1 + ((chapter * 4 + index) % 17)],
+      ),
+      _SampleBook.mixed => List.generate(
+        32,
+        (index) => ordinary[1 + ((chapter + index) % 17)],
+      ),
+      _SampleBook.styledParagraphs => ordinary.skip(2).take(12),
+      _SampleBook.linkedNotes => ordinary.skip(5 + chapter).take(3),
+      _SampleBook.shortChapters => ordinary.take(4),
+    };
+    final rendered = [
+      for (final (index, original) in paragraphs.indexed)
+        _paragraphHtml(
+          sample,
+          name,
+          index,
+          editLastParagraph && chapter == sample.chapters - 1 && index == 11
+              ? _editedParagraph
+              : original,
+        ),
+    ].join();
+    final includesNotes =
+        sample == _SampleBook.linkedNotes ||
+        (sample == _SampleBook.mixed && chapter == _chapterCount - 1);
+    final attachedNote = includesNotes
         ? '<p>The lantern was still burning.'
               '<a epub:type="noteref" href="#chapter-note">1</a></p>'
               '<p>He waited beside the <em>stone arch</em> until dusk.</p>'
@@ -267,8 +520,7 @@ Future<File> _writeBook(Directory directory) async {
             'xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en"><head>'
             '<title>Lantern Passage $name</title></head><body>'
             '<h1>Lantern Passage $name</h1>'
-            '${paragraphs.map((sentence) => '<p>$sentence</p>').join()}'
-            '$attachedNote</body></html>',
+            '$rendered$attachedNote</body></html>',
       ),
     );
   }
@@ -288,7 +540,7 @@ Future<File> _writeBook(Directory directory) async {
             '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
             '<dc:identifier id="book-id">urn:uuid:080fa65a-e140-4d41-ac61-08b64f8deaa2</dc:identifier>'
             '<dc:title>The Lantern Log</dc:title><dc:language>en</dc:language>'
-            '<meta property="dcterms:modified">2026-11-20T00:00:00Z</meta></metadata>'
+            '<meta property="dcterms:modified">2026-11-${20 + metadataRevision}T00:00:00Z</meta></metadata>'
             '<manifest>$manifest<item id="nav" href="nav.xhtml" properties="nav" '
             'media-type="application/xhtml+xml"/></manifest><spine>$spine</spine></package>',
       ),
@@ -296,6 +548,17 @@ Future<File> _writeBook(Directory directory) async {
   return File(
     p.join(directory.path, 'lantern-log.epub'),
   ).writeAsBytes(ZipEncoder().encodeBytes(archive));
+}
+
+String _paragraphHtml(
+  _SampleBook sample,
+  String chapter,
+  int index,
+  String text,
+) {
+  if (sample != _SampleBook.styledParagraphs) return '<p>$text</p>';
+  return '<p id="layout-$chapter-$index" class="$_layoutClass" '
+      'style="$_layoutStyle">  $text </p>';
 }
 
 class _FixtureClient extends TranslationApiClient {
@@ -309,9 +572,13 @@ class _FixtureClient extends TranslationApiClient {
 }
 
 class _FixtureAdapter implements HttpClientAdapter {
+  _FixtureAdapter({required this.omitOnce});
+
+  final bool omitOnce;
   final requestsByKind = <String, int>{};
   final bytesByKind = <String, int>{};
   final repairBlockCounts = <int>[];
+  final bodyGroups = <String>[];
   final translationOutputTokenLimits = <int>{};
   int thinkingDisabledBodyRequests = 0;
   int thinkingDisabledOtherRequests = 0;
@@ -326,6 +593,10 @@ class _FixtureAdapter implements HttpClientAdapter {
   int retryBytes = 0;
   int bodyRequestsWithUnrelatedGlossary = 0;
   int bodyRequestsWithLockedName = 0;
+  int textBodyRows = 0;
+  int htmlBodyRows = 0;
+  int slotBodyRows = 0;
+  bool bodySawEdit = false;
 
   int get memoryRequests =>
       (requestsByKind['chapterMemory'] ?? 0) +
@@ -369,12 +640,20 @@ class _FixtureAdapter implements HttpClientAdapter {
         bodyRequestsWithUnrelatedGlossary++;
       }
       final blocks = payload?['blocks'];
+      if (blocks is List) {
+        final title = (payload?['context'] as Map?)?['chapterTitle'];
+        bodyGroups.add(
+          '$title: ${blocks.map((block) => (block as Map)['id']).join(', ')}',
+        );
+      }
       final selectedTerms = (payload?['context'] as Map?)?['lockedGlossary'];
       if (blocks is List &&
           blocks.any(
             (block) =>
-                ((block as Map)['html'] as String?)?.contains('Aster Vale') ==
-                true,
+                ((block as Map)['html'] as String? ??
+                        block['text'] as String? ??
+                        '')
+                    .contains('Aster Vale'),
           ) &&
           selectedTerms is List &&
           selectedTerms.whereType<Map>().any(
@@ -445,16 +724,29 @@ class _FixtureAdapter implements HttpClientAdapter {
       final translated = <Map<String, Object?>>[];
       for (final block in blocks.cast<Map>()) {
         final html = block['html'] as String?;
-        if (html != null) {
-          _recordBodyAttempt(html);
-          if (omittedBlocks == 0 &&
+        final text = block['text'] as String?;
+        if (html != null || text != null) {
+          final source = html ?? text!;
+          if (source.contains(_editedParagraph)) bodySawEdit = true;
+          if (html == null) {
+            textBodyRows++;
+          } else {
+            htmlBodyRows++;
+          }
+          _recordBodyAttempt(source);
+          if (omitOnce &&
+              omittedBlocks == 0 &&
               blocks.length > 1 &&
-              html.contains(_omittedSentence)) {
+              source.contains(_omittedSentence)) {
             omittedBlocks++;
             continue;
           }
-          translated.add({'id': block['id'], 'html': _translate(html)});
+          translated.add({
+            'id': block['id'],
+            html == null ? 'text' : 'html': _translate(source),
+          });
         } else if (block['slots'] case final List slots) {
+          slotBodyRows++;
           translated.add({
             'id': block['id'],
             'slots': [
@@ -462,9 +754,6 @@ class _FixtureAdapter implements HttpClientAdapter {
                 {'id': slot['id'], 'text': _translate(slot['text'] as String)},
             ],
           });
-        } else if (block['text'] case final String text) {
-          _recordBodyAttempt(text);
-          translated.add({'id': block['id'], 'text': _translate(text)});
         } else {
           throw StateError('Unexpected fixture block fields ${block.keys}');
         }
@@ -488,7 +777,7 @@ class _FixtureAdapter implements HttpClientAdapter {
   };
 
   void _recordBodyAttempt(String source) {
-    if (!source.contains(_omittedSentence)) return;
+    if (!omitOnce || !source.contains(_omittedSentence)) return;
     _omissionFixtureAttempts++;
     if (_omissionFixtureAttempts > 1) bodyBlockRetries++;
   }

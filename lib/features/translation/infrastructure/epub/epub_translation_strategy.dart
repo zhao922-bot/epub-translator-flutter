@@ -22,6 +22,21 @@ class _EpubTranslationStrategy {
   late final _TokenSavingBodyStrategy _tokenSavingBody =
       _TokenSavingBodyStrategy(this);
 
+  bool _persistDraftsBeforeReview(TranslationConfig config) =>
+      config.tokenSavingMode || config.maxBookTokens > 0;
+
+  int _estimateTokenSavingBlockBudget(ExtractedBlock block) {
+    final planner = owner._batchPlanner;
+    final baseline = planner.blockBudgetFor(block);
+    if (planner.isTinyTextBlock(block)) return baseline;
+    final plain = _PlainBodyText.fromBlock(block);
+    if (plain == null) return baseline;
+    // Match the chapter planner's character budget. The request layer measures
+    // the full serialized prompt and output in estimated tokens before send.
+    final wireChars = jsonEncode({'id': block.id, 'text': plain.text}).length;
+    return min(baseline, max(planner.tinyBlockBudget, wireChars));
+  }
+
   TranslationBlockBatch _batchSubset(
     TranslationBlockBatch source,
     List<ExtractedBlock> blocks,
@@ -267,15 +282,18 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     int? fallbackWindow,
     Future<void> Function(String id, String html)? onValidated,
+    _ReadReusableBody? readReusable,
+    _RememberReusableBody? rememberReusable,
   }) async {
     final List<ExtractedBlock> htmlBlocks = <ExtractedBlock>[];
+    final plainText = <String, _PlainBodyText>{};
     final List<_ProtectedSlotRequest> slotRequests = <_ProtectedSlotRequest>[];
     final Map<String, String> translatedById = <String, String>{};
     final blocksById = {for (final block in batch.blocks) block.id: block};
     final Future<void> Function(String, String)? onDraftValidated =
         !config.semanticQualityCheck
         ? onValidated
-        : config.tokenSavingMode
+        : _persistDraftsBeforeReview(config)
         ? (id, html) => owner._semanticReviewer.writeDraft(
             config,
             chapterPath ?? '',
@@ -297,6 +315,14 @@ class _EpubTranslationStrategy {
           translatedById[block.id] = draft;
           continue;
         }
+      }
+      final plain = config.tokenSavingMode
+          ? _PlainBodyText.fromBlock(block)
+          : null;
+      if (plain != null) {
+        plainText[block.id] = plain;
+        htmlBlocks.add(block);
+        continue;
       }
       final ProtectedAnchorTextSlots? template = _tryParseProtectedSlots(
         block.sourceHtml,
@@ -327,6 +353,9 @@ class _EpubTranslationStrategy {
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
         onValidated: onDraftValidated,
+        plainText: plainText,
+        readReusable: config.semanticQualityCheck ? null : readReusable,
+        rememberReusable: config.semanticQualityCheck ? null : rememberReusable,
       );
       for (int index = 0; index < htmlBlocks.length; index += 1) {
         translatedById[htmlBlocks[index].id] = translatedHtml[index];
@@ -380,17 +409,23 @@ class _EpubTranslationStrategy {
     CancelToken? cancelToken,
     int? fallbackWindow,
     Future<void> Function(String id, String html)? onValidated,
+    required Map<String, _PlainBodyText> plainText,
+    _ReadReusableBody? readReusable,
+    _RememberReusableBody? rememberReusable,
   }) async {
     if (config.tokenSavingMode && batch.blocks.isNotEmpty) {
       return _tokenSavingBody.translate(
         dio: dio,
         config: config,
         batch: batch,
+        plainText: plainText,
         chapterPath: chapterPath,
         retryDelayOverride: retryDelayOverride,
         cancelToken: cancelToken,
         fallbackWindow: fallbackWindow,
         onValidated: onValidated,
+        readReusable: readReusable,
+        rememberReusable: rememberReusable,
       );
     }
     final Map<String, dynamic> payloadMap = <String, dynamic>{
@@ -651,6 +686,8 @@ class _EpubTranslationStrategy {
             await onValidated?.call(block.id, translated);
           }
           return translated;
+        } on TranslationBookBudgetException {
+          rethrow;
         } catch (error) {
           if (error is TranslationCancelledException ||
               EpubChapterTranslator._isCancelError(error) ||
@@ -796,6 +833,8 @@ class _EpubTranslationStrategy {
               },
             );
         return locked;
+      } on TranslationBookBudgetException {
+        rethrow;
       } catch (error) {
         if (EpubChapterTranslator._isCancelError(error) ||
             error is TranslationCancelledException) {
@@ -1046,7 +1085,7 @@ class _EpubTranslationStrategy {
           retryDelayOverride: retryDelayOverride,
           cancelToken: cancelToken,
           onRequestAttempt: onRequestAttempt,
-          onValidated: config.tokenSavingMode
+          onValidated: _persistDraftsBeforeReview(config)
               ? (id, html) {
                   final reference = referencesById[id]!;
                   return owner._semanticReviewer.writeDraft(
@@ -1259,7 +1298,7 @@ class _EpubTranslationStrategy {
               config: config,
               cancelToken: cancelToken,
               process: (List<FootnoteBlockReference> part) =>
-                  (config.tokenSavingMode
+                  (_persistDraftsBeforeReview(config)
                   ? _translateFootnoteBatchRaw
                   : _translateFootnoteBatch)(
                     dio: dio,
@@ -2039,6 +2078,8 @@ class _EpubTranslationStrategy {
           onRequestAttempt: onRequestAttempt,
           retryReason: retryReason,
         );
+      } on TranslationBookBudgetException {
+        rethrow;
       } catch (error, stackTrace) {
         if (error is TranslationCancelledException ||
             EpubChapterTranslator._isCancelError(error)) {

@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
 import '../../../../shared/platform/android_service_bridge.dart';
 import '../../../../shared/widgets/page_scaffold.dart';
 import '../../../settings/application/settings_controller.dart';
@@ -10,6 +11,8 @@ import '../../application/translation_dashboard_controller.dart';
 import '../../domain/models/actionable_error.dart';
 import '../../domain/models/translation_job.dart';
 import '../../domain/models/translation_style_profile.dart';
+import '../../domain/models/translation_token_usage.dart';
+import '../widgets/book_token_budget_dialog.dart';
 import '../widgets/translation_inputs.dart';
 import '../widgets/translation_logs.dart';
 import '../widgets/translation_overview.dart';
@@ -80,6 +83,7 @@ class _DashboardOverview extends ConsumerWidget {
         (s) => (
           job: s.job,
           estimate: s.runEstimate,
+          maxBookTokens: s.config.maxBookTokens,
           isSaving: s.isSaving,
           isSharing: s.isSharing,
           actionableError: s.actionableError,
@@ -122,6 +126,28 @@ class _DashboardOverview extends ConsumerWidget {
               ? () => context.go('/preview')
               : null,
           estimate: overview.estimate,
+          maxBookTokens: overview.maxBookTokens,
+          onResumeBudgetPaused:
+              job?.isBudgetPaused == true && !overview.isRunActive
+              ? () async {
+                  final tokens = await askBookBudgetForResume(
+                    context: context,
+                    strings: strings,
+                    currentBudget: overview.maxBookTokens,
+                    usage: TranslationTokenUsage(job!.apiUsage),
+                  );
+                  if (tokens == null || !context.mounted) return;
+                  if (!await settingsController.setMaxBookTokens(tokens)) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(strings.savedBookBudgetFailed)),
+                      );
+                    }
+                    return;
+                  }
+                  if (context.mounted) await controller.retryJob(job.id);
+                }
+              : null,
           canCancel: overview.isRunActive,
           onCancelPressed: controller.requestCancel,
           isSaving: overview.isSaving,
@@ -176,6 +202,7 @@ class _DashboardInputs extends ConsumerWidget {
           reviewEnabled: s.config.semanticQualityCheck,
           reviewRequests: s.config.maxSemanticReviewRequests,
           reviewTokens: s.config.maxSemanticReviewTokens,
+          budgetPaused: s.job?.isBudgetPaused ?? false,
           bilingual: s.config.bilingual,
           isRunActive: s.isRunActive,
           inspectedChapters: s.inspectedChapters,
@@ -203,16 +230,18 @@ class _DashboardInputs extends ConsumerWidget {
     // freshly typed paths instead of silently using stale ones.
     void unfocusBeforeRun() => FocusScope.of(context).unfocus();
     if (!isRunActive && canTranslate) {
-      primaryActions.add(
-        FilledButton.icon(
-          onPressed: () {
-            unfocusBeforeRun();
-            controller.startTranslation();
-          },
-          icon: const Icon(Icons.translate_rounded),
-          label: Text(strings.translateSelected),
-        ),
-      );
+      if (!inputs.budgetPaused) {
+        primaryActions.add(
+          FilledButton.icon(
+            onPressed: () {
+              unfocusBeforeRun();
+              controller.startTranslation();
+            },
+            icon: const Icon(Icons.translate_rounded),
+            label: Text(strings.translateSelected),
+          ),
+        );
+      }
       if (hasInput) {
         primaryActions.add(
           TextButton(
@@ -224,7 +253,7 @@ class _DashboardInputs extends ConsumerWidget {
           ),
         );
       }
-    } else if (!isRunActive && hasInput) {
+    } else if (!isRunActive && hasInput && !inputs.budgetPaused) {
       primaryActions.add(
         FilledButton.icon(
           onPressed: () {

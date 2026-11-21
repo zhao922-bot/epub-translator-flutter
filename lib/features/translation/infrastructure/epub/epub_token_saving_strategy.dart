@@ -160,7 +160,135 @@ class _LocalBodyLimitException extends TranslationParseException {
 
 enum _BodyRepairReason { missing, structure, residual, truncated }
 
-/// Keeps checked HTML rows and sends at most one smaller grouped repair for
+/// A paragraph or heading whose XHTML stays local throughout translation.
+class _PlainBodyText {
+  _PlainBodyText(this._source, this._rootIndex, this._sourceText);
+
+  static const _tags = {'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'};
+  static final _layoutDeclaration = RegExp(
+    r'^\s*(?:text-align(?:-last)?|text-indent|line-height|letter-spacing|'
+    r'word-spacing|widows|orphans|font-style|font-weight|'
+    r'(?:margin|padding)(?:-(?:top|right|bottom|left|'
+    r'(?:inline|block)(?:-start|-end)?))?)\s*:\s*'
+    r'[a-z0-9.%+ ]+(?:!important)?\s*$',
+    caseSensitive: false,
+  );
+  static final _specialIdentifiers = RegExp(
+    r'notranslate|no[-_]?translate|footnote|endnote|noteref|note[-_]?ref|'
+    r'backlink|page[-_]?break|bibliograph|(?:^|[\s_-])'
+    r'(?:notes?|verse|poems?|poetry|code|literal|index(?:main)?|'
+    r'references?|hidden|sr-only)\d*(?:$|[\s_-])',
+    caseSensitive: false,
+  );
+  static final _letter = RegExp(r'\p{L}', unicode: true);
+  static final _preservedSpacing = RegExp(r'[^\S ]| {2,}', unicode: true);
+
+  final _ResponseHtml _source;
+  final int _rootIndex;
+  final String _sourceText;
+  String get text => _sourceText.trim();
+
+  static _PlainBodyText? fromBlock(ExtractedBlock block) {
+    if (block.isAuthorSignature || !_tags.contains(block.tagName)) return null;
+    // Inline tags, comments, and other multi-tag fragments can go directly to
+    // the existing HTML/anchor path without parsing them twice.
+    final html = block.sourceHtml;
+    final int opening = html.indexOf('<');
+    final int closing = html.indexOf('<', opening + 1);
+    if (opening < 0 ||
+        closing < 0 ||
+        !html.startsWith('</${block.tagName}>', closing) ||
+        html.indexOf('<', closing + 1) >= 0) {
+      return null;
+    }
+    final _ResponseHtml source;
+    try {
+      source = _ResponseHtml.parse(block.sourceHtml, null);
+    } on FormatException {
+      return null;
+    }
+    final nodes = source.fragment.nodes;
+    final int rootIndex = nodes.indexWhere((node) => node is dom.Element);
+    if (rootIndex < 0) return null;
+    for (int i = 0; i < nodes.length; i++) {
+      final node = nodes[i];
+      if (i != rootIndex &&
+          (node is! dom.Text || node.data.trim().isNotEmpty)) {
+        return null;
+      }
+    }
+    final root = nodes[rootIndex] as dom.Element;
+    if (root.localName != block.tagName ||
+        !root.attributes.entries.every(_isPresentationAttribute) ||
+        root.nodes.length != 1) {
+      return null;
+    }
+    final node = root.nodes.single;
+    if (node is! dom.Text) return null;
+    final text = node.data.trim();
+    if (!_letter.hasMatch(text) || _preservedSpacing.hasMatch(text)) {
+      return null;
+    }
+    return _PlainBodyText(source, rootIndex, node.data);
+  }
+
+  static bool _isPresentationAttribute(MapEntry<Object, String> attribute) =>
+      switch (attribute.key) {
+        'id' || 'class' => !_specialIdentifiers.hasMatch(attribute.value),
+        'style' =>
+          attribute.value
+              .split(';')
+              .every(
+                (declaration) =>
+                    declaration.trim().isEmpty ||
+                    _layoutDeclaration.hasMatch(declaration),
+              ),
+        _ => false,
+      };
+
+  String render({
+    required TranslationConfig config,
+    required ExtractedBlock block,
+    required String translation,
+  }) {
+    validateEpubXmlCharacters(translation);
+    _EpubTranslationStrategy._validateIndividualSlotTranslation(
+      sourceText: text,
+      translatedText: translation,
+      checkHtmlTags: false,
+    );
+    final rendered = _source.fragment.clone(true);
+    final root = rendered.nodes[_rootIndex] as dom.Element;
+    final node = root.nodes.single as dom.Text;
+    final int leading = _sourceText.length - _sourceText.trimLeft().length;
+    final int trailing = _sourceText.trimRight().length;
+    node.data =
+        '${_sourceText.substring(0, leading)}${translation.trim()}'
+        '${_sourceText.substring(trailing)}';
+    EpubChapterTranslator._validateTranslatedBlockQuality(
+      config: config,
+      block: block,
+      sourceDom: _source,
+      translatedDom: _ResponseHtml(rendered),
+    );
+    return rendered.outerHtml;
+  }
+}
+
+typedef _ReadReusableBody =
+    Future<Map<String, String>> Function(
+      List<ExtractedBlock> blocks,
+      Map<String, dynamic> request,
+    );
+
+typedef _RememberReusableBody =
+    Future<void> Function(
+      List<ExtractedBlock> blocks,
+      Map<String, dynamic> request,
+      Map<String, String> translated,
+    );
+
+/// Keeps checked rows and sends at most one smaller grouped repair for
 /// the remaining body blocks before using the existing atomic fallback.
 class _TokenSavingBodyStrategy {
   _TokenSavingBodyStrategy(this.strategy);
@@ -172,11 +300,14 @@ class _TokenSavingBodyStrategy {
     required Dio dio,
     required TranslationConfig config,
     required TranslationBlockBatch batch,
+    required Map<String, _PlainBodyText> plainText,
     String? chapterPath,
     Duration? retryDelayOverride,
     CancelToken? cancelToken,
     int? fallbackWindow,
     Future<void> Function(String, String)? onValidated,
+    _ReadReusableBody? readReusable,
+    _RememberReusableBody? rememberReusable,
   }) async {
     final accepted = <String, String>{};
     final budget = owner._bodyBudget(config);
@@ -197,29 +328,50 @@ class _TokenSavingBodyStrategy {
         blocks,
         compact: repair,
       );
-      final payloadBlocks = <Map<String, String>>[
+      final textById = repair ? const <String, _PlainBodyText>{} : plainText;
+      final outputBlocks = <Map<String, String>>[
         for (final block in blocks)
           {
             'id': block.id,
-            'html': block.sourceHtml,
-            if (repair)
-              'reason': (failures[block.id] ?? _BodyRepairReason.missing).name,
+            if (textById[block.id] case final plain?)
+              'text': plain.text
+            else
+              'html': block.sourceHtml,
           },
       ];
+      final payloadBlocks = repair
+          ? [
+              for (final row in outputBlocks)
+                {
+                  ...row,
+                  'reason':
+                      (failures[row['id']] ?? _BodyRepairReason.missing).name,
+                },
+            ]
+          : outputBlocks;
       final data = _request(config, context, payloadBlocks, repair: repair);
-      final outputShape = {
-        'blocks': [
-          for (final block in blocks)
-            {'id': block.id, 'html': block.sourceHtml},
-        ],
-      };
-      final size = budget.measure(data, outputShape);
+      final size = budget.measure(data, {'blocks': outputBlocks});
       if (blocks.length > 1 &&
           (!size.fits || size.bodyEstimate > budget.targetBodyTokens)) {
         final int half = blocks.length ~/ 2;
         await runGroup(blocks.sublist(0, half), repair: repair);
         await runGroup(blocks.sublist(half), repair: repair);
         return;
+      }
+      data['max_tokens'] = size.wireOutput;
+      if (!repair && readReusable != null) {
+        final reused = await readReusable(blocks, data);
+        if (blocks.every((block) => reused.containsKey(block.id))) {
+          for (final block in blocks) {
+            final String html = reused[block.id]!;
+            accepted[block.id] = html;
+            await onValidated?.call(block.id, html);
+          }
+          // This exact group completed on the provider in an earlier run.
+          // Preserve successful-group sizing without counting historical usage.
+          budget.observe(size, null, truncated: false);
+          return;
+        }
       }
       if (size.wireOutput <= 0 || (!size.fits && !repair)) {
         for (final block in blocks) {
@@ -241,7 +393,7 @@ class _TokenSavingBodyStrategy {
           cancelToken: cancelToken,
           operation: () => owner._postChatCompletions(
             dio: dio,
-            data: data..['max_tokens'] = size.wireOutput,
+            data: data,
             cancelToken: cancelToken,
           ),
         );
@@ -254,8 +406,10 @@ class _TokenSavingBodyStrategy {
         final unique = _uniqueResponseRows(rows, requested);
         for (final block in blocks) {
           final row = unique[block.id];
-          final Object? value = row?['html'];
-          if (row != null && row.length != 2) {
+          final plain = textById[block.id];
+          final String field = plain == null ? 'html' : 'text';
+          final Object? value = row?[field];
+          if (row != null && (row.length != 2 || !row.containsKey(field))) {
             failures[block.id] = _BodyRepairReason.structure;
             continue;
           }
@@ -265,14 +419,19 @@ class _TokenSavingBodyStrategy {
                 : _BodyRepairReason.missing;
             continue;
           }
-          final String html = value.trim();
           final String locked;
           try {
-            locked = EpubChapterTranslator._lockAndValidateTranslatedBlock(
-              config: config,
-              block: block,
-              translatedHtml: html,
-            );
+            locked = plain == null
+                ? EpubChapterTranslator._lockAndValidateTranslatedBlock(
+                    config: config,
+                    block: block,
+                    translatedHtml: value.trim(),
+                  )
+                : plain.render(
+                    config: config,
+                    block: block,
+                    translation: value,
+                  );
           } on FormatException catch (error) {
             failures[block.id] =
                 _EpubTranslationStrategy._isQualityRejection(error)
@@ -284,14 +443,19 @@ class _TokenSavingBodyStrategy {
           failures.remove(block.id);
           await onValidated?.call(block.id, locked);
         }
+        final bool complete =
+            !repair && blocks.every((block) => accepted.containsKey(block.id));
         budget.observe(
           size,
           response.data,
           truncated: truncated,
-          complete:
-              !repair &&
-              blocks.every((block) => accepted.containsKey(block.id)),
+          complete: complete,
         );
+        if (complete && !truncated && rememberReusable != null) {
+          await rememberReusable(blocks, data, {
+            for (final block in blocks) block.id: accepted[block.id]!,
+          });
+        }
       } on DioException catch (error) {
         if (EpubChapterTranslator._isCancelError(error)) {
           throw const TranslationCancelledException();
@@ -391,6 +555,17 @@ class _TokenSavingBodyStrategy {
         : context.needsContinuity
         ? 'Translate these EPUB fragments into ${config.targetLanguage}. Use read-only context for continuity, pronouns, tone, terminology and paragraph flow. Preserve known relationships without guessing gender, age or unsupported specificity.'
         : 'Translate these EPUB fragments into ${config.targetLanguage}. Use relevant read-only context to keep terminology and tone consistent.';
+    final int textRows = blocks
+        .where((block) => block.containsKey('text'))
+        .length;
+    final String responseShape = switch (textRows) {
+      0 =>
+        'Return only JSON with a blocks array of {"id", "html"} objects in order. Keep all ids and translate only readable text. Preserve every HTML tag, attribute, entity, footnote marker and emphasis.',
+      _ when textRows == blocks.length =>
+        'Return only JSON with a blocks array of {"id", "text"} objects in order. Keep all ids. Translate the plain text without adding markup or commentary.',
+      _ =>
+        'Return only JSON with a blocks array in order. Keep each id and return its original text or html field. Translate text as plain text. In html, translate only readable text and preserve all tags, attributes, entities, footnote markers and emphasis.',
+    };
     return {
       '_folioFerryBudgetedBody': true,
       if (!repair && !context.needsContinuity)
@@ -401,7 +576,7 @@ class _TokenSavingBodyStrategy {
         {
           'role': 'system',
           'content':
-              '$instruction Return only JSON with a blocks array of {"id", "html"} objects in order. Keep all ids and translate only readable text. Preserve every HTML tag, attribute, entity, footnote marker and emphasis.${strategy._styleInstructionFragment(config: config, styleProfile: profile, confirmed: confirmed)}${strategy._bodyGlossaryInstruction(config, context)}${strategy._idiomaticTranslationInstruction()}',
+              '$instruction $responseShape${strategy._styleInstructionFragment(config: config, styleProfile: profile, confirmed: confirmed)}${strategy._bodyGlossaryInstruction(config, context)}${strategy._idiomaticTranslationInstruction()}',
         },
         {
           'role': 'user',

@@ -85,6 +85,7 @@ Set<String> _changedFields(TranslationConfig before, TranslationConfig after) {
     changed.add('lockedGlossary');
   }
   if (before.httpProxy != after.httpProxy) changed.add('httpProxy');
+  if (before.maxBookTokens != after.maxBookTokens) changed.add('maxBookTokens');
   if (before.tokenSavingMode != after.tokenSavingMode) {
     changed.add('tokenSavingMode');
   }
@@ -1038,6 +1039,12 @@ class SettingsController extends StateNotifier<TranslationConfig> {
       customModel: nextModel,
     );
   });
+
+  Future<bool> setMaxBookTokens(int value) => _update(
+    (config) => config.copyWith(
+      maxBookTokens: value.clamp(0, TranslationConfig.maxBookTokenBudget),
+    ),
+  );
 
   Future<void> setTokenSavingMode(bool value) =>
       _update((config) => config.copyWith(tokenSavingMode: value));

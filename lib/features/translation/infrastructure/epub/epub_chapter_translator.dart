@@ -47,6 +47,7 @@ import 'review_evidence_validator.dart';
 import 'semantic_source_analysis.dart';
 import 'cancellable_fingerprint.dart';
 import 'translation_batch_planner.dart';
+import 'translation_book_budget.dart';
 import 'translation_progress_persistence.dart';
 import 'translation_run_context.dart';
 import 'translation_work_queue.dart';
@@ -58,6 +59,7 @@ part 'epub_semantic_grounding.dart';
 part 'epub_response_dom_locker.dart';
 part 'epub_translator_paths.dart';
 part 'epub_token_saving_strategy.dart';
+part 'epub_incremental_cache.dart';
 part 'epub_chapter_memory_batch.dart';
 
 /// Orchestrates cache, book-memory, batch planning, and API translation.
@@ -175,9 +177,39 @@ class EpubChapterTranslator {
     TranslationConfig config,
     List<InspectedChapter> chapters,
   ) => TranslationArtifactCache.key(config, 'style-usage', [
-    for (final c in chapters)
-      if (c.includeInTranslation) [c.path, c.sourceIdentity?.sha256],
+    for (final chapter in chapters)
+      if (chapter.includeInTranslation)
+        [chapter.path, chapter.sourceIdentity?.sha256],
   ]);
+
+  Future<TranslationBookBudget> _openBookBudget(
+    TranslationConfig config,
+    List<InspectedChapter> chapters,
+  ) {
+    // Use the exact inspected EPUB revision, independent of translation/cache
+    // settings. The chapter evidence is for callers without archive metadata.
+    final archive = sourceIdentityForChapters(chapters)?.sha256;
+    final identity = [
+      config.targetLanguage.trim().toLowerCase(),
+      if (archive != null)
+        archive
+      else
+        [
+          for (final chapter in chapters)
+            [
+              chapter.path,
+              sha256.convert(utf8.encode(chapter.originalHtml)).toString(),
+            ],
+        ],
+    ];
+    final key = sha256.convert(utf8.encode(jsonEncode(identity))).toString();
+    return TranslationBookBudget.open(
+      file: _cacheStore.bookUsageLedger(key),
+      maxTokens: config.maxBookTokens,
+      throwIfCancelled: _run.throwIfCancelled,
+    );
+  }
+
   late final _EpubTranslationStrategy _strategy = _EpubTranslationStrategy(
     this,
   );
@@ -841,6 +873,7 @@ class EpubChapterTranslator {
     }
     run.watchCancellation();
     Dio? dio;
+    TranslationBookBudget? bookBudget;
     try {
       await validateInspectedSource(
         chapters,
@@ -849,13 +882,21 @@ class EpubChapterTranslator {
       );
       run.throwIfCancelled();
       dio = _apiClient.buildDio(config);
-      final profile = await _invocation(run)._memory.generateStyleProfile(
+      final invocation = _invocation(run).._rateLimitConfig = config;
+      bookBudget = await invocation._openBookBudget(config, chapters);
+      _apiClient.useBookBudget(
+        dio,
+        bookBudget,
+        syncCancellation: run.syncCancellation,
+      );
+      final profile = await invocation._memory.generateStyleProfile(
         dio: dio,
         config: config,
         chapters: chapters,
         cancelToken: run.cancelToken,
         throwIfCancelled: run.throwIfCancelled,
       );
+      bookBudget.throwIfAccountingFailed();
       final identity = _styleUsageIdentity(config, chapters);
       final usage = TranslationApiMetrics()..add(_apiClient.metricsFor(dio));
       final previous = _pendingStyleUsage;
@@ -867,8 +908,12 @@ class EpubChapterTranslator {
     } finally {
       // Fresh Dio per call (own HttpClient pool); close it so sockets/FDs
       // do not accumulate across runs.
-      run.dispose();
-      dio?.close(force: true);
+      try {
+        run.dispose();
+        dio?.close(force: true);
+      } finally {
+        await bookBudget?.close();
+      }
     }
   }
 
@@ -943,12 +988,13 @@ class EpubChapterTranslator {
       isCancelled: isCancelled,
     );
     final EpubChapterTranslator invocation = _invocation(run);
-    final styleUsage = _pendingStyleUsage;
+    final pendingStyle = _pendingStyleUsage;
     _pendingStyleUsage = null;
-    if (styleUsage != null &&
-        styleUsage.identity == _styleUsageIdentity(config, chapters)) {
-      run.styleMetrics.add(styleUsage.usage);
-    }
+    final workflowStyleUsage =
+        pendingStyle != null &&
+            pendingStyle.identity == _styleUsageIdentity(config, chapters)
+        ? pendingStyle.usage
+        : null;
     invocation._rateLimitConfig = config;
     _run = run;
     run.watchCancellation();
@@ -963,6 +1009,7 @@ class EpubChapterTranslator {
         onProgress: onProgress,
         isCancelled: isCancelled,
         onChapterSourcesReleased: onChapterSourcesReleased,
+        workflowStyleUsage: workflowStyleUsage,
       );
     } finally {
       run.dispose();
@@ -979,6 +1026,7 @@ class EpubChapterTranslator {
     TranslationProgressCallback? onProgress,
     TranslationCancellationCheck? isCancelled,
     void Function(String chapterPath)? onChapterSourcesReleased,
+    TranslationApiMetrics? workflowStyleUsage,
   }) async {
     // Localized strings for the user-visible run log; the run's UI language
     // comes from the config, not from a BuildContext (see runLog* keys).
@@ -994,6 +1042,7 @@ class EpubChapterTranslator {
     // closed in the finally below so sockets/FDs do not accumulate (see M7).
     late final Dio dio;
     bool dioReady = false;
+    TranslationBookBudget? bookBudget;
     TranslationJob? lastProgressJob;
     final sourceSpool = ChapterSourceSpool();
     final cacheSpool = CacheRestorationSpool();
@@ -1167,6 +1216,10 @@ class EpubChapterTranslator {
         expectedSourceFingerprint: sourceIdentityForChapters(chapters)?.sha256,
         cancelToken: cancelToken,
       );
+      bookBudget = await _openBookBudget(config, chapters);
+      if (workflowStyleUsage != null) {
+        bookBudget.includeStyleUsage(workflowStyleUsage);
+      }
       final String jobKey = _jobKey(
         inputFingerprint: inputFingerprint,
         config: config,
@@ -1227,12 +1280,7 @@ class EpubChapterTranslator {
 
       void emit(TranslationJob job, String logLine) {
         job = job.copyWith(
-          apiUsage: dioReady
-              ? (TranslationApiMetrics()
-                      ..add(_apiClient.metricsFor(dio))
-                      ..add(_run.styleMetrics))
-                    .toJson()
-              : const {},
+          apiUsage: bookBudget?.apiUsage ?? const {},
           elapsedMilliseconds: translationStopwatch.elapsedMilliseconds,
           reviewSuggestionCount: _run.semanticCorrections.length,
           unreviewedBlockCount: _run.semanticUnreviewed.length,
@@ -1250,8 +1298,15 @@ class EpubChapterTranslator {
             tag: 'translate',
           );
         }
-        AppLogger.debug(logLine, tag: 'translate');
+        if (logLine.isNotEmpty) AppLogger.debug(logLine, tag: 'translate');
       }
+
+      _apiClient.useBookBudget(
+        dio,
+        bookBudget,
+        onAttemptSettled: () => emit(currentJob, ''),
+        syncCancellation: _run.syncCancellation,
+      );
 
       void throwIfCancelled() {
         _run.throwIfCancelled();
@@ -1369,6 +1424,9 @@ class EpubChapterTranslator {
         config.tokenSavingMode
             ? restoredMemory?.pendingChapters ?? const []
             : const [],
+        recentFingerprints: config.tokenSavingMode
+            ? restoredMemory?.recentFingerprints ?? const {}
+            : const {},
       );
       final memoryChapters = <String>{
         ...?restoredMemory?.completedChapterPaths,
@@ -1494,6 +1552,7 @@ class EpubChapterTranslator {
             pendingChapters: config.tokenSavingMode
                 ? chapterMemoryBatch.chapters
                 : const [],
+            recentFingerprints: chapterMemoryBatch.recentFingerprints,
           );
         } catch (error) {
           AppLogger.warn(
@@ -1668,6 +1727,7 @@ class EpubChapterTranslator {
             }
           }
         } catch (error) {
+          if (error is TranslationBookBudgetException) rethrow;
           throwIfCancelled();
           if (config.autoApplyVerifiedCorrections) {
             try {
@@ -1693,7 +1753,8 @@ class EpubChapterTranslator {
                 );
                 return;
               }
-            } catch (_) {
+            } catch (error) {
+              if (error is TranslationBookBudgetException) rethrow;
               throwIfCancelled();
             }
           }
@@ -2113,6 +2174,12 @@ class EpubChapterTranslator {
         return endChapterIndex;
       }
 
+      final incrementalBookScope = _EpubIncrementalCache.bookScopeFor(
+        config: config,
+        inputPath: inputPath,
+        chapters: selectedChapters,
+      );
+
       Future<void> translateSingleChapter(int chapterIndex) async {
         throwIfCancelled();
         final InspectedChapter chapter = selectedChapters[chapterIndex];
@@ -2180,6 +2247,26 @@ class EpubChapterTranslator {
         }
 
         final String chapterCacheContext = cacheContextForChapter(chapter);
+        String cacheKeyForBlock(ExtractedBlock block) => _blockCacheKey(
+          config,
+          block,
+          chapterPath: chapter.path,
+          inputFingerprint: inputFingerprint,
+          contextIdentity: chapterCacheContext,
+          confirmedStyleProfile: userStyleProfile,
+        );
+        final incrementalCache = incrementalBookScope == null
+            ? null
+            : _EpubIncrementalCache(
+                artifacts: _artifactCache,
+                apiClient: _apiClient,
+                config: config,
+                bookScope: incrementalBookScope,
+                chapter: chapter,
+                cacheKeyFor: cacheKeyForBlock,
+                throwIfCancelled: throwIfCancelled,
+              );
+        final incrementalHits = <String>{};
         final int chunkSize = config.tokenSavingMode
             ? _bodyBudget(config).plannedChunkSize
             : config.chunkSize;
@@ -2188,6 +2275,9 @@ class EpubChapterTranslator {
           chunkSize: chunkSize,
           chapterBlocks: chapter.blocks,
           chapterTitle: chapter.title,
+          estimateBlockBudget: config.tokenSavingMode
+              ? _strategy._estimateTokenSavingBlockBudget
+              : null,
           // Positional snapshot: a retranslated earlier chapter must not
           // see rolling memory that already contains later chapters.
           bookMemory: bookMemorySnapshotFor(chapter),
@@ -2214,20 +2304,19 @@ class EpubChapterTranslator {
               batch: batch,
               chapterPath: chapter.path,
               cancelToken: cancelToken,
+              readReusable: incrementalCache == null
+                  ? null
+                  : (blocks, request) async {
+                      final hits = await incrementalCache.read(blocks, request);
+                      incrementalHits.addAll(hits.keys);
+                      cachedBlocks += hits.length;
+                      return hits;
+                    },
+              rememberReusable: incrementalCache?.remember,
               onValidated: (String id, String html) async {
                 final block = batch.blocks.firstWhere((b) => b.id == id);
                 final Stopwatch stopwatch = Stopwatch()..start();
-                if (await putValidated(
-                  _blockCacheKey(
-                    config,
-                    block,
-                    chapterPath: chapter.path,
-                    inputFingerprint: inputFingerprint,
-                    contextIdentity: chapterCacheContext,
-                    confirmedStyleProfile: userStyleProfile,
-                  ),
-                  html,
-                )) {
+                if (await putValidated(cacheKeyForBlock(block), html)) {
                   chapterCacheWrites += 1;
                   cacheWriteCount += 1;
                 }
@@ -2253,14 +2342,7 @@ class EpubChapterTranslator {
                 await Future.wait<bool>(<Future<bool>>[
                   for (final int index in cacheableIndexes)
                     putValidated(
-                      _blockCacheKey(
-                        config,
-                        batch.blocks[index],
-                        chapterPath: chapter.path,
-                        inputFingerprint: inputFingerprint,
-                        contextIdentity: chapterCacheContext,
-                        confirmedStyleProfile: userStyleProfile,
-                      ),
+                      cacheKeyForBlock(batch.blocks[index]),
                       translated[index],
                     ),
                 ]);
@@ -2288,17 +2370,22 @@ class EpubChapterTranslator {
             final List<String> translatedBatch = timedBatch.translatedBlocks;
             chapterApiElapsed += timedBatch.elapsed;
             totalApiElapsed += timedBatch.elapsed;
+            final int incrementalHitCount = batch.blocks
+                .where((block) => incrementalHits.contains(block.id))
+                .length;
             chapterApiBlocks += batch.blocks
                 .where(
-                  (block) => !_run.reusedDraftBlocks.contains(
-                    EpubRepacker.degradedKeyForBlock(
-                      chapterPath: chapter.path,
-                      blockId: block.id,
-                    ),
-                  ),
+                  (block) =>
+                      !incrementalHits.contains(block.id) &&
+                      !_run.reusedDraftBlocks.contains(
+                        EpubRepacker.degradedKeyForBlock(
+                          chapterPath: chapter.path,
+                          blockId: block.id,
+                        ),
+                      ),
                 )
                 .length;
-            apiTranslatedBlocks += batch.blocks.length;
+            apiTranslatedBlocks += batch.blocks.length - incrementalHitCount;
             emit(
               currentJob.copyWith(
                 currentChapter: chapter.title,
@@ -2402,53 +2489,77 @@ class EpubChapterTranslator {
           await ensureInitialBookMemory();
           final int lastPending =
               selectedPositionByPath[chapterMemoryBatch.lastPath] ?? -1;
+          final bool footnotesNext = isFootnoteChapter(chapterIndex + 1);
+          final bool lastTranslationNext =
+              memoryTimeline.isEmpty &&
+              !restoration.hasPendingBlocksFromChapter(chapterIndex + 2);
+          bool shouldFlush() =>
+              chapterMemoryBatch.shouldUpdate ||
+              footnotesNext ||
+              lastTranslationNext;
           if (chapterIndex > maxRecordedTimelinePosition &&
-              chapterIndex > lastPending &&
+              (chapterIndex > lastPending ||
+                  (chapterIndex == lastPending && shouldFlush())) &&
               !memoryChapters.contains(chapter.path)) {
             final memory = bookMemory ?? _BookMemory.empty;
-            final sample = _memory.chapterMemorySample(
-              chapter: updatedByPath[chapter.path]!,
-              currentMemory: memory,
-              degradedBlockIds: _degradedBlocks,
-            );
-            if (sample != null) chapterMemoryBatch.add(sample);
+            if (chapterIndex > lastPending) {
+              final sample = _memory.chapterMemorySample(
+                chapter: updatedByPath[chapter.path]!,
+                currentMemory: memory,
+                degradedBlockIds: _degradedBlocks,
+              );
+              if (sample != null) chapterMemoryBatch.add(sample);
+            }
             final samples = chapterMemoryBatch.chapters;
-            final bool footnotesNext =
-                chapterIndex + 1 < selectedChapters.length &&
-                isFootnoteChapter(chapterIndex + 1);
-            final bool lastTranslationNext =
-                memoryTimeline.isEmpty &&
-                !restoration.hasPendingBlocksFromChapter(chapterIndex + 2);
-            if (samples.isNotEmpty &&
-                (chapterMemoryBatch.shouldUpdate ||
-                    footnotesNext ||
-                    lastTranslationNext)) {
+            if (samples.isNotEmpty && shouldFlush()) {
               final clock = Stopwatch()..start();
               try {
-                bookMemory = await trackMemoryRequests(
-                  () => _memory.updateBookMemoryBatch(
-                    dio: dio,
-                    config: config,
-                    currentMemory: memory,
-                    chapters: samples,
-                    cancelToken: cancelToken,
-                  ),
-                );
-                throwIfCancelled();
+                if (!footnotesNext && chapterMemoryBatch.repeatsRecentUpdate) {
+                  emit(
+                    chapterDoneJob,
+                    config.uiLanguage == UiLanguage.chinese
+                        ? '本批章节与近期记忆一致，已跳过更新。'
+                        : 'Chapter memory skipped for repeated content.',
+                  );
+                } else {
+                  bookMemory = await trackMemoryRequests(
+                    () => _memory.updateBookMemoryBatch(
+                      dio: dio,
+                      config: config,
+                      currentMemory: memory,
+                      chapters: samples,
+                      cancelToken: cancelToken,
+                    ),
+                  );
+                  throwIfCancelled();
+                  chapterMemoryBatch.rememberUpdate(
+                    crossedBoundary:
+                        footnotesNext || identical(bookMemory, memory),
+                  );
+                  bookMemory = bookMemory!.withLockedGlossary(
+                    config.lockedGlossary,
+                  );
+                  recordMemoryTimeline(chapter.path, bookMemory!);
+                  emit(
+                    chapterDoneJob,
+                    s.runLogBookMemoryUpdated(
+                      chapter.title,
+                      _formatDuration(clock.elapsed),
+                    ),
+                  );
+                }
                 memoryChapters.addAll(samples.map((sample) => sample.path));
-                bookMemory = bookMemory!.withLockedGlossary(
-                  config.lockedGlossary,
-                );
-                recordMemoryTimeline(chapter.path, bookMemory!);
-                emit(
-                  chapterDoneJob,
-                  s.runLogBookMemoryUpdated(
-                    chapter.title,
-                    _formatDuration(clock.elapsed),
-                  ),
-                );
+              } on TranslationBookBudgetException {
+                await persistBookMemory();
+                rethrow;
               } catch (error) {
+                if (_isCancelError(error) ||
+                    error is TranslationCancelledException) {
+                  await persistBookMemory();
+                  rethrow;
+                }
                 throwIfCancelled();
+                chapterMemoryBatch.rememberUpdate(crossedBoundary: true);
                 emit(
                   chapterDoneJob,
                   s.runLogBookMemoryChapterSkipped(
@@ -2458,6 +2569,8 @@ class EpubChapterTranslator {
                 );
               }
               chapterMemoryBatch.clear();
+            } else if (footnotesNext) {
+              chapterMemoryBatch.rememberUpdate(crossedBoundary: true);
             }
             await persistBookMemory();
           }
@@ -2502,6 +2615,7 @@ class EpubChapterTranslator {
                 ),
               );
             } catch (error) {
+              if (error is TranslationBookBudgetException) rethrow;
               emit(
                 chapterDoneJob,
                 s.runLogBookMemoryChapterSkipped(
@@ -2624,7 +2738,9 @@ class EpubChapterTranslator {
               inputFingerprint: inputFingerprint,
               inputPath: currentJob.inputPath,
               outputPath: currentJob.outputPath,
-              status: cancelled ? 'cancelled' : 'failed',
+              status: cancelled
+                  ? 'cancelled'
+                  : (bookBudget.isPaused ? 'budgetPaused' : 'failed'),
               completedFiles: completedFiles,
               totalFiles: selectedChapters.length,
               completedBlocks: completedBlocks,
@@ -2762,7 +2878,8 @@ class EpubChapterTranslator {
               cancelToken: cancelToken,
             );
           } catch (error) {
-            if (error is TranslationCancelledException ||
+            if (error is TranslationBookBudgetException ||
+                error is TranslationCancelledException ||
                 _isCancelError(error)) {
               rethrow;
             }
@@ -2787,6 +2904,7 @@ class EpubChapterTranslator {
               )?.sha256,
             )
           : null;
+      bookBudget.throwIfAccountingFailed();
       await _repacker.writeTranslatedEpub(
         reviewSnapshots: reviewSnapshots,
         reviewChapterPaths: {
@@ -2840,11 +2958,7 @@ class EpubChapterTranslator {
           : hasWarnings
           ? TranslationJobStatus.completedWithWarnings
           : TranslationJobStatus.completed;
-      final apiUsage =
-          (TranslationApiMetrics()
-                ..add(_apiClient.metricsFor(dio))
-                ..add(_run.styleMetrics))
-              .toJson();
+      final apiUsage = bookBudget.apiUsage;
       TranslationJob terminalJob = currentJob.copyWith(
         apiUsage: apiUsage,
         elapsedMilliseconds: translationStopwatch.elapsedMilliseconds,
@@ -3088,15 +3202,42 @@ class EpubChapterTranslator {
         );
         return done;
       }
+      if (lastProgressJob != null &&
+          error is! TranslationBudgetAccountingException &&
+          error is! TranslationCancelledException &&
+          !_isCancelError(error) &&
+          (bookBudget?.isPaused ?? false)) {
+        bookBudget!.throwIfAccountingFailed();
+        final usage = bookBudget.apiUsage;
+        final paused = lastProgressJob!.copyWith(
+          status: TranslationJobStatus.budgetPaused,
+          outputPath: '',
+          apiUsage: usage,
+        );
+        try {
+          onProgress?.call(
+            paused,
+            s.isChinese
+                ? '已达到整本令牌预算，已保存完成的工作。'
+                : 'Paused at the whole-book token budget. Completed work was saved.',
+          );
+        } catch (callbackError) {
+          AppLogger.warn(
+            'Progress callback failed (${callbackError.runtimeType}).',
+            tag: 'translate',
+          );
+        }
+        return TranslationRunResult(
+          job: paused,
+          chapters: chapters,
+          apiUsage: usage,
+        );
+      }
       if (dioReady && lastProgressJob != null) {
         try {
           onProgress?.call(
             lastProgressJob!.copyWith(
-              apiUsage:
-                  (TranslationApiMetrics()
-                        ..add(_apiClient.metricsFor(dio))
-                        ..add(_run.styleMetrics))
-                      .toJson(),
+              apiUsage: bookBudget?.apiUsage ?? const {},
             ),
             config.uiLanguage == UiLanguage.chinese
                 ? '任务已中断；已完成请求计入用量统计。'
@@ -3114,10 +3255,14 @@ class EpubChapterTranslator {
       }
       rethrow;
     } finally {
-      await cacheSpool.dispose();
-      await sourceSpool.dispose();
-      if (dioReady) {
-        dio.close(force: true);
+      try {
+        await cacheSpool.dispose();
+        await sourceSpool.dispose();
+        if (dioReady) {
+          dio.close(force: true);
+        }
+      } finally {
+        await bookBudget?.close();
       }
     }
   }

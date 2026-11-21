@@ -15,6 +15,13 @@ import '../../domain/repositories/translation_repository.dart';
 import '../translation_response_guard.dart';
 import 'cancellation_listener.dart';
 import 'sse_stream_decoder.dart';
+import 'translation_api_metrics.dart';
+import 'translation_book_budget.dart';
+import 'translation_budget_paused.dart';
+
+export 'translation_api_metrics.dart' show TranslationApiMetrics;
+
+export 'translation_budget_paused.dart';
 
 /// Thrown when a translation, style, or memory reply cannot be parsed as JSON
 /// (the message content is missing or is not a JSON object).
@@ -54,59 +61,6 @@ class ProxyAuthenticationException implements Exception {
 
   @override
   String toString() => message;
-}
-
-/// Counts actual HTTP attempts (including bounded truncation retries), not
-/// orchestration calls. No headers, prompts or reply content are retained.
-class TranslationApiMetrics {
-  int requests = 0,
-      errors = 0,
-      promptTokens = 0,
-      completionTokens = 0,
-      elapsedMs = 0;
-  int usageReportedRequests = 0;
-  final Map<String, int> byKind = {};
-  final Map<String, int> finishReasons = {};
-  int reasoningTokens = 0;
-  final Map<String, int> elapsedMsByKind = {},
-      promptTokensByKind = {},
-      completionTokensByKind = {};
-  Map<String, Object> toJson() => {
-    'requests': requests,
-    'finishReasons': Map<String, int>.from(finishReasons),
-    'reasoningTokens': reasoningTokens,
-    'errors': errors,
-    'promptTokens': promptTokens,
-    'completionTokens': completionTokens,
-    'elapsedMs': elapsedMs,
-    'byKind': Map<String, int>.from(byKind),
-    'usageReportedRequests': usageReportedRequests,
-    'elapsedMsByKind': Map<String, int>.from(elapsedMsByKind),
-    'promptTokensByKind': Map<String, int>.from(promptTokensByKind),
-    'completionTokensByKind': Map<String, int>.from(completionTokensByKind),
-  };
-  void add(TranslationApiMetrics other) {
-    reasoningTokens += other.reasoningTokens;
-    usageReportedRequests += other.usageReportedRequests;
-    for (final pair in [
-      (finishReasons, other.finishReasons),
-      (elapsedMsByKind, other.elapsedMsByKind),
-      (promptTokensByKind, other.promptTokensByKind),
-      (completionTokensByKind, other.completionTokensByKind),
-    ]) {
-      for (final e in pair.$2.entries) {
-        pair.$1.update(e.key, (v) => v + e.value, ifAbsent: () => e.value);
-      }
-    }
-    requests += other.requests;
-    errors += other.errors;
-    promptTokens += other.promptTokens;
-    completionTokens += other.completionTokens;
-    elapsedMs += other.elapsedMs;
-    for (final e in other.byKind.entries) {
-      byKind.update(e.key, (v) => v + e.value, ifAbsent: () => e.value);
-    }
-  }
 }
 
 // Some Dart SDKs retry cached Basic proxy credentials without invoking
@@ -219,73 +173,6 @@ class TranslationApiClient {
         sendTimeout: Duration(seconds: config.timeoutSeconds),
       ),
     );
-    final metrics = metricsFor(dio);
-    void finish(RequestOptions options, dynamic data, {bool failed = false}) {
-      final watch = options.extra.remove('apiWatch') as Stopwatch?;
-      if (watch == null) return;
-      final kind = options.extra['requestKind'] as String? ?? 'translation';
-      metrics.elapsedMsByKind.update(
-        kind,
-        (v) => v + watch.elapsedMilliseconds,
-        ifAbsent: () => watch.elapsedMilliseconds,
-      );
-      metrics.elapsedMs += watch.elapsedMilliseconds;
-      if (failed) metrics.errors++;
-      final choices = data is Map ? data['choices'] : null;
-      if (choices is List && choices.isNotEmpty && choices.first is Map) {
-        final reason = _safeFinishReason(choices.first['finish_reason']);
-        metrics.finishReasons.update(reason, (v) => v + 1, ifAbsent: () => 1);
-      }
-      final usage = data is Map ? data['usage'] : null;
-      if (usage is Map) {
-        final details = usage['completion_tokens_details'];
-        final reasoning = details is Map ? details['reasoning_tokens'] : null;
-        if (reasoning is int) metrics.reasoningTokens += max(0, reasoning);
-        if (usage['prompt_tokens'] is int &&
-            usage['completion_tokens'] is int) {
-          metrics.usageReportedRequests++;
-        }
-        if (usage['prompt_tokens'] is int) {
-          final count = max(0, usage['prompt_tokens'] as int);
-          metrics.promptTokens += count;
-          metrics.promptTokensByKind.update(
-            kind,
-            (v) => v + count,
-            ifAbsent: () => count,
-          );
-        }
-        if (usage['completion_tokens'] is int) {
-          final count = max(0, usage['completion_tokens'] as int);
-          metrics.completionTokens += count;
-          metrics.completionTokensByKind.update(
-            kind,
-            (v) => v + count,
-            ifAbsent: () => count,
-          );
-        }
-      }
-    }
-
-    dio.interceptors.add(
-      InterceptorsWrapper(
-        onRequest: (options, handler) {
-          options.extra['apiWatch'] = Stopwatch()..start();
-          metrics.requests++;
-          final kind = options.extra['requestKind'] as String? ?? 'translation';
-          metrics.byKind.update(kind, (v) => v + 1, ifAbsent: () => 1);
-          handler.next(options);
-        },
-        onResponse: (response, handler) {
-          finish(response.requestOptions, response.data);
-          handler.next(response);
-        },
-        onError: (error, handler) {
-          finish(error.requestOptions, error.response?.data, failed: true);
-          handler.next(error);
-        },
-      ),
-    );
-
     final proxyFailureMessage = config.uiLanguage == UiLanguage.chinese
         ? '代理认证失败（HTTP 407），请检查代理用户名和密码。'
         : 'Proxy authentication failed (HTTP 407). Check the proxy username and password.';
@@ -815,83 +702,164 @@ class TranslationApiClient {
     void Function(String delta)? onStreamDelta,
     void Function()? onStreamUnsupported,
   }) async {
-    if (!streaming) {
+    Future<Response<dynamic>> postBuffered() {
       request.remove('stream');
-      return dio.post<dynamic>(
-        endpoint.toString(),
-        data: request,
+      return _postPhysicalAttempt(
+        dio: dio,
+        request: request,
+        kind: kind,
         cancelToken: cancelToken,
-        options: Options(extra: {'requestKind': kind}),
-      );
-    }
-
-    final Map<String, dynamic> streamedPayload = <String, dynamic>{
-      ...request,
-      'stream': true,
-    };
-    try {
-      final Response<ResponseBody> rawResponse = await dio.post<ResponseBody>(
-        endpoint.toString(),
-        data: streamedPayload,
-        cancelToken: cancelToken,
-        options: Options(
-          extra: {'requestKind': kind},
-          responseType: ResponseType.stream,
-        ),
-      );
-      final ResponseBody? responseBody = rawResponse.data;
-      if (responseBody == null) {
-        return Response<dynamic>(
-          requestOptions: rawResponse.requestOptions,
-          statusCode: rawResponse.statusCode,
-          statusMessage: rawResponse.statusMessage,
-          headers: rawResponse.headers,
-          extra: rawResponse.extra,
-          data: <String, dynamic>{},
-        );
-      }
-      final String? contentType = rawResponse.headers.value(
-        Headers.contentTypeHeader,
-      );
-      final Map<String, dynamic> assembled = await decodeChatCompletionStream(
-        stream: responseBody.stream,
-        contentType: contentType,
-        cancelToken: cancelToken,
-        onContentDelta: onStreamDelta,
-      );
-      return Response<dynamic>(
-        requestOptions: rawResponse.requestOptions,
-        statusCode: rawResponse.statusCode,
-        statusMessage: rawResponse.statusMessage,
-        headers: rawResponse.headers,
-        extra: rawResponse.extra,
-        data: assembled,
-      );
-    } on DioException catch (error) {
-      final Response<dynamic>? decodedErrorResponse =
-          await _materializeErrorBody(error.response);
-      final DioException materialized = decodedErrorResponse == null
-          ? error
-          : DioException(
-              requestOptions: error.requestOptions,
-              response: decodedErrorResponse,
-              type: error.type,
-              error: error.error,
-              message: error.message,
-              stackTrace: error.stackTrace,
-            );
-      if (materialized.response?.statusCode == 400 &&
-          _errorMentionsUnsupportedStream(decodedErrorResponse?.data)) {
-        onStreamUnsupported?.call();
-        request.remove('stream');
-        return dio.post<dynamic>(
+        send: () => dio.post<dynamic>(
           endpoint.toString(),
           data: request,
           cancelToken: cancelToken,
           options: Options(extra: {'requestKind': kind}),
-        );
+        ),
+      );
+    }
+
+    if (!streaming) return postBuffered();
+    final streamedPayload = <String, dynamic>{...request, 'stream': true};
+    Map<String, dynamic>? partialUsage;
+    try {
+      return await _postPhysicalAttempt(
+        dio: dio,
+        request: streamedPayload,
+        kind: kind,
+        cancelToken: cancelToken,
+        partialUsage: () => partialUsage,
+        send: () async {
+          final Response<ResponseBody> rawResponse;
+          try {
+            rawResponse = await dio.post<ResponseBody>(
+              endpoint.toString(),
+              data: streamedPayload,
+              cancelToken: cancelToken,
+              options: Options(
+                extra: {'requestKind': kind},
+                responseType: ResponseType.stream,
+              ),
+            );
+          } on DioException catch (error) {
+            final response = await _materializeErrorBody(error.response);
+            throw error.copyWith(response: response);
+          }
+          final body = rawResponse.data;
+          final assembled = body == null
+              ? <String, dynamic>{}
+              : await decodeChatCompletionStream(
+                  stream: body.stream,
+                  contentType: rawResponse.headers.value(
+                    Headers.contentTypeHeader,
+                  ),
+                  cancelToken: cancelToken,
+                  onContentDelta: onStreamDelta,
+                  onUsage: (usage) => partialUsage = usage,
+                );
+          return Response<dynamic>(
+            requestOptions: rawResponse.requestOptions,
+            statusCode: rawResponse.statusCode,
+            statusMessage: rawResponse.statusMessage,
+            headers: rawResponse.headers,
+            extra: rawResponse.extra,
+            data: assembled,
+          );
+        },
+      );
+    } on DioException catch (error) {
+      if (error.response?.statusCode == 400 &&
+          _errorMentionsUnsupportedStream(error.response?.data)) {
+        onStreamUnsupported?.call();
+        return postBuffered();
       }
-      throw materialized;
+      rethrow;
+    }
+  }
+
+  void useBookBudget(
+    Dio dio,
+    TranslationBookBudget budget, {
+    void Function()? onAttemptSettled,
+    void Function()? syncCancellation,
+  }) {
+    dio.options.extra['syncBookCancellation'] = syncCancellation;
+    dio.options.extra['bookBudget'] = budget;
+    dio.options.extra['onBookAttemptSettled'] = onAttemptSettled;
+  }
+
+  Future<Response<dynamic>> _postPhysicalAttempt({
+    required Dio dio,
+    required Map<String, dynamic> request,
+    required String kind,
+    required CancelToken? cancelToken,
+    required Future<Response<dynamic>> Function() send,
+    Map<String, dynamic>? Function()? partialUsage,
+  }) async {
+    void throwIfCancelled() {
+      if (cancelToken?.isCancelled ?? false) {
+        throw const TranslationCancelledException();
+      }
+    }
+
+    throwIfCancelled();
+    final estimate = (
+      input:
+          16 + (utf8.encode(jsonEncode(request['messages'])).length / 3).ceil(),
+      output:
+          (request['max_completion_tokens'] ?? request['max_tokens']) as int,
+    );
+    final budget = dio.options.extra['bookBudget'] as TranslationBookBudget?;
+    final reservation = await budget?.reserve(
+      kind: kind,
+      estimate: estimate,
+      throwIfCancelled: throwIfCancelled,
+      cancelToken: cancelToken,
+    );
+    final watch = Stopwatch()..start();
+    Object? body;
+    bool sent = false;
+    bool failed = true;
+    try {
+      throwIfCancelled();
+      sent = true;
+      final response = await send();
+      body = response.data;
+      failed = false;
+      return response;
+    } on DioException catch (error) {
+      body = error.response?.data;
+      // Retry orchestration sees this failure after the ledger write. Sync the
+      // callback now so transport cancellation does not depend on disk latency.
+      (dio.options.extra['syncBookCancellation'] as void Function()?)?.call();
+      rethrow;
+    } finally {
+      watch.stop();
+      TranslationApiMetrics? attempt;
+      if (sent) {
+        final usage = body is Map ? body['usage'] : null;
+        final choices = body is Map ? body['choices'] : null;
+        final finish =
+            choices is List && choices.isNotEmpty && choices.first is Map
+            ? _safeFinishReason(choices.first['finish_reason'])
+            : null;
+        attempt = TranslationApiMetrics()
+          ..recordAttempt(
+            kind: kind,
+            estimate: estimate,
+            usage: usage is Map ? usage : partialUsage?.call(),
+            elapsed: watch.elapsedMilliseconds,
+            failed: failed,
+            finishReason: finish,
+          );
+        metricsFor(dio).add(attempt);
+      }
+      if (reservation != null) {
+        await budget!.settle(reservation, attempt);
+        if (sent) {
+          (dio.options.extra['onBookAttemptSettled'] as void Function()?)
+              ?.call();
+        }
+      }
     }
   }
 
@@ -959,6 +927,7 @@ class TranslationApiClient {
         }
         return await operation();
       } catch (error, stackTrace) {
+        if (error is TranslationBookBudgetException) rethrow;
         if (error is TranslationCancelledException || isCancelError(error)) {
           throw const TranslationCancelledException();
         }

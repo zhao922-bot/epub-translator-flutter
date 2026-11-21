@@ -1027,7 +1027,8 @@ class _EpubSemanticReviewer {
           }
         }
       } catch (error) {
-        if (error is TranslationCancelledException ||
+        if (error is TranslationBookBudgetException ||
+            error is TranslationCancelledException ||
             EpubChapterTranslator._isCancelError(error)) {
           rethrow;
         }
@@ -1292,7 +1293,8 @@ class _EpubSemanticReviewer {
         failures: failures,
       );
     } catch (error) {
-      if (error is TranslationCancelledException ||
+      if (error is TranslationBookBudgetException ||
+          error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }
@@ -1380,7 +1382,8 @@ class _EpubSemanticReviewer {
         failure: '',
       );
     } catch (error) {
-      if (error is TranslationCancelledException ||
+      if (error is TranslationBookBudgetException ||
+          error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }
@@ -1642,7 +1645,8 @@ class _EpubSemanticReviewer {
         }
       }
     } catch (error) {
-      if (error is TranslationCancelledException ||
+      if (error is TranslationBookBudgetException ||
+          error is TranslationCancelledException ||
           EpubChapterTranslator._isCancelError(error)) {
         rethrow;
       }

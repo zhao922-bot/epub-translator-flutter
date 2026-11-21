@@ -10,6 +10,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../shared/localization/app_strings.dart';
+import '../../../shared/localization/book_budget_strings.dart';
 import '../../../shared/logging/app_logger.dart';
 import '../../../shared/platform/android_service_bridge.dart';
 import '../../../shared/platform/native_platform_bridge.dart';
@@ -25,7 +26,10 @@ import '../domain/models/translation_job.dart';
 import '../domain/models/translation_run_estimate.dart';
 import '../domain/models/translation_run_result.dart';
 import '../domain/models/translation_style_profile.dart';
+import '../domain/models/translation_token_usage.dart';
 import '../domain/repositories/translation_repository.dart';
+import '../infrastructure/epub/translation_api_client.dart'
+    show TranslationBudgetPausedException;
 import '../infrastructure/job_history_store.dart';
 import '../infrastructure/session_path_store.dart';
 import '../infrastructure/translation_cache_store.dart';
@@ -214,6 +218,7 @@ class _ResumeProgressHint {
     required this.inputPath,
     required this.completedBlocks,
     required this.totalBlocks,
+    this.budgetPausedJob,
   });
 
   /// The book this hint belongs to. A hint must never apply to a different
@@ -224,6 +229,7 @@ class _ResumeProgressHint {
   final String inputPath;
   final int completedBlocks;
   final int totalBlocks;
+  final TranslationJob? budgetPausedJob;
 }
 
 class TranslationDashboardController
@@ -964,6 +970,26 @@ class TranslationDashboardController
         state = state.copyWith(isGeneratingStyleProfile: false);
         return;
       }
+      final paused = state.job;
+      if (paused?.isBudgetPaused == true &&
+          paused!.phase == TranslationJobPhase.inspection) {
+        final resumed = paused.copyWith(
+          status: TranslationJobStatus.inspected,
+          runStartedAt: max(
+            DateTime.now().microsecondsSinceEpoch,
+            paused.runStartedAt + 1,
+          ),
+          recordRevision: 0,
+          apiUsage: {
+            ...paused.apiUsage,
+            'maxBookTokens': state.config.maxBookTokens,
+          }..remove('nextRequestEstimatedTokens'),
+        );
+        state = state.copyWith(
+          job: resumed,
+          jobHistory: _jobHistoryWith(resumed),
+        );
+      }
       if (profile.isEmpty) {
         // Empty profile means "generic translation style": auto-confirm it
         // (restores the pre-v1.6.7 semantics). The v1.6.7 "empty sampling
@@ -1021,6 +1047,30 @@ class TranslationDashboardController
       if (error is TranslationCancelledException ||
           (error is DioException && error.type == DioExceptionType.cancel)) {
         state = state.copyWith(isGeneratingStyleProfile: false);
+        return;
+      }
+      final job = state.job;
+      if (error is TranslationBudgetPausedException && job != null) {
+        final paused = job.copyWith(
+          status: TranslationJobStatus.budgetPaused,
+          phase: TranslationJobPhase.inspection,
+          outputPath: '',
+          apiUsage: error.apiUsage,
+          currentChapter: null,
+          currentBlock: null,
+          errorMessage: null,
+          selectedChapterPaths: [
+            for (final chapter in state.inspectedChapters)
+              if (chapter.includeInTranslation) chapter.path,
+          ],
+        );
+        state = state.copyWith(
+          job: paused,
+          jobHistory: _jobHistoryWith(paused),
+          runEstimate: _buildEstimate(job: paused),
+          isGeneratingStyleProfile: false,
+          logs: [...state.logs, _s.budgetPaused],
+        );
         return;
       }
       final String safeError = _safeErrorText(error);
@@ -1455,7 +1505,8 @@ class TranslationDashboardController
     final TranslationJob? currentJob = state.job;
     final bool currentJobIsResumable =
         currentJob != null &&
-        (currentJob.status == TranslationJobStatus.failed ||
+        (currentJob.isBudgetPaused ||
+            currentJob.status == TranslationJobStatus.failed ||
             currentJob.status == TranslationJobStatus.cancelled ||
             currentJob.status == TranslationJobStatus.completedWithWarnings) &&
         currentJob.phase != TranslationJobPhase.inspection &&
@@ -1486,6 +1537,23 @@ class TranslationDashboardController
     final selectedPaths = List<String>.unmodifiable(
       selectedChapters.map((chapter) => chapter.path),
     );
+    final priorJob = resumeHint?.budgetPausedJob ?? currentJob;
+    final previousUsage =
+        priorJob?.inputPath == state.inputPath &&
+            listEquals(priorJob?.selectedChapterPaths, selectedPaths)
+        ? priorJob!.apiUsage
+        : const <String, Object>{};
+    final accounted = TranslationTokenUsage(previousUsage).accountedTokens;
+    final previousBudgetUsage = TranslationTokenUsage(previousUsage);
+    final queuedUsage = <String, Object>{
+      if (accounted > 0) ...{
+        'chargedTokensEstimate': accounted,
+        'priorChargedTokensEstimate': accounted,
+        'cumulativeUsage': previousBudgetUsage.cumulative.values,
+      },
+      if (previousUsage.isNotEmpty || state.config.maxBookTokens > 0)
+        'maxBookTokens': state.config.maxBookTokens,
+    };
     // The checkpoint is unverified until the cache scan runs: the progress
     // bar and block counters start at zero while `resumeCheckpointBlocks`
     // keeps the pending figure (the UI labels it as "to verify").
@@ -1502,12 +1570,14 @@ class TranslationDashboardController
     _activeTranslationOutputDirectory = state.outputDirectory;
     final TranslationJob queuedJob =
         state.job?.copyWith(
+          id: resumeHint?.budgetPausedJob?.id,
           outputDirectory: _activeTranslationOutputDirectory,
           runStartedAt: _activeTranslationRunStartedAt,
           recordRevision: _activeTranslationRecordRevision,
           selectedChapterPaths: selectedPaths,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
+          apiUsage: queuedUsage,
           progress: 0,
           currentChapter: _s.jobStatusRestoringCache,
           currentBlock: null,
@@ -1535,6 +1605,7 @@ class TranslationDashboardController
           recordRevision: _activeTranslationRecordRevision,
           status: TranslationJobStatus.queued,
           phase: TranslationJobPhase.cacheRestoration,
+          apiUsage: queuedUsage,
           selectedChapterPaths: selectedPaths,
           progress: 0,
           currentChapter: _s.jobStatusRestoringCache,
@@ -1606,7 +1677,9 @@ class TranslationDashboardController
           final TranslationJob progressJob = _translationHistoryJob(
             _verifiedCacheProgress(job.copyWith(errorMessage: null)),
           );
-          final List<String> newLogs = <String>[_safeLogText(logLine)];
+          final List<String> newLogs = <String>[
+            if (logLine.isNotEmpty) _safeLogText(logLine),
+          ];
           final bool cacheScanComplete =
               progressJob.phase == TranslationJobPhase.cacheRestoration &&
               progressJob.cacheScanTotalBlocks > 0 &&
@@ -1693,8 +1766,7 @@ class TranslationDashboardController
         return true;
       }
       _progressCoalescer.flush();
-      // A returned terminal result means the repository already committed the
-      // EPUB. A cancellation arriving afterward cannot undo that output.
+      final bool pausedResult = result.job.isBudgetPaused;
       final bool failedResult =
           result.job.status == TranslationJobStatus.failed;
       final String? safeResultError = failedResult
@@ -1705,8 +1777,11 @@ class TranslationDashboardController
           : null;
       final TranslationJob terminalJob = _translationHistoryJob(
         result.job.copyWith(
-          apiUsage: result.apiUsage,
-          qualityReportPath: result.qualityReportPath,
+          apiUsage: result.apiUsage.isNotEmpty
+              ? result.apiUsage
+              : result.job.apiUsage,
+          outputPath: pausedResult ? '' : result.job.outputPath,
+          qualityReportPath: pausedResult ? null : result.qualityReportPath,
           // Exported results already report translation in the repository.
           // An explicit cacheRestoration result has not entered that phase
           // (e.g. a cache-only terminal path); do not invent a transition or
@@ -1731,7 +1806,9 @@ class TranslationDashboardController
             : null,
         logs: <String>[
           ...state.logs,
-          if (failedResult)
+          if (pausedResult)
+            _s.budgetPaused
+          else if (failedResult)
             _s.logTranslationFailed(safeResultError!)
           else if (terminalJob.status ==
               TranslationJobStatus.completedWithWarnings)
@@ -2115,7 +2192,8 @@ class TranslationDashboardController
     }
     if (job.status != TranslationJobStatus.failed &&
         job.status != TranslationJobStatus.cancelled &&
-        job.status != TranslationJobStatus.completedWithWarnings) {
+        job.status != TranslationJobStatus.completedWithWarnings &&
+        !job.isBudgetPaused) {
       state = state.copyWith(
         logs: <String>[...state.logs, _s.logOnlyFailedOrCancelled],
       );
@@ -2128,6 +2206,17 @@ class TranslationDashboardController
       return;
     }
 
+    if (job.isBudgetPaused &&
+        state.job?.id == job.id &&
+        state.inspectedChapters.isNotEmpty) {
+      if (job.phase == TranslationJobPhase.inspection &&
+          state.requiresStyleProfileConfirmation) {
+        await generateStyleProfile();
+      } else {
+        await startTranslation(logRetryContinuation: true);
+      }
+      return;
+    }
     final String outputDirectory = _outputDirectoryForRetry(job);
     final bool styleModeMatches =
         job.styleProfileEnabled == null ||
@@ -2146,6 +2235,7 @@ class TranslationDashboardController
             // cachedBlocks, not the stale completedBlocks checkpoint.
             completedBlocks: _confirmedProgressBlocks(job),
             totalBlocks: job.totalBlocks,
+            budgetPausedJob: job.isBudgetPaused ? job : null,
           )
         : null;
     _sessionPathRevision += 1;
@@ -2172,7 +2262,9 @@ class TranslationDashboardController
       // A null selection means "unknown" (jobs written before 1.4.3 have no
       // selectedChapterPaths): fall back to the inspection's recommended
       // selection instead of an empty one that would stall the retry.
-      chapterSelection: wasTranslationFailure ? job.selectedChapterPaths : null,
+      chapterSelection: wasTranslationFailure || job.isBudgetPaused
+          ? job.selectedChapterPaths
+          : null,
       generateStyle:
           !wasTranslationFailure ||
           // Unknown selection (pre-1.4.3 job): the old job predates style

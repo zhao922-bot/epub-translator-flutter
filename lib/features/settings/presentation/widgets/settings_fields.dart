@@ -93,6 +93,8 @@ class SettingsTextField extends StatefulWidget {
     this.maxLines = 1,
     this.enabled = true,
     this.readOnly = false,
+    this.keyboardType,
+    this.validator,
   });
 
   final Key fieldKey;
@@ -114,6 +116,8 @@ class SettingsTextField extends StatefulWidget {
   final int maxLines;
   final bool enabled;
   final bool readOnly;
+  final TextInputType? keyboardType;
+  final FormFieldValidator<String>? validator;
 
   @override
   State<SettingsTextField> createState() => SettingsTextFieldState();
@@ -303,6 +307,11 @@ class SettingsTextFieldState extends State<SettingsTextField> {
       key: widget.fieldKey,
       controller: _controller,
       focusNode: _focusNode,
+      keyboardType: widget.keyboardType,
+      validator: widget.validator,
+      autovalidateMode: widget.validator == null
+          ? AutovalidateMode.disabled
+          : AutovalidateMode.onUserInteraction,
       obscureText: widget.maxLines > 1 ? false : _obscureText,
       maxLines: widget.maxLines,
       minLines: widget.maxLines > 1 ? 3 : 1,

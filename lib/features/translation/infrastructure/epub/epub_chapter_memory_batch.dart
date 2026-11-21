@@ -2,12 +2,51 @@ part of 'epub_chapter_translator.dart';
 
 /// Retains bounded excerpts from the current run and its checkpoint.
 class _ChapterMemoryBatch {
-  _ChapterMemoryBatch(Iterable<_ChapterMemorySample> restored)
-    : _chapters = restored.toList();
+  _ChapterMemoryBatch(
+    Iterable<_ChapterMemorySample> restored, {
+    Set<String> recentFingerprints = const {},
+  }) : _chapters = restored.toList(),
+       _recentFingerprints = {...recentFingerprints};
 
   static const int chapterLimit = 4;
   static const int _batchByteThreshold = 3200;
+  static final RegExp _fingerprintFormat = RegExp(r'^[a-f0-9]{64}$');
   final List<_ChapterMemorySample> _chapters;
+  final Set<String> _recentFingerprints;
+
+  Set<String> get recentFingerprints => Set.unmodifiable(_recentFingerprints);
+
+  // A heterogeneous group can convey a new sequence even when every chapter
+  // has appeared before. Only skip a group of the same repeated content.
+  bool get repeatsRecentUpdate =>
+      _chapters.isNotEmpty &&
+      _recentFingerprints.length == 1 &&
+      _chapters.every(
+        (chapter) => _recentFingerprints.contains(chapter.fingerprint),
+      );
+
+  void rememberUpdate({required bool crossedBoundary}) {
+    _recentFingerprints.clear();
+    if (crossedBoundary ||
+        _chapters.any((chapter) => chapter.fingerprint == null)) {
+      return;
+    }
+    _recentFingerprints.addAll(
+      _chapters.map((chapter) => chapter.fingerprint!),
+    );
+  }
+
+  static Set<String> readFingerprints(Object? raw) {
+    if (raw == null) return const {};
+    if (raw is! List ||
+        raw.length > chapterLimit ||
+        raw.any(
+          (entry) => entry is! String || !_fingerprintFormat.hasMatch(entry),
+        )) {
+      throw const FormatException('Invalid recent chapter fingerprints.');
+    }
+    return raw.cast<String>().toSet();
+  }
 
   List<_ChapterMemorySample> get chapters => List.unmodifiable(_chapters);
   String? get lastPath => _chapters.isEmpty ? null : _chapters.last.path;
@@ -36,6 +75,8 @@ class _ChapterMemorySample {
     required this.text,
     required this.newTerms,
     required this.startsSection,
+    this.sourceExcerpt = '',
+    this.fingerprint,
   }) : textBytes = utf8.encode(text).length;
 
   static const int titleLimit = 180;
@@ -55,16 +96,73 @@ class _ChapterMemorySample {
   final int textBytes;
   final List<String> newTerms;
   final bool startsSection;
+  final String sourceExcerpt;
+  final String? fingerprint;
+
+  static final _numberedTitle = RegExp(
+    r'^\s*(?:chapter|section)\s+(?:[0-9]+|[ivxlcdm]+)\s*$',
+    caseSensitive: false,
+  );
+  static final _plainParagraph = RegExp(
+    r'^<p>[^<]+</p>$',
+    caseSensitive: false,
+  );
+  static final _attachmentMarkup = RegExp(
+    r'<(?:[\w.-]+:)?(?:a|aside|note)(?=\s|/?>)|(?:epub:type|role)\s*=',
+    caseSensitive: false,
+  );
+
+  /// Compare only complete, plain short chapters with interchangeable labels.
+  /// Exact source and validated target text keeps small but meaningful edits
+  /// (including negation, names, and punctuation) from matching.
+  static String? fingerprintFor(
+    InspectedChapter chapter, {
+    required String translatedExcerpt,
+    required List<String> newTerms,
+  }) {
+    if (chapter.category != ChapterCategory.content ||
+        !_numberedTitle.hasMatch(chapter.title) ||
+        utf8.encode(translatedExcerpt).length >= _substantialChapterBytes ||
+        newTerms.isNotEmpty ||
+        chapter.blocks.length > 8 ||
+        _attachmentMarkup.hasMatch(chapter.originalHtml)) {
+      return null;
+    }
+    final blocks = <(String, String)>[];
+    var length = 0;
+    for (final block in chapter.blocks) {
+      final translated = block.translatedHtml?.trim();
+      final source = block.sourceHtml.trim();
+      if (translated == null ||
+          source.length + translated.length > textLimit - length ||
+          !_plainParagraph.hasMatch(source) ||
+          !_plainParagraph.hasMatch(translated)) {
+        return null;
+      }
+      length += source.length + translated.length;
+      blocks.add((source, translated));
+    }
+    if (blocks.isEmpty) return null;
+    return sha256
+        .convert(
+          utf8.encode(
+            jsonEncode([
+              for (final (source, translated) in blocks) [source, translated],
+            ]),
+          ),
+        )
+        .toString();
+  }
 
   bool get needsPromptUpdate =>
       startsSection ||
       newTerms.isNotEmpty ||
       textBytes >= _substantialChapterBytes;
 
-  Map<String, Object> toPromptJson() => {
+  Map<String, Object> toPromptJson({String? excerpt}) => {
     'title': title,
     'category': category.name,
-    'text': text,
+    'text': excerpt ?? text,
     if (newTerms.isNotEmpty) 'newTerms': newTerms,
   };
 
@@ -72,6 +170,8 @@ class _ChapterMemorySample {
     ...toPromptJson(),
     'path': path,
     'startsSection': startsSection,
+    if (sourceExcerpt.isNotEmpty) 'sourceExcerpt': sourceExcerpt,
+    'fingerprint': ?fingerprint,
   };
 
   static List<_ChapterMemorySample> readPending(Object? raw) {
@@ -93,6 +193,8 @@ class _ChapterMemorySample {
     final text = raw['text'];
     final terms = raw['newTerms'] ?? const [];
     final startsSection = raw['startsSection'];
+    final sourceExcerpt = raw['sourceExcerpt'] ?? '';
+    final fingerprint = raw['fingerprint'];
     if (path is! String ||
         path.isEmpty ||
         !paths.add(path) ||
@@ -108,7 +210,14 @@ class _ChapterMemorySample {
           (term) =>
               term is! String || term.isEmpty || term.length > termLengthLimit,
         ) ||
-        startsSection is! bool) {
+        startsSection is! bool ||
+        sourceExcerpt is! String ||
+        sourceExcerpt.length > textLimit ||
+        (fingerprint != null &&
+            (fingerprint is! String ||
+                !_ChapterMemoryBatch._fingerprintFormat.hasMatch(
+                  fingerprint,
+                )))) {
       throw const FormatException('Invalid chapter memory sample fields.');
     }
     return _ChapterMemorySample(
@@ -118,6 +227,8 @@ class _ChapterMemorySample {
       text: text,
       newTerms: terms.cast<String>(),
       startsSection: startsSection,
+      sourceExcerpt: sourceExcerpt,
+      fingerprint: fingerprint as String?,
     );
   }
 }

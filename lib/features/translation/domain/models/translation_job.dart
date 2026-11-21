@@ -15,6 +15,9 @@ enum TranslationJobStatus {
 
   /// Translation finished and a translated EPUB path is available.
   completed,
+
+  /// The next API request would exceed the book's configured threshold.
+  budgetPaused,
 }
 
 /// Distinguishes inspection runs from translation runs in history/UI.
@@ -121,7 +124,10 @@ class TranslationJob {
     return normalized.endsWith('.epub');
   }
 
+  bool get isBudgetPaused => status == TranslationJobStatus.budgetPaused;
+
   bool get canResumeTranslation {
+    if (isBudgetPaused) return true;
     final bool resumableStatus =
         status == TranslationJobStatus.failed ||
         status == TranslationJobStatus.cancelled ||
@@ -404,7 +410,7 @@ TranslationJobPhase _readPhase(
 }
 
 // History stores counters only, never arbitrary response data or credentials.
-Map<String, Object> _readUsage(Object? value) {
+Map<String, Object> _readUsage(Object? value, {bool includeCumulative = true}) {
   if (value is! Map) return const {};
   const counters = [
     'requests',
@@ -414,12 +420,27 @@ Map<String, Object> _readUsage(Object? value) {
     'elapsedMs',
     'usageReportedRequests',
     'reasoningTokens',
+    'reasoningReportedRequests',
+    'cachedPromptTokens',
+    'promptCacheReportedRequests',
+    'totalUsageReportedRequests',
+    'reportedTotalTokens',
+    'chargedTokensEstimate',
+    'priorChargedTokensEstimate',
+    'estimatedUnreportedTokens',
+    'maxBookTokens',
+    'nextRequestEstimatedTokens',
   ];
   const kinds = [
     'styleProfile',
     'initialBookMemory',
     'chapterMemory',
+    'chapterMemoryBatch',
+    'entityGlossary',
     'translation',
+    'bodyRepair',
+    'footnoteTranslation',
+    'protectedSlots',
     'semanticReview',
     'semanticVerification',
     'semanticSourceAnalysis',
@@ -430,6 +451,11 @@ Map<String, Object> _readUsage(Object? value) {
     'probe',
   ];
   return {
+    if (includeCumulative && value['cumulativeUsage'] is Map)
+      'cumulativeUsage': _readUsage(
+        value['cumulativeUsage'],
+        includeCumulative: false,
+      ),
     for (final key in counters)
       if (value.containsKey(key)) key: _readNonNegativeInt(value[key]),
     for (final key in [
@@ -438,6 +464,8 @@ Map<String, Object> _readUsage(Object? value) {
       'promptTokensByKind',
       'finishReasons',
       'completionTokensByKind',
+      'chargedTokensEstimateByKind',
+      'priorChargedTokensEstimateByKind',
     ])
       if (value[key] is Map)
         key: <String, int>{

@@ -139,6 +139,7 @@ class AppStrings {
       'inspected' => isChinese ? '检查完成' : 'Inspected',
       'cancelled' => isChinese ? '已取消' : 'Cancelled',
       'failed' => isChinese ? '失败' : 'Failed',
+      'budgetPaused' => isChinese ? '因预算暂停' : 'Paused at token budget',
       'completedWithWarnings' =>
         isChinese ? '完成但有警告' : 'Completed with warnings',
       'completed' => isChinese ? '已完成' : 'Completed',

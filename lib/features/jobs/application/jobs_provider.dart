@@ -52,6 +52,7 @@ final jobsProvider = Provider<List<JobSummary>>((ref) {
               job.status == TranslationJobStatus.running,
           canOpenOutput: job.hasExportableEpub,
           canRetry:
+              job.isBudgetPaused ||
               job.status == TranslationJobStatus.failed ||
               job.status == TranslationJobStatus.cancelled ||
               job.status == TranslationJobStatus.completedWithWarnings,

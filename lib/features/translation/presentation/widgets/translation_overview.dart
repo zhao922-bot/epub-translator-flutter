@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as path;
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
 import '../../../../shared/platform/platform_utils.dart';
 import '../../../../shared/widgets/section_card.dart';
 import '../../domain/models/translation_job.dart';
@@ -19,6 +20,8 @@ class TranslationOverview extends StatelessWidget {
     required this.onSaveToDownloadsPressed,
     required this.canTranslate,
     this.estimate,
+    this.maxBookTokens = 0,
+    this.onResumeBudgetPaused,
     this.onPreviewWarnings,
     this.onCancelPressed,
     this.canCancel = false,
@@ -42,6 +45,8 @@ class TranslationOverview extends StatelessWidget {
   final bool isSaving;
   final bool isSharing;
   final TranslationRunEstimate? estimate;
+  final int maxBookTokens;
+  final VoidCallback? onResumeBudgetPaused;
   final VoidCallback? onPreviewWarnings;
   final VoidCallback? onCancelPressed;
   final bool canCancel;
@@ -58,6 +63,7 @@ class TranslationOverview extends StatelessWidget {
     final TranslationJobStatus status =
         job?.status ?? TranslationJobStatus.idle;
     final bool canExport = job?.hasExportableEpub ?? false;
+    final bool paused = job?.isBudgetPaused ?? false;
     final bool hasWarnings =
         status == TranslationJobStatus.completedWithWarnings;
     final String? reportPath = job?.qualityReportPath;
@@ -156,6 +162,16 @@ class TranslationOverview extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
+          if (paused) ...<Widget>[
+            Semantics(liveRegion: true, child: Text(strings.budgetPausedBody)),
+            if (onResumeBudgetPaused != null)
+              FilledButton.tonalIcon(
+                onPressed: onResumeBudgetPaused,
+                icon: const Icon(Icons.play_arrow_rounded),
+                label: Text(strings.adjustBudgetAndResume),
+              ),
+            const SizedBox(height: 8),
+          ],
           if (hasWarnings) ...<Widget>[
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -242,7 +258,7 @@ class TranslationOverview extends StatelessWidget {
                   '${strings.blocksLabel}: ${job!.completedBlocks}/${job!.totalBlocks}',
                 ),
               if (estimate case final TranslationRunEstimate e
-                  when e.hasRuntimeData && !canExport)
+                  when e.hasRuntimeData && !canExport && !paused)
                 _MetaText('${strings.etaLabel}: ${e.remainingLabel(strings)}'),
               if (estimate case final TranslationRunEstimate e
                   when e.hasSelection && !canExport)
@@ -252,6 +268,17 @@ class TranslationOverview extends StatelessWidget {
                     e.estimatedInputTokens,
                   ),
                 ),
+              if (estimate case final TranslationRunEstimate e
+                  when e.hasSelection && e.bookTokensHigh > 0 && !canExport)
+                _MetaText(
+                  strings.estimatedBookTokenRange(
+                    e.bookTokensLow,
+                    e.bookTokensHigh,
+                    usesObservedUsage: e.hasObservedBookUsage,
+                  ),
+                ),
+              if (maxBookTokens > 0 && !canExport)
+                _MetaText(strings.bookBudgetThreshold(maxBookTokens)),
             ],
           ),
           if (job?.currentBlock?.isNotEmpty == true) ...<Widget>[
@@ -327,7 +354,8 @@ class _StatusPill extends StatelessWidget {
         scheme.secondary.withValues(alpha: 0.12),
         scheme.secondary,
       ),
-      TranslationJobStatus.completedWithWarnings => (
+      TranslationJobStatus.completedWithWarnings ||
+      TranslationJobStatus.budgetPaused => (
         scheme.tertiaryContainer,
         scheme.onTertiaryContainer,
       ),

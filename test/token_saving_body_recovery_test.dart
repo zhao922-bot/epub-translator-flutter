@@ -7,6 +7,7 @@ import 'package:epub_translator_flutter/features/translation/domain/models/inspe
 import 'package:epub_translator_flutter/features/translation/domain/models/translation_config.dart';
 import 'package:epub_translator_flutter/features/translation/domain/repositories/translation_repository.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/epub/epub_chapter_translator.dart';
+import 'package:epub_translator_flutter/features/translation/infrastructure/epub/translation_api_client.dart';
 import 'package:epub_translator_flutter/features/translation/infrastructure/translation_cache_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -76,6 +77,154 @@ void main() {
   }
 
   test(
+    'plain heading removes markup from the wire and safely restores it',
+    () async {
+      final classes = List.generate(
+        24,
+        (index) => 'chapter-heading-format-$index',
+      ).join(' ');
+      const layout =
+          'text-indent: 1.2em; margin-block: 0.75em; line-height: 1.45; widows: 3; orphans: 3';
+      final attrs =
+          'id="chapter-first-heading" class="$classes" style="$layout"';
+      const body = 'The lighthouse & the river.';
+      const translated = '灯塔 & 河流 <标记>。';
+      final heading = ExtractedBlock(
+        id: 'heading',
+        tagName: 'h2',
+        sourceHtml: '<h2 $attrs>\t  The lighthouse &amp; the river. \n</h2>',
+        sourceText: body,
+      );
+      final compact = _ScriptedBodyAdapter((payload, _, attempt) {
+        expect(attempt, 0);
+        expect(payload['blocks'], [
+          {'id': 'heading', 'text': body},
+        ]);
+        return _response(
+          jsonEncode({
+            'blocks': [
+              {'id': 'heading', 'text': '  $translated  '},
+            ],
+          }),
+        );
+      });
+      expect(await translate(compact, blocks: [heading]), [
+        '<h2 $attrs>\t  灯塔 &amp; 河流 &lt;标记&gt;。 \n</h2>',
+      ]);
+
+      final legacy = _ScriptedBodyAdapter((payload, _, attempt) {
+        expect(attempt, 0);
+        expect(payload['blocks'], [
+          {'id': 'heading', 'html': heading.sourceHtml},
+        ]);
+        return _response(
+          jsonEncode({
+            'blocks': [
+              {'id': 'heading', 'html': '<h2 $attrs>灯塔和河流。</h2>'},
+            ],
+          }),
+        );
+      });
+      await translate(
+        legacy,
+        blocks: [heading],
+        withConfig: config.copyWith(tokenSavingMode: false),
+      );
+      expect(compact.wireBytes.single, lessThan(legacy.wireBytes.single - 500));
+      expect(
+        compact.outputBudgets.single,
+        lessThan(legacy.outputBudgets.single),
+      );
+    },
+  );
+
+  test('mixed batch keeps inline and semantic markup in the HTML rows', () async {
+    final blocks = [
+      _blocks[0],
+      _blocks[1].copyWith(
+        sourceHtml: '<p>A sailor sees <em>the river</em>.</p>',
+      ),
+      _blocks[2].copyWith(
+        sourceHtml:
+            '<p role="doc-epigraph" lang="en">The boat sails south.</p>',
+      ),
+      _blocks[2].copyWith(
+        id: 'p-4',
+        sourceHtml:
+            '<p style="margin: 1em; visibility: hidden">The boat sails south.</p>',
+      ),
+    ];
+    final adapter = _ScriptedBodyAdapter((payload, _, attempt) {
+      expect(attempt, 0);
+      expect(payload['blocks'], [
+        {'id': 'p-1', 'text': blocks[0].sourceText},
+        {'id': 'p-2', 'html': blocks[1].sourceHtml},
+        {'id': 'p-3', 'html': blocks[2].sourceHtml},
+        {'id': 'p-4', 'html': blocks[3].sourceHtml},
+      ]);
+      return _response(
+        jsonEncode({
+          'blocks': [
+            _row('p-1', plain: true),
+            {'id': 'p-2', 'html': '<p>水手看见了<em>河流</em>。</p>'},
+            _row('p-3'),
+            {'id': 'p-4', 'html': _translations['p-3']},
+          ],
+        }),
+      );
+    });
+    expect(await translate(adapter, blocks: blocks), [
+      _translations['p-1'],
+      '<p>水手看见了<em>河流</em>。</p>',
+      '<p role="doc-epigraph" lang="en">小船往南航行。</p>',
+      '<p style="margin: 1em; visibility: hidden">小船往南航行。</p>',
+    ]);
+    expect(adapter.wireBytes, hasLength(1));
+  });
+
+  test(
+    'invalid text rows take one HTML repair without invalid cache writes',
+    () async {
+      final validated = <String, String>{};
+      final adapter = _ScriptedBodyAdapter((payload, _, attempt) {
+        final rows = (payload['blocks'] as List).cast<Map>();
+        if (attempt == 0) {
+          expect(rows.every((row) => row.containsKey('text')), isTrue);
+          return _response(
+            jsonEncode({
+              'blocks': [
+                _row('p-1', plain: true),
+                _row('p-2'),
+                {'id': 'p-3', 'text': '小船\u0000往南航行。'},
+              ],
+            }),
+          );
+        }
+        expect(attempt, 1);
+        expect(validated, {'p-1': _translations['p-1']});
+        expect(payload['kind'], 'bodyRepair');
+        expect(rows, [
+          {'id': 'p-2', 'html': _blocks[1].sourceHtml, 'reason': 'structure'},
+          {'id': 'p-3', 'html': _blocks[2].sourceHtml, 'reason': 'structure'},
+        ]);
+        return _response(_rows(['p-2', 'p-3']));
+      });
+      expect(
+        await translate(
+          adapter,
+          onValidated: (id, html) async {
+            expect(validated.containsKey(id), isFalse);
+            validated[id] = html;
+          },
+        ),
+        _translations.values.toList(),
+      );
+      expect(validated, _translations);
+      expect(adapter.wireBytes, hasLength(2));
+    },
+  );
+
+  test(
     'keeps a valid paragraph and groups missing and residual repairs',
     () async {
       final validated = <String>[];
@@ -84,8 +233,8 @@ void main() {
           return _response(
             jsonEncode({
               'blocks': [
-                _row('p-1'),
-                {'id': 'p-2', 'html': _blocks[1].sourceHtml},
+                _row('p-1', plain: true),
+                {'id': 'p-2', 'text': _blocks[1].sourceText},
               ],
             }),
           );
@@ -123,7 +272,7 @@ void main() {
       final adapter = _ScriptedBodyAdapter((payload, options, attempt) {
         if (attempt == 0) {
           return _response(
-            '{"blocks":[${jsonEncode(_row('p-1'))}',
+            '{"blocks":[${jsonEncode(_row('p-1', plain: true))}',
             finish: 'length',
           );
         }
@@ -249,7 +398,7 @@ void main() {
     () async {
       final checking = config.copyWith(semanticQualityCheck: true);
       final partial = _ScriptedBodyAdapter((payload, options, attempt) {
-        if (attempt == 0) return _response(_rows(['p-1']));
+        if (attempt == 0) return _response(_rows(['p-1'], plain: true));
         throw DioException(
           requestOptions: options,
           type: DioExceptionType.cancel,
@@ -280,12 +429,103 @@ void main() {
       expect(resumed.outputBudgets, hasLength(1));
     },
   );
+  test(
+    'legacy semantic drafts survive a pause before protected blocks',
+    () async {
+      final checking = config.copyWith(
+        tokenSavingMode: false,
+        maxBookTokens: 5000,
+        semanticQualityCheck: true,
+      );
+      final protected = _blocks[1].copyWith(
+        sourceHtml:
+            '<p>A sailor sees the river.'
+            '<a id="footnote_ref_1" href="notes.xhtml#note-1">*</a></p>',
+        sourceText: 'A sailor sees the river.*',
+      );
+      final dio = Dio();
+      addTearDown(() => dio.close(force: true));
+
+      Future<List<String>> run(_BudgetPausingApi api) =>
+          EpubChapterTranslator(
+            cacheStore: cache,
+            apiClient: api,
+          ).translateBlockBatchForTest(
+            dio: dio,
+            config: checking,
+            blocks: [_blocks.first, protected],
+            chapterPath: 'chapter.xhtml',
+            onValidated: (_, _) async =>
+                fail('Semantic review has not completed.'),
+          );
+
+      final original = _BudgetPausingApi();
+      await expectLater(
+        run(original),
+        throwsA(isA<TranslationBudgetPausedException>()),
+      );
+      expect(original.attemptedGroups, [
+        ['p-1'],
+        ['p-2'],
+      ]);
+
+      final resumed = _BudgetPausingApi();
+      await expectLater(
+        run(resumed),
+        throwsA(isA<TranslationBudgetPausedException>()),
+      );
+      expect(resumed.attemptedGroups, [
+        ['p-2'],
+      ]);
+    },
+  );
 }
 
-Map<String, String> _row(String id) => {'id': id, 'html': _translations[id]!};
+class _BudgetPausingApi extends TranslationApiClient {
+  final attemptedGroups = <List<String>>[];
 
-String _rows(List<String> ids) => jsonEncode({
-  'blocks': [for (final id in ids) _row(id)],
+  @override
+  Future<Response<dynamic>> postChatCompletions({
+    required Dio dio,
+    required Map<String, dynamic> data,
+    CancelToken? cancelToken,
+  }) async {
+    final messages = (data['messages'] as List).cast<Map>();
+    final payload = jsonDecode(messages.last['content'] as String) as Map;
+    final blocks = (payload['blocks'] as List).cast<Map>();
+    attemptedGroups.add([for (final block in blocks) block['id'] as String]);
+    if (blocks.single.containsKey('slots')) {
+      throw const TranslationBudgetPausedException({
+        'maxBookTokens': 5000,
+        'nextRequestEstimatedTokens': 1000,
+      });
+    }
+    return Response<dynamic>(
+      requestOptions: RequestOptions(),
+      data: <String, dynamic>{
+        'choices': [
+          {
+            'finish_reason': 'stop',
+            'message': {
+              'content': _rows(['p-1']),
+            },
+          },
+        ],
+      },
+    );
+  }
+}
+
+Map<String, String> _row(String id, {bool plain = false}) => {
+  'id': id,
+  if (plain)
+    'text': _translations[id]!.replaceAll(RegExp('</?p>'), '')
+  else
+    'html': _translations[id]!,
+};
+
+String _rows(List<String> ids, {bool plain = false}) => jsonEncode({
+  'blocks': [for (final id in ids) _row(id, plain: plain)],
 });
 
 ResponseBody _response(
@@ -313,6 +553,7 @@ class _ScriptedBodyAdapter implements HttpClientAdapter {
   final ResponseBody Function(Map<String, dynamic>, RequestOptions, int)
   respond;
   final outputBudgets = <int>[];
+  final wireBytes = <int>[];
 
   @override
   void close({bool force = false}) {}
@@ -328,6 +569,7 @@ class _ScriptedBodyAdapter implements HttpClientAdapter {
     final payload =
         jsonDecode(messages.last['content'] as String) as Map<String, dynamic>;
     final attempt = outputBudgets.length;
+    wireBytes.add(utf8.encode(jsonEncode(request)).length);
     outputBudgets.add(
       (request['max_completion_tokens'] ?? request['max_tokens']) as int,
     );

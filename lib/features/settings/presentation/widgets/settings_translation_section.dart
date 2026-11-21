@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../../shared/localization/app_strings.dart';
+import '../../../../shared/localization/book_budget_strings.dart';
 import '../../../translation/application/translation_dashboard_controller.dart';
 import '../../../translation/domain/models/translation_config.dart';
+import '../../../translation/presentation/widgets/book_token_budget_field.dart';
 import '../../application/settings_controller.dart';
 import 'settings_copy.dart';
 import 'settings_fields.dart';
@@ -24,6 +26,7 @@ class SettingsTranslationSection extends ConsumerWidget {
           residualQualityCheck: c.residualQualityCheck,
           styleProfileEnabled: c.styleProfileEnabled,
           tokenSavingMode: c.tokenSavingMode,
+          maxBookTokens: c.maxBookTokens,
         ),
       ),
     );
@@ -43,6 +46,33 @@ class SettingsTranslationSection extends ConsumerWidget {
             subtitle: Text(strings.tokenSavingModeBody),
             value: config.tokenSavingMode,
             onChanged: isRunActive ? null : controller.setTokenSavingMode,
+          ),
+          const SizedBox(height: 8),
+          SettingsTextField(
+            fieldKey: const ValueKey('settings-max-book-tokens'),
+            strings: strings,
+            enabled: !isRunActive,
+            value: config.maxBookTokens == 0 ? '' : '${config.maxBookTokens}',
+            keyboardType: TextInputType.number,
+            validator: (value) =>
+                BookTokenBudgetField.parse(value ?? '') == null
+                ? strings.invalidBookBudget
+                : null,
+            onChanged: (_) {},
+            onCommit: (value) async {
+              final tokens = BookTokenBudgetField.parse(value);
+              return tokens != null &&
+                  await controller.setMaxBookTokens(tokens);
+            },
+            decoration: InputDecoration(
+              labelText: strings.bookTokenBudget,
+              helperText: strings.bookBudgetUnlimitedHint,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            strings.bookBudgetHelp,
+            style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 8),
           _TuningPresetSelector(enabled: !isRunActive),

@@ -118,6 +118,7 @@ class TranslationBatchPlanner {
     List<ExtractedBlock> chapterBlocks = const <ExtractedBlock>[],
     String chapterTitle = '',
     Map<String, Object?>? bookMemory,
+    int Function(ExtractedBlock)? estimateBlockBudget,
   }) {
     final List<TranslationBlockBatch> batches = <TranslationBlockBatch>[];
     List<ExtractedBlock> current = <ExtractedBlock>[];
@@ -169,7 +170,8 @@ class TranslationBatchPlanner {
     }
 
     for (final ExtractedBlock block in pendingBlocks) {
-      final int blockBudget = blockBudgetFor(block);
+      final int blockBudget =
+          estimateBlockBudget?.call(block) ?? blockBudgetFor(block);
       final int? blockIndex = indexById[block.id];
       // Snippet ranges for the batch if `block` joins it (mirrors
       // buildContext: min/max over the batch blocks' chapter indexes).

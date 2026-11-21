@@ -56,6 +56,7 @@ class TranslationConfig {
     this.maxSemanticReviewTokens = 64000,
     this.useStreamingApi = false,
     this.tokenSavingMode = false,
+    this.maxBookTokens = 0,
   });
 
   final String apiBaseUrl;
@@ -121,6 +122,12 @@ class TranslationConfig {
 
   /// Opts into compact prompts and adaptive translation request planning.
   final bool tokenSavingMode;
+
+  /// Cumulative estimate threshold across requests for the same book/task.
+  /// A zero value leaves the book unbounded.
+  final int maxBookTokens;
+
+  static const int maxBookTokenBudget = 1000000000;
 
   /// Resolved capability profile for the active endpoint, model, and effort.
   ModelCapabilityProfile get capabilities => ModelCapabilityProfile.resolve(
@@ -237,6 +244,7 @@ class TranslationConfig {
     int? maxSemanticReviewTokens,
     bool? useStreamingApi,
     bool? tokenSavingMode,
+    int? maxBookTokens,
   }) {
     return TranslationConfig(
       apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
@@ -245,6 +253,7 @@ class TranslationConfig {
           maxSemanticReviewTokens ?? this.maxSemanticReviewTokens,
       useStreamingApi: useStreamingApi ?? this.useStreamingApi,
       tokenSavingMode: tokenSavingMode ?? this.tokenSavingMode,
+      maxBookTokens: maxBookTokens ?? this.maxBookTokens,
       apiKey: apiKey ?? this.apiKey,
       model: model ?? this.model,
       apiProviderSelection: apiProviderSelection ?? this.apiProviderSelection,
@@ -324,6 +333,7 @@ class TranslationConfig {
       'maxSemanticReviewTokens': maxSemanticReviewTokens,
       'useStreamingApi': useStreamingApi,
       'tokenSavingMode': tokenSavingMode,
+      'maxBookTokens': maxBookTokens,
     };
   }
 
@@ -542,6 +552,12 @@ class TranslationConfig {
       httpProxy: _readTrimmedStringAllowEmpty(json['httpProxy']),
       useStreamingApi: json['useStreamingApi'] == true,
       tokenSavingMode: json['tokenSavingMode'] == true,
+      maxBookTokens: _readBoundedInt(
+        json['maxBookTokens'],
+        fallback: 0,
+        min: 0,
+        max: maxBookTokenBudget,
+      ),
     );
   }
 

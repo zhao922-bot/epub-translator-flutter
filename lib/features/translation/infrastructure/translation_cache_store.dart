@@ -1225,6 +1225,12 @@ class TranslationCacheStore {
     return File(path.join(root.path, 'jobs', '$jobKey.json'));
   }
 
+  /// Whole-book request accounting is excluded from artifact eviction.
+  Future<File> bookUsageLedger(String key) async {
+    final root = await _cacheRoot();
+    return File(path.join(root.path, 'book_usage', '$key.json'));
+  }
+
   Future<Directory> _cacheRoot() async {
     if (_rootOverride != null) return _rootOverride;
     final Future<Directory>? pending = _rootFuture;
